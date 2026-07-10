@@ -1,0 +1,6 @@
+# FaultLoom's deterministic builder uses only the Python 3.12 standard library.
+# This release lock is therefore intentionally empty until a distributable
+# package declares an external runtime dependency. At that point each package
+# must have an exact pin and one or more sha256 hashes here. Unhashed, mutable,
+# URL, path, and editable requirements are rejected by the build policy.
+

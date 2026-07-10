@@ -26,3 +26,14 @@ mediated by the Gateway. Installation of a pack never grants authority.
 
 See [SECURITY.md](SECURITY.md) and [ETHICAL_USE.md](ETHICAL_USE.md) before use.
 
+## Build verification
+
+The clean-checkout build is offline and byte-reproducible. With the pinned
+Python and Rust toolchains preinstalled, run:
+
+```bash
+python3 tools/verify_clean_checkout.py
+```
+
+See [docs/REPRODUCIBLE_BUILDS.md](docs/REPRODUCIBLE_BUILDS.md) for dependency
+admission, artifact metadata, and the intentionally disabled release gate.
