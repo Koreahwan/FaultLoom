@@ -298,17 +298,12 @@ class EncryptedCAS:
             finally:
                 if descriptor is not None:
                     os.close(descriptor)
-            try:
-                os.link(
-                    temporary,
-                    self._filename(reference.sha256),
-                    src_dir_fd=shard_fd,
-                    dst_dir_fd=shard_fd,
-                    follow_symlinks=False,
-                )
-            except FileExistsError:
-                existing = self._read_envelope(reference)
-                self._decrypt(reference, existing)
+            os.replace(
+                temporary,
+                self._filename(reference.sha256),
+                src_dir_fd=shard_fd,
+                dst_dir_fd=shard_fd,
+            )
             os.fsync(shard_fd)
         finally:
             try:
@@ -426,6 +421,75 @@ class EncryptedCAS:
             finally:
                 os.close(shard_fd)
         return tuple(sorted(result))
+
+    def temporary_entries(self) -> tuple[tuple[str, str], ...]:
+        """Return interrupted pre-publication writes for crash reconciliation."""
+
+        self._require_open()
+        result: list[tuple[str, str]] = []
+        for shard in os.listdir(self._namespace_fd):
+            if len(shard) != 2 or any(character not in "0123456789abcdef" for character in shard):
+                continue
+            shard_fd = _open_directory(self._namespace_fd, shard, create=False)
+            try:
+                for filename in os.listdir(shard_fd):
+                    if not filename.startswith(".tmp-"):
+                        continue
+                    suffix = filename.removeprefix(".tmp-")
+                    if len(suffix) != 32 or any(
+                        character not in "0123456789abcdef" for character in suffix
+                    ):
+                        raise ChainIntegrityError("CAS contains an unknown temporary entry")
+                    entry = os.stat(filename, dir_fd=shard_fd, follow_symlinks=False)
+                    if not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
+                        raise ChainIntegrityError(
+                            "CAS temporary entry is not a private regular file"
+                        )
+                    result.append((shard, filename))
+            finally:
+                os.close(shard_fd)
+        return tuple(sorted(result))
+
+    def quarantine_temporary(
+        self, shard: str, filename: str, *, recovery_id: str
+    ) -> None:
+        self._require_open()
+        if (
+            len(shard) != 2
+            or any(character not in "0123456789abcdef" for character in shard)
+            or not filename.startswith(".tmp-")
+        ):
+            raise StorageError("temporary CAS entry identity is invalid")
+        require_identifier(recovery_id, field="recovery_id")
+        source_fd = _open_directory(self._namespace_fd, shard, create=False)
+        orphan_fd = _open_directory(self._namespace_fd, "orphaned", create=True)
+        recovery_fd = _open_directory(orphan_fd, recovery_id, create=True)
+        target = f"{shard}-{filename.removeprefix('.tmp-')}.interrupted"
+        try:
+            descriptor = os.open(filename, os.O_RDONLY | NOFOLLOW, dir_fd=source_fd)
+            try:
+                entry = os.fstat(descriptor)
+                if not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
+                    raise ChainIntegrityError("interrupted write changed during recovery")
+            finally:
+                os.close(descriptor)
+            try:
+                os.link(
+                    filename,
+                    target,
+                    src_dir_fd=source_fd,
+                    dst_dir_fd=recovery_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as exc:
+                raise ChainIntegrityError("interrupted-write quarantine collision") from exc
+            os.unlink(filename, dir_fd=source_fd)
+            os.fsync(source_fd)
+            os.fsync(recovery_fd)
+        finally:
+            os.close(recovery_fd)
+            os.close(orphan_fd)
+            os.close(source_fd)
 
     def quarantine_orphan(self, digest: str, *, recovery_id: str) -> None:
         self._require_open()

@@ -21,6 +21,7 @@ class RecoveryReport:
     chain_head: str
     verified_artifacts: tuple[str, ...]
     quarantined_orphans: tuple[str, ...]
+    quarantined_interrupted_writes: tuple[str, ...]
     recovery_id: str | None
 
 
@@ -106,6 +107,16 @@ class StateStore:
         """Verify durable state and quarantine uncommitted CAS writes."""
 
         chain_head = self.ledger.verify_chain()
+        interrupted = self.cas.temporary_entries()
+        interrupted_labels = tuple(f"{shard}/{name}" for shard, name in interrupted)
+        pre_recovery_id: str | None = None
+        if interrupted:
+            stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            pre_recovery_id = f"recovery-{stamp}-{secrets.token_hex(4)}"
+            for shard, filename in interrupted:
+                self.cas.quarantine_temporary(
+                    shard, filename, recovery_id=pre_recovery_id
+                )
         references = self.ledger.referenced_artifacts()
         verified: list[str] = []
         for reference in references:
@@ -119,10 +130,11 @@ class StateStore:
                 f"ledger references missing encrypted artifacts: {sorted(missing)}"
             )
         orphans = sorted(live - referenced)
-        recovery_id: str | None = None
+        recovery_id: str | None = pre_recovery_id
         if orphans:
-            stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-            recovery_id = f"recovery-{stamp}-{secrets.token_hex(4)}"
+            if recovery_id is None:
+                stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+                recovery_id = f"recovery-{stamp}-{secrets.token_hex(4)}"
             for digest in orphans:
                 self.cas.quarantine_orphan(digest, recovery_id=recovery_id)
         return RecoveryReport(
@@ -130,6 +142,6 @@ class StateStore:
             chain_head=chain_head,
             verified_artifacts=tuple(sorted(verified)),
             quarantined_orphans=tuple(orphans),
+            quarantined_interrupted_writes=interrupted_labels,
             recovery_id=recovery_id,
         )
-

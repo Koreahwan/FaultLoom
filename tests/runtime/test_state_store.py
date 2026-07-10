@@ -272,6 +272,23 @@ def test_recovery_quarantines_uncommitted_cas_write(tmp_path: Path) -> None:
         assert store.cas.get(committed) == b"committed"
 
 
+def test_recovery_quarantines_interrupted_prepublication_write(tmp_path: Path) -> None:
+    engagement_id = "eng.interrupted"
+    namespace = hashlib.sha256(engagement_id.encode()).hexdigest()
+    with StateStore(tmp_path, engagement_id, key()) as store:
+        shard = tmp_path / "cas" / namespace / "ab"
+        shard.mkdir()
+        temporary = shard / (".tmp-" + "1" * 32)
+        temporary.write_bytes(b"partial encrypted envelope")
+        report = store.recover()
+        assert report.quarantined_interrupted_writes == (
+            "ab/.tmp-" + "1" * 32,
+        )
+        assert report.recovery_id is not None
+        assert not temporary.exists()
+        assert store.cas.temporary_entries() == ()
+
+
 def test_recovery_fails_if_ledger_artifact_is_missing(tmp_path: Path) -> None:
     with StateStore(tmp_path, "eng.missing", key()) as store:
         _, reference = store.append_observation(
