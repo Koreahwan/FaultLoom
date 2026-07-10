@@ -173,6 +173,60 @@ dependencies = [
 
 
 class ReproducibleBuildTests(unittest.TestCase):
+    def test_exact_project_license_files_are_packaged_from_the_project(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            make_repository(root)
+            project = root / "packages/demo/pyproject.toml"
+            contents = project.read_text(encoding="utf-8").replace(
+                'description = "Synthetic package"',
+                'description = "Synthetic package"\n'
+                'license = "Apache-2.0"\n'
+                'license-files = ["LICENSE", "NOTICE"]',
+            )
+            write(project, contents)
+            write(root / "packages/demo/LICENSE", "project license\n")
+            write(root / "packages/demo/NOTICE", "project notice\n")
+            commit_all(root, "Declare exact project license files")
+
+            output = root / "output"
+            build_once(root, output, EPOCH)
+            with zipfile.ZipFile(next(output.glob("*.whl"))) as wheel:
+                self.assertEqual(
+                    wheel.read("faultloom_demo-0.1.0.dist-info/licenses/LICENSE"),
+                    b"project license\n",
+                )
+                self.assertEqual(
+                    wheel.read("faultloom_demo-0.1.0.dist-info/licenses/NOTICE"),
+                    b"project notice\n",
+                )
+
+    def test_project_license_files_fail_closed(self) -> None:
+        variants = (
+            ('license-files = ["../LICENSE", "NOTICE"]', "escapes the repository"),
+            ('license-files = ["LICEN*", "NOTICE"]', "must use exact paths"),
+            ('license-files = ["LICENSE"]', "must contain LICENSE and NOTICE"),
+            ('license-files = ["LICENSE", "license", "NOTICE"]', "duplicate name"),
+            ('license-files = ["LICENSE", "MISSING"]', "missing or unsafe"),
+        )
+        for declaration, error in variants:
+            with self.subTest(declaration=declaration):
+                with tempfile.TemporaryDirectory() as raw:
+                    root = Path(raw)
+                    make_repository(root)
+                    project = root / "packages/demo/pyproject.toml"
+                    contents = project.read_text(encoding="utf-8").replace(
+                        'description = "Synthetic package"',
+                        f'description = "Synthetic package"\n{declaration}',
+                    )
+                    write(project, contents)
+                    write(root / "packages/demo/LICENSE", "project license\n")
+                    write(root / "packages/demo/NOTICE", "project notice\n")
+                    write(root / "packages/demo/license", "duplicate project license\n")
+                    commit_all(root, "Declare invalid project license files")
+                    with self.assertRaisesRegex(BuildPolicyError, error):
+                        discover_projects(root, load_policy(root))
+
     def test_synthetic_package_build_is_byte_reproducible(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             base = Path(raw)
@@ -252,6 +306,16 @@ class ReproducibleBuildTests(unittest.TestCase):
             write(lock, "example-dependency==2.4.1\n")
             with self.assertRaisesRegex(BuildPolicyError, "exact and sha256-hashed"):
                 parse_release_lock(lock)
+
+    def test_numeric_two_component_release_version_is_admitted(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            lock = Path(raw) / "requirements-release.lock"
+            digest = "b" * 64
+            write(lock, f"pycparser==3.0 --hash=sha256:{digest}\n")
+            self.assertEqual(
+                parse_release_lock(lock),
+                {"pycparser": ("3.0", (digest,))},
+            )
             write(lock, "example-dependency>=2.4.1 --hash=sha256:" + "b" * 64 + "\n")
             with self.assertRaisesRegex(BuildPolicyError, "exact and sha256-hashed"):
                 parse_release_lock(lock)

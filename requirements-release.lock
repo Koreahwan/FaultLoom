@@ -1,9 +1,13 @@
-# FaultLoom's deterministic builder uses only the Python 3.12 standard library.
-# This release lock is therefore intentionally empty until a distributable
-# package declares an external runtime dependency. At that point each package
-# must have an exact pin and one or more sha256 hashes here. Unhashed, mutable,
-# URL, path, and editable requirements are rejected by the build policy.
-# Hashes remain declared-unverified metadata until an admitted offline
-# wheelhouse is reconciled against them; release mode remains hard-disabled.
-# Every lock entry must also appear in requirements-release.graph.json, which
-# records the complete exact-version dependency graph including transitives.
+# Runtime closure resolved for CPython 3.12 on manylinux_2_17_x86_64.
+# Each digest identifies the exact wheel selected for the offline release
+# candidate. The build records these as declared-unverified until a separately
+# admitted wheelhouse is reconciled; release mode remains hard-disabled.
+# Every entry also appears in requirements-release.graph.json.
+annotated-types==0.7.0 --hash=sha256:1f02e8b43a8fbbc3f3e0d4f0f4bfc8131bcb4eebe8849b8e5c773f3a1c582a53
+cffi==2.1.0 --hash=sha256:1e9f50d192a3e525b15a75ab5114e442d83d657b7ec29182a991bc9a88fd3a66
+cryptography==41.0.7 --hash=sha256:841df4caa01008bad253bce2a6f7b47f86dc9f08df4b433c404def869f590a15
+pycparser==3.0 --hash=sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992
+pydantic==2.12.5 --hash=sha256:e561593fccf61e8a20fc46dfc2dfe075b8be7d0188df33f221ad1f0139180f9d
+pydantic-core==2.41.5 --hash=sha256:eceb81a8d74f9267ef4081e246ffd6d129da5d87e37a77c9bde550cb04870c1c
+typing-extensions==4.16.0 --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8
+typing-inspection==0.4.2 --hash=sha256:4ed1cacbdc298c220f1bd249ed5287caa16f34d44ef4e9c3d0cbad5b521545e7

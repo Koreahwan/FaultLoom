@@ -80,7 +80,10 @@ EXACT_PROJECT_DEPENDENCY = re.compile(
     r"^(?P<name>[A-Za-z0-9][A-Za-z0-9_.-]*)=="
     r"(?P<version>[A-Za-z0-9][A-Za-z0-9_.+!-]*)$"
 )
-SAFE_VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+# Stable PEP 440 release segments may contain two or more numeric components
+# (for example, pycparser 3.0).  Pre/dev/local versions stay outside the
+# admitted release-lock grammar.
+SAFE_VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+){1,3}$")
 SAFE_PROJECT_NAME = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$"
 )
@@ -189,6 +192,7 @@ class Project:
     build_requirements: tuple[str, ...]
     readme: Path | None
     readme_content_type: str | None
+    license_files: tuple[Path, ...]
 
 
 @dataclass(frozen=True)
@@ -820,6 +824,7 @@ def discover_projects(
                 "description",
                 "dynamic",
                 "license",
+                "license-files",
                 "name",
                 "optional-dependencies",
                 "readme",
@@ -882,6 +887,44 @@ def discover_projects(
             for item in build_requirements:
                 _validate_exact_requirement(item, context=f"build requirement in {manifest.path}")
             project_directory = PurePosixPath(manifest.path).parent
+            raw_license_files = project.get("license-files")
+            license_files: list[Path] = []
+            if raw_license_files is not None:
+                if not isinstance(raw_license_files, list) or not raw_license_files:
+                    raise BuildPolicyError(
+                        f"project license-files must be a non-empty string list in {manifest.path}"
+                    )
+                seen_license_names: set[str] = set()
+                for raw_license_file in raw_license_files:
+                    if not isinstance(raw_license_file, str) or any(
+                        token in raw_license_file for token in ("*", "?", "[")
+                    ):
+                        raise BuildPolicyError(
+                            f"project license-files must use exact paths in {manifest.path}"
+                        )
+                    relative_license = _safe_repository_path(
+                        f"{project_directory.as_posix()}/{raw_license_file}",
+                        context=f"project license file in {manifest.path}",
+                    )
+                    if relative_license.as_posix() not in by_path:
+                        raise BuildPolicyError(
+                            f"project license file is missing or unsafe: {relative_license}"
+                        )
+                    folded_name = relative_license.name.casefold()
+                    if folded_name not in {"license", "notice"}:
+                        raise BuildPolicyError(
+                            f"project license-files may contain only LICENSE and NOTICE in {manifest.path}"
+                        )
+                    if folded_name in seen_license_names:
+                        raise BuildPolicyError(
+                            f"project license-files contain a duplicate name in {manifest.path}"
+                        )
+                    seen_license_names.add(folded_name)
+                    license_files.append(root / relative_license.as_posix())
+                if seen_license_names != {"license", "notice"}:
+                    raise BuildPolicyError(
+                        f"project license-files must contain LICENSE and NOTICE in {manifest.path}"
+                    )
             readme_value = project.get("readme")
             readme: Path | None = None
             readme_content_type: str | None = None
@@ -917,6 +960,7 @@ def discover_projects(
                     build_requirements=tuple(build_requirements),
                     readme=readme,
                     readme_content_type=readme_content_type,
+                    license_files=tuple(license_files),
                 )
             )
     names = [_normalized_name(project.name) for project in projects]
@@ -1232,7 +1276,8 @@ def build_wheel(
         "Root-Is-Purelib: true\n"
         "Tag: py3-none-any\n"
     ).encode()
-    for license_path in policy.license_files:
+    wheel_license_files = project.license_files or policy.license_files
+    for license_path in wheel_license_files:
         relative_license = license_path.relative_to(root).as_posix()
         files[f"{dist_info}/licenses/{license_path.name}"] = _head_blob_for_path(
             root, relative_license, revision=revision
