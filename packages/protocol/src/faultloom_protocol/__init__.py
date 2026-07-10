@@ -15,7 +15,7 @@ from .compatibility import (
     require_protocol_compatible,
 )
 from .models import *  # noqa: F403
-from .models import REQUIRED_MODEL_TYPES, schema_catalog
+from .models import REQUIRED_MODEL_TYPES, WIRE_MODEL_TYPES, schema_catalog
 from .signing import (
     AuthorityRevokedError,
     AuthoritySigner,
@@ -23,6 +23,7 @@ from .signing import (
     SignatureBlock,
     SignatureExpiredError,
     SignatureNotYetValidError,
+    SignaturePurpose,
     SignatureRollbackError,
     SignatureTamperError,
     SignatureVerificationError,
@@ -59,10 +60,12 @@ __all__ = [
     "protocol_range_contains",
     "require_protocol_compatible",
     "REQUIRED_MODEL_TYPES",
+    "WIRE_MODEL_TYPES",
     "schema_catalog",
     "AuthoritySigner",
     "Ed25519PublicKeyRecord",
     "SignatureBlock",
+    "SignaturePurpose",
     "SignedAuthorityGrant",
     "SignedScopeEpoch",
     "SignedEngagementBundle",

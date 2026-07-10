@@ -5,7 +5,13 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import faultloom_protocol.models as m
-from faultloom_protocol import SecretRef, sha256_digest
+from faultloom_protocol import (
+    SCHEMA_VERSION,
+    AuthoritySigner,
+    SecretRef,
+    sha256_digest,
+    sign_authority_grant,
+)
 
 NOW = datetime(2030, 1, 2, 3, 4, 5, 678901, tzinfo=timezone.utc)
 LATER = NOW + timedelta(hours=2)
@@ -15,8 +21,13 @@ D3 = "sha256:" + "33" * 32
 D4 = "sha256:" + "44" * 32
 
 
+def _model(model_type: type[m.ProtocolModel], /, **values: object) -> m.ProtocolModel:
+    return model_type(schema_version=SCHEMA_VERSION, **values)
+
+
 def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
-    target = m.TargetAsset(
+    target = _model(
+        m.TargetAsset,
         target_id="target.lab",
         hostnames=("loopback.test",),
         ports=(443,),
@@ -24,20 +35,23 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         paths=("/api",),
         methods=("GET", "POST"),
     )
-    deny = m.ExplicitDeny(
+    deny = _model(
+        m.ExplicitDeny,
         deny_id="deny.external-message",
         target_id="target.lab",
         action_families=("external_message",),
         reason="External messages are not approved.",
     )
-    action_policy = m.ActionPolicy(
+    action_policy = _model(
+        m.ActionPolicy,
         allowed_classes=(m.ActionClass.OBSERVE, m.ActionClass.SAFE_PROBE),
         allowed_families=("http.semantic", "browser.observe"),
         allowed_methods=("GET", "POST"),
         allowed_path_patterns=("/api/*",),
         denied=(deny,),
     )
-    budget = m.ActionBudget(
+    budget = _model(
+        m.ActionBudget,
         total_actions=100,
         rate_per_minute=10,
         max_concurrency=2,
@@ -45,26 +59,31 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         max_response_bytes=65536,
         max_duration_seconds=3600,
     )
-    callback_policy = m.CallbackPolicy(
+    callback_policy = _model(
+        m.CallbackPolicy,
         owned_domains=("callbacks.loopback.test",), maximum_ttl_seconds=300
     )
-    provider_policy = m.ProviderPolicy(
+    provider_policy = _model(
+        m.ProviderPolicy,
         allowed_providers=("provider.test",),
         allowed_model_snapshots=("frontier-2030-01-01",),
         data_policy_id="policy.no-training",
     )
-    retention = m.RetentionPolicy(
+    retention = _model(
+        m.RetentionPolicy,
         policy_id="retention.short", retain_until=LATER, delete_after_seconds=60
     )
-    state_change = m.StateChangePolicy()
-    window = m.TimeWindow(starts_at=NOW, ends_at=LATER)
-    draft = m.ScopeContractDraft(
+    state_change = _model(m.StateChangePolicy)
+    window = _model(m.TimeWindow, starts_at=NOW, ends_at=LATER)
+    draft = _model(
+        m.ScopeContractDraft,
         draft_id="draft.1",
         revision=1,
         title="Owned loopback lab",
         created_at=NOW,
         created_by="operator.1",
         targets=(target,),
+        adapter_ids=("adapter.http",),
         action_policy=action_policy,
         identities=("identity.owner",),
         tenants=("tenant.alpha",),
@@ -76,7 +95,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         state_change_policy=state_change,
         emergency_contact_ref="contact.stop",
     )
-    grant = m.AuthorityGrant(
+    grant = _model(
+        m.AuthorityGrant,
         grant_id="grant.1",
         grant_version=3,
         draft_digest=sha256_digest(draft),
@@ -87,6 +107,7 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         approved_by="operator.1",
         targets=(target,),
         pack_ids=("pack.web",),
+        adapter_ids=("adapter.http",),
         action_policy=action_policy,
         identities=("identity.owner",),
         roles=("role.owner",),
@@ -99,25 +120,32 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         state_change_policy=state_change,
         emergency_contact_ref="contact.stop",
     )
-    epoch = m.ScopeEpoch(
+    authority_signer = AuthoritySigner.from_private_bytes(bytes(range(32)))
+    signed_grant = sign_authority_grant(grant, authority_signer, signed_at=NOW)
+    epoch = _model(
+        m.ScopeEpoch,
         grant_id="grant.1", epoch=7, issued_at=NOW, expires_at=LATER
     )
-    subject = m.SubjectRef(
+    subject = _model(
+        m.SubjectRef,
         subject_id="subject.owner",
         subject_kind="human",
         identity_id="identity.owner",
         tenant_id="tenant.alpha",
     )
-    resource = m.ResourceRef(
+    resource = _model(
+        m.ResourceRef,
         resource_id="resource.invoice-1",
         resource_kind="invoice",
         target_id="target.lab",
         tenant_id="tenant.alpha",
     )
-    state_before = m.StateRef(
+    state_before = _model(
+        m.StateRef,
         state_id="state.invoice-1", state_kind="draft", state_version=1, state_digest=D1
     )
-    intent = m.ActionIntent(
+    intent = _model(
+        m.ActionIntent,
         action_id="action.1",
         run_id="run.1",
         target_id="target.lab",
@@ -132,8 +160,9 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         path="/api/invoices/1",
         requested_at=NOW,
     )
-    reservation = m.BudgetReservation(duration_seconds=10)
-    lease = m.ActionLease(
+    reservation = _model(m.BudgetReservation, duration_seconds=10)
+    lease = _model(
+        m.ActionLease,
         lease_id="lease.1",
         intent_digest=sha256_digest(intent),
         grant_id="grant.1",
@@ -143,7 +172,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         expires_at=NOW + timedelta(minutes=1),
         reservation=reservation,
     )
-    decision = m.PolicyDecision(
+    decision = _model(
+        m.PolicyDecision,
         decision_id="decision.1",
         intent_digest=sha256_digest(intent),
         grant_id="grant.1",
@@ -154,7 +184,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         evaluated_at=NOW,
         lease_id="lease.1",
     )
-    receipt = m.DispatchReceipt(
+    receipt = _model(
+        m.DispatchReceipt,
         receipt_id="receipt.1",
         lease_id="lease.1",
         intent_digest=sha256_digest(intent),
@@ -169,7 +200,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         bytes_sent=120,
         bytes_received=240,
     )
-    observation = m.ObservationRef(
+    observation = _model(
+        m.ObservationRef,
         observation_id="observation.1",
         run_id="run.1",
         cas_digest=D1,
@@ -178,7 +210,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         cursor="cursor.1",
         created_at=NOW,
     )
-    evidence = m.EvidenceRef(
+    evidence = _model(
+        m.EvidenceRef,
         evidence_id="evidence.1",
         run_id="run.1",
         cas_digest=D2,
@@ -186,7 +219,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         redaction_digest=D3,
         created_at=NOW,
     )
-    delta = m.ResearchDelta(
+    delta = _model(
+        m.ResearchDelta,
         delta_id="delta.1",
         run_id="run.1",
         actor_id="researcher.1",
@@ -197,7 +231,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         evidence_refs=(evidence,),
         introduced_hypothesis_ids=("hypothesis.1",),
     )
-    hypothesis = m.HypothesisRecord(
+    hypothesis = _model(
+        m.HypothesisRecord,
         hypothesis_id="hypothesis.1",
         run_id="run.1",
         statement="Object authorization differs by tenant.",
@@ -207,7 +242,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         updated_at=NOW,
         supporting_evidence=(evidence,),
     )
-    negative = m.NegativeResult(
+    negative = _model(
+        m.NegativeResult,
         negative_result_id="negative.1",
         run_id="run.1",
         hypothesis_id="hypothesis.1",
@@ -216,7 +252,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         evidence_refs=(evidence,),
         recorded_at=NOW,
     )
-    primitive = m.PrimitiveRecord(
+    primitive = _model(
+        m.PrimitiveRecord,
         primitive_id="primitive.1",
         run_id="run.1",
         primitive_kind="cross_tenant_read",
@@ -229,7 +266,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         evidence_refs=(evidence,),
         verified=True,
     )
-    effect = m.EffectRecord(
+    effect = _model(
+        m.EffectRecord,
         effect_id="effect.1",
         run_id="run.1",
         effect_kind="metadata_disclosed",
@@ -241,7 +279,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         reversible=True,
         cleanup_receipt_digest=D4,
     )
-    candidate = m.FindingCandidate(
+    candidate = _model(
+        m.FindingCandidate,
         candidate_id="candidate.1",
         run_id="run.1",
         finding_class=m.FindingClass.ZERO_DAY_LIKE,
@@ -254,7 +293,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         confidence_bps=8500,
         final_effect_observed=True,
     )
-    claim = m.ClaimPacket(
+    claim = _model(
+        m.ClaimPacket,
         claim_id="claim.1",
         candidate_id="candidate.1",
         run_id="run.1",
@@ -265,8 +305,10 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         replay_plan_id="replay.1",
         created_at=NOW,
     )
-    verdict = m.VerificationVerdict(
+    verdict = _model(
+        m.VerificationVerdict,
         verdict_id="verdict.1",
+        run_id="run.1",
         claim_id="claim.1",
         claim_packet_digest=sha256_digest(claim),
         verifier_run_id="verify.1",
@@ -276,17 +318,19 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         evidence_refs=(evidence,),
         verified_at=NOW,
     )
-    remaining = m.RemainingBudget(
+    remaining = _model(
+        m.RemainingBudget,
         actions=80, duration_seconds=3000, model_tokens=100000, cost_microunits=500000
     )
-    cursor = m.RetrievalCursor(index_id="evidence-index", cursor="cursor.1", watermark=10)
-    checkpoint = m.ContextCheckpoint(
+    cursor = _model(m.RetrievalCursor, index_id="evidence-index", cursor="cursor.1", watermark=10)
+    checkpoint = _model(
+        m.ContextCheckpoint,
         checkpoint_id="checkpoint.1",
         run_id="run.1",
         sequence=1,
         goal_digest=D1,
         plan_digest=D2,
-        authority_digest=sha256_digest(grant),
+        authority_digest=sha256_digest(signed_grant),
         scope_epoch=7,
         active_hypothesis_ids=("hypothesis.1",),
         important_negative_result_ids=("negative.1",),
@@ -294,14 +338,21 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         workflow_graph_id="workflow-graph.1",
         surface_graph_id="surface-graph.1",
         chain_graph_id="chain-graph.1",
-        secret_refs=(SecretRef(uri="secret://run/identity-owner", purpose="owned identity"),),
+        secret_refs=(
+            _model(
+                SecretRef,
+                uri="secret://run/identity-owner",
+                purpose="owned identity",
+            ),
+        ),
         recent_evidence_refs=(evidence,),
         retrieval_cursors=(cursor,),
         remaining_budget=remaining,
         stable_watermark=10,
         created_at=NOW,
     )
-    model_identity = m.ModelIdentity(
+    model_identity = _model(
+        m.ModelIdentity,
         provider_id="provider.test",
         requested_alias="frontier",
         actual_snapshot="frontier-2030-01-01",
@@ -310,11 +361,12 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         prompt_digest=D1,
         tool_schema_digest=D2,
     )
-    run_manifest = m.RunManifest(
+    run_manifest = _model(
+        m.RunManifest,
         run_id="run.1",
         engagement_id="engagement.1",
         target_id="target.lab",
-        authority_digest=sha256_digest(grant),
+        authority_digest=sha256_digest(signed_grant),
         scope_epoch=7,
         pack_ids=("pack.web",),
         adapter_ids=("adapter.http",),
@@ -322,7 +374,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         plan_digest=D2,
         started_at=NOW,
     )
-    adapter_manifest = m.AdapterManifest(
+    adapter_manifest = _model(
+        m.AdapterManifest,
         adapter_id="adapter.http",
         adapter_version="0.1.0",
         upstream_version="0.28.1",
@@ -333,13 +386,15 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         network_mode="gateway_only",
         input_schema_digest=D1,
         output_schema_digest=D2,
-        budget=m.AdapterBudget(
+        budget=_model(
+            m.AdapterBudget,
             rate_per_minute=10, timeout_seconds=30, max_bytes=65536, max_concurrency=2
         ),
         telemetry_policy="telemetry.disabled",
         evidence_capability=m.EvidenceCapability.EVIDENCE_CAPABLE,
     )
-    pack_manifest = m.PackManifest(
+    pack_manifest = _model(
+        m.PackManifest,
         pack_id="pack.web",
         pack_version="0.1.0",
         protocol_range=">=0.1.0,<0.2.0",
@@ -354,49 +409,72 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         required_adapter_capabilities=("semantic_http",),
     )
 
-    tenant = m.TenantRef(tenant_id="tenant.alpha", tenant_kind="workspace", target_id="target.lab")
-    role_grant = m.RoleGrant(
+    tenant = _model(
+        m.TenantRef,
+        tenant_id="tenant.alpha",
+        tenant_kind="workspace",
+        target_id="target.lab",
+    )
+    role_grant = _model(
+        m.RoleGrant,
         role_grant_id="role-grant.1",
         identity_id="identity.owner",
         tenant_id="tenant.alpha",
         role_id="role.owner",
         granted_at=NOW,
     )
-    identity_profile = m.IdentityProfile(
+    identity_profile = _model(
+        m.IdentityProfile,
         identity_id="identity.owner",
         account_ref="account.owner",
         display_label="Lab owner",
         tenant_ids=("tenant.alpha",),
         role_ids=("role.owner",),
-        credential_ref=SecretRef(uri="secret://engagement/owner-credential", purpose="login"),
+        credential_ref=_model(
+            SecretRef,
+            uri="secret://engagement/owner-credential",
+            purpose="login",
+        ),
         mfa_state="satisfied",
         status="active",
     )
-    auth_session = m.AuthSession(
+    auth_session = _model(
+        m.AuthSession,
         auth_session_id="auth-session.1",
         identity_id="identity.owner",
         tenant_id="tenant.alpha",
-        session_handle_ref=SecretRef(uri="secret://session/owner-browser", purpose="session"),
+        session_handle_ref=_model(
+            SecretRef,
+            uri="secret://session/owner-browser",
+            purpose="session",
+        ),
         issued_at=NOW,
         expires_at=LATER,
         mfa_satisfied=True,
     )
-    identity_context = m.IdentityContext(
+    identity_context = _model(
+        m.IdentityContext,
         identity_context_id="identity-context.1",
         identity_id="identity.owner",
         tenant_id="tenant.alpha",
         role_ids=("role.owner",),
         auth_session_id="auth-session.1",
-        browser_context_ref=SecretRef(uri="secret://browser/context-owner", purpose="browser"),
+        browser_context_ref=_model(
+            SecretRef,
+            uri="secret://browser/context-owner",
+            purpose="browser",
+        ),
     )
-    relationship = m.IdentityRelationship(
+    relationship = _model(
+        m.IdentityRelationship,
         relationship_id="relationship.1",
         source_id="identity.owner",
         target_id="tenant.alpha",
         relationship_kind="ownership",
         evidence_refs=(evidence,),
     )
-    identity_graph = m.IdentityGraph(
+    identity_graph = _model(
+        m.IdentityGraph,
         graph_id="identity-graph.1",
         run_id="run.1",
         identities=(identity_profile,),
@@ -405,21 +483,24 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         relationships=(relationship,),
         version=1,
     )
-    workflow_state_1 = m.WorkflowState(
+    workflow_state_1 = _model(
+        m.WorkflowState,
         workflow_state_id="workflow-state.draft",
         workflow_id="workflow.invoice",
         state_name="draft",
         tenant_id="tenant.alpha",
         resource=resource,
     )
-    workflow_state_2 = m.WorkflowState(
+    workflow_state_2 = _model(
+        m.WorkflowState,
         workflow_state_id="workflow-state.viewed",
         workflow_id="workflow.invoice",
         state_name="viewed",
         tenant_id="tenant.alpha",
         resource=resource,
     )
-    transition = m.TransitionRecord(
+    transition = _model(
+        m.TransitionRecord,
         transition_id="transition.1",
         workflow_id="workflow.invoice",
         from_state_id="workflow-state.draft",
@@ -431,7 +512,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         dispatch_receipt_digest=sha256_digest(receipt),
         evidence_refs=(evidence,),
     )
-    workflow_graph = m.WorkflowGraph(
+    workflow_graph = _model(
+        m.WorkflowGraph,
         graph_id="workflow-graph.1",
         run_id="run.1",
         workflow_kind="billing",
@@ -440,7 +522,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         invariant_ids=("invariant.tenant-isolation",),
         version=1,
     )
-    differential_case = m.DifferentialCase(
+    differential_case = _model(
+        m.DifferentialCase,
         case_id="differential.1",
         operation_id="operation.get-invoice",
         baseline_identity_context_id="identity-context.1",
@@ -448,7 +531,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         varied_dimension="tenant",
         expected_invariant_id="invariant.tenant-isolation",
     )
-    differential_plan = m.DifferentialPlan(
+    differential_plan = _model(
+        m.DifferentialPlan,
         plan_id="differential-plan.1",
         run_id="run.1",
         workflow_graph_id="workflow-graph.1",
@@ -457,7 +541,9 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         created_at=NOW,
     )
 
-    operation = m.OperationRef(
+    operation = _model(
+
+        m.OperationRef,
         operation_id="operation.get-invoice",
         target_id="target.lab",
         operation_kind=m.OperationKind.REST,
@@ -466,17 +552,20 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         schema_namespace="openapi.v1",
         documented=True,
     )
-    schema_evidence = m.SchemaEvidence(
+    schema_evidence = _model(
+        m.SchemaEvidence,
         schema_evidence_id="schema-evidence.1",
         source_kind="openapi",
         source_digest=D1,
         operation_ids=("operation.get-invoice",),
         observed_at=NOW,
     )
-    correlation = m.CorrelationRef(
+    correlation = _model(
+        m.CorrelationRef,
         correlation_id="correlation.1", correlation_kind="request_id", opaque_value_digest=D2
     )
-    message = m.MessageEnvelope(
+    message = _model(
+        m.MessageEnvelope,
         message_id="message.1",
         channel_id="channel.1",
         direction="server_to_client",
@@ -486,7 +575,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         correlation_refs=(correlation,),
         observed_at=NOW,
     )
-    async_flow = m.AsyncFlow(
+    async_flow = _model(
+        m.AsyncFlow,
         async_flow_id="async-flow.1",
         initiating_operation_id="operation.get-invoice",
         terminal_operation_id="operation.get-invoice",
@@ -496,18 +586,24 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         initiated_at=NOW,
         completed_at=NOW + timedelta(seconds=1),
     )
-    callback_lease = m.CallbackLease(
+    callback_lease = _model(
+        m.CallbackLease,
         callback_lease_id="callback-lease.1",
         engagement_id="engagement.1",
         grant_id="grant.1",
         scope_epoch=7,
         owned_domain="callbacks.loopback.test",
         callback_path_digest=D1,
-        callback_token_ref=SecretRef(uri="secret://callback/lease-1", purpose="callback token"),
+        callback_token_ref=_model(
+            SecretRef,
+            uri="secret://callback/lease-1",
+            purpose="callback token",
+        ),
         issued_at=NOW,
         expires_at=NOW + timedelta(minutes=5),
     )
-    job = m.JobObservation(
+    job = _model(
+        m.JobObservation,
         job_observation_id="job-observation.1",
         async_flow_id="async-flow.1",
         job_id_digest=D3,
@@ -517,7 +613,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         evidence_refs=(evidence,),
         observed_at=NOW,
     )
-    file_stage = m.FileStage(
+    file_stage = _model(
+        m.FileStage,
         stage_id="file-stage.1",
         stage_kind="upload",
         operation_id="operation.get-invoice",
@@ -525,7 +622,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         tenant_id="tenant.alpha",
         observed_at=NOW,
     )
-    file_pipeline = m.FilePipeline(
+    file_pipeline = _model(
+        m.FilePipeline,
         file_pipeline_id="file-pipeline.1",
         run_id="run.1",
         canary_id="canary.inert-1",
@@ -534,14 +632,16 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         correlation_refs=(correlation,),
         evidence_refs=(evidence,),
     )
-    surface_edge = m.SurfaceEdge(
+    surface_edge = _model(
+        m.SurfaceEdge,
         edge_id="surface-edge.1",
         source_operation_id="operation.get-invoice",
         target_operation_id="operation.get-invoice",
         edge_kind="job",
         correlation_refs=(correlation,),
     )
-    surface_graph = m.SurfaceGraph(
+    surface_graph = _model(
+        m.SurfaceGraph,
         graph_id="surface-graph.1",
         run_id="run.1",
         operations=(operation,),
@@ -551,7 +651,9 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         version=1,
     )
 
-    fingerprint = m.ComponentFingerprint(
+    fingerprint = _model(
+
+        m.ComponentFingerprint,
         fingerprint_id="fingerprint.1",
         target_id="target.lab",
         component_name="example-component",
@@ -559,7 +661,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         evidence_refs=(evidence,),
         observed_at=NOW,
     )
-    version_hypothesis = m.VersionHypothesis(
+    version_hypothesis = _model(
+        m.VersionHypothesis,
         version_hypothesis_id="version-hypothesis.1",
         fingerprint_id="fingerprint.1",
         version_range=">=1.2.0,<1.3.0",
@@ -567,7 +670,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         backport_possible=True,
         evidence_refs=(evidence,),
     )
-    advisory = m.AdvisoryMatch(
+    advisory = _model(
+        m.AdvisoryMatch,
         advisory_match_id="advisory-match.1",
         version_hypothesis_id="version-hypothesis.1",
         advisory_id="CVE-2030-0001",
@@ -576,7 +680,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         security_commit="abcdef0123456789",
         match_confidence_bps=8000,
     )
-    reachability = m.ReachabilityClaim(
+    reachability = _model(
+        m.ReachabilityClaim,
         reachability_claim_id="reachability.1",
         advisory_match_id="advisory-match.1",
         component_present=True,
@@ -586,7 +691,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         evidence_refs=(evidence,),
         conclusion="reachable",
     )
-    patch_delta = m.PatchDelta(
+    patch_delta = _model(
+        m.PatchDelta,
         patch_delta_id="patch-delta.1",
         advisory_match_id="advisory-match.1",
         vulnerable_revision="rev-vulnerable",
@@ -595,7 +701,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         test_diff_digest=D4,
         evidence_refs=(evidence,),
     )
-    invariant = m.InvariantChange(
+    invariant = _model(
+        m.InvariantChange,
         invariant_change_id="invariant-change.1",
         patch_delta_id="patch-delta.1",
         invariant="Tenant binding must precede object lookup.",
@@ -603,7 +710,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         sink_or_boundary="Invoice repository boundary",
         evidence_refs=(evidence,),
     )
-    variant = m.VariantHypothesis(
+    variant = _model(
+        m.VariantHypothesis,
         variant_hypothesis_id="variant.1",
         invariant_change_id="invariant-change.1",
         variant_kind="sibling_path",
@@ -612,7 +720,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         source_query_digest=D4,
         evidence_refs=(evidence,),
     )
-    adaptation = m.DeploymentAdaptation(
+    adaptation = _model(
+        m.DeploymentAdaptation,
         adaptation_id="adaptation.1",
         advisory_match_id="advisory-match.1",
         target_id="target.lab",
@@ -624,13 +733,15 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         removed_unsafe_step_digests=(D1,),
         evidence_refs=(evidence,),
     )
-    poc_step = m.PoCStep(
+    poc_step = _model(
+        m.PoCStep,
         step_id="poc-step.1",
         action_intent=intent,
         expected_effect="Read only the inert canary metadata.",
         negative_control="An unrelated object identifier is denied.",
     )
-    poc = m.PoCRecipe(
+    poc = _model(
+        m.PoCRecipe,
         recipe_id="poc.1",
         adaptation_id="adaptation.1",
         prerequisites=("Owned identities and canary object",),
@@ -640,7 +751,9 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         evidence_refs=(evidence,),
     )
 
-    capability = m.CapabilityPrimitive(
+    capability = _model(
+
+        m.CapabilityPrimitive,
         capability_id="capability.1",
         primitive=primitive,
         capability_kind="read_owned_cross_tenant_canary",
@@ -649,7 +762,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         precondition_ids=("prerequisite.owned-object",),
         effect_ids=("effect.1",),
     )
-    chain_edge = m.ChainEdge(
+    chain_edge = _model(
+        m.ChainEdge,
         edge_id="chain-edge.1",
         source_capability_id="capability.1",
         target_capability_id="capability.1",
@@ -670,7 +784,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         time_cost_seconds=1,
         confidence_bps=9000,
     )
-    chain_graph = m.ChainGraph(
+    chain_graph = _model(
+        m.ChainGraph,
         graph_id="chain-graph.1",
         run_id="run.1",
         capabilities=(capability,),
@@ -680,7 +795,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         time_budget_seconds=60,
         version=1,
     )
-    chain_plan = m.ChainPlan(
+    chain_plan = _model(
+        m.ChainPlan,
         chain_plan_id="chain-plan.1",
         chain_graph_id="chain-graph.1",
         edge_ids=("chain-edge.1",),
@@ -689,7 +805,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         total_action_cost=1,
         total_time_cost_seconds=1,
     )
-    missing = m.MissingLink(
+    missing = _model(
+        m.MissingLink,
         missing_link_id="missing-link.1",
         chain_graph_id="chain-graph.1",
         source_capability_id="capability.1",
@@ -698,7 +815,8 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         minimum_experiment_intent=intent,
         expected_information_gain_bps=5000,
     )
-    replay = m.ReplayPlan(
+    replay = _model(
+        m.ReplayPlan,
         replay_plan_id="replay.1",
         chain_plan_id="chain-plan.1",
         fresh_identity_context_ids=("identity-context.1",),
@@ -706,8 +824,10 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         edge_ids=("chain-edge.1",),
         negative_control_edge_ids=("chain-edge.1",),
     )
-    chain_verdict = m.ChainVerdict(
+    chain_verdict = _model(
+        m.ChainVerdict,
         chain_verdict_id="chain-verdict.1",
+        run_id="run.1",
         replay_plan_id="replay.1",
         outcome=m.VerdictOutcome.VERIFIED,
         verified_edge_ids=("chain-edge.1",),
@@ -717,11 +837,13 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         verified_at=NOW,
     )
 
-    engagement = m.EngagementBundle(
+    engagement = _model(
+
+        m.EngagementBundle,
         bundle_id="engagement-bundle.1",
         bundle_version=1,
         engagement_id="engagement.1",
-        authority_grant=grant,
+        authority_grant=signed_grant,
         run_manifest=run_manifest,
         identity_profiles=(identity_profile,),
         pack_manifests=(pack_manifest,),
@@ -730,13 +852,14 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         created_at=NOW,
         expires_at=LATER,
     )
-    result = m.RunResultBundle(
+    result = _model(
+        m.RunResultBundle,
         bundle_id="result-bundle.1",
         bundle_version=2,
         engagement_id="engagement.1",
         run_id="run.1",
         run_manifest_digest=sha256_digest(run_manifest),
-        authority_digest=sha256_digest(grant),
+        authority_digest=sha256_digest(signed_grant),
         finding_candidates=(candidate,),
         claim_packets=(claim,),
         verification_verdicts=(verdict,),

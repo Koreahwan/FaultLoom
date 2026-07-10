@@ -26,6 +26,8 @@ def test_semver_parser_is_stable_release_only() -> None:
     for invalid in ("1.2", "v1.2.3", "1.2.3-rc1", "01.2.3"):
         with pytest.raises(ValueError, match="semantic version"):
             SemVer.parse(invalid)
+    with pytest.raises(ValueError, match="signed int64"):
+        SemVer.parse(f"{2**63}.0.0")
 
 
 def test_protocol_range_parser_fails_closed() -> None:

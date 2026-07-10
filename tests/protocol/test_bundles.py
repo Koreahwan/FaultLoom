@@ -22,12 +22,14 @@ from .factories import NOW, sample_models
 def test_signed_engagement_bundle_json_round_trip() -> None:
     bundle = sample_models()["EngagementBundle"]
     signer = AuthoritySigner.from_private_bytes(bytes(reversed(range(32))))
+    authority_signer = AuthoritySigner.from_private_bytes(bytes(range(32)))
     signed = sign_engagement_bundle(bundle, signer, signed_at=NOW)
     restored = SignedEngagementBundle.model_validate_json(signed.model_dump_json())
 
     assert verify_engagement_bundle(
         restored,
         signer.public_key_record,
+        authority_public_key=authority_signer.public_key_record,
         now=NOW + timedelta(minutes=1),
         expected_engagement_id="engagement.1",
     ) == bundle
@@ -50,6 +52,9 @@ def test_signed_run_result_bundle_json_round_trip() -> None:
         now=NOW + timedelta(minutes=1),
         minimum_version=2,
         expected_engagement_id="engagement.1",
+        expected_run_id=bundle.run_id,
+        expected_run_manifest_digest=bundle.run_manifest_digest,
+        expected_authority_digest=bundle.authority_digest,
     ) == bundle
 
 
@@ -60,7 +65,13 @@ def test_bundle_identity_and_monotonic_version_are_bound() -> None:
 
     with pytest.raises(SignatureRollbackError):
         verify_run_result_bundle(
-            signed, signer.public_key_record, now=NOW, minimum_version=3
+            signed,
+            signer.public_key_record,
+            now=NOW,
+            minimum_version=3,
+            expected_run_id=bundle.run_id,
+            expected_run_manifest_digest=bundle.run_manifest_digest,
+            expected_authority_digest=bundle.authority_digest,
         )
     with pytest.raises(SignatureTamperError, match="different engagement"):
         verify_run_result_bundle(
@@ -68,4 +79,7 @@ def test_bundle_identity_and_monotonic_version_are_bound() -> None:
             signer.public_key_record,
             now=NOW,
             expected_engagement_id="engagement.other",
+            expected_run_id=bundle.run_id,
+            expected_run_manifest_digest=bundle.run_manifest_digest,
+            expected_authority_digest=bundle.authority_digest,
         )

@@ -24,12 +24,14 @@ def test_all_required_models_round_trip_strict_json() -> None:
 
 def test_all_required_models_publish_closed_json_schemas() -> None:
     catalog = schema_catalog()
-    assert set(catalog) == {model.__name__ for model in m.REQUIRED_MODEL_TYPES}
+    assert {model.__name__ for model in m.REQUIRED_MODEL_TYPES}.issubset(catalog)
+    assert {model.__name__ for model in m.WIRE_MODEL_TYPES}.issubset(catalog)
 
     for name, schema in catalog.items():
         assert schema["type"] == "object", name
         assert schema["additionalProperties"] is False, name
         assert "schema_version" in schema["properties"], name
+        assert "schema_version" in schema["required"], name
 
 
 def test_models_forbid_unknown_fields_and_schema_downgrade() -> None:
@@ -38,16 +40,24 @@ def test_models_forbid_unknown_fields_and_schema_downgrade() -> None:
     document["unexpected"] = "value"
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         m.SubjectRef.model_validate(document)
-
     document.pop("unexpected")
     document["schema_version"] = "0.0.9"
     with pytest.raises(ValidationError, match="Input should be '0.1.0'"):
         m.SubjectRef.model_validate(document)
 
 
+def test_every_required_payload_rejects_omitted_schema_version() -> None:
+    for sample in sample_models().values():
+        document = sample.model_dump(mode="python")
+        document.pop("schema_version")
+        with pytest.raises(ValidationError, match="Field required"):
+            type(sample).model_validate(document)
+
+
 def test_unsupported_action_classes_cannot_be_enabled() -> None:
     with pytest.raises(ValidationError, match="unsupported v0.1 action classes"):
         m.ActionPolicy(
+            schema_version=SCHEMA_VERSION,
             allowed_classes=(m.ActionClass.DESTRUCTIVE,),
             allowed_families=("unsafe",),
         )
@@ -88,6 +98,7 @@ def test_engagement_bundle_binds_embedded_grant_digest() -> None:
 def test_naive_wire_datetime_is_rejected() -> None:
     with pytest.raises(ValidationError, match="timezone"):
         m.ScopeEpoch(
+            schema_version=SCHEMA_VERSION,
             grant_id="grant.1",
             epoch=1,
             issued_at=NOW.replace(tzinfo=None),
@@ -111,6 +122,7 @@ def test_verified_results_require_independent_final_effect_proof() -> None:
 def test_scope_epoch_revocation_state_is_unambiguous() -> None:
     with pytest.raises(ValidationError, match="exactly when revoked"):
         m.ScopeEpoch(
+            schema_version=SCHEMA_VERSION,
             grant_id="grant.1",
             epoch=2,
             issued_at=NOW,

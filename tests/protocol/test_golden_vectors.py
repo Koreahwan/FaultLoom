@@ -48,7 +48,9 @@ def test_scope_epoch_golden_bytes_digest_and_signature() -> None:
         json.loads(signing_bytes(payload, envelope.signature))
     ) == fixture["signing_digest"]
     assert verify_scope_epoch(
-        SignedScopeEpoch(payload=payload, signature=expected_block),
+        SignedScopeEpoch(
+            schema_version="0.1.0", payload=payload, signature=expected_block
+        ),
         expected_public,
         now=expected_block.signed_at,
         minimum_epoch=7,

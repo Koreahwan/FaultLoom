@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from .base import PROTOCOL_VERSION, SUPPORTED_PROTOCOL_RANGE
+from .base import MAX_INT64, PROTOCOL_VERSION, SUPPORTED_PROTOCOL_RANGE
 
 _SEMVER = re.compile(
     r"^(?P<major>0|[1-9][0-9]*)\."
@@ -21,12 +21,22 @@ class SemVer:
     minor: int
     patch: int
 
+    def __post_init__(self) -> None:
+        components = (self.major, self.minor, self.patch)
+        if any(type(component) is not int for component in components):
+            raise TypeError("semantic version components must be integers")
+        if any(not 0 <= component <= MAX_INT64 for component in components):
+            raise ValueError("semantic version component exceeds signed int64")
+
     @classmethod
     def parse(cls, value: str) -> "SemVer":
         match = _SEMVER.fullmatch(value)
         if match is None:
             raise ValueError(f"invalid stable semantic version: {value!r}")
-        return cls(*(int(match.group(name)) for name in ("major", "minor", "patch")))
+        components = tuple(
+            int(match.group(name)) for name in ("major", "minor", "patch")
+        )
+        return cls(*components)
 
 
 def protocol_range_contains(version: str, version_range: str) -> bool:

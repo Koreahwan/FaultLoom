@@ -5,8 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 from datetime import datetime, timedelta, timezone
-from enum import Enum
-from typing import Annotated, Literal, TypeVar
+from typing import TypeVar
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
@@ -14,71 +13,28 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
 )
-from pydantic import Field, model_validator
-
 from .base import (
-    AwareDatetime,
+    MAX_INT64,
     PROTOCOL_VERSION,
     ProtocolModel,
-    Sha256Digest,
+    SCHEMA_VERSION,
 )
 from .canonical import canonical_json_bytes, sha256_digest
-from .models import AuthorityGrant, EngagementBundle, RunResultBundle, ScopeEpoch
+from .models import (
+    AuthorityGrant,
+    Ed25519PublicKeyRecord,
+    EngagementBundle,
+    RunResultBundle,
+    ScopeEpoch,
+    SignatureBlock,
+    SignaturePurpose,
+    SignedAuthorityGrant,
+    SignedEngagementBundle,
+    SignedRunResultBundle,
+    SignedScopeEpoch,
+)
 
-Base64Url = Annotated[str, Field(pattern=r"^[A-Za-z0-9_-]+$")]
-KeyId = Annotated[str, Field(pattern=r"^ed25519:sha256:[0-9a-f]{64}$")]
 T = TypeVar("T", bound=ProtocolModel)
-
-
-class SignaturePurpose(str, Enum):
-    AUTHORITY_GRANT = "authority_grant"
-    SCOPE_EPOCH = "scope_epoch"
-    ENGAGEMENT_BUNDLE = "engagement_bundle"
-    RUN_RESULT_BUNDLE = "run_result_bundle"
-
-
-class SignatureBlock(ProtocolModel):
-    algorithm: Literal["Ed25519"] = "Ed25519"
-    protocol_version: Literal["0.1.0"] = PROTOCOL_VERSION
-    purpose: SignaturePurpose
-    key_id: KeyId
-    sequence: Annotated[int, Field(ge=1)]
-    signed_at: AwareDatetime
-    expires_at: AwareDatetime | None = None
-    payload_digest: Sha256Digest
-    signature: Base64Url
-
-    @model_validator(mode="after")
-    def _expiry_ordered(self) -> "SignatureBlock":
-        if self.expires_at is not None and self.expires_at <= self.signed_at:
-            raise ValueError("signature expiry must follow signing time")
-        return self
-
-
-class Ed25519PublicKeyRecord(ProtocolModel):
-    algorithm: Literal["Ed25519"] = "Ed25519"
-    key_id: KeyId
-    public_key: Base64Url
-
-
-class SignedAuthorityGrant(ProtocolModel):
-    payload: AuthorityGrant
-    signature: SignatureBlock
-
-
-class SignedScopeEpoch(ProtocolModel):
-    payload: ScopeEpoch
-    signature: SignatureBlock
-
-
-class SignedEngagementBundle(ProtocolModel):
-    payload: EngagementBundle
-    signature: SignatureBlock
-
-
-class SignedRunResultBundle(ProtocolModel):
-    payload: RunResultBundle
-    signature: SignatureBlock
 
 
 class SignatureVerificationError(ValueError):
@@ -116,9 +72,12 @@ def _b64_encode(value: bytes) -> str:
 def _b64_decode(value: str) -> bytes:
     padding = "=" * (-len(value) % 4)
     try:
-        return base64.b64decode(value + padding, altchars=b"-_", validate=True)
+        decoded = base64.b64decode(value + padding, altchars=b"-_", validate=True)
     except (ValueError, TypeError) as exc:
         raise SignatureTamperError("invalid URL-safe base64 signature material") from exc
+    if _b64_encode(decoded) != value:
+        raise SignatureTamperError("URL-safe base64 value is not canonical")
+    return decoded
 
 
 def _public_key_bytes(public_key: Ed25519PublicKey) -> bytes:
@@ -163,6 +122,7 @@ class AuthoritySigner:
     def public_key_record(self) -> Ed25519PublicKeyRecord:
         public_key = self.__private_key.public_key()
         return Ed25519PublicKeyRecord(
+            schema_version=SCHEMA_VERSION,
             key_id=self.key_id,
             public_key=_b64_encode(_public_key_bytes(public_key)),
         )
@@ -175,6 +135,7 @@ class AuthoritySigner:
 
 
 def load_public_key(record: Ed25519PublicKeyRecord) -> Ed25519PublicKey:
+    record = Ed25519PublicKeyRecord.model_validate(record.model_dump(mode="python"))
     raw_key = _b64_decode(record.public_key)
     if len(raw_key) != 32:
         raise UnknownKeyError("Ed25519 public key must contain exactly 32 bytes")
@@ -247,6 +208,7 @@ def _sign(
     )
     signature = signer.sign(canonical_json_bytes(unsigned))
     return SignatureBlock(
+        schema_version=SCHEMA_VERSION,
         purpose=purpose,
         key_id=signer.key_id,
         sequence=sequence,
@@ -279,7 +241,9 @@ def sign_authority_grant(
         signed_at=signed_at,
         expires_at=grant.expires_at,
     )
-    return SignedAuthorityGrant(payload=grant, signature=block)
+    return SignedAuthorityGrant(
+        schema_version=SCHEMA_VERSION, payload=grant, signature=block
+    )
 
 
 def sign_scope_epoch(
@@ -300,7 +264,7 @@ def sign_scope_epoch(
         signed_at=signed_at,
         expires_at=epoch.expires_at,
     )
-    return SignedScopeEpoch(payload=epoch, signature=block)
+    return SignedScopeEpoch(schema_version=SCHEMA_VERSION, payload=epoch, signature=block)
 
 
 def sign_engagement_bundle(
@@ -313,6 +277,8 @@ def sign_engagement_bundle(
     signed_at = signed_at or _utc_now()
     if signed_at < bundle.created_at:
         raise ValueError("engagement bundle cannot be signed before creation")
+    if signed_at > bundle.run_manifest.started_at:
+        raise ValueError("engagement bundle cannot be signed after the run starts")
     block = _sign(
         bundle,
         signer,
@@ -321,7 +287,9 @@ def sign_engagement_bundle(
         signed_at=signed_at,
         expires_at=bundle.expires_at,
     )
-    return SignedEngagementBundle(payload=bundle, signature=block)
+    return SignedEngagementBundle(
+        schema_version=SCHEMA_VERSION, payload=bundle, signature=block
+    )
 
 
 def sign_run_result_bundle(
@@ -343,7 +311,9 @@ def sign_run_result_bundle(
         signed_at=signed_at,
         expires_at=expires_at,
     )
-    return SignedRunResultBundle(payload=bundle, signature=block)
+    return SignedRunResultBundle(
+        schema_version=SCHEMA_VERSION, payload=bundle, signature=block
+    )
 
 
 def _verify(
@@ -354,11 +324,14 @@ def _verify(
     purpose: SignaturePurpose,
     expected_sequence: int,
     minimum_sequence: int,
+    payload_issued_at: datetime,
     now: datetime,
     maximum_clock_skew: timedelta,
 ) -> T:
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("verification time must include a timezone")
+    if type(minimum_sequence) is not int or not 1 <= minimum_sequence <= MAX_INT64:
+        raise ValueError("minimum trusted sequence must be within signed int64")
     if block.purpose is not purpose:
         raise SignatureTamperError(
             f"signature purpose {block.purpose.value!r} does not match {purpose.value!r}"
@@ -383,6 +356,8 @@ def _verify(
         public_key.verify(_b64_decode(block.signature), signing_bytes(payload, block))
     except InvalidSignature as exc:
         raise SignatureTamperError("Ed25519 signature verification failed") from exc
+    if block.signed_at < payload_issued_at:
+        raise SignatureNotYetValidError("signature is before payload issuance")
     return payload
 
 
@@ -404,6 +379,7 @@ def verify_authority_grant(
         purpose=SignaturePurpose.AUTHORITY_GRANT,
         expected_sequence=envelope.payload.grant_version,
         minimum_sequence=minimum_version,
+        payload_issued_at=envelope.payload.issued_at,
         now=now,
         maximum_clock_skew=maximum_clock_skew,
     )
@@ -436,6 +412,7 @@ def verify_scope_epoch(
         purpose=SignaturePurpose.SCOPE_EPOCH,
         expected_sequence=envelope.payload.epoch,
         minimum_sequence=minimum_epoch,
+        payload_issued_at=envelope.payload.issued_at,
         now=now,
         maximum_clock_skew=maximum_clock_skew,
     )
@@ -452,9 +429,12 @@ def verify_engagement_bundle(
     envelope: SignedEngagementBundle,
     public_key: Ed25519PublicKeyRecord,
     *,
+    authority_public_key: Ed25519PublicKeyRecord,
     now: datetime | None = None,
     minimum_version: int = 1,
+    minimum_authority_version: int = 1,
     expected_engagement_id: str | None = None,
+    expected_grant_id: str | None = None,
     maximum_clock_skew: timedelta = timedelta(minutes=5),
 ) -> EngagementBundle:
     envelope = SignedEngagementBundle.model_validate(envelope.model_dump(mode="python"))
@@ -466,13 +446,24 @@ def verify_engagement_bundle(
         purpose=SignaturePurpose.ENGAGEMENT_BUNDLE,
         expected_sequence=envelope.payload.bundle_version,
         minimum_sequence=minimum_version,
+        payload_issued_at=envelope.payload.created_at,
         now=now,
         maximum_clock_skew=maximum_clock_skew,
     )
     if envelope.signature.expires_at != bundle.expires_at:
         raise SignatureTamperError("bundle signature expiry differs from bundle expiry")
+    if envelope.signature.signed_at > bundle.run_manifest.started_at:
+        raise SignatureTamperError("engagement bundle was signed after the run started")
     if expected_engagement_id is not None and bundle.engagement_id != expected_engagement_id:
         raise SignatureTamperError("engagement_id does not match expected engagement")
+    verify_authority_grant(
+        bundle.authority_grant,
+        authority_public_key,
+        now=now,
+        minimum_version=minimum_authority_version,
+        expected_grant_id=expected_grant_id,
+        maximum_clock_skew=maximum_clock_skew,
+    )
     return bundle
 
 
@@ -483,6 +474,9 @@ def verify_run_result_bundle(
     now: datetime | None = None,
     minimum_version: int = 1,
     expected_engagement_id: str | None = None,
+    expected_run_id: str,
+    expected_run_manifest_digest: str,
+    expected_authority_digest: str,
     maximum_clock_skew: timedelta = timedelta(minutes=5),
 ) -> RunResultBundle:
     envelope = SignedRunResultBundle.model_validate(envelope.model_dump(mode="python"))
@@ -494,9 +488,16 @@ def verify_run_result_bundle(
         purpose=SignaturePurpose.RUN_RESULT_BUNDLE,
         expected_sequence=envelope.payload.bundle_version,
         minimum_sequence=minimum_version,
+        payload_issued_at=envelope.payload.generated_at,
         now=now,
         maximum_clock_skew=maximum_clock_skew,
     )
     if expected_engagement_id is not None and bundle.engagement_id != expected_engagement_id:
         raise SignatureTamperError("result belongs to a different engagement")
+    if bundle.run_id != expected_run_id:
+        raise SignatureTamperError("result belongs to a different run")
+    if bundle.run_manifest_digest != expected_run_manifest_digest:
+        raise SignatureTamperError("result run manifest digest does not match expected")
+    if bundle.authority_digest != expected_authority_digest:
+        raise SignatureTamperError("result authority digest does not match expected")
     return bundle

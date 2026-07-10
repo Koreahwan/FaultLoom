@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Mapping, Sequence
-from uuid import UUID
 
 from pydantic import BaseModel
 
@@ -22,12 +21,8 @@ def _normalize(value: object) -> object:
             raise ValueError("cannot canonicalize a naive datetime")
         utc_value = value.astimezone(timezone.utc)
         return utc_value.isoformat(timespec="microseconds").replace("+00:00", "Z")
-    if isinstance(value, date):
-        return value.isoformat()
     if isinstance(value, Enum):
         return _normalize(value.value)
-    if isinstance(value, UUID):
-        return str(value)
     if isinstance(value, Mapping):
         if not all(isinstance(key, str) for key in value):
             raise TypeError("canonical JSON object keys must be strings")

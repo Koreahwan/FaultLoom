@@ -11,6 +11,7 @@ from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 PROTOCOL_VERSION = "0.1.0"
 SCHEMA_VERSION = "0.1.0"
 SUPPORTED_PROTOCOL_RANGE = ">=0.1.0,<0.2.0"
+MAX_INT64 = 2**63 - 1
 
 SchemaVersion = Literal["0.1.0"]
 NonEmptyStr = Annotated[str, Field(min_length=1, max_length=4096)]
@@ -43,7 +44,7 @@ class ProtocolModel(BaseModel):
         validate_default=True,
     )
 
-    schema_version: SchemaVersion = SCHEMA_VERSION
+    schema_version: SchemaVersion
 
 
 class SecretRef(ProtocolModel):
@@ -60,11 +61,48 @@ class SecretRef(ProtocolModel):
     purpose: ShortStr
 
 
-_FORBIDDEN_SECRET_KEYS = re.compile(
-    r"^(password|passwd|credential|cookie|authorization|bearer|api[_-]?key|"
-    r"access[_-]?token|refresh[_-]?token|private[_-]?key|client[_-]?secret)$",
-    re.IGNORECASE,
+_FORBIDDEN_SECRET_KEYS = frozenset(
+    {
+        "access_token",
+        "api_key",
+        "auth_token",
+        "authorization",
+        "aws_secret_access_key",
+        "bearer",
+        "client_secret",
+        "cookie",
+        "credential",
+        "id_token",
+        "password",
+        "passwd",
+        "private_key",
+        "proxy_authorization",
+        "refresh_token",
+        "request_body",
+        "secret",
+        "session_cookie",
+        "set_cookie",
+        "token",
+        "x_api_key",
+    }
 )
+_FORBIDDEN_SECRET_KEY_COMPACT = frozenset(
+    key.replace("_", "") for key in _FORBIDDEN_SECRET_KEYS
+)
+
+
+def _normalize_key(value: str) -> str:
+    with_word_boundaries = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", value)
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", with_word_boundaries)
+    return normalized.strip("_").casefold()
+
+
+def _is_raw_secret_key(value: str) -> bool:
+    normalized = _normalize_key(value)
+    return (
+        normalized in _FORBIDDEN_SECRET_KEYS
+        or normalized.replace("_", "") in _FORBIDDEN_SECRET_KEY_COMPACT
+    )
 
 
 def assert_no_raw_secret_fields(value: object, *, path: str = "$") -> None:
@@ -78,9 +116,11 @@ def assert_no_raw_secret_fields(value: object, *, path: str = "$") -> None:
     if isinstance(value, BaseModel):
         value = value.model_dump(mode="python")
     if isinstance(value, dict):
+        if isinstance(value.get("key"), str) and _is_raw_secret_key(value["key"]):
+            raise ValueError(f"raw secret field is forbidden at {path}.key={value['key']!r}")
         for key, child in value.items():
             key_text = str(key)
-            if _FORBIDDEN_SECRET_KEYS.fullmatch(key_text):
+            if _is_raw_secret_key(key_text):
                 raise ValueError(f"raw secret field is forbidden at {path}.{key_text}")
             assert_no_raw_secret_fields(child, path=f"{path}.{key_text}")
     elif isinstance(value, (list, tuple)):

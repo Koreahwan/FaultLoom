@@ -17,6 +17,10 @@ apply the following exact rules before SHA-256 hashing or Ed25519 signing:
 5. Sort object keys lexicographically by Unicode code point. Emit no optional
    whitespace: separators are exactly `,` and `:`.
 
+`date`, UUID, decimal, binary, and other Python-specific scalar conveniences
+are not part of this profile. URL-safe base64 values must be unpadded and must
+equal the result of decoding and canonically re-encoding their bytes.
+
 Digests are lowercase hex SHA-256 prefixed by `sha256:`. Ed25519 signatures are
 unpadded URL-safe base64. The signed document includes the protocol version,
 purpose, key ID, monotonic sequence, signing time, optional expiry, payload

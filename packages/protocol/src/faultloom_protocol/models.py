@@ -10,12 +10,14 @@ from __future__ import annotations
 from enum import Enum
 from typing import Annotated, Literal
 
-from pydantic import Field, model_validator
+from pydantic import BeforeValidator, Field, model_validator
 
 from .base import (
     AwareDatetime,
     Identifier,
+    MAX_INT64,
     NonEmptyStr,
+    PROTOCOL_VERSION,
     ProtocolModel,
     SecretRef,
     Sha256Digest,
@@ -25,9 +27,23 @@ from .canonical import sha256_digest
 from .compatibility import require_protocol_compatible
 
 Port = Annotated[int, Field(ge=1, le=65535)]
-PositiveInt = Annotated[int, Field(ge=1)]
-NonNegativeInt = Annotated[int, Field(ge=0)]
+PositiveInt = Annotated[int, Field(ge=1, le=MAX_INT64)]
+NonNegativeInt = Annotated[int, Field(ge=0, le=MAX_INT64)]
 ConfidenceBps = Annotated[int, Field(ge=0, le=10_000)]
+
+
+def _reject_base64url_surrounding_whitespace(value: object) -> object:
+    if isinstance(value, str) and value != value.strip():
+        raise ValueError("URL-safe base64 cannot contain surrounding whitespace")
+    return value
+
+
+Base64Url = Annotated[
+    str,
+    BeforeValidator(_reject_base64url_surrounding_whitespace),
+    Field(pattern=r"^[A-Za-z0-9_-]+$"),
+]
+KeyId = Annotated[str, Field(pattern=r"^ed25519:sha256:[0-9a-f]{64}$")]
 
 
 class ActionClass(str, Enum):
@@ -163,6 +179,7 @@ class ScopeContractDraft(ProtocolModel):
     created_at: AwareDatetime
     created_by: Identifier
     targets: tuple[TargetAsset, ...]
+    adapter_ids: tuple[Identifier, ...] = ()
     action_policy: ActionPolicy
     identities: tuple[Identifier, ...]
     tenants: tuple[Identifier, ...] = ()
@@ -188,6 +205,7 @@ class AuthorityGrant(ProtocolModel):
     approved_by: Identifier
     targets: tuple[TargetAsset, ...]
     pack_ids: tuple[Identifier, ...]
+    adapter_ids: tuple[Identifier, ...] = ()
     action_policy: ActionPolicy
     identities: tuple[Identifier, ...]
     roles: tuple[Identifier, ...] = ()
@@ -226,6 +244,47 @@ class ScopeEpoch(ProtocolModel):
         if self.revoked != (self.revocation_reason is not None):
             raise ValueError("revocation_reason must be present exactly when revoked")
         return self
+
+
+class SignaturePurpose(str, Enum):
+    AUTHORITY_GRANT = "authority_grant"
+    SCOPE_EPOCH = "scope_epoch"
+    ENGAGEMENT_BUNDLE = "engagement_bundle"
+    RUN_RESULT_BUNDLE = "run_result_bundle"
+
+
+class SignatureBlock(ProtocolModel):
+    algorithm: Literal["Ed25519"] = "Ed25519"
+    protocol_version: Literal["0.1.0"] = PROTOCOL_VERSION
+    purpose: SignaturePurpose
+    key_id: KeyId
+    sequence: PositiveInt
+    signed_at: AwareDatetime
+    expires_at: AwareDatetime | None = None
+    payload_digest: Sha256Digest
+    signature: Base64Url
+
+    @model_validator(mode="after")
+    def _expiry_ordered(self) -> "SignatureBlock":
+        if self.expires_at is not None and self.expires_at <= self.signed_at:
+            raise ValueError("signature expiry must follow signing time")
+        return self
+
+
+class Ed25519PublicKeyRecord(ProtocolModel):
+    algorithm: Literal["Ed25519"] = "Ed25519"
+    key_id: KeyId
+    public_key: Base64Url
+
+
+class SignedAuthorityGrant(ProtocolModel):
+    payload: AuthorityGrant
+    signature: SignatureBlock
+
+
+class SignedScopeEpoch(ProtocolModel):
+    payload: ScopeEpoch
+    signature: SignatureBlock
 
 
 class SubjectRef(ProtocolModel):
@@ -491,6 +550,7 @@ class VerdictOutcome(str, Enum):
 
 class VerificationVerdict(ProtocolModel):
     verdict_id: Identifier
+    run_id: Identifier
     claim_id: Identifier
     claim_packet_digest: Sha256Digest
     verifier_run_id: Identifier
@@ -1102,6 +1162,7 @@ class ReplayPlan(ProtocolModel):
 
 class ChainVerdict(ProtocolModel):
     chain_verdict_id: Identifier
+    run_id: Identifier
     replay_plan_id: Identifier
     outcome: VerdictOutcome
     verified_edge_ids: tuple[Identifier, ...]
@@ -1126,7 +1187,7 @@ class EngagementBundle(ProtocolModel):
     bundle_id: Identifier
     bundle_version: PositiveInt
     engagement_id: Identifier
-    authority_grant: AuthorityGrant
+    authority_grant: SignedAuthorityGrant
     run_manifest: RunManifest
     identity_profiles: tuple[IdentityProfile, ...]
     pack_manifests: tuple[PackManifest, ...]
@@ -1137,20 +1198,53 @@ class EngagementBundle(ProtocolModel):
 
     @model_validator(mode="after")
     def _bundle_consistency(self) -> "EngagementBundle":
+        grant = self.authority_grant.payload
         if self.expires_at <= self.created_at:
             raise ValueError("engagement bundle expiry must follow creation")
+        if self.created_at < grant.issued_at:
+            raise ValueError("engagement bundle cannot predate its authority grant")
+        if self.expires_at > grant.expires_at:
+            raise ValueError("engagement bundle cannot outlive its authority grant")
         if self.run_manifest.engagement_id != self.engagement_id:
             raise ValueError("run manifest belongs to a different engagement")
+        if not self.created_at <= self.run_manifest.started_at < self.expires_at:
+            raise ValueError("run start is outside engagement bundle validity")
+        if self.authority_grant.signature.signed_at > self.run_manifest.started_at:
+            raise ValueError("authority grant was signed after the run started")
+        if not grant.not_before <= self.run_manifest.started_at < grant.expires_at:
+            raise ValueError("run start is outside authority validity")
+        if not any(
+            window.starts_at <= self.run_manifest.started_at < window.ends_at
+            for window in grant.execution_windows
+        ):
+            raise ValueError("run start is outside approved execution windows")
         if self.run_manifest.authority_digest != sha256_digest(self.authority_grant):
             raise ValueError("run authority digest does not identify the embedded grant")
         if self.run_manifest.target_id not in {
-            target.target_id for target in self.authority_grant.targets
+            target.target_id for target in grant.targets
         }:
             raise ValueError("run target is absent from the authority grant")
-        if not set(self.run_manifest.pack_ids).issubset(
-            {manifest.pack_id for manifest in self.pack_manifests}
+        granted_packs = set(grant.pack_ids)
+        bundled_packs = {manifest.pack_id for manifest in self.pack_manifests}
+        if not bundled_packs.issubset(granted_packs):
+            raise ValueError("bundle contains an unauthorized pack")
+        if not set(self.run_manifest.pack_ids).issubset(granted_packs & bundled_packs):
+            raise ValueError("run references an unauthorized or absent pack")
+        granted_adapters = set(grant.adapter_ids)
+        bundled_adapters = {manifest.adapter_id for manifest in self.adapter_manifests}
+        if not bundled_adapters.issubset(granted_adapters):
+            raise ValueError("bundle contains an unauthorized adapter")
+        if not set(self.run_manifest.adapter_ids).issubset(
+            granted_adapters & bundled_adapters
         ):
-            raise ValueError("run references a pack absent from the bundle")
+            raise ValueError("run references an unauthorized or absent adapter")
+        for profile in self.identity_profiles:
+            if profile.identity_id not in grant.identities:
+                raise ValueError("bundle contains an unauthorized identity")
+            if not set(profile.tenant_ids).issubset(grant.tenants):
+                raise ValueError("identity profile contains an unauthorized tenant")
+            if not set(profile.role_ids).issubset(grant.roles):
+                raise ValueError("identity profile contains an unauthorized role")
         return self
 
 
@@ -1169,6 +1263,57 @@ class RunResultBundle(ProtocolModel):
     final_checkpoint_digest: Sha256Digest
     generated_at: AwareDatetime
     cleanup_receipt_digests: tuple[Sha256Digest, ...] = ()
+
+    @model_validator(mode="after")
+    def _nested_records_belong_to_run(self) -> "RunResultBundle":
+        run_bound_records = (
+            *self.finding_candidates,
+            *self.claim_packets,
+            *self.verification_verdicts,
+            *self.chain_verdicts,
+            *self.evidence_refs,
+        )
+        if any(record.run_id != self.run_id for record in run_bound_records):
+            raise ValueError("result contains a record from a different run")
+
+        candidate_ids = {candidate.candidate_id for candidate in self.finding_candidates}
+        if len(candidate_ids) != len(self.finding_candidates):
+            raise ValueError("result contains duplicate candidate IDs")
+        if any(claim.candidate_id not in candidate_ids for claim in self.claim_packets):
+            raise ValueError("claim references a candidate absent from the result")
+
+        claim_ids = {claim.claim_id for claim in self.claim_packets}
+        if len(claim_ids) != len(self.claim_packets):
+            raise ValueError("result contains duplicate claim IDs")
+        if any(verdict.claim_id not in claim_ids for verdict in self.verification_verdicts):
+            raise ValueError("verdict references a claim absent from the result")
+        claims_by_id = {claim.claim_id: claim for claim in self.claim_packets}
+        if any(
+            verdict.claim_packet_digest != sha256_digest(claims_by_id[verdict.claim_id])
+            for verdict in self.verification_verdicts
+        ):
+            raise ValueError("verdict claim digest does not match the included claim")
+
+        nested_evidence = (
+            *(ref for item in self.finding_candidates for ref in item.evidence_refs),
+            *(ref for item in self.claim_packets for ref in item.evidence_refs),
+            *(ref for item in self.claim_packets for ref in item.negative_control_refs),
+            *(ref for item in self.verification_verdicts for ref in item.evidence_refs),
+            *(ref for item in self.chain_verdicts for ref in item.evidence_refs),
+        )
+        if any(ref.run_id != self.run_id for ref in nested_evidence):
+            raise ValueError("result contains nested evidence from a different run")
+        return self
+
+
+class SignedEngagementBundle(ProtocolModel):
+    payload: EngagementBundle
+    signature: SignatureBlock
+
+
+class SignedRunResultBundle(ProtocolModel):
+    payload: RunResultBundle
+    signature: SignatureBlock
 
 
 REQUIRED_MODEL_TYPES: tuple[type[ProtocolModel], ...] = (
@@ -1235,8 +1380,20 @@ REQUIRED_MODEL_TYPES: tuple[type[ProtocolModel], ...] = (
     ChainVerdict,
 )
 
+WIRE_MODEL_TYPES: tuple[type[ProtocolModel], ...] = (
+    SignatureBlock,
+    Ed25519PublicKeyRecord,
+    SignedAuthorityGrant,
+    SignedScopeEpoch,
+    SignedEngagementBundle,
+    SignedRunResultBundle,
+)
+
 
 def schema_catalog() -> dict[str, dict[str, object]]:
-    """Return JSON Schemas for every type required by the v0.1 protocol plan."""
+    """Return JSON Schemas for all v0.1 payload and signed wire types."""
 
-    return {model.__name__: model.model_json_schema() for model in REQUIRED_MODEL_TYPES}
+    return {
+        model.__name__: model.model_json_schema()
+        for model in (*REQUIRED_MODEL_TYPES, *WIRE_MODEL_TYPES)
+    }
