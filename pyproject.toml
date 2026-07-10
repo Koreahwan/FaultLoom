@@ -1,0 +1,15 @@
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests", "packages", "packs"]
+pythonpath = [
+  "packages/protocol/src",
+  "packages/sdk/src",
+  "packages/runtime/src",
+  "packs/web/src",
+  "packs/llm/src",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
