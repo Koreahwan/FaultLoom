@@ -106,6 +106,15 @@ flat direct-only graph cannot silently represent a transitive dependency as a
 leaf. Optional and dynamic project dependencies are rejected until their
 installation semantics can be represented without ambiguity.
 
+Distributable projects use Core Metadata 2.4 and emit
+`License-Expression: Apache-2.0` plus one `License-File` field for every
+packaged license file. FaultLoom deliberately narrows PEP 639's more general
+pattern language: `license-files` must be a non-empty list naming the direct
+project-root files `LICENSE` and `NOTICE`. Empty lists,
+absolute paths, traversal, globs, missing files, and case-folded duplicate
+basenames fail closed. This stricter project policy ensures every public wheel
+carries both policy files even though PEP 639 itself permits an empty list.
+
 This graph is still operator-declared until an admitted wheelhouse supplies
 independent package metadata. SBOM and provenance therefore label non-empty
 graphs `declared_unverified`; structural reconciliation is not presented as

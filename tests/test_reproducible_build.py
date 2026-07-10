@@ -192,6 +192,14 @@ class ReproducibleBuildTests(unittest.TestCase):
             output = root / "output"
             build_once(root, output, EPOCH)
             with zipfile.ZipFile(next(output.glob("*.whl"))) as wheel:
+                metadata = wheel.read(
+                    "faultloom_demo-0.1.0.dist-info/METADATA"
+                ).decode("utf-8")
+                self.assertIn("Metadata-Version: 2.4\n", metadata)
+                self.assertIn("License-Expression: Apache-2.0\n", metadata)
+                self.assertEqual(metadata.count("License-File: LICENSE\n"), 1)
+                self.assertEqual(metadata.count("License-File: NOTICE\n"), 1)
+                self.assertNotIn("\nLicense: Apache-2.0\n", metadata)
                 self.assertEqual(
                     wheel.read("faultloom_demo-0.1.0.dist-info/licenses/LICENSE"),
                     b"project license\n",
@@ -204,7 +212,14 @@ class ReproducibleBuildTests(unittest.TestCase):
     def test_project_license_files_fail_closed(self) -> None:
         variants = (
             ('license-files = ["../LICENSE", "NOTICE"]', "escapes the repository"),
+            ('license-files = ["/LICENSE", "NOTICE"]', "escapes the repository"),
+            ('license-files = ["//LICENSE", "NOTICE"]', "escapes the repository"),
             ('license-files = ["LICEN*", "NOTICE"]', "must use exact paths"),
+            ('license-files = []', "must be a non-empty string list"),
+            (
+                'license-files = ["legal/LICENSE", "NOTICE"]',
+                "must name direct project files",
+            ),
             ('license-files = ["LICENSE"]', "must contain LICENSE and NOTICE"),
             ('license-files = ["LICENSE", "license", "NOTICE"]', "duplicate name"),
             ('license-files = ["LICENSE", "MISSING"]', "missing or unsafe"),
@@ -927,6 +942,7 @@ dependencies = []
     def test_project_readme_forms_and_content_types_are_explicit(self) -> None:
         invalid = (
             ('readme = "README.md"', 'readme = "README.txt"', "must be a .md or .rst"),
+            ('readme = "README.md"', 'readme = "/README.md"', "escapes the repository"),
             (
                 'readme = "README.md"',
                 'readme = {file = "README.md", content-type = "text/markdown"}',

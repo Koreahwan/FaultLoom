@@ -902,8 +902,18 @@ def discover_projects(
                         raise BuildPolicyError(
                             f"project license-files must use exact paths in {manifest.path}"
                         )
+                    project_relative_license = _safe_repository_path(
+                        raw_license_file,
+                        context=f"project-relative license file in {manifest.path}",
+                    )
+                    if len(project_relative_license.parts) != 1:
+                        raise BuildPolicyError(
+                            "project license-files must name direct project files in "
+                            f"{manifest.path}"
+                        )
                     relative_license = _safe_repository_path(
-                        f"{project_directory.as_posix()}/{raw_license_file}",
+                        f"{project_directory.as_posix()}/"
+                        f"{project_relative_license.as_posix()}",
                         context=f"project license file in {manifest.path}",
                     )
                     if relative_license.as_posix() not in by_path:
@@ -938,8 +948,13 @@ def discover_projects(
                     raise BuildPolicyError(
                         f"project readme must be a .md or .rst file in {manifest.path}"
                     )
+                project_relative_readme = _safe_repository_path(
+                    readme_value,
+                    context=f"project-relative readme in {manifest.path}",
+                )
                 readme_path = _safe_repository_path(
-                    f"{project_directory.as_posix()}/{readme_value}",
+                    f"{project_directory.as_posix()}/"
+                    f"{project_relative_readme.as_posix()}",
                     context=f"project readme in {manifest.path}",
                 )
                 if readme_path.as_posix() not in by_path:
@@ -1239,8 +1254,18 @@ def build_wheel(
             "tracked source may not provide installer-control wheel paths: "
             f"{sorted(installer_control_paths)}"
         )
+    wheel_license_files = project.license_files or policy.license_files
+    if project.license_files:
+        license_metadata_paths = tuple(
+            license_path.relative_to(project.directory).as_posix()
+            for license_path in wheel_license_files
+        )
+    else:
+        license_metadata_paths = tuple(
+            license_path.name for license_path in wheel_license_files
+        )
     metadata = [
-        "Metadata-Version: 2.3",
+        "Metadata-Version: 2.4",
         f"Name: {project.name}",
         f"Version: {project.version}",
     ]
@@ -1248,7 +1273,8 @@ def build_wheel(
         metadata.append(f"Summary: {project.description}")
     if project.requires_python:
         metadata.append(f"Requires-Python: {project.requires_python}")
-    metadata.append("License: Apache-2.0")
+    metadata.append("License-Expression: Apache-2.0")
+    metadata.extend(f"License-File: {path}" for path in license_metadata_paths)
     for dependency in project.dependencies:
         metadata.append(f"Requires-Dist: {dependency}")
     if project.readme is not None:
@@ -1276,10 +1302,11 @@ def build_wheel(
         "Root-Is-Purelib: true\n"
         "Tag: py3-none-any\n"
     ).encode()
-    wheel_license_files = project.license_files or policy.license_files
-    for license_path in wheel_license_files:
+    for license_path, metadata_path in zip(
+        wheel_license_files, license_metadata_paths, strict=True
+    ):
         relative_license = license_path.relative_to(root).as_posix()
-        files[f"{dist_info}/licenses/{license_path.name}"] = _head_blob_for_path(
+        files[f"{dist_info}/licenses/{metadata_path}"] = _head_blob_for_path(
             root, relative_license, revision=revision
         )
 
