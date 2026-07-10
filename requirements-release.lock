@@ -3,4 +3,7 @@
 # package declares an external runtime dependency. At that point each package
 # must have an exact pin and one or more sha256 hashes here. Unhashed, mutable,
 # URL, path, and editable requirements are rejected by the build policy.
-
+# Hashes remain declared-unverified metadata until an admitted offline
+# wheelhouse is reconciled against them; release mode remains hard-disabled.
+# Every lock entry must also appear in requirements-release.graph.json, which
+# records the complete exact-version dependency graph including transitives.

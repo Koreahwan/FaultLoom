@@ -4,12 +4,10 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import re
 import sys
 import uuid
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -33,8 +31,11 @@ def _load_context(path: Path) -> dict[str, Any]:
         raise HookError(f"cannot read build context: {exc}") from exc
     required = {
         "builder",
+        "ci_policy",
         "components",
+        "dependency_graph",
         "locked_dependencies",
+        "network",
         "source",
         "source_date_epoch",
         "subjects",
@@ -44,15 +45,42 @@ def _load_context(path: Path) -> dict[str, Any]:
         raise HookError("unsupported or incomplete build context")
     if not isinstance(value["subjects"], list) or not value["subjects"]:
         raise HookError("build context must contain at least one subject")
+    network = value["network"]
+    if (
+        not isinstance(network, dict)
+        or network.get("mode") not in {"offline_requested", "isolated"}
+        or not isinstance(network.get("enforced"), bool)
+        or network.get("enforced") != (network.get("mode") == "isolated")
+    ):
+        raise HookError("build context has an invalid network enforcement claim")
+    dependency_graph = value["dependency_graph"]
+    if (
+        not isinstance(dependency_graph, dict)
+        or dependency_graph.get("verification")
+        not in {"declared_unverified", "complete_no_external_dependencies"}
+        or not isinstance(dependency_graph.get("source"), str)
+    ):
+        raise HookError("build context has an invalid dependency graph claim")
+    ci_policy = value["ci_policy"]
+    if (
+        not isinstance(ci_policy, dict)
+        or ci_policy.get("workflow") != ".github/workflows/ci.yml"
+        or re.fullmatch(r"[0-9a-f]{64}", ci_policy.get("workflow_sha256", ""))
+        is None
+        or ci_policy.get("validation") != "byte_exact_repository_self_check"
+        or ci_policy.get("external_trust_anchor") is not False
+    ):
+        raise HookError("build context has an invalid CI trust-anchor claim")
+    toolchains = value["toolchains"]
+    if (
+        not isinstance(toolchains, dict)
+        or toolchains.get("python_runtime_verification")
+        != "version_only_unverified"
+        or toolchains.get("rust_runtime_verification")
+        != "policy_declared_unverified"
+    ):
+        raise HookError("build context has an invalid Python runtime verification claim")
     return value
-
-
-def _timestamp(epoch: int) -> str:
-    try:
-        value = datetime.fromtimestamp(epoch, UTC).isoformat(timespec="seconds")
-        return value.replace("+00:00", "Z")
-    except (OverflowError, OSError, TypeError, ValueError) as exc:
-        raise HookError("invalid source date epoch") from exc
 
 
 def make_sbom(context: dict[str, Any]) -> dict[str, Any]:
@@ -60,6 +88,7 @@ def make_sbom(context: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(commit, str) or len(commit) != 40:
         raise HookError("source commit must be a full Git object ID")
     serial = uuid.uuid5(uuid.NAMESPACE_URL, f"https://faultloom.invalid/core/{commit}")
+    root_ref = f"urn:faultloom:core:{commit}"
     components = []
     dependency_edges = []
     internal_purls = {component["purl"] for component in context["components"]}
@@ -91,24 +120,62 @@ def make_sbom(context: dict[str, Any]) -> dict[str, Any]:
                 "version": dependency["version"],
                 "purl": purl,
                 "bom-ref": purl,
-                "hashes": [
-                    {"alg": "SHA-256", "content": digest}
-                    for digest in dependency["sha256"]
+                "properties": [
+                    {
+                        "name": "faultloom:hashVerification",
+                        "value": dependency["hash_verification"],
+                    },
+                    {
+                        "name": "faultloom:declaredSha256",
+                        "value": ",".join(dependency["sha256"]),
+                    },
                 ],
             }
         )
+        depends_on = []
+        for requirement in dependency["dependencies"]:
+            name, version = requirement.split("==", 1)
+            depends_on.append(f"pkg:pypi/{_normalized_name(name)}@{version}")
+        dependency_edges.append({"ref": purl, "dependsOn": sorted(depends_on)})
+    dependency_edges.append({"ref": root_ref, "dependsOn": sorted(internal_purls)})
     return {
         "bomFormat": "CycloneDX",
         "specVersion": "1.5",
         "serialNumber": f"urn:uuid:{serial}",
         "version": 1,
         "metadata": {
-            "timestamp": _timestamp(context["source_date_epoch"]),
             "tools": {"components": [{"type": "application", "name": context["builder"]}]},
+            "properties": [
+                {
+                    "name": "faultloom:dependencyGraphVerification",
+                    "value": context["dependency_graph"]["verification"],
+                },
+                {
+                    "name": "faultloom:dependencyGraphSource",
+                    "value": context["dependency_graph"]["source"],
+                },
+                {
+                    "name": "faultloom:pythonRuntimeVerification",
+                    "value": context["toolchains"]["python_runtime_verification"],
+                },
+                {
+                    "name": "faultloom:ciExternalTrustAnchor",
+                    "value": str(context["ci_policy"]["external_trust_anchor"]).lower(),
+                },
+                {
+                    "name": "faultloom:ciWorkflowSha256",
+                    "value": context["ci_policy"]["workflow_sha256"],
+                },
+                {
+                    "name": "faultloom:rustRuntimeVerification",
+                    "value": context["toolchains"]["rust_runtime_verification"],
+                },
+            ],
             "component": {
                 "type": "application",
                 "name": "faultloom-core",
                 "version": commit,
+                "bom-ref": root_ref,
                 "hashes": [{"alg": "SHA-1", "content": context["source"]["tree"]}],
             },
         },
@@ -118,7 +185,6 @@ def make_sbom(context: dict[str, Any]) -> dict[str, Any]:
 
 
 def make_provenance(context: dict[str, Any]) -> dict[str, Any]:
-    timestamp = _timestamp(context["source_date_epoch"])
     subjects = [
         {"name": item["name"], "digest": {"sha256": item["sha256"]}}
         for item in context["subjects"]
@@ -133,13 +199,15 @@ def make_provenance(context: dict[str, Any]) -> dict[str, Any]:
         }
     ]
     for item in context["locked_dependencies"]:
-        for digest in item["sha256"]:
-            resolved_dependencies.append(
-                {
-                    "uri": f"pkg:pypi/{item['name']}@{item['version']}",
-                    "digest": {"sha256": digest},
-                }
-            )
+        resolved_dependencies.append(
+            {
+                "uri": f"pkg:pypi/{item['name']}@{item['version']}",
+                "annotations": {
+                    "faultloom:hashVerification": item["hash_verification"],
+                    "faultloom:declaredSha256": ",".join(item["sha256"]),
+                },
+            }
+        )
     return {
         "_type": "https://in-toto.io/Statement/v1",
         "subject": subjects,
@@ -150,19 +218,15 @@ def make_provenance(context: dict[str, Any]) -> dict[str, Any]:
                 "externalParameters": {"sourceDateEpoch": context["source_date_epoch"]},
                 "internalParameters": {
                     "toolchains": context["toolchains"],
-                    "network": "disabled",
+                    "ciPolicy": context["ci_policy"],
+                    "network": context["network"],
+                    "dependencyGraph": context["dependency_graph"],
                 },
                 "resolvedDependencies": resolved_dependencies,
             },
             "runDetails": {
                 "builder": {"id": context["builder"]},
-                "metadata": {
-                    "invocationId": hashlib.sha256(
-                        _canonical_json(context).encode("utf-8")
-                    ).hexdigest(),
-                    "startedOn": timestamp,
-                    "finishedOn": timestamp,
-                },
+                "metadata": {},
                 "byproducts": [],
             },
         },

@@ -1,12 +1,17 @@
 schema_version = 1
 python_version = "3.12.3"
+python_runtime_verification = "version_only_unverified"
 rust_version = "1.96.1"
+rustc_host = "x86_64-unknown-linux-gnu"
+rustc_sha256 = "4a84e05991ad6f2a84c1361c29b52b38c390365bd1fc269b1936c88d482a8928"
+rustc_closure_sha256 = "3d19810cf6dce3f1e2e836d73a1d9023461a9b7133b0067a4e4c0ba29d671387"
 release_lock = "requirements-release.lock"
+release_dependency_graph = "requirements-release.graph.json"
 package_roots = ["packages", "packs"]
 license_files = ["LICENSE", "NOTICE"]
 release_enabled = false
+ci_external_trust_anchor = false
 
 [hooks]
 sbom = "tools/build_metadata_hook.py"
 provenance = "tools/build_metadata_hook.py"
-
