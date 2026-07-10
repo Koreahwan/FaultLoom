@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools==81.0.0", "wheel==0.42.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "faultloom-protocol"
+version = "0.1.0"
+description = "Versioned contracts and authority signatures for FaultLoom"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { text = "Apache-2.0" }
+dependencies = [
+  "cryptography==41.0.7",
+  "pydantic==2.12.5",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
