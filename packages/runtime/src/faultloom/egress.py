@@ -15,7 +15,9 @@ import hmac
 import ipaddress
 import re
 import sqlite3
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from threading import RLock
@@ -94,6 +96,7 @@ class DenialCode(str, Enum):
     AUTHORITY_NOT_CURRENT = "authority_not_current"
     AUTHORITY_VERIFICATION_FAILED = "authority_verification_failed"
     DATA_POLICY_DENIED = "data_policy_denied"
+    DISPATCH_BINDING_MISMATCH = "dispatch_binding_mismatch"
     DESTINATION_OVERLAPS_TARGET = "destination_overlaps_target"
     DESTINATION_RESOLUTION_DENIED = "destination_resolution_denied"
     DESTINATION_SPECIAL_USE = "destination_special_use"
@@ -417,6 +420,9 @@ class CompiledProviderRequest(ProtocolModel):
     tool_ids: tuple[Identifier, ...]
     resolved_addresses: tuple[ShortStr, ...]
     resolution_digest: Sha256Digest
+    destination_digest: Sha256Digest
+    execution_component_digest: Sha256Digest
+    dispatch_authorization_digest: Sha256Digest
     maximum_request_bytes: PositiveInt
     maximum_response_bytes: PositiveInt
     follow_redirects: Literal[False] = False
@@ -432,6 +438,9 @@ class CompiledKnowledgeRequest(ProtocolModel):
     data_policy_id: Identifier
     resolved_addresses: tuple[ShortStr, ...]
     resolution_digest: Sha256Digest
+    destination_digest: Sha256Digest
+    execution_component_digest: Sha256Digest
+    dispatch_authorization_digest: Sha256Digest
     maximum_request_bytes: PositiveInt
     maximum_response_bytes: PositiveInt
     follow_redirects: Literal[False] = False
@@ -456,6 +465,7 @@ class EgressReceipt(ProtocolModel):
     policy_digest: Sha256Digest
     destination_digest: Sha256Digest | None
     execution_component_digest: Sha256Digest | None
+    dispatch_authorization_digest: Sha256Digest | None
     outcome: EgressOutcome
     denial_code: DenialCode | None
     response_digest: Sha256Digest | None
@@ -473,6 +483,15 @@ class EgressReceipt(ProtocolModel):
             raise ValueError("only unknown outcomes require reconciliation")
         if self.outcome is EgressOutcome.DENIED and (self.bytes_sent or self.bytes_received):
             raise ValueError("denied receipts cannot report transport bytes")
+        dispatched_bindings = (
+            self.destination_digest,
+            self.execution_component_digest,
+            self.dispatch_authorization_digest,
+        )
+        if self.outcome is not EgressOutcome.DENIED and any(
+            value is None for value in dispatched_bindings
+        ):
+            raise ValueError("dispatched receipts require complete dispatch bindings")
         payload = self.model_dump(mode="python", exclude={"receipt_digest"})
         if not hmac.compare_digest(self.receipt_digest, sha256_digest(payload)):
             raise ValueError("egress receipt digest does not match its fields")
@@ -498,6 +517,14 @@ class KnowledgeTransport(Protocol):
 
 
 Clock = Callable[[], datetime]
+
+
+@dataclass(frozen=True, slots=True)
+class _AuthorityGeneration:
+    authority_digest: str
+    scope_epoch: int
+    scope_epoch_digest: str
+    generation_digest: str
 
 
 def _system_clock() -> datetime:
@@ -644,6 +671,7 @@ def _receipt(
     policy_digest: str,
     destination_digest: str | None,
     execution_component_digest: str | None = None,
+    dispatch_authorization_digest: str | None = None,
     outcome: EgressOutcome,
     denial_code: DenialCode | None,
     result: EgressTransportResult | None,
@@ -664,6 +692,7 @@ def _receipt(
         "policy_digest": policy_digest,
         "destination_digest": destination_digest,
         "execution_component_digest": execution_component_digest,
+        "dispatch_authorization_digest": dispatch_authorization_digest,
         "outcome": outcome,
         "denial_code": denial_code,
         "response_digest": response_digest,
@@ -728,11 +757,13 @@ class TrustedAuthorityState:
 
     @property
     def authority_digest(self) -> str:
-        return sha256_digest(self._authority)
+        with self._lock:
+            return sha256_digest(self._authority)
 
     @property
     def scope_epoch_number(self) -> int:
-        return self._scope_epoch.payload.epoch
+        with self._lock:
+            return self._scope_epoch.payload.epoch
 
     @property
     def state_store(self) -> SqliteEgressStateStore:
@@ -752,26 +783,81 @@ class TrustedAuthorityState:
 
     def verify(self, now: datetime) -> tuple[AuthorityGrant, ScopeEpoch]:
         with self._lock:
-            grant = verify_authority_grant(
-                self._authority,
+            grant, epoch, _ = self._verify_generation_locked(now)
+            return grant, epoch
+
+    def snapshot_generation(self) -> _AuthorityGeneration:
+        with self._lock:
+            return self._generation_locked()
+
+    def verify_generation(
+        self,
+        now: datetime,
+        *,
+        expected: _AuthorityGeneration | None = None,
+    ) -> tuple[AuthorityGrant, ScopeEpoch, _AuthorityGeneration]:
+        with self._lock:
+            grant, epoch, generation = self._verify_generation_locked(now)
+            if expected is not None and generation != expected:
+                raise ValueError("authority generation changed during dispatch")
+            return grant, epoch, generation
+
+    @contextmanager
+    def dispatch_guard(
+        self, *, expected: _AuthorityGeneration, now: datetime
+    ) -> Iterator[None]:
+        """Hold the generation stable across the concrete send boundary."""
+
+        with self._lock:
+            _, _, generation = self._verify_generation_locked(now)
+            if generation != expected:
+                raise ValueError("authority generation changed before dispatch")
+            yield
+
+    def _generation_locked(self) -> _AuthorityGeneration:
+        authority_digest = sha256_digest(self._authority)
+        scope_epoch_digest = sha256_digest(self._scope_epoch)
+        generation_digest = sha256_digest(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "trust_domain": self._trust_domain,
+                "trusted_key_digest": sha256_digest(self._trusted_key),
+                "key_id": self._trusted_key.key_id,
+                "authority_digest": authority_digest,
+                "scope_epoch": self._scope_epoch.payload.epoch,
+                "scope_epoch_digest": scope_epoch_digest,
+            }
+        )
+        return _AuthorityGeneration(
+            authority_digest=authority_digest,
+            scope_epoch=self._scope_epoch.payload.epoch,
+            scope_epoch_digest=scope_epoch_digest,
+            generation_digest=generation_digest,
+        )
+
+    def _verify_generation_locked(
+        self, now: datetime
+    ) -> tuple[AuthorityGrant, ScopeEpoch, _AuthorityGeneration]:
+        grant = verify_authority_grant(
+            self._authority,
+            self._trusted_key,
+            now=now,
+            minimum_version=1,
+            expected_grant_id=self._authority.payload.grant_id,
+        )
+        try:
+            epoch = verify_scope_epoch(
+                self._scope_epoch,
                 self._trusted_key,
                 now=now,
-                minimum_version=1,
-                expected_grant_id=self._authority.payload.grant_id,
+                minimum_epoch=1,
+                expected_grant_id=grant.grant_id,
             )
-            try:
-                epoch = verify_scope_epoch(
-                    self._scope_epoch,
-                    self._trusted_key,
-                    now=now,
-                    minimum_epoch=1,
-                    expected_grant_id=grant.grant_id,
-                )
-            except AuthorityRevokedError:
-                self._observe(grant, self._scope_epoch.payload, now, revoked=True)
-                raise
-            self._observe(grant, epoch, now, revoked=False)
-            return grant, epoch
+        except AuthorityRevokedError:
+            self._observe(grant, self._scope_epoch.payload, now, revoked=True)
+            raise
+        self._observe(grant, epoch, now, revoked=False)
+        return grant, epoch, self._generation_locked()
 
     def install_scope_epoch(self, scope_epoch: SignedScopeEpoch, *, now: datetime) -> None:
         candidate = SignedScopeEpoch.model_validate(scope_epoch.model_dump(mode="python"))
@@ -781,7 +867,7 @@ class TrustedAuthorityState:
                 raise ValueError("scope epoch update must advance monotonically")
             self._scope_epoch = candidate
             try:
-                self.verify(now)
+                self._verify_generation_locked(now)
             except AuthorityRevokedError:
                 raise
             except (SignatureVerificationError, ValueError, sqlite3.Error, OSError, RuntimeError):
@@ -895,16 +981,44 @@ def _component_id(value: object, *, field: str) -> str:
 def _execution_component_digest(
     plane: EgressPlane, resolver: DestinationResolver, transport: object
 ) -> str:
+    resolver_plane = getattr(resolver, "plane", None)
+    transport_plane = getattr(transport, "plane", None)
+    if resolver_plane is not plane or transport_plane is not plane:
+        raise ValueError("egress components belong to another plane")
     return sha256_digest(
         {
             "schema_version": SCHEMA_VERSION,
             "plane": plane,
+            "resolver_plane": resolver_plane,
+            "transport_plane": transport_plane,
             "resolver_id": _component_id(
                 getattr(resolver, "resolver_id", None), field="resolver_id"
             ),
             "transport_id": _component_id(
                 getattr(transport, "transport_id", None), field="transport_id"
             ),
+        }
+    )
+
+
+def _dispatch_authorization_digest(
+    *,
+    plane: EgressPlane,
+    generation: _AuthorityGeneration,
+    action_digest: str,
+    request_digest: str,
+    destination_digest: str,
+    execution_component_digest: str,
+) -> str:
+    return sha256_digest(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "plane": plane,
+            "authority_generation_digest": generation.generation_digest,
+            "action_digest": action_digest,
+            "request_digest": request_digest,
+            "destination_digest": destination_digest,
+            "execution_component_digest": execution_component_digest,
         }
     )
 
@@ -993,8 +1107,9 @@ class ProviderProxy:
         now = _trusted_now(self._clock)
         request_digest = sha256_digest(request)
         action_digest = provider_action_digest(request)
-        authority_digest = self._authority.authority_digest
-        scope_epoch = self._authority.scope_epoch_number
+        snapshot = self._authority.snapshot_generation()
+        authority_digest = snapshot.authority_digest
+        scope_epoch = snapshot.scope_epoch
         endpoint = self._endpoints.get(request.endpoint_id)
         unverified_policy_digest = sha256_digest(
             {
@@ -1007,7 +1122,7 @@ class ProviderProxy:
             }
         )
         try:
-            grant, epoch = self._authority.verify(now)
+            grant, epoch, generation = self._authority.verify_generation(now)
         except (AuthorityRevokedError, SignatureExpiredError, SignatureNotYetValidError):
             return self._denied(
                 request=request,
@@ -1028,6 +1143,7 @@ class ProviderProxy:
                 denial=DenialCode.AUTHORITY_VERIFICATION_FAILED,
                 now=now,
             )
+        authority_digest = generation.authority_digest
         policy_digest = sha256_digest(
             {
                 "schema_version": SCHEMA_VERSION,
@@ -1085,6 +1201,61 @@ class ProviderProxy:
                 denial=destination_denial or DenialCode.DESTINATION_RESOLUTION_DENIED,
                 now=now,
             )
+        admitted_at = _trusted_now(self._clock)
+        try:
+            self._authority.verify_generation(admitted_at, expected=generation)
+        except (AuthorityRevokedError, SignatureExpiredError, SignatureNotYetValidError):
+            return self._denied(
+                request=request,
+                request_digest=request_digest,
+                authority_digest=authority_digest,
+                scope_epoch=epoch.epoch,
+                policy_digest=policy_digest,
+                denial=DenialCode.AUTHORITY_NOT_CURRENT,
+                now=admitted_at,
+            )
+        except (SignatureVerificationError, ValueError, sqlite3.Error, OSError, RuntimeError):
+            return self._denied(
+                request=request,
+                request_digest=request_digest,
+                authority_digest=authority_digest,
+                scope_epoch=epoch.epoch,
+                policy_digest=policy_digest,
+                denial=DenialCode.AUTHORITY_VERIFICATION_FAILED,
+                now=admitted_at,
+            )
+        try:
+            execution_component_digest = _execution_component_digest(
+                EgressPlane.MODEL_PROVIDER, self._resolver, self._transport
+            )
+        except ValueError:
+            execution_component_digest = None
+        if execution_component_digest != self._component_digest:
+            return self._denied(
+                request=request,
+                request_digest=request_digest,
+                authority_digest=authority_digest,
+                scope_epoch=epoch.epoch,
+                policy_digest=policy_digest,
+                denial=DenialCode.TRANSPORT_PLANE_MISMATCH,
+                now=admitted_at,
+            )
+        destination_digest = sha256_digest(
+            {
+                "plane": EgressPlane.MODEL_PROVIDER,
+                "endpoint_id": endpoint.endpoint_id,
+                "origin": endpoint.origin,
+                "resolution_digest": sha256_digest(resolution),
+            }
+        )
+        dispatch_authorization_digest = _dispatch_authorization_digest(
+            plane=EgressPlane.MODEL_PROVIDER,
+            generation=generation,
+            action_digest=action_digest,
+            request_digest=request_digest,
+            destination_digest=destination_digest,
+            execution_component_digest=execution_component_digest,
+        )
         compiled = CompiledProviderRequest(
             schema_version=SCHEMA_VERSION,
             request_id=request.request_id,
@@ -1099,6 +1270,9 @@ class ProviderProxy:
             tool_ids=request.tool_ids,
             resolved_addresses=_compiled_addresses(resolution),
             resolution_digest=sha256_digest(resolution),
+            destination_digest=destination_digest,
+            execution_component_digest=execution_component_digest,
+            dispatch_authorization_digest=dispatch_authorization_digest,
             maximum_request_bytes=grant.budget.max_request_bytes,
             maximum_response_bytes=grant.budget.max_response_bytes,
         )
@@ -1112,7 +1286,8 @@ class ProviderProxy:
                     request_id=request.request_id,
                 ),
                 request_digest=request_digest,
-                reserved_at=now,
+                dispatch_authorization_digest=dispatch_authorization_digest,
+                reserved_at=admitted_at,
             )
         except (sqlite3.Error, OSError, RuntimeError):
             return self._denied(
@@ -1122,7 +1297,7 @@ class ProviderProxy:
                 scope_epoch=epoch.epoch,
                 policy_digest=policy_digest,
                 denial=DenialCode.STATE_STORE_UNAVAILABLE,
-                now=now,
+                now=admitted_at,
             )
         if reservation != _ReservationResult.RESERVED.value:
             return self._denied(
@@ -1132,7 +1307,7 @@ class ProviderProxy:
                 scope_epoch=epoch.epoch,
                 policy_digest=policy_digest,
                 denial=DenialCode.REQUEST_REPLAY_DENIED,
-                now=now,
+                now=admitted_at,
             )
         return self._dispatch_compiled(
             request=request,
@@ -1142,7 +1317,8 @@ class ProviderProxy:
             authority_digest=authority_digest,
             scope_epoch=epoch.epoch,
             policy_digest=policy_digest,
-            now=now,
+            generation=generation,
+            now=admitted_at,
         )
 
     def reconcile(
@@ -1273,6 +1449,7 @@ class ProviderProxy:
         authority_digest: str,
         scope_epoch: int,
         policy_digest: str,
+        generation: _AuthorityGeneration,
         now: datetime,
     ) -> EgressReceipt:
         destination_digest = sha256_digest(
@@ -1284,38 +1461,83 @@ class ProviderProxy:
             }
         )
         try:
-            current_component_digest = _execution_component_digest(
-                EgressPlane.MODEL_PROVIDER, self._resolver, self._transport
-            )
-        except ValueError:
-            current_component_digest = None
-        if current_component_digest != self._component_digest:
-            self._state_store.finish_dispatch(
-                plane=EgressPlane.MODEL_PROVIDER.value,
+            dispatch_now = _trusted_now(self._clock)
+            with self._authority.dispatch_guard(expected=generation, now=dispatch_now):
+                try:
+                    current_component_digest = _execution_component_digest(
+                        EgressPlane.MODEL_PROVIDER, self._resolver, self._transport
+                    )
+                except ValueError:
+                    current_component_digest = None
+                current_authorization_digest = _dispatch_authorization_digest(
+                    plane=EgressPlane.MODEL_PROVIDER,
+                    generation=generation,
+                    action_digest=action_digest,
+                    request_digest=request_digest,
+                    destination_digest=destination_digest,
+                    execution_component_digest=(
+                        current_component_digest or compiled.execution_component_digest
+                    ),
+                )
+                binding_matches = (
+                    destination_digest == compiled.destination_digest
+                    and current_component_digest == self._component_digest
+                    and current_component_digest == compiled.execution_component_digest
+                    and current_authorization_digest
+                    == compiled.dispatch_authorization_digest
+                )
+                if binding_matches:
+                    try:
+                        result = _validated_transport_result(
+                            self._transport.dispatch(compiled)
+                        )
+                    except Exception:
+                        result = None
+                else:
+                    result = None
+        except (AuthorityRevokedError, SignatureExpiredError, SignatureNotYetValidError):
+            return self._finish_reserved_without_send(
+                request=request,
+                compiled=compiled,
                 action_digest=action_digest,
                 request_digest=request_digest,
-                outcome=EgressOutcome.FAILED.value,
-                finished_at=now,
+                authority_digest=authority_digest,
+                scope_epoch=scope_epoch,
+                policy_digest=policy_digest,
+                denial=DenialCode.AUTHORITY_NOT_CURRENT,
+                now=_trusted_now(self._clock),
             )
-            return _receipt(
-                plane=EgressPlane.MODEL_PROVIDER,
-                request_id=request.request_id,
+        except (SignatureVerificationError, ValueError, sqlite3.Error, OSError, RuntimeError):
+            return self._finish_reserved_without_send(
+                request=request,
+                compiled=compiled,
+                action_digest=action_digest,
                 request_digest=request_digest,
                 authority_digest=authority_digest,
                 scope_epoch=scope_epoch,
                 policy_digest=policy_digest,
-                destination_digest=destination_digest,
-                execution_component_digest=self._component_digest,
-                outcome=EgressOutcome.FAILED,
-                denial_code=None,
-                result=None,
-                evaluated_at=now,
+                denial=DenialCode.AUTHORITY_VERIFICATION_FAILED,
+                now=_trusted_now(self._clock),
             )
-        try:
-            result = _validated_transport_result(self._transport.dispatch(compiled))
-        except Exception:
+        if not binding_matches:
+            return self._finish_reserved_without_send(
+                request=request,
+                compiled=compiled,
+                action_digest=action_digest,
+                request_digest=request_digest,
+                authority_digest=authority_digest,
+                scope_epoch=scope_epoch,
+                policy_digest=policy_digest,
+                denial=DenialCode.DISPATCH_BINDING_MISMATCH,
+                now=dispatch_now,
+            )
+        if result is None:
             self._finish_or_hold_unknown(
-                action_digest, request_digest, now, plane=EgressPlane.MODEL_PROVIDER
+                action_digest,
+                request_digest,
+                compiled.dispatch_authorization_digest,
+                dispatch_now,
+                plane=EgressPlane.MODEL_PROVIDER,
             )
             return _receipt(
                 plane=EgressPlane.MODEL_PROVIDER,
@@ -1326,10 +1548,11 @@ class ProviderProxy:
                 policy_digest=policy_digest,
                 destination_digest=destination_digest,
                 execution_component_digest=self._component_digest,
+                dispatch_authorization_digest=compiled.dispatch_authorization_digest,
                 outcome=EgressOutcome.UNKNOWN_OUTCOME,
                 denial_code=None,
                 result=None,
-                evaluated_at=now,
+                evaluated_at=dispatch_now,
             )
         if result.plane is not EgressPlane.MODEL_PROVIDER:
             outcome = EgressOutcome.UNKNOWN_OUTCOME
@@ -1345,8 +1568,9 @@ class ProviderProxy:
                 plane=EgressPlane.MODEL_PROVIDER.value,
                 action_digest=action_digest,
                 request_digest=request_digest,
+                dispatch_authorization_digest=compiled.dispatch_authorization_digest,
                 outcome=outcome.value,
-                finished_at=now,
+                finished_at=dispatch_now,
             )
         except (sqlite3.Error, OSError, RuntimeError):
             outcome = EgressOutcome.UNKNOWN_OUTCOME
@@ -1359,9 +1583,50 @@ class ProviderProxy:
             policy_digest=policy_digest,
             destination_digest=destination_digest,
             execution_component_digest=self._component_digest,
+            dispatch_authorization_digest=compiled.dispatch_authorization_digest,
             outcome=outcome,
             denial_code=None,
             result=result,
+            evaluated_at=dispatch_now,
+        )
+
+    def _finish_reserved_without_send(
+        self,
+        *,
+        request: ProviderRequest,
+        compiled: CompiledProviderRequest,
+        action_digest: str,
+        request_digest: str,
+        authority_digest: str,
+        scope_epoch: int,
+        policy_digest: str,
+        denial: DenialCode,
+        now: datetime,
+    ) -> EgressReceipt:
+        try:
+            self._state_store.finish_dispatch(
+                plane=EgressPlane.MODEL_PROVIDER.value,
+                action_digest=action_digest,
+                request_digest=request_digest,
+                dispatch_authorization_digest=compiled.dispatch_authorization_digest,
+                outcome=EgressOutcome.FAILED.value,
+                finished_at=now,
+            )
+        except (sqlite3.Error, OSError, RuntimeError):
+            denial = DenialCode.STATE_STORE_UNAVAILABLE
+        return _receipt(
+            plane=EgressPlane.MODEL_PROVIDER,
+            request_id=request.request_id,
+            request_digest=request_digest,
+            authority_digest=authority_digest,
+            scope_epoch=scope_epoch,
+            policy_digest=policy_digest,
+            destination_digest=compiled.destination_digest,
+            execution_component_digest=compiled.execution_component_digest,
+            dispatch_authorization_digest=compiled.dispatch_authorization_digest,
+            outcome=EgressOutcome.DENIED,
+            denial_code=denial,
+            result=None,
             evaluated_at=now,
         )
 
@@ -1369,6 +1634,7 @@ class ProviderProxy:
         self,
         action_digest: str,
         request_digest: str,
+        dispatch_authorization_digest: str,
         now: datetime,
         *,
         plane: EgressPlane,
@@ -1378,6 +1644,7 @@ class ProviderProxy:
                 plane=plane.value,
                 action_digest=action_digest,
                 request_digest=request_digest,
+                dispatch_authorization_digest=dispatch_authorization_digest,
                 outcome=EgressOutcome.UNKNOWN_OUTCOME.value,
                 finished_at=now,
             )
@@ -1420,8 +1687,9 @@ class KnowledgeFetcher:
         now = _trusted_now(self._clock)
         request_digest = sha256_digest(request)
         action_digest = knowledge_action_digest(request)
-        authority_digest = self._authority.authority_digest
-        scope_epoch = self._authority.scope_epoch_number
+        snapshot = self._authority.snapshot_generation()
+        authority_digest = snapshot.authority_digest
+        scope_epoch = snapshot.scope_epoch
         source = self._sources.get(request.source_id)
         unverified_policy_digest = sha256_digest(
             {
@@ -1433,7 +1701,7 @@ class KnowledgeFetcher:
             }
         )
         try:
-            grant, epoch = self._authority.verify(now)
+            grant, epoch, generation = self._authority.verify_generation(now)
         except (AuthorityRevokedError, SignatureExpiredError, SignatureNotYetValidError):
             return self._denied(
                 request=request,
@@ -1454,6 +1722,7 @@ class KnowledgeFetcher:
                 denial=DenialCode.AUTHORITY_VERIFICATION_FAILED,
                 now=now,
             )
+        authority_digest = generation.authority_digest
         policy_digest = sha256_digest(
             {
                 "schema_version": SCHEMA_VERSION,
@@ -1509,6 +1778,63 @@ class KnowledgeFetcher:
                 denial=destination_denial or DenialCode.DESTINATION_RESOLUTION_DENIED,
                 now=now,
             )
+        admitted_at = _trusted_now(self._clock)
+        try:
+            self._authority.verify_generation(admitted_at, expected=generation)
+        except (AuthorityRevokedError, SignatureExpiredError, SignatureNotYetValidError):
+            return self._denied(
+                request=request,
+                request_digest=request_digest,
+                authority_digest=authority_digest,
+                scope_epoch=epoch.epoch,
+                policy_digest=policy_digest,
+                denial=DenialCode.AUTHORITY_NOT_CURRENT,
+                now=admitted_at,
+            )
+        except (SignatureVerificationError, ValueError, sqlite3.Error, OSError, RuntimeError):
+            return self._denied(
+                request=request,
+                request_digest=request_digest,
+                authority_digest=authority_digest,
+                scope_epoch=epoch.epoch,
+                policy_digest=policy_digest,
+                denial=DenialCode.AUTHORITY_VERIFICATION_FAILED,
+                now=admitted_at,
+            )
+        try:
+            execution_component_digest = _execution_component_digest(
+                EgressPlane.KNOWLEDGE, self._resolver, self._transport
+            )
+        except ValueError:
+            execution_component_digest = None
+        if execution_component_digest != self._component_digest:
+            return self._denied(
+                request=request,
+                request_digest=request_digest,
+                authority_digest=authority_digest,
+                scope_epoch=epoch.epoch,
+                policy_digest=policy_digest,
+                denial=DenialCode.TRANSPORT_PLANE_MISMATCH,
+                now=admitted_at,
+            )
+        resolution_digest = sha256_digest(resolution)
+        destination_digest = sha256_digest(
+            {
+                "plane": EgressPlane.KNOWLEDGE,
+                "source_id": source.source_id,
+                "origin": source.origin,
+                "path": request.path,
+                "resolution_digest": resolution_digest,
+            }
+        )
+        dispatch_authorization_digest = _dispatch_authorization_digest(
+            plane=EgressPlane.KNOWLEDGE,
+            generation=generation,
+            action_digest=action_digest,
+            request_digest=request_digest,
+            destination_digest=destination_digest,
+            execution_component_digest=execution_component_digest,
+        )
         compiled = CompiledKnowledgeRequest(
             schema_version=SCHEMA_VERSION,
             request_id=request.request_id,
@@ -1518,20 +1844,14 @@ class KnowledgeFetcher:
             path=request.path,
             data_policy_id=request.data_policy_id,
             resolved_addresses=_compiled_addresses(resolution),
-            resolution_digest=sha256_digest(resolution),
+            resolution_digest=resolution_digest,
+            destination_digest=destination_digest,
+            execution_component_digest=execution_component_digest,
+            dispatch_authorization_digest=dispatch_authorization_digest,
             maximum_request_bytes=grant.budget.max_request_bytes,
             maximum_response_bytes=min(
                 source.maximum_response_bytes, grant.budget.max_response_bytes
             ),
-        )
-        destination_digest = sha256_digest(
-            {
-                "plane": compiled.plane,
-                "source_id": compiled.source_id,
-                "origin": compiled.origin,
-                "path": compiled.path,
-                "resolution_digest": compiled.resolution_digest,
-            }
         )
         try:
             reservation = self._state_store.reserve_dispatch(
@@ -1543,7 +1863,8 @@ class KnowledgeFetcher:
                     request_id=request.request_id,
                 ),
                 request_digest=request_digest,
-                reserved_at=now,
+                dispatch_authorization_digest=dispatch_authorization_digest,
+                reserved_at=admitted_at,
             )
         except (sqlite3.Error, OSError, RuntimeError):
             return self._denied(
@@ -1553,7 +1874,7 @@ class KnowledgeFetcher:
                 scope_epoch=epoch.epoch,
                 policy_digest=policy_digest,
                 denial=DenialCode.STATE_STORE_UNAVAILABLE,
-                now=now,
+                now=admitted_at,
             )
         if reservation != _ReservationResult.RESERVED.value:
             return self._denied(
@@ -1563,21 +1884,85 @@ class KnowledgeFetcher:
                 scope_epoch=epoch.epoch,
                 policy_digest=policy_digest,
                 denial=DenialCode.REQUEST_REPLAY_DENIED,
-                now=now,
+                now=admitted_at,
             )
         try:
-            current_component_digest = _execution_component_digest(
-                EgressPlane.KNOWLEDGE, self._resolver, self._transport
-            )
-        except ValueError:
-            current_component_digest = None
-        if current_component_digest != self._component_digest:
-            self._state_store.finish_dispatch(
-                plane=EgressPlane.KNOWLEDGE.value,
+            dispatch_now = _trusted_now(self._clock)
+            with self._authority.dispatch_guard(expected=generation, now=dispatch_now):
+                try:
+                    current_component_digest = _execution_component_digest(
+                        EgressPlane.KNOWLEDGE, self._resolver, self._transport
+                    )
+                except ValueError:
+                    current_component_digest = None
+                current_authorization_digest = _dispatch_authorization_digest(
+                    plane=EgressPlane.KNOWLEDGE,
+                    generation=generation,
+                    action_digest=action_digest,
+                    request_digest=request_digest,
+                    destination_digest=destination_digest,
+                    execution_component_digest=(
+                        current_component_digest or compiled.execution_component_digest
+                    ),
+                )
+                binding_matches = (
+                    destination_digest == compiled.destination_digest
+                    and current_component_digest == self._component_digest
+                    and current_component_digest == compiled.execution_component_digest
+                    and current_authorization_digest
+                    == compiled.dispatch_authorization_digest
+                )
+                if binding_matches:
+                    try:
+                        result = _validated_transport_result(
+                            self._transport.dispatch(compiled)
+                        )
+                    except Exception:
+                        result = None
+                else:
+                    result = None
+        except (AuthorityRevokedError, SignatureExpiredError, SignatureNotYetValidError):
+            return self._finish_reserved_without_send(
+                request=request,
+                compiled=compiled,
                 action_digest=action_digest,
                 request_digest=request_digest,
-                outcome=EgressOutcome.FAILED.value,
-                finished_at=now,
+                authority_digest=authority_digest,
+                scope_epoch=epoch.epoch,
+                policy_digest=policy_digest,
+                denial=DenialCode.AUTHORITY_NOT_CURRENT,
+                now=_trusted_now(self._clock),
+            )
+        except (SignatureVerificationError, ValueError, sqlite3.Error, OSError, RuntimeError):
+            return self._finish_reserved_without_send(
+                request=request,
+                compiled=compiled,
+                action_digest=action_digest,
+                request_digest=request_digest,
+                authority_digest=authority_digest,
+                scope_epoch=epoch.epoch,
+                policy_digest=policy_digest,
+                denial=DenialCode.AUTHORITY_VERIFICATION_FAILED,
+                now=_trusted_now(self._clock),
+            )
+        if not binding_matches:
+            return self._finish_reserved_without_send(
+                request=request,
+                compiled=compiled,
+                action_digest=action_digest,
+                request_digest=request_digest,
+                authority_digest=authority_digest,
+                scope_epoch=epoch.epoch,
+                policy_digest=policy_digest,
+                denial=DenialCode.DISPATCH_BINDING_MISMATCH,
+                now=dispatch_now,
+            )
+        if result is None:
+            self._finish_or_hold_unknown(
+                action_digest,
+                request_digest,
+                compiled.dispatch_authorization_digest,
+                dispatch_now,
             )
             return _receipt(
                 plane=EgressPlane.KNOWLEDGE,
@@ -1588,28 +1973,11 @@ class KnowledgeFetcher:
                 policy_digest=policy_digest,
                 destination_digest=destination_digest,
                 execution_component_digest=self._component_digest,
-                outcome=EgressOutcome.FAILED,
-                denial_code=None,
-                result=None,
-                evaluated_at=now,
-            )
-        try:
-            result = _validated_transport_result(self._transport.dispatch(compiled))
-        except Exception:
-            self._finish_or_hold_unknown(action_digest, request_digest, now)
-            return _receipt(
-                plane=EgressPlane.KNOWLEDGE,
-                request_id=request.request_id,
-                request_digest=request_digest,
-                authority_digest=authority_digest,
-                scope_epoch=epoch.epoch,
-                policy_digest=policy_digest,
-                destination_digest=destination_digest,
-                execution_component_digest=self._component_digest,
+                dispatch_authorization_digest=compiled.dispatch_authorization_digest,
                 outcome=EgressOutcome.UNKNOWN_OUTCOME,
                 denial_code=None,
                 result=None,
-                evaluated_at=now,
+                evaluated_at=dispatch_now,
             )
         if result.plane is not EgressPlane.KNOWLEDGE:
             outcome = EgressOutcome.UNKNOWN_OUTCOME
@@ -1625,8 +1993,9 @@ class KnowledgeFetcher:
                 plane=EgressPlane.KNOWLEDGE.value,
                 action_digest=action_digest,
                 request_digest=request_digest,
+                dispatch_authorization_digest=compiled.dispatch_authorization_digest,
                 outcome=outcome.value,
-                finished_at=now,
+                finished_at=dispatch_now,
             )
         except (sqlite3.Error, OSError, RuntimeError):
             outcome = EgressOutcome.UNKNOWN_OUTCOME
@@ -1639,10 +2008,11 @@ class KnowledgeFetcher:
             policy_digest=policy_digest,
             destination_digest=destination_digest,
             execution_component_digest=self._component_digest,
+            dispatch_authorization_digest=compiled.dispatch_authorization_digest,
             outcome=outcome,
             denial_code=None,
             result=result,
-            evaluated_at=now,
+            evaluated_at=dispatch_now,
         )
 
     def reconcile(
@@ -1715,14 +2085,59 @@ class KnowledgeFetcher:
             return None
         return DenialCode.REQUEST_REPLAY_DENIED
 
+    def _finish_reserved_without_send(
+        self,
+        *,
+        request: KnowledgeFetchIntent,
+        compiled: CompiledKnowledgeRequest,
+        action_digest: str,
+        request_digest: str,
+        authority_digest: str,
+        scope_epoch: int,
+        policy_digest: str,
+        denial: DenialCode,
+        now: datetime,
+    ) -> EgressReceipt:
+        try:
+            self._state_store.finish_dispatch(
+                plane=EgressPlane.KNOWLEDGE.value,
+                action_digest=action_digest,
+                request_digest=request_digest,
+                dispatch_authorization_digest=compiled.dispatch_authorization_digest,
+                outcome=EgressOutcome.FAILED.value,
+                finished_at=now,
+            )
+        except (sqlite3.Error, OSError, RuntimeError):
+            denial = DenialCode.STATE_STORE_UNAVAILABLE
+        return _receipt(
+            plane=EgressPlane.KNOWLEDGE,
+            request_id=request.request_id,
+            request_digest=request_digest,
+            authority_digest=authority_digest,
+            scope_epoch=scope_epoch,
+            policy_digest=policy_digest,
+            destination_digest=compiled.destination_digest,
+            execution_component_digest=compiled.execution_component_digest,
+            dispatch_authorization_digest=compiled.dispatch_authorization_digest,
+            outcome=EgressOutcome.DENIED,
+            denial_code=denial,
+            result=None,
+            evaluated_at=now,
+        )
+
     def _finish_or_hold_unknown(
-        self, action_digest: str, request_digest: str, now: datetime
+        self,
+        action_digest: str,
+        request_digest: str,
+        dispatch_authorization_digest: str,
+        now: datetime,
     ) -> None:
         try:
             self._state_store.finish_dispatch(
                 plane=EgressPlane.KNOWLEDGE.value,
                 action_digest=action_digest,
                 request_digest=request_digest,
+                dispatch_authorization_digest=dispatch_authorization_digest,
                 outcome=EgressOutcome.UNKNOWN_OUTCOME.value,
                 finished_at=now,
             )

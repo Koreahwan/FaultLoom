@@ -136,6 +136,7 @@ CREATE TABLE dispatch_hold (
     action_digest TEXT NOT NULL,
     correlation_digest TEXT NOT NULL,
     request_digest TEXT NOT NULL,
+    dispatch_authorization_digest TEXT NOT NULL,
     state TEXT NOT NULL,
     attempts INTEGER NOT NULL CHECK (attempts > 0),
     reconciliation_sequence INTEGER NOT NULL CHECK (reconciliation_sequence >= 0),
@@ -143,6 +144,14 @@ CREATE TABLE dispatch_hold (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (plane, action_digest),
     UNIQUE (plane, correlation_digest)
+);
+CREATE TABLE dispatch_correlation (
+    plane TEXT NOT NULL,
+    correlation_digest TEXT NOT NULL,
+    action_digest TEXT NOT NULL,
+    first_request_digest TEXT NOT NULL,
+    first_reserved_at TEXT NOT NULL,
+    PRIMARY KEY (plane, correlation_digest)
 );
 CREATE TABLE reconciliation_watermark (
     trust_domain TEXT PRIMARY KEY,
@@ -190,6 +199,12 @@ class SqliteEgressStateStore:
         except Exception:
             os.close(self._state_parent_fd)
             raise
+        if self._state_parent_identity == self._anchor_parent_identity:
+            os.close(self._anchor_parent_fd)
+            os.close(self._state_parent_fd)
+            raise EgressStateIntegrityError(
+                "egress anchor and mutable state roots share one physical directory"
+            )
         lock_name = f".{self._anchor_path.name}.lock"
         try:
             self._lock_fd = os.open(
@@ -430,6 +445,7 @@ class SqliteEgressStateStore:
         for table, order in (
             ("authority_watermark", "trust_domain"),
             ("dispatch_hold", "plane, action_digest"),
+            ("dispatch_correlation", "plane, correlation_digest"),
             ("reconciliation_watermark", "trust_domain"),
         ):
             rows = connection.execute(f"SELECT * FROM {table} ORDER BY {order}").fetchall()
@@ -739,6 +755,7 @@ class SqliteEgressStateStore:
         action_digest: str,
         correlation_digest: str,
         request_digest: str,
+        dispatch_authorization_digest: str,
         reserved_at: datetime,
     ) -> str:
         timestamp = reserved_at.isoformat()
@@ -754,7 +771,7 @@ class SqliteEgressStateStore:
             ).fetchone()
             correlation = connection.execute(
                 """
-                SELECT action_digest FROM dispatch_hold
+                SELECT action_digest FROM dispatch_correlation
                 WHERE plane = ? AND correlation_digest = ?
                 """,
                 (plane, correlation_digest),
@@ -766,11 +783,34 @@ class SqliteEgressStateStore:
                 connection.execute(
                     """
                     INSERT INTO dispatch_hold
-                    (plane, action_digest, correlation_digest, request_digest, state, attempts,
+                    (plane, action_digest, correlation_digest, request_digest,
+                     dispatch_authorization_digest, state, attempts,
                      reconciliation_sequence, reconciliation_id, updated_at)
-                    VALUES (?, ?, ?, ?, 'pending', 1, 0, NULL, ?)
+                    VALUES (?, ?, ?, ?, ?, 'pending', 1, 0, NULL, ?)
                     """,
-                    (plane, action_digest, correlation_digest, request_digest, timestamp),
+                    (
+                        plane,
+                        action_digest,
+                        correlation_digest,
+                        request_digest,
+                        dispatch_authorization_digest,
+                        timestamp,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO dispatch_correlation
+                    (plane, correlation_digest, action_digest, first_request_digest,
+                     first_reserved_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        plane,
+                        correlation_digest,
+                        action_digest,
+                        request_digest,
+                        timestamp,
+                    ),
                 )
                 self._commit(connection)
                 return "reserved"
@@ -778,13 +818,39 @@ class SqliteEgressStateStore:
             if state != "retry_authorized":
                 connection.rollback()
                 return "replay"
+            if correlation is None:
+                connection.execute(
+                    """
+                    INSERT INTO dispatch_correlation
+                    (plane, correlation_digest, action_digest, first_request_digest,
+                     first_reserved_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        plane,
+                        correlation_digest,
+                        action_digest,
+                        request_digest,
+                        timestamp,
+                    ),
+                )
             connection.execute(
                 """
                 UPDATE dispatch_hold
-                SET request_digest = ?, state = 'pending', attempts = ?, updated_at = ?
+                SET correlation_digest = ?, request_digest = ?,
+                    dispatch_authorization_digest = ?, state = 'pending',
+                    attempts = ?, updated_at = ?
                 WHERE plane = ? AND action_digest = ?
                 """,
-                (request_digest, attempts + 1, timestamp, plane, action_digest),
+                (
+                    correlation_digest,
+                    request_digest,
+                    dispatch_authorization_digest,
+                    attempts + 1,
+                    timestamp,
+                    plane,
+                    action_digest,
+                ),
             )
             self._commit(connection)
             return "reserved"
@@ -795,6 +861,7 @@ class SqliteEgressStateStore:
         plane: str,
         action_digest: str,
         request_digest: str,
+        dispatch_authorization_digest: str,
         outcome: str,
         finished_at: datetime,
     ) -> None:
@@ -807,7 +874,8 @@ class SqliteEgressStateStore:
                 """
                 UPDATE dispatch_hold SET state = ?, updated_at = ?
                 WHERE plane = ? AND action_digest = ?
-                  AND request_digest = ? AND state = 'pending'
+                  AND request_digest = ? AND dispatch_authorization_digest = ?
+                  AND state = 'pending'
                 """,
                 (
                     outcome,
@@ -815,6 +883,7 @@ class SqliteEgressStateStore:
                     plane,
                     action_digest,
                     request_digest,
+                    dispatch_authorization_digest,
                 ),
             )
             if cursor.rowcount != 1:

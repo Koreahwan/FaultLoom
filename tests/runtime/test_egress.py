@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import stat
 import tempfile
+from threading import Thread
 
 import pytest
 from pydantic import ValidationError
@@ -1303,6 +1304,7 @@ def test_pending_crash_hold_can_be_explicitly_effect_confirmed(tmp_path: Path) -
         action_digest=action_digest,
         correlation_digest=D1,
         request_digest=sha256_digest(request),
+        dispatch_authorization_digest=D1,
         reserved_at=DISPATCH_TIME,
     ) == "reserved"
     transport = MemoryProviderTransport()
@@ -1427,3 +1429,356 @@ def test_target_plane_resolver_cannot_be_injected(kind: str, tmp_path: Path) -> 
                 authority_state=state,
                 clock=clock,
             )
+
+
+@pytest.mark.parametrize("kind", ["provider", "knowledge"])
+def test_scope_revocation_during_resolution_prevents_dispatch(
+    kind: str, tmp_path: Path
+) -> None:
+    authority = grant()
+    state = authority_state(authority, tmp_path / "state.sqlite3")
+    revoked_epoch = signed_authority(authority, scope_epoch=8, revoked=True)[1]
+
+    class RevokingResolver:
+        plane = (
+            EgressPlane.MODEL_PROVIDER if kind == "provider" else EgressPlane.KNOWLEDGE
+        )
+        resolver_id = f"resolver.revoking-{kind}"
+
+        def resolve(self, origin: str) -> DestinationResolution:
+            try:
+                state.install_scope_epoch(revoked_epoch, now=DISPATCH_TIME)
+            except AuthorityRevokedError:
+                pass
+            return DestinationResolution(
+                schema_version=SCHEMA_VERSION,
+                plane=self.plane,
+                origin=origin,
+                addresses=("8.8.8.8",),
+            )
+
+    if kind == "provider":
+        transport = MemoryProviderTransport()
+        receipt = ProviderProxy(
+            endpoints=(provider_endpoint(),),
+            transport=transport,
+            resolver=RevokingResolver(),
+            authority_state=state,
+            live=True,
+            clock=clock,
+        ).dispatch(provider_request(authority))
+    else:
+        transport = MemoryKnowledgeTransport()
+        receipt = KnowledgeFetcher(
+            sources=(knowledge_source(),),
+            transport=transport,
+            resolver=RevokingResolver(),
+            authority_state=state,
+            clock=clock,
+        ).dispatch(knowledge_request(authority))
+
+    assert state.scope_epoch_number == 8
+    assert receipt.denial_code is DenialCode.AUTHORITY_NOT_CURRENT
+    assert transport.requests == []
+
+
+@pytest.mark.parametrize("kind", ["provider", "knowledge"])
+def test_concurrent_revocation_after_reservation_prevents_dispatch(
+    kind: str, tmp_path: Path
+) -> None:
+    authority = grant()
+    state = authority_state(authority, tmp_path / "state.sqlite3")
+    revoked_epoch = signed_authority(authority, scope_epoch=8, revoked=True)[1]
+    reserve = state.state_store.reserve_dispatch
+
+    def reserve_then_revoke(**kwargs: object) -> str:
+        reservation = reserve(**kwargs)
+
+        def revoke() -> None:
+            try:
+                state.install_scope_epoch(revoked_epoch, now=DISPATCH_TIME)
+            except AuthorityRevokedError:
+                pass
+
+        thread = Thread(target=revoke)
+        thread.start()
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+        return reservation
+
+    state.state_store.reserve_dispatch = reserve_then_revoke  # type: ignore[method-assign]
+    if kind == "provider":
+        transport = MemoryProviderTransport()
+        receipt = provider_proxy(
+            authority,
+            tmp_path / "unused.sqlite3",
+            transport=transport,
+            state=state,
+        ).dispatch(provider_request(authority))
+    else:
+        transport = MemoryKnowledgeTransport()
+        receipt = knowledge_fetcher(
+            authority,
+            tmp_path / "unused.sqlite3",
+            transport=transport,
+            state=state,
+        ).dispatch(knowledge_request(authority))
+
+    assert receipt.denial_code is DenialCode.AUTHORITY_NOT_CURRENT
+    assert transport.requests == []
+
+
+@pytest.mark.parametrize("kind", ["provider", "knowledge"])
+def test_resolver_cannot_switch_transport_to_target_plane(
+    kind: str, tmp_path: Path
+) -> None:
+    authority = grant()
+    state = authority_state(authority, tmp_path / "state.sqlite3")
+    if kind == "provider":
+        transport = MemoryProviderTransport()
+        expected_plane = EgressPlane.MODEL_PROVIDER
+    else:
+        transport = MemoryKnowledgeTransport()
+        expected_plane = EgressPlane.KNOWLEDGE
+
+    class MutatingResolver:
+        plane = expected_plane
+        resolver_id = f"resolver.mutating-{kind}-transport"
+
+        def resolve(self, origin: str) -> DestinationResolution:
+            transport.plane = EgressPlane.TARGET
+            return DestinationResolution(
+                schema_version=SCHEMA_VERSION,
+                plane=self.plane,
+                origin=origin,
+                addresses=("8.8.8.8",),
+            )
+
+    if kind == "provider":
+        receipt = ProviderProxy(
+            endpoints=(provider_endpoint(),),
+            transport=transport,
+            resolver=MutatingResolver(),
+            authority_state=state,
+            live=True,
+            clock=clock,
+        ).dispatch(provider_request(authority))
+    else:
+        receipt = KnowledgeFetcher(
+            sources=(knowledge_source(),),
+            transport=transport,
+            resolver=MutatingResolver(),
+            authority_state=state,
+            clock=clock,
+        ).dispatch(knowledge_request(authority))
+
+    assert receipt.denial_code is DenialCode.TRANSPORT_PLANE_MISMATCH
+    assert transport.requests == []
+
+
+@pytest.mark.parametrize("kind", ["provider", "knowledge"])
+def test_transport_plane_is_rechecked_after_reservation(
+    kind: str, tmp_path: Path
+) -> None:
+    authority = grant()
+    state = authority_state(authority, tmp_path / "state.sqlite3")
+    transport = (
+        MemoryProviderTransport() if kind == "provider" else MemoryKnowledgeTransport()
+    )
+    reserve = state.state_store.reserve_dispatch
+
+    def reserve_then_switch_plane(**kwargs: object) -> str:
+        reservation = reserve(**kwargs)
+        transport.plane = EgressPlane.TARGET
+        return reservation
+
+    state.state_store.reserve_dispatch = reserve_then_switch_plane  # type: ignore[method-assign]
+    if kind == "provider":
+        receipt = provider_proxy(
+            authority,
+            tmp_path / "unused.sqlite3",
+            transport=transport,
+            state=state,
+        ).dispatch(provider_request(authority))
+    else:
+        receipt = knowledge_fetcher(
+            authority,
+            tmp_path / "unused.sqlite3",
+            transport=transport,
+            state=state,
+        ).dispatch(knowledge_request(authority))
+
+    assert receipt.denial_code is DenialCode.DISPATCH_BINDING_MISMATCH
+    assert transport.requests == []
+
+
+def test_retry_alias_correlation_cannot_be_reused_by_another_action(
+    tmp_path: Path,
+) -> None:
+    authority = grant()
+    state = authority_state(authority, tmp_path / "state.sqlite3")
+    transport = MemoryProviderTransport(
+        response=EgressTransportResult(
+            schema_version=SCHEMA_VERSION,
+            plane=EgressPlane.MODEL_PROVIDER,
+            outcome=TransportOutcome.UNKNOWN_OUTCOME,
+            response_digest=D1,
+            response_status=200,
+            bytes_sent=32,
+            bytes_received=128,
+        )
+    )
+    proxy = provider_proxy(
+        authority,
+        tmp_path / "unused.sqlite3",
+        transport=transport,
+        state=state,
+    )
+    first = provider_request(authority)
+    assert proxy.dispatch(first).outcome is EgressOutcome.UNKNOWN_OUTCOME
+    assert proxy.reconcile(
+        first,
+        reconciliation_authorization(
+            first, ReconciliationDisposition.RETRY_AUTHORIZED
+        ),
+    )
+
+    transport.response = result(EgressPlane.MODEL_PROVIDER)
+    retry_alias = provider_request(
+        authority,
+        request_id="provider-request.retry",
+        run_id="run.retry",
+    )
+    assert proxy.dispatch(retry_alias).outcome is EgressOutcome.COMPLETED
+    changed = provider_request(
+        authority,
+        request_id="provider-request.retry",
+        run_id="run.retry",
+        payload_digest=sha256_digest({"different": "semantic-action"}),
+    )
+    denied = proxy.dispatch(changed)
+
+    assert denied.denial_code is DenialCode.REQUEST_REPLAY_DENIED
+    assert len(transport.requests) == 2
+    with sqlite3.connect(state.state_store.path) as connection:
+        rows = connection.execute(
+            "SELECT action_digest FROM dispatch_correlation ORDER BY correlation_digest"
+        ).fetchall()
+    assert rows == [(provider_action_digest(first),), (provider_action_digest(first),)]
+
+
+def test_retry_alias_correlation_survives_crash_before_transport(tmp_path: Path) -> None:
+    authority = grant()
+    state = authority_state(authority, tmp_path / "state.sqlite3")
+    transport = MemoryProviderTransport(
+        response=EgressTransportResult(
+            schema_version=SCHEMA_VERSION,
+            plane=EgressPlane.MODEL_PROVIDER,
+            outcome=TransportOutcome.UNKNOWN_OUTCOME,
+            response_digest=D1,
+            response_status=200,
+            bytes_sent=32,
+            bytes_received=128,
+        )
+    )
+    proxy = provider_proxy(
+        authority,
+        tmp_path / "unused.sqlite3",
+        transport=transport,
+        state=state,
+    )
+    first = provider_request(authority)
+    assert proxy.dispatch(first).outcome is EgressOutcome.UNKNOWN_OUTCOME
+    assert proxy.reconcile(
+        first,
+        reconciliation_authorization(
+            first, ReconciliationDisposition.RETRY_AUTHORIZED
+        ),
+    )
+    retry_alias = provider_request(
+        authority,
+        request_id="provider-request.crash-retry",
+        run_id="run.crash-retry",
+    )
+    correlation_digest = sha256_digest(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "plane": EgressPlane.MODEL_PROVIDER,
+            "run_id": retry_alias.run_id,
+            "request_id": retry_alias.request_id,
+        }
+    )
+    assert state.state_store.reserve_dispatch(
+        plane=EgressPlane.MODEL_PROVIDER.value,
+        action_digest=provider_action_digest(retry_alias),
+        correlation_digest=correlation_digest,
+        request_digest=sha256_digest(retry_alias),
+        dispatch_authorization_digest=D1,
+        reserved_at=DISPATCH_TIME,
+    ) == "reserved"
+
+    changed = provider_request(
+        authority,
+        request_id=retry_alias.request_id,
+        run_id=retry_alias.run_id,
+        payload_digest=sha256_digest({"different": "post-crash-action"}),
+    )
+    denied = proxy.dispatch(changed)
+    assert denied.denial_code is DenialCode.REQUEST_REPLAY_DENIED
+    assert len(transport.requests) == 1
+
+
+def test_state_and_anchor_physical_parent_alias_is_rejected(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    shared = real / "shared"
+    real.mkdir(mode=0o700)
+    shared.mkdir(mode=0o700)
+    (tmp_path / "alias-a").symlink_to(real, target_is_directory=True)
+    (tmp_path / "alias-b").symlink_to(real, target_is_directory=True)
+    state_parent = tmp_path / "alias-a" / "shared"
+    anchor_parent = tmp_path / "alias-b" / "shared"
+    assert (state_parent.stat().st_dev, state_parent.stat().st_ino) == (
+        anchor_parent.stat().st_dev,
+        anchor_parent.stat().st_ino,
+    )
+
+    with pytest.raises(RuntimeError, match="physical directory"):
+        SqliteEgressStateStore(
+            state_parent / "state.sqlite3",
+            anchor_path=anchor_parent / "state.anchor",
+            authentication_key=STATE_AUTHENTICATION_KEY,
+            minimum_anchor=EgressStateCheckpoint.empty(),
+        )
+
+
+@pytest.mark.parametrize("kind", ["provider", "knowledge"])
+def test_compiled_request_and_receipt_bind_dispatch_authorization(
+    kind: str, tmp_path: Path
+) -> None:
+    authority = grant()
+    if kind == "provider":
+        transport = MemoryProviderTransport()
+        receipt = provider_proxy(
+            authority,
+            tmp_path / "state.sqlite3",
+            transport=transport,
+        ).dispatch(provider_request(authority))
+    else:
+        transport = MemoryKnowledgeTransport()
+        receipt = knowledge_fetcher(
+            authority,
+            tmp_path / "state.sqlite3",
+            transport=transport,
+        ).dispatch(knowledge_request(authority))
+
+    compiled = transport.requests[0]
+    assert compiled.destination_digest == receipt.destination_digest
+    assert compiled.execution_component_digest == receipt.execution_component_digest
+    assert (
+        compiled.dispatch_authorization_digest
+        == receipt.dispatch_authorization_digest
+    )
+    changed = receipt.model_dump(mode="python")
+    changed["dispatch_authorization_digest"] = D1
+    with pytest.raises(ValidationError, match="receipt digest"):
+        EgressReceipt.model_validate(changed)
