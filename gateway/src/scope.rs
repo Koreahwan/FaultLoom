@@ -9,6 +9,10 @@ use crate::policy::{ScopeApproval, ScopeVerifier};
 
 const MAX_SIGNED_EPOCH_BYTES: usize = 16_384;
 
+mod epoch_verifier_private {
+    pub trait Sealed {}
+}
+
 pub trait ScopeClock {
     fn now_millis(&self) -> u64;
 }
@@ -60,9 +64,10 @@ pub struct VerifiedScopeEpoch {
     verifier_receipt_digest: Digest,
 }
 
+#[cfg(test)]
 impl VerifiedScopeEpoch {
     #[allow(clippy::too_many_arguments)]
-    pub fn from_trusted_verifier(
+    fn from_trusted_verifier(
         grant_id: String,
         epoch: u64,
         issued_at_millis: u64,
@@ -91,7 +96,7 @@ impl VerifiedScopeEpoch {
     }
 }
 
-pub trait EpochVerifier {
+pub trait EpochVerifier: epoch_verifier_private::Sealed {
     fn verify(
         &self,
         envelope: &SignedEpochEnvelope,
@@ -100,6 +105,8 @@ pub trait EpochVerifier {
 }
 
 pub struct UnavailableEpochVerifier;
+
+impl epoch_verifier_private::Sealed for UnavailableEpochVerifier {}
 
 impl EpochVerifier for UnavailableEpochVerifier {
     fn verify(
@@ -134,6 +141,7 @@ pub struct IpNetwork {
 
 impl IpNetwork {
     pub fn new(address: IpAddr, prefix: u8) -> Result<Self, ScopePolicyError> {
+        let (address, prefix) = canonical_network(address, prefix)?;
         let maximum = if address.is_ipv4() { 32 } else { 128 };
         if prefix > maximum {
             return Err(ScopePolicyError::InvalidNetwork);
@@ -145,7 +153,7 @@ impl IpNetwork {
     }
 
     fn contains(self, candidate: IpAddr) -> bool {
-        match (self.address, candidate) {
+        match (self.address, canonical_ip(candidate)) {
             (IpAddr::V4(network), IpAddr::V4(candidate)) => {
                 mask_v4(candidate, self.prefix) == network
             }
@@ -154,6 +162,26 @@ impl IpNetwork {
             }
             _ => false,
         }
+    }
+}
+
+fn canonical_network(address: IpAddr, prefix: u8) -> Result<(IpAddr, u8), ScopePolicyError> {
+    match address {
+        IpAddr::V6(address) => match address.to_ipv4_mapped() {
+            Some(mapped) if prefix >= 96 => Ok((IpAddr::V4(mapped), prefix - 96)),
+            Some(_) => Err(ScopePolicyError::InvalidNetwork),
+            None => Ok((IpAddr::V6(address), prefix)),
+        },
+        IpAddr::V4(address) => Ok((IpAddr::V4(address), prefix)),
+    }
+}
+
+fn canonical_ip(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map_or(IpAddr::V6(address), IpAddr::V4),
+        IpAddr::V4(address) => IpAddr::V4(address),
     }
 }
 
@@ -823,27 +851,33 @@ fn target_matches(target: &TargetRule, request: &DispatchRequest) -> bool {
 }
 
 fn is_special_address(address: IpAddr) -> bool {
-    match address {
+    match canonical_ip(address) {
         IpAddr::V4(address) => {
             let value = u32::from(address);
-            address.is_unspecified()
+            value >> 24 == 0
                 || address.is_loopback()
                 || address.is_private()
                 || address.is_link_local()
                 || address.is_multicast()
                 || value >> 22 == u32::from(Ipv4Addr::new(100, 64, 0, 0)) >> 22
+                || value >> 8 == u32::from(Ipv4Addr::new(192, 0, 0, 0)) >> 8
+                || value >> 8 == u32::from(Ipv4Addr::new(192, 0, 2, 0)) >> 8
+                || value >> 17 == u32::from(Ipv4Addr::new(198, 18, 0, 0)) >> 17
                 || value >= u32::from(Ipv4Addr::new(240, 0, 0, 0))
-                || (value & 0xffff_ff00) == u32::from(Ipv4Addr::new(192, 0, 2, 0))
-                || (value & 0xffff_ff00) == u32::from(Ipv4Addr::new(198, 51, 100, 0))
-                || (value & 0xffff_ff00) == u32::from(Ipv4Addr::new(203, 0, 113, 0))
+                || value >> 8 == u32::from(Ipv4Addr::new(198, 51, 100, 0)) >> 8
+                || value >> 8 == u32::from(Ipv4Addr::new(203, 0, 113, 0)) >> 8
         }
         IpAddr::V6(address) => {
             let value = u128::from(address);
             address.is_unspecified()
                 || address.is_loopback()
                 || address.is_multicast()
+                || value >> 32 == 0
+                || value >> 64 == u128::from(Ipv6Addr::new(0x0100, 0, 0, 0, 0, 0, 0, 0)) >> 64
                 || value >> 121 == u128::from(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0)) >> 121
                 || value >> 118 == u128::from(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0)) >> 118
+                || value >> 118 == u128::from(Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 0)) >> 118
+                || value >> 80 == u128::from(Ipv6Addr::new(0x2001, 2, 0, 0, 0, 0, 0, 0)) >> 80
                 || value >> 96 == u128::from(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0)) >> 96
         }
     }
@@ -962,6 +996,8 @@ mod tests {
         revoked: bool,
     }
 
+    impl super::epoch_verifier_private::Sealed for FixtureVerifier {}
+
     impl EpochVerifier for FixtureVerifier {
         fn verify(
             &self,
@@ -991,6 +1027,8 @@ mod tests {
     struct SequenceVerifier {
         accepted: Vec<(Digest, u64, bool)>,
     }
+
+    impl super::epoch_verifier_private::Sealed for SequenceVerifier {}
 
     impl EpochVerifier for SequenceVerifier {
         fn verify(
@@ -1229,6 +1267,82 @@ mod tests {
     }
 
     #[test]
+    fn hostname_only_scope_denies_special_addresses_after_ip_canonicalization() {
+        let clock = FixedClock::new(1_000);
+        let (envelope, verifier) = envelope(7, false);
+        let mut hostname_only = policy();
+        hostname_only.targets[0].networks.clear();
+        let kernel = DeterministicScopeKernel::new(hostname_only, verifier, clock).unwrap();
+        kernel.admit_epoch(&envelope).unwrap();
+
+        for address in [
+            "0.0.0.1",
+            "10.0.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "172.16.0.1",
+            "192.0.0.1",
+            "192.0.2.1",
+            "192.168.0.1",
+            "198.18.0.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "::",
+            "::1",
+            "::127.0.0.1",
+            "::ffff:127.0.0.1",
+            "100::1",
+            "2001:2::1",
+            "2001:db8::1",
+            "fc00::1",
+            "fe80::1",
+            "fec0::1",
+            "ff02::1",
+        ] {
+            let mut denied = request();
+            denied.target = std::net::SocketAddr::new(address.parse().unwrap(), 8080);
+            assert_eq!(
+                kernel.issue_scope_proof(&denied),
+                Err(DenialCode::ScopeTargetDenied),
+                "hostname-only scope admitted special address {address}"
+            );
+        }
+
+        let mut global = request();
+        global.target = "93.184.216.34:8080".parse().unwrap();
+        assert!(kernel.issue_scope_proof(&global).is_ok());
+
+        let mut mapped_global = request();
+        mapped_global.target =
+            std::net::SocketAddr::new("::ffff:93.184.216.34".parse().unwrap(), 8080);
+        assert!(kernel.issue_scope_proof(&mapped_global).is_ok());
+    }
+
+    #[test]
+    fn explicit_networks_match_mapped_ipv4_only_after_canonicalization() {
+        let mapped_loopback = IpNetwork::new("::ffff:127.0.0.0".parse().unwrap(), 104).unwrap();
+        assert!(mapped_loopback.contains("127.1.2.3".parse().unwrap()));
+        assert!(mapped_loopback.contains("::ffff:127.1.2.3".parse().unwrap()));
+        assert!(!mapped_loopback.contains("128.0.0.1".parse().unwrap()));
+        assert_eq!(
+            IpNetwork::new("::ffff:127.0.0.0".parse().unwrap(), 95),
+            Err(ScopePolicyError::InvalidNetwork)
+        );
+
+        let clock = FixedClock::new(1_000);
+        let (envelope, verifier) = envelope(7, false);
+        let kernel = make_kernel(verifier, clock);
+        kernel.admit_epoch(&envelope).unwrap();
+        let mut explicitly_allowed = request();
+        explicitly_allowed.target =
+            std::net::SocketAddr::new("::ffff:127.0.0.1".parse().unwrap(), 8080);
+        assert!(kernel.issue_scope_proof(&explicitly_allowed).is_ok());
+    }
+
+    #[test]
     fn dns_redirect_and_each_child_flow_are_re_evaluated() {
         let clock = FixedClock::new(1_000);
         let (envelope, verifier) = envelope(7, false);
@@ -1335,6 +1449,8 @@ mod tests {
         );
 
         struct ForgedReceiptVerifier;
+        impl super::epoch_verifier_private::Sealed for ForgedReceiptVerifier {}
+
         impl EpochVerifier for ForgedReceiptVerifier {
             fn verify(
                 &self,

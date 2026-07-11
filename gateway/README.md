@@ -27,14 +27,20 @@ and requires each child to name an already approved parent action in the current
 epoch. Hostnames, resolved IP/CIDR, ports, protocols, paths, methods, packs,
 action families/classes, identities, tenants, and execution windows must all
 match explicit policy. Special-use IP space requires an explicit CIDR allow.
+IPv4-mapped IPv6 addresses are canonicalized before CIDR and special-use
+classification, so alternate address notation cannot turn loopback, private,
+link-local, shared, documentation, benchmarking, multicast, or reserved space
+into an implicit hostname-only allow.
 
 Epoch admission is intentionally a sealed trust boundary. The Rust kernel accepts
-only the output of an injected `EpochVerifier`, binds it to the exact canonical
-signed-envelope digest, verifier receipt, key ID, sequence, validity interval, and
-grant ID, and rejects tamper, replay, and rollback. The production verifier remains
-`UnavailableEpochVerifier`; the standalone binary therefore remains fail closed
-until a non-model T13 Ed25519 verifier is wired through a sealed local channel.
-Caller assertion is not treated as signature evidence.
+only an opaque epoch produced by a verifier implementation inside the Gateway
+crate, binds it to the exact canonical signed-envelope digest, verifier receipt,
+key ID, sequence, validity interval, and grant ID, and rejects tamper, replay, and
+rollback. External crates cannot implement the sealed verifier trait or construct
+a verified epoch. The production verifier remains `UnavailableEpochVerifier`; the
+standalone binary therefore remains fail closed until a non-model T13 Ed25519
+verifier is implemented inside this boundary and wired through a sealed local
+channel. Caller assertion is not treated as signature evidence.
 
 Advancing or revoking an epoch atomically invalidates approved parent actions and
 cancels registered queued actions, open connections, WebSockets, callback leases,
