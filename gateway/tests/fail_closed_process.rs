@@ -4,21 +4,33 @@ use std::process::{Command, Stdio};
 
 use faultloom_gateway::Digest;
 use faultloom_gateway::ipc::{
-    ActionClass, ActionKind, DenialCode, DeniedResponse, DispatchRequest, GatewayResponse,
-    RequiredFeature, decode_response, encode_request, read_frame, write_frame,
+    ActionClass, ActionKind, DenialCode, DeniedResponse, DispatchRequest, FlowKind,
+    GatewayResponse, RequiredFeature, decode_response, encode_request, read_frame, write_frame,
 };
 
 fn request(target: std::net::SocketAddr) -> DispatchRequest {
     DispatchRequest {
         action_id: "action:process".to_owned(),
+        grant_id: "grant:process".to_owned(),
+        grant_version: 1,
         target_id: "target:owned-loopback".to_owned(),
+        pack_id: "web".to_owned(),
+        action_family: "http.semantic".to_owned(),
+        identity_id: "identity:operator".to_owned(),
+        tenant_id: Some("tenant:owned".to_owned()),
         intent_digest: Digest::of(b"intent"),
         decision_digest: Digest::of(b"decision"),
         lease_id: "lease:process".to_owned(),
         scope_epoch: 1,
         action_kind: ActionKind::SemanticHttpV1,
         action_class: ActionClass::Observe,
+        flow_kind: FlowKind::TopLevel,
+        parent_action_id: None,
         required_features: vec![RequiredFeature::GatewayDispatchV1],
+        hostname: "localhost".to_owned(),
+        protocol: "http".to_owned(),
+        method: "GET".to_owned(),
+        path: "/".to_owned(),
         target,
         payload: b"PING".to_vec(),
         scope_proof: b"untrusted-scope-proof".to_vec(),
@@ -27,6 +39,34 @@ fn request(target: std::net::SocketAddr) -> DispatchRequest {
         canary_ref: None,
         cleanup_plan_ref: None,
     }
+}
+
+fn skip_string(encoded: &[u8], offset: &mut usize) {
+    let length = u16::from_be_bytes([encoded[*offset], encoded[*offset + 1]]) as usize;
+    *offset += 2 + length;
+}
+
+fn skip_optional_string(encoded: &[u8], offset: &mut usize) {
+    let present = encoded[*offset];
+    *offset += 1;
+    if present == 1 {
+        skip_string(encoded, offset);
+    }
+}
+
+fn action_kind_offset(encoded: &[u8]) -> usize {
+    let mut offset = 6;
+    skip_string(encoded, &mut offset); // action ID
+    skip_string(encoded, &mut offset); // grant ID
+    offset += 8; // grant version
+    skip_string(encoded, &mut offset); // target ID
+    skip_string(encoded, &mut offset); // pack ID
+    skip_string(encoded, &mut offset); // action family
+    skip_string(encoded, &mut offset); // identity ID
+    skip_optional_string(encoded, &mut offset); // tenant ID
+    offset += 64; // intent and decision digests
+    skip_string(encoded, &mut offset); // lease ID
+    offset + 8 // scope epoch
 }
 
 fn run_frame(encoded: &[u8]) -> GatewayResponse {
@@ -78,17 +118,8 @@ fn separate_process_denies_untrusted_proofs_without_target_egress() {
 fn process_returns_a_typed_denial_for_unknown_action_kind() {
     let target = "127.0.0.1:9".parse().expect("address");
     let mut encoded = encode_request(&request(target)).expect("encoded request");
-    let action_id_length = u16::from_be_bytes([encoded[6], encoded[7]]) as usize;
-    let target_length_offset = 8 + action_id_length;
-    let target_id_length = u16::from_be_bytes([
-        encoded[target_length_offset],
-        encoded[target_length_offset + 1],
-    ]) as usize;
-    let action_kind_offset = target_length_offset + 2 + target_id_length + 32 + 32;
-    let lease_length =
-        u16::from_be_bytes([encoded[action_kind_offset], encoded[action_kind_offset + 1]]) as usize;
-    let action_kind_offset = action_kind_offset + 2 + lease_length + 8;
-    encoded[action_kind_offset] = 200;
+    let action_kind = action_kind_offset(&encoded);
+    encoded[action_kind] = 200;
 
     let response = run_frame(&encoded);
     assert!(matches!(

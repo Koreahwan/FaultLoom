@@ -65,7 +65,10 @@ where
         if scope.intent_digest != request.intent_digest
             || scope.decision_digest != request.decision_digest
             || scope.lease_id != request.lease_id
+            || scope.grant_id != request.grant_id
+            || scope.grant_version != request.grant_version
             || scope.scope_epoch != request.scope_epoch
+            || scope.scope_binding_digest != request.scope_binding_digest()
             || scope.target != request.target
             || scope.action_kind != request.action_kind
             || scope.action_class != request.action_class
@@ -231,7 +234,7 @@ mod tests {
     use std::thread;
 
     use super::*;
-    use crate::ipc::{ActionClass, ActionKind, RequiredFeature, encode_request};
+    use crate::ipc::{ActionClass, ActionKind, FlowKind, RequiredFeature, encode_request};
     use crate::policy::{
         CompiledAction, LeaseApproval, ScopeApproval, UnavailableActionCompiler,
         UnavailableLeaseVerifier, UnavailableScopeVerifier,
@@ -293,14 +296,26 @@ mod tests {
     fn request(target: std::net::SocketAddr) -> DispatchRequest {
         DispatchRequest {
             action_id: "action:loopback".to_owned(),
+            grant_id: "grant:fixture".to_owned(),
+            grant_version: 1,
             target_id: "target:owned-loopback".to_owned(),
+            pack_id: "web".to_owned(),
+            action_family: "http.semantic".to_owned(),
+            identity_id: "identity:operator".to_owned(),
+            tenant_id: Some("tenant:owned".to_owned()),
             intent_digest: Digest::of(b"fixture-intent"),
             decision_digest: Digest::of(b"fixture-decision"),
             lease_id: "lease:fixture".to_owned(),
             scope_epoch: 7,
             action_kind: ActionKind::SemanticHttpV1,
             action_class: ActionClass::SafeProbe,
+            flow_kind: FlowKind::TopLevel,
+            parent_action_id: None,
             required_features: vec![RequiredFeature::GatewayDispatchV1],
+            hostname: "localhost".to_owned(),
+            protocol: "http".to_owned(),
+            method: "GET".to_owned(),
+            path: "/".to_owned(),
             target,
             payload: b"PING".to_vec(),
             scope_proof: b"fixture-scope-proof".to_vec(),

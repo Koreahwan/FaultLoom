@@ -2,6 +2,7 @@ mod digest;
 pub mod ipc;
 mod kernel;
 mod policy;
+pub mod scope;
 mod transport;
 
 use std::io::{self, Read, Write};

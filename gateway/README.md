@@ -2,8 +2,9 @@
 
 `faultloom-gateway` is the separate-process target egress boundary for
 FaultLoom. Its local control channel is a bounded, versioned binary protocol on
-standard input and output. It accepts IP socket addresses rather than hostnames;
-DNS, redirect, child-request, and revocation policy belong to T16.
+standard input and output. Each request carries a resolved IP socket address plus
+canonical hostname, protocol, method, path, identity, tenant, pack, action family,
+and parent-flow metadata. The scope binding digest covers all of those fields.
 
 The T15 binary is intentionally fail closed. It contains no production scope,
 lease, or semantic action compiler, so every well-formed dispatch request is
@@ -18,6 +19,27 @@ Only `observe`, `safe_probe`, and `state_change` are representable in the typed
 client API. Raw wire tags for `high_load`, `destructive`, unknown action kinds,
 or unknown Gateway features are denied. A state-changing request must carry
 both a canary reference and a cleanup-plan reference.
+
+The T16 library policy is deterministic and fail closed. It applies
+`explicit deny > explicit allow > ambiguity deny`, rechecks every DNS, redirect,
+browser, scanner, GraphQL/batch, callback, polling, raw-schedule, and pack child,
+and requires each child to name an already approved parent action in the current
+epoch. Hostnames, resolved IP/CIDR, ports, protocols, paths, methods, packs,
+action families/classes, identities, tenants, and execution windows must all
+match explicit policy. Special-use IP space requires an explicit CIDR allow.
+
+Epoch admission is intentionally a sealed trust boundary. The Rust kernel accepts
+only the output of an injected `EpochVerifier`, binds it to the exact canonical
+signed-envelope digest, verifier receipt, key ID, sequence, validity interval, and
+grant ID, and rejects tamper, replay, and rollback. The production verifier remains
+`UnavailableEpochVerifier`; the standalone binary therefore remains fail closed
+until a non-model T13 Ed25519 verifier is wired through a sealed local channel.
+Caller assertion is not treated as signature evidence.
+
+Advancing or revoking an epoch atomically invalidates approved parent actions and
+cancels registered queued actions, open connections, WebSockets, callback leases,
+polling, and long scanner jobs. Expiry performs the same cancellation. The records
+are deterministic integration instructions; T19 owns physical handle closure.
 
 Build and test with the pinned toolchain and no dependency downloads:
 
@@ -34,6 +56,6 @@ and emits `faultloom-gateway-0.1.0-x86_64-unknown-linux-gnu` with a checksum, SB
 component, and provenance subject. Direct Cargo commands remain developer checks and
 do not create an official build receipt.
 
-The crate has no external dependencies. Installation does not grant authority,
-and this foundation does not implement T16 scope evaluation, T18 lease/budget
-accounting, or T19 semantic HTTP/browser execution.
+The crate has no external dependencies. Installation does not grant authority.
+T18 lease/budget accounting and T19 semantic HTTP/browser execution remain separate
+layers and cannot bypass the T16 decision.
