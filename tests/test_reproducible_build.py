@@ -6,6 +6,7 @@ import io
 import json
 import os
 import shutil
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -13,6 +14,7 @@ import unittest
 import zipfile
 import zlib
 from pathlib import Path
+from unittest import mock
 
 from tools.check_public_tree import scan
 from tools.reproducible_build import (
@@ -423,8 +425,93 @@ class ReproducibleBuildTests(unittest.TestCase):
             root = base / "source"
             root.mkdir()
             make_repository(root)
-            manifest = build_reproducibly(root, base / "output", EPOCH)
-            self.assertEqual(set(manifest), {path.name for path in (base / "output").iterdir()})
+            output = base / "output"
+            manifest = build_reproducibly(root, output, EPOCH)
+            self.assertEqual(set(manifest), {path.name for path in output.iterdir()})
+            self.assertEqual(
+                {path.name: 0o644 for path in output.iterdir()},
+                {
+                    path.name: stat.S_IMODE(path.stat().st_mode)
+                    for path in output.iterdir()
+                },
+            )
+
+    def test_build_once_rejects_chmod_that_leaves_wrong_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            root = base / "source"
+            root.mkdir()
+            make_repository(root)
+            output = base / "output"
+            original_chmod = Path.chmod
+
+            def leave_wrong_mode(
+                path: Path, mode: int, *, follow_symlinks: bool = True
+            ) -> None:
+                applied_mode = 0o600 if path.parent == output else mode
+                original_chmod(
+                    path, applied_mode, follow_symlinks=follow_symlinks
+                )
+
+            with mock.patch.object(Path, "chmod", new=leave_wrong_mode):
+                with self.assertRaisesRegex(
+                    BuildPolicyError,
+                    r"artifact mode mismatch .* expected 0644, found 0600",
+                ):
+                    build_once(root, output, EPOCH)
+
+    def test_metadata_hook_rejects_chmod_that_leaves_wrong_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            root = base / "source"
+            root.mkdir()
+            make_repository(root)
+            output = base / "output"
+            original_chmod = Path.chmod
+
+            def leave_wrong_mode(
+                path: Path, mode: int, *, follow_symlinks: bool = True
+            ) -> None:
+                is_sbom = (
+                    path.parent == output
+                    and path.name == "faultloom-core.sbom.cdx.json"
+                )
+                applied_mode = 0o600 if is_sbom else mode
+                original_chmod(
+                    path, applied_mode, follow_symlinks=follow_symlinks
+                )
+
+            with mock.patch.object(Path, "chmod", new=leave_wrong_mode):
+                with self.assertRaisesRegex(
+                    BuildPolicyError,
+                    r"artifact mode mismatch for faultloom-core\.sbom\.cdx\.json: "
+                    r"expected 0644, found 0600",
+                ):
+                    build_once(root, output, EPOCH)
+
+    def test_reproducible_driver_rejects_wrong_final_destination_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            root = base / "source"
+            root.mkdir()
+            make_repository(root)
+            output = base / "output"
+            original_chmod = Path.chmod
+
+            def leave_wrong_mode(
+                path: Path, mode: int, *, follow_symlinks: bool = True
+            ) -> None:
+                applied_mode = 0o600 if path.parent == output else mode
+                original_chmod(
+                    path, applied_mode, follow_symlinks=follow_symlinks
+                )
+
+            with mock.patch.object(Path, "chmod", new=leave_wrong_mode):
+                with self.assertRaisesRegex(
+                    BuildPolicyError,
+                    r"artifact mode mismatch .* expected 0644, found 0600",
+                ):
+                    build_reproducibly(root, output, EPOCH)
 
     def test_external_dependency_requires_matching_hashed_lock(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
