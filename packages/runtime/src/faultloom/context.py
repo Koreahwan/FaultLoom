@@ -360,6 +360,8 @@ class ContextState(_RuntimeModel):
         _validate_evidence_runs(self, checkpoint.run_id)
         _require_unique(checkpoint.pending_action_ids, "pending action IDs")
         _require_unique(checkpoint.unknown_outcome_action_ids, "unknown-outcome action IDs")
+        if set(checkpoint.pending_action_ids) & set(checkpoint.unknown_outcome_action_ids):
+            raise ValueError("an action cannot be both pending and unknown-outcome")
         _require_unique(
             tuple(secret.uri for secret in checkpoint.secret_refs),
             "secret references",
@@ -371,6 +373,11 @@ class ContextState(_RuntimeModel):
             ),
             "retrieval cursors",
         )
+        if any(
+            cursor.watermark > checkpoint.stable_watermark
+            for cursor in checkpoint.retrieval_cursors
+        ):
+            raise ValueError("retrieval cursors cannot exceed the stable watermark")
 
         expected_engagement_digest = _engagement_digest(self.engagement_id)
         view_keys: list[tuple[object, ...]] = []
@@ -715,6 +722,7 @@ class BoundedRetriever:
             not content.media_type
             or content.media_type != content.media_type.strip()
             or len(content.media_type) > 256
+            or any(not 32 <= ord(character) <= 126 for character in content.media_type)
         ):
             raise RetrievalError("stored media type is invalid")
         if type(content.watermark) is not int or content.watermark <= 0:

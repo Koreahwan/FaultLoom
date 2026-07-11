@@ -25,6 +25,7 @@ from faultloom.context import (
     RetrievalAccessError,
     RetrievalCursorError,
     RetrievalEncodingError,
+    RetrievalError,
     RetrievalRangeError,
     RetrievalUnit,
     RetrievedContent,
@@ -471,6 +472,27 @@ def test_checkpoint_graph_and_research_mismatches_fail_closed() -> None:
         compile_context(missing_graph, provider(), live=False)
 
 
+def test_checkpoint_rejects_overlapping_actions_and_unstable_cursors() -> None:
+    state = context_state()
+    overlapping = state.checkpoint.model_copy(
+        update={
+            "pending_action_ids": ("action.same",),
+            "unknown_outcome_action_ids": ("action.same",),
+        }
+    )
+    with pytest.raises(ValidationError, match="both pending and unknown"):
+        ContextState.model_validate(
+            state.model_copy(update={"checkpoint": overlapping}).model_dump(mode="python")
+        )
+
+    cursor = state.checkpoint.retrieval_cursors[0].model_copy(update={"watermark": 11})
+    unstable = state.checkpoint.model_copy(update={"retrieval_cursors": (cursor,)})
+    with pytest.raises(ValidationError, match="stable watermark"):
+        ContextState.model_validate(
+            state.model_copy(update={"checkpoint": unstable}).model_dump(mode="python")
+        )
+
+
 def test_unicode_overflow_is_counted_by_utf8_bytes_without_truncation() -> None:
     goal = "한" * 4_000
     original = context_state()
@@ -816,6 +838,20 @@ def test_backend_cannot_substitute_other_engagement_or_changed_content() -> None
         retriever.read_range(
             engagement_id="engagement.a",
             content_id=original.content_id,
+            unit=RetrievalUnit.BYTES,
+            start=0,
+            count=1,
+        )
+
+
+def test_backend_rejects_control_characters_in_media_type() -> None:
+    backend = MemoryBackend()
+    record = backend.add(b"data", media_type="text/plain\nforged")
+    retriever = BoundedRetriever(backend, cursor_key=b"m" * 32)
+    with pytest.raises(RetrievalError, match="media type"):
+        retriever.read_range(
+            engagement_id="engagement.1",
+            content_id=record.content_id,
             unit=RetrievalUnit.BYTES,
             start=0,
             count=1,
