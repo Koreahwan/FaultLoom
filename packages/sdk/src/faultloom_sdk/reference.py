@@ -31,29 +31,19 @@ from .rpc import (
     NormalizeObservationRequest,
     NormalizeObservationResponse,
     RpcErrorResponse,
+    RpcMethod,
+    rpc_input_schema,
+    rpc_output_schema,
 )
 
-REFERENCE_INPUT_SCHEMA = {
-    "methods": ("compile_action", "describe", "normalize_observation"),
-    "name": "faultloom.reference.rpc.input",
-    "version": "0.1.0",
-}
-REFERENCE_OUTPUT_SCHEMA = {
-    "dispatch_authorized": False,
-    "name": "faultloom.reference.rpc.output",
-    "network_modes": ("gateway_only", "none"),
-    "version": "0.1.0",
-}
-REFERENCE_PACK_DESCRIPTORS = frozenset(
-    {
-        "reference.local_transform",
-        "reference.digest",
-        "reference.observation_digest",
-        "reference.hypothesis",
-        "reference.verifier",
-        "reference.evaluation",
-    }
-)
+REFERENCE_INPUT_SCHEMA_DIGEST = sha256_digest(rpc_input_schema())
+REFERENCE_OUTPUT_SCHEMA_DIGEST = sha256_digest(rpc_output_schema())
+REFERENCE_CAPABILITY_DESCRIPTORS = frozenset({"reference.local_transform"})
+REFERENCE_ACTION_COMPILERS = frozenset({"reference.digest"})
+REFERENCE_OBSERVATION_NORMALIZERS = frozenset({"reference.observation_digest"})
+REFERENCE_HYPOTHESIS_PROVIDERS = frozenset({"reference.hypothesis"})
+REFERENCE_VERIFIER_DESCRIPTORS = frozenset({"reference.verifier"})
+REFERENCE_EVALUATION_DESCRIPTORS = frozenset({"reference.evaluation"})
 REFERENCE_ADAPTER_CAPABILITIES = frozenset({"reference.digest_normalizer"})
 REFERENCE_GATEWAY_FEATURES = frozenset({"dispatch.leases"})
 
@@ -136,8 +126,8 @@ def _reference_adapter_manifest(worker_digest: str) -> AdapterManifest:
         capabilities=("reference.digest_normalizer",),
         action_classes=(ActionClass.OBSERVE, ActionClass.SAFE_PROBE),
         network_mode="none",
-        input_schema_digest=sha256_digest(REFERENCE_INPUT_SCHEMA),
-        output_schema_digest=sha256_digest(REFERENCE_OUTPUT_SCHEMA),
+        input_schema_digest=REFERENCE_INPUT_SCHEMA_DIGEST,
+        output_schema_digest=REFERENCE_OUTPUT_SCHEMA_DIGEST,
         budget=AdapterBudget(
             schema_version="0.1.0",
             rate_per_minute=60,
@@ -157,7 +147,12 @@ def reference_adapter_manifest() -> AdapterManifest:
 
 def reference_registry() -> ManifestRegistry:
     registry = ManifestRegistry(
-        known_pack_descriptors=REFERENCE_PACK_DESCRIPTORS,
+        known_capability_descriptors=REFERENCE_CAPABILITY_DESCRIPTORS,
+        known_action_compilers=REFERENCE_ACTION_COMPILERS,
+        known_observation_normalizers=REFERENCE_OBSERVATION_NORMALIZERS,
+        known_hypothesis_providers=REFERENCE_HYPOTHESIS_PROVIDERS,
+        known_verifier_descriptors=REFERENCE_VERIFIER_DESCRIPTORS,
+        known_evaluation_descriptors=REFERENCE_EVALUATION_DESCRIPTORS,
         known_adapter_capabilities=REFERENCE_ADAPTER_CAPABILITIES,
         available_gateway_features=REFERENCE_GATEWAY_FEATURES,
     )
@@ -191,7 +186,12 @@ class ReferenceProcessClient:
         self._timeout_seconds = timeout_seconds
 
     def describe(self, *, request_id: str) -> DescribeResponse:
-        request = DescribeRequest(schema_version="0.1.0", request_id=request_id)
+        request = DescribeRequest(
+            schema_version="0.1.0",
+            rpc_version="0.1.0",
+            request_id=request_id,
+            method=RpcMethod.DESCRIBE,
+        )
         response = DescribeResponse.model_validate_json(
             json.dumps(self._exchange(request.model_dump(mode="json")))
         )

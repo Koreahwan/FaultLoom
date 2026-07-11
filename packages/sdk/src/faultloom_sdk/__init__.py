@@ -25,6 +25,8 @@ from .rpc import (
     NormalizedObservation,
     RpcErrorResponse,
     RpcMethod,
+    rpc_input_schema,
+    rpc_output_schema,
 )
 
 __version__ = "0.1.0"
@@ -51,4 +53,6 @@ __all__ = [
     "reference_adapter_manifest",
     "reference_pack_manifest",
     "reference_registry",
+    "rpc_input_schema",
+    "rpc_output_schema",
 ]

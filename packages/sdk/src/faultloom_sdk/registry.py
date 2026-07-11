@@ -19,7 +19,7 @@ from faultloom_protocol import (
     sha256_digest,
 )
 
-from .rpc import CompileActionRequest, NormalizeObservationRequest
+from .rpc import CompileActionRequest, NormalizeObservationRequest, RpcMethod
 
 
 class ManifestRegistryError(ValueError):
@@ -48,11 +48,23 @@ class ManifestRegistry:
     def __init__(
         self,
         *,
-        known_pack_descriptors: Iterable[str] = (),
+        known_capability_descriptors: Iterable[str] = (),
+        known_action_compilers: Iterable[str] = (),
+        known_observation_normalizers: Iterable[str] = (),
+        known_hypothesis_providers: Iterable[str] = (),
+        known_verifier_descriptors: Iterable[str] = (),
+        known_evaluation_descriptors: Iterable[str] = (),
         known_adapter_capabilities: Iterable[str] = (),
         available_gateway_features: Iterable[str] = (),
     ) -> None:
-        self._known_pack_descriptors = frozenset(known_pack_descriptors)
+        self._known_pack_descriptor_roles = {
+            "capability_descriptors": frozenset(known_capability_descriptors),
+            "action_compilers": frozenset(known_action_compilers),
+            "observation_normalizers": frozenset(known_observation_normalizers),
+            "hypothesis_providers": frozenset(known_hypothesis_providers),
+            "verifier_descriptors": frozenset(known_verifier_descriptors),
+            "evaluation_descriptors": frozenset(known_evaluation_descriptors),
+        }
         self._known_adapter_capabilities = frozenset(known_adapter_capabilities)
         self._available_gateway_features = frozenset(available_gateway_features)
         self._packs: dict[str, PackManifest] = {}
@@ -67,17 +79,10 @@ class ManifestRegistry:
         return tuple(self._adapters[key] for key in sorted(self._adapters))
 
     def install_pack(self, manifest: PackManifest) -> None:
-        descriptors = (
-            *manifest.capability_descriptors,
-            *manifest.action_compilers,
-            *manifest.observation_normalizers,
-            *manifest.hypothesis_providers,
-            *manifest.verifier_descriptors,
-            *manifest.evaluation_descriptors,
-        )
-        unknown = _unknown(descriptors, self._known_pack_descriptors)
-        if unknown:
-            raise UnknownDescriptorError(f"unknown pack descriptors: {unknown}")
+        for field, admitted in self._known_pack_descriptor_roles.items():
+            unknown = _unknown(getattr(manifest, field), admitted)
+            if unknown:
+                raise UnknownDescriptorError(f"unknown pack {field}: {unknown}")
         unknown = _unknown(
             manifest.required_adapter_capabilities,
             self._known_adapter_capabilities,
@@ -134,7 +139,9 @@ class ManifestRegistry:
         self._require_adapter_coverage(manifest, grant, intent.action_class)
         return CompileActionRequest(
             schema_version="0.1.0",
+            rpc_version="0.1.0",
             request_id=request_id,
+            method=RpcMethod.COMPILE_ACTION,
             authority_grant_digest=sha256_digest(grant),
             action_intent=intent,
         )
@@ -157,7 +164,9 @@ class ManifestRegistry:
             raise UnknownDescriptorError(f"unknown adapter capability: {capability}")
         return NormalizeObservationRequest(
             schema_version="0.1.0",
+            rpc_version="0.1.0",
             request_id=request_id,
+            method=RpcMethod.NORMALIZE_OBSERVATION,
             authority_grant_digest=sha256_digest(grant),
             adapter_id=adapter_id,
             capability=capability,

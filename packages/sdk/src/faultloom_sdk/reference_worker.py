@@ -15,17 +15,8 @@ RPC_VERSION = "0.1.0"
 IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
 DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
-INPUT_SCHEMA = {
-    "methods": ("compile_action", "describe", "normalize_observation"),
-    "name": "faultloom.reference.rpc.input",
-    "version": "0.1.0",
-}
-OUTPUT_SCHEMA = {
-    "dispatch_authorized": False,
-    "name": "faultloom.reference.rpc.output",
-    "network_modes": ("gateway_only", "none"),
-    "version": "0.1.0",
-}
+INPUT_SCHEMA_DIGEST = "sha256:6a084ecbce279e360616dbc5a945e42ea8c88163a84bc40551877a96975db02a"
+OUTPUT_SCHEMA_DIGEST = "sha256:c9397046a37dc06721f0f2010a88c0761636a05e5a98dccbad33b5ad8d75a64d"
 
 
 def _deny_network(event: str, _arguments: tuple[object, ...]) -> None:
@@ -231,8 +222,8 @@ def _manifests(worker_digest: str) -> tuple[dict[str, object], dict[str, object]
         "capabilities": ["reference.digest_normalizer"],
         "action_classes": ["observe", "safe_probe"],
         "network_mode": "none",
-        "input_schema_digest": _digest(INPUT_SCHEMA),
-        "output_schema_digest": _digest(OUTPUT_SCHEMA),
+        "input_schema_digest": INPUT_SCHEMA_DIGEST,
+        "output_schema_digest": OUTPUT_SCHEMA_DIGEST,
         "budget": {
             "schema_version": SCHEMA_VERSION,
             "rate_per_minute": 60,

@@ -43,7 +43,7 @@ def test_installation_does_not_grant_pack_or_adapter_authority() -> None:
 
 def test_unknown_descriptors_and_action_kinds_fail_closed() -> None:
     empty = ManifestRegistry()
-    with pytest.raises(UnknownDescriptorError, match="unknown pack descriptors"):
+    with pytest.raises(UnknownDescriptorError, match="unknown pack capability_descriptors"):
         empty.install_pack(reference_pack_manifest())
     with pytest.raises(UnknownDescriptorError, match="unknown adapter capabilities"):
         empty.install_adapter(reference_adapter_manifest())
@@ -82,14 +82,12 @@ def test_prepared_requests_are_bound_but_never_leases() -> None:
 
 def test_required_adapter_must_be_installed_and_granted_for_action_class() -> None:
     registry = ManifestRegistry(
-        known_pack_descriptors={
-            "reference.local_transform",
-            "reference.digest",
-            "reference.observation_digest",
-            "reference.hypothesis",
-            "reference.verifier",
-            "reference.evaluation",
-        },
+        known_capability_descriptors={"reference.local_transform"},
+        known_action_compilers={"reference.digest"},
+        known_observation_normalizers={"reference.observation_digest"},
+        known_hypothesis_providers={"reference.hypothesis"},
+        known_verifier_descriptors={"reference.verifier"},
+        known_evaluation_descriptors={"reference.evaluation"},
         known_adapter_capabilities={"reference.digest_normalizer"},
         available_gateway_features={"dispatch.leases"},
     )
@@ -100,3 +98,25 @@ def test_required_adapter_must_be_installed_and_granted_for_action_class() -> No
             grant=reference_grant(),
             intent=reference_intent(),
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "misclassified"),
+    [
+        ("capability_descriptors", "reference.digest"),
+        ("action_compilers", "reference.local_transform"),
+        ("observation_normalizers", "reference.hypothesis"),
+        ("hypothesis_providers", "reference.verifier"),
+        ("verifier_descriptors", "reference.evaluation"),
+        ("evaluation_descriptors", "reference.observation_digest"),
+    ],
+)
+def test_pack_descriptor_roles_cannot_be_reclassified(
+    field: str, misclassified: str
+) -> None:
+    source = reference_pack_manifest().model_dump(mode="python")
+    source[field] = (misclassified,)
+    manifest = m.PackManifest.model_validate(source)
+
+    with pytest.raises(UnknownDescriptorError, match=field):
+        reference_registry().install_pack(manifest)

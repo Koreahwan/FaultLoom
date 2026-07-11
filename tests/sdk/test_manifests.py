@@ -1,10 +1,22 @@
 from __future__ import annotations
 
+from copy import deepcopy
+
 import pytest
 from pydantic import ValidationError
 
 import faultloom_protocol.models as m
-from faultloom_sdk import reference_adapter_manifest, reference_pack_manifest
+from faultloom_protocol import sha256_digest
+from faultloom_sdk import (
+    CompileActionRequest,
+    CompileActionResponse,
+    NormalizeObservationRequest,
+    reference_adapter_manifest,
+    reference_pack_manifest,
+    rpc_input_schema,
+    rpc_output_schema,
+)
+from faultloom_sdk import reference_worker
 
 
 def test_reference_manifests_round_trip_and_pin_immutable_artifacts() -> None:
@@ -75,3 +87,79 @@ def test_adapter_cannot_advertise_unsupported_v01_actions(
     source["action_classes"] = (m.ActionClass.OBSERVE, action_class)
     with pytest.raises(ValidationError, match="unsupported v0.1"):
         m.AdapterManifest.model_validate(source)
+
+
+def test_adapter_schema_digests_bind_complete_typed_rpc_contracts() -> None:
+    input_schema = rpc_input_schema()
+    output_schema = rpc_output_schema()
+    manifest = reference_adapter_manifest()
+
+    for model, schema in (
+        (CompileActionRequest, input_schema),
+        (NormalizeObservationRequest, input_schema),
+        (CompileActionResponse, output_schema),
+    ):
+        expected = model.model_json_schema(mode="validation")
+        nested = expected.pop("$defs", {})
+        assert schema["$defs"][model.__name__] == expected
+        assert all(schema["$defs"][name] == value for name, value in nested.items())
+    assert manifest.input_schema_digest == sha256_digest(input_schema)
+    assert manifest.output_schema_digest == sha256_digest(output_schema)
+    assert reference_worker.INPUT_SCHEMA_DIGEST == manifest.input_schema_digest
+    assert reference_worker.OUTPUT_SCHEMA_DIGEST == manifest.output_schema_digest
+
+    compile_input = input_schema["$defs"]["CompileActionRequest"]
+    assert set(compile_input["required"]) == {
+        "schema_version",
+        "rpc_version",
+        "request_id",
+        "method",
+        "authority_grant_digest",
+        "action_intent",
+    }
+    normalize_input = input_schema["$defs"]["NormalizeObservationRequest"]
+    assert set(normalize_input["required"]) == {
+        "schema_version",
+        "rpc_version",
+        "request_id",
+        "method",
+        "authority_grant_digest",
+        "adapter_id",
+        "capability",
+        "observation",
+    }
+    compile_output = output_schema["$defs"]["CompileActionResponse"]
+    assert set(compile_output["required"]) == {
+        "schema_version",
+        "rpc_version",
+        "request_id",
+        "status",
+        "compiled_action",
+    }
+    assert "network_guard_active" in output_schema["$defs"]["DescribeResponse"][
+        "required"
+    ]
+    compiled_action = output_schema["$defs"]["CompiledAction"]
+    assert {
+        "required_network_mode",
+        "dispatch_authorized",
+    }.issubset(compiled_action["required"])
+    assert compiled_action["properties"]["dispatch_authorized"]["const"] is False
+    assert compiled_action["properties"]["required_network_mode"]["const"] == (
+        "gateway_only"
+    )
+
+
+def test_rpc_schema_constraint_drift_changes_advertised_digests() -> None:
+    manifest = reference_adapter_manifest()
+
+    input_drift = deepcopy(rpc_input_schema())
+    input_drift["$defs"]["CompileActionRequest"]["required"].remove(
+        "authority_grant_digest"
+    )
+    assert sha256_digest(input_drift) != manifest.input_schema_digest
+
+    output_drift = deepcopy(rpc_output_schema())
+    compiled = output_drift["$defs"]["CompiledAction"]
+    compiled["properties"]["dispatch_authorized"]["const"] = True
+    assert sha256_digest(output_drift) != manifest.output_schema_digest
