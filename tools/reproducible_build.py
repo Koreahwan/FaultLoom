@@ -789,8 +789,14 @@ def _safe_repository_path(value: str, *, context: str) -> PurePosixPath:
 def _metadata_header_value(value: Any, *, context: str) -> str:
     if not isinstance(value, str):
         raise BuildPolicyError(f"{context} must be a string")
-    if any(ord(character) < 32 or ord(character) == 127 for character in value):
-        raise BuildPolicyError(f"{context} contains a forbidden control character")
+    if any(
+        unicodedata.category(character).startswith("C")
+        or unicodedata.category(character) in {"Zl", "Zp"}
+        for character in value
+    ):
+        raise BuildPolicyError(
+            f"{context} contains a forbidden control character or Unicode separator"
+        )
     return value
 
 

@@ -936,6 +936,23 @@ dependencies = []
                     with self.assertRaisesRegex(BuildPolicyError, "control character"):
                         discover_projects(root, load_policy(root))
 
+    def test_unicode_metadata_controls_fail_before_full_build(self) -> None:
+        escapes = (r"\u0085", r"\u2028", r"\u2029", r"\u202e")
+        for escape in escapes:
+            with self.subTest(escape=escape):
+                with tempfile.TemporaryDirectory() as raw:
+                    root = Path(raw)
+                    make_repository(root)
+                    project = root / "packages/demo/pyproject.toml"
+                    contents = project.read_text(encoding="utf-8").replace(
+                        'description = "Synthetic package"',
+                        f'description = "safe{escape}Requires-Dist: injected==9.9.9"',
+                    )
+                    write(project, contents)
+                    commit_all(root, "Inject a Unicode metadata control")
+                    with self.assertRaisesRegex(BuildPolicyError, "control character"):
+                        build_once(root, root / "output", EPOCH)
+
     def test_project_metadata_must_use_the_supported_packaging_subset(self) -> None:
         variants = (
             ('name = "faultloom-demo"', 'name = "faultloom-demo-"', "project name"),
