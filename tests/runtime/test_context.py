@@ -1,0 +1,1031 @@
+from __future__ import annotations
+
+import base64
+import json
+from dataclasses import replace
+from datetime import timedelta
+
+import pytest
+from pydantic import ValidationError
+
+from faultloom.context import (
+    BoundedRetriever,
+    ContextAllocation,
+    ContextBudgetError,
+    ContextCompiler,
+    ContextError,
+    ContextGraphEdge,
+    ContextGraphNode,
+    ContextGraphSlice,
+    ContextGraphSlices,
+    ContextScopeError,
+    ContextState,
+    ProviderContextMetadata,
+    ProviderMetadataError,
+    RetrievalAccessError,
+    RetrievalCursorError,
+    RetrievalEncodingError,
+    RetrievalRangeError,
+    RetrievalUnit,
+    RetrievedContent,
+    RetrievedView,
+    ScopeTrustAnchor,
+    checkpoint_binding_tag_for,
+    content_id_for,
+)
+from faultloom_protocol import AuthoritySigner, sign_scope_epoch
+from tests.protocol.factories import D1, D2, NOW, sample_models
+
+
+VERIFY_AT = NOW + timedelta(minutes=1)
+SCOPE_SIGNER = AuthoritySigner.from_private_bytes(bytes(range(32)))
+DEFAULT_RETRIEVAL_KEY = b"retrieval-engagement-1-key" + b"x" * 32
+
+
+class MemoryBackend:
+    def __init__(self) -> None:
+        self.records: dict[tuple[str, str], RetrievedContent] = {}
+
+    def add(
+        self,
+        body: bytes,
+        *,
+        engagement_id: str = "engagement.1",
+        run_id: str = "run.1",
+        media_type: str = "text/plain",
+        watermark: int = 10,
+    ) -> RetrievedContent:
+        record = RetrievedContent(
+            engagement_id=engagement_id,
+            run_id=run_id,
+            content_id=content_id_for(body),
+            media_type=media_type,
+            body=body,
+            watermark=watermark,
+        )
+        self.records[(engagement_id, record.content_id)] = record
+        return record
+
+    def load(self, *, engagement_id: str, content_id: str) -> RetrievedContent | None:
+        return self.records.get((engagement_id, content_id))
+
+
+def provider(*, context_window: int | None = 50_000) -> ProviderContextMetadata:
+    return ProviderContextMetadata(
+        provider_id="provider.test",
+        requested_alias="frontier",
+        actual_snapshot="frontier-2030-01-01",
+        runtime_version="runtime-1.0.0",
+        tokenizer_id="tokenizer-2030-01-01",
+        context_window=context_window,
+        prompt_digest=D1,
+        tool_schema_digest=D2,
+        snapshot_exact=True,
+        context_window_exact=True,
+        prompt_overhead_tokens=32,
+        prompt_overhead_exact=True,
+    )
+
+
+def graph_slice(graph_id: str, *, reverse: bool = False) -> ContextGraphSlice:
+    nodes = (
+        ContextGraphNode(node_id="node.1", node_kind="subject", summary="Owned subject"),
+        ContextGraphNode(node_id="node.2", node_kind="resource", summary="Canary resource"),
+    )
+    edges = (
+        ContextGraphEdge(
+            edge_id="edge.1",
+            edge_kind="observed",
+            source_id="node.1",
+            target_id="node.2",
+            summary="Evidence-linked observation",
+            evidence_ids=("evidence.1",),
+        ),
+    )
+    return ContextGraphSlice(
+        graph_id=graph_id,
+        watermark=10,
+        nodes=tuple(reversed(nodes)) if reverse else nodes,
+        edges=edges,
+    )
+
+
+def context_state(*, reverse_graph_nodes: bool = False) -> ContextState:
+    models = sample_models()
+    goal = "Rebuild FaultLoom v0.1 without widening authority."
+    checkpoint = models["ContextCheckpoint"].model_copy(
+        update={
+            "goal_digest": content_id_for(goal.encode()),
+            "pending_action_ids": ("action.pending",),
+            "unknown_outcome_action_ids": ("action.unknown",),
+        }
+    )
+    return ContextState(
+        engagement_id="engagement.1",
+        goal=goal,
+        checkpoint=checkpoint,
+        checkpoint_binding_tag=checkpoint_binding_tag_for(
+            checkpoint,
+            engagement_id="engagement.1",
+            binding_key=DEFAULT_RETRIEVAL_KEY,
+        ),
+        signed_scope_epoch=sign_scope_epoch(
+            models["ScopeEpoch"],
+            SCOPE_SIGNER,
+            signed_at=NOW,
+        ),
+        active_hypotheses=(models["HypothesisRecord"],),
+        important_negative_results=(models["NegativeResult"],),
+        graph_slices=ContextGraphSlices(
+            identity=graph_slice("identity-graph.1", reverse=reverse_graph_nodes),
+            workflow=graph_slice("workflow-graph.1", reverse=reverse_graph_nodes),
+            surface=graph_slice("surface-graph.1", reverse=reverse_graph_nodes),
+            chain=graph_slice("chain-graph.1", reverse=reverse_graph_nodes),
+        ),
+        retrieved_views=(),
+    )
+
+
+def scope_anchor(*, minimum_epoch: int = 7) -> ScopeTrustAnchor:
+    checkpoint = context_state().checkpoint
+    return ScopeTrustAnchor(
+        authority_digest=checkpoint.authority_digest,
+        grant_id="grant.1",
+        public_key=SCOPE_SIGNER.public_key_record,
+        minimum_epoch=minimum_epoch,
+    )
+
+
+def compiler(
+    *,
+    minimum_epoch: int = 7,
+    retrieval_keys: dict[str, bytes] | None = None,
+    lab_context_window: int = 4096,
+    lab_unknown_prompt_overhead_tokens: int = 1024,
+) -> ContextCompiler:
+    return ContextCompiler(
+        scope_anchors=(scope_anchor(minimum_epoch=minimum_epoch),),
+        retrieval_binding_keys=(
+            {"engagement.1": DEFAULT_RETRIEVAL_KEY}
+            if retrieval_keys is None
+            else retrieval_keys
+        ),
+        lab_context_window=lab_context_window,
+        lab_unknown_prompt_overhead_tokens=lab_unknown_prompt_overhead_tokens,
+    )
+
+
+def compile_context(
+    state: ContextState,
+    metadata: ProviderContextMetadata,
+    *,
+    live: bool,
+    context_compiler: ContextCompiler | None = None,
+):
+    return (context_compiler or compiler()).compile(
+        state,
+        metadata,
+        live=live,
+        verification_time=VERIFY_AT,
+    )
+
+
+@pytest.mark.parametrize(
+    ("window", "input_limit", "output_reserve", "observation_reserve"),
+    [
+        (4, 2, 1, 1),
+        (100, 75, 15, 10),
+        (101, 74, 16, 11),
+        (10_001, 7_499, 1_501, 1_001),
+    ],
+)
+def test_budget_math_never_spends_reserves(
+    window: int,
+    input_limit: int,
+    output_reserve: int,
+    observation_reserve: int,
+) -> None:
+    allocation = ContextAllocation.for_window(window)
+    assert allocation.input_limit == input_limit
+    assert allocation.output_reserve == output_reserve
+    assert allocation.observation_reserve == observation_reserve
+    assert allocation.input_limit * 100 <= window * 75
+    assert allocation.output_reserve * 100 >= window * 15
+    assert allocation.observation_reserve * 100 >= window * 10
+    assert sum(
+        (
+            allocation.input_limit,
+            allocation.output_reserve,
+            allocation.observation_reserve,
+        )
+    ) <= window
+
+
+def test_budget_rejects_windows_too_small_for_all_three_allocations() -> None:
+    with pytest.raises(ProviderMetadataError, match="too small"):
+        ContextAllocation.for_window(2)
+    with pytest.raises(ProviderMetadataError, match="positive integer"):
+        ContextAllocation.for_window(True)  # type: ignore[arg-type]
+
+
+def test_compiler_contains_every_mandatory_section_and_is_canonical() -> None:
+    compiled = compile_context(context_state(), provider(), live=True)
+    document = json.loads(compiled.payload)
+
+    assert compiled.context_id == content_id_for(compiled.payload)
+    assert compiled.input_tokens == len(compiled.payload) + 32
+    assert compiled.input_tokens <= compiled.allocation.input_limit
+    assert document["goal"]["text"].startswith("Rebuild FaultLoom")
+    assert document["goal"]["digest"] == content_id_for(
+        context_state().goal.encode()
+    )
+    assert document["plan"]["digest"] == D2
+    assert set(document["scope"]) == {
+        "grant_digest",
+        "grant_id",
+        "epoch",
+        "signed_epoch_digest",
+        "trusted_key_id",
+        "signed_epoch",
+    }
+    assert document["scope"]["grant_id"] == "grant.1"
+    assert document["scope"]["epoch"] == 7
+    assert document["scope"]["trusted_key_id"] == SCOPE_SIGNER.key_id
+    assert document["checkpoint_binding_tag"] == context_state().checkpoint_binding_tag
+    assert set(document["research"]) == {
+        "active_hypotheses",
+        "important_negative_results",
+    }
+    assert set(document["graphs"]) == {"identity", "workflow", "surface", "chain"}
+    assert set(document["actions"]) == {"pending_ids", "unknown_outcome_ids"}
+    assert document["actions"] == {
+        "pending_ids": ["action.pending"],
+        "unknown_outcome_ids": ["action.unknown"],
+    }
+    assert set(document["evidence"]) == {
+        "recent_refs",
+        "retrieval_cursors",
+        "bounded_views",
+    }
+    assert [item["evidence_id"] for item in document["evidence"]["recent_refs"]] == [
+        "evidence.1"
+    ]
+    assert document["evidence"]["retrieval_cursors"] == [
+        {
+            "cursor": "cursor.1",
+            "index_id": "evidence-index",
+            "schema_version": "0.1.0",
+            "watermark": 10,
+        }
+    ]
+    assert document["secret_refs"] == [
+        {
+            "purpose": "owned identity",
+            "schema_version": "0.1.0",
+            "uri": "secret://run/identity-owner",
+        }
+    ]
+    assert document["remaining_budget"] == {
+        "actions": 80,
+        "cost_microunits": 500000,
+        "duration_seconds": 3000,
+        "model_tokens": 100000,
+        "schema_version": "0.1.0",
+    }
+    assert document["stable_watermark"] == 10
+    assert b'"chain_of_thought"' not in compiled.payload
+    assert compiled.payload == json.dumps(
+        document,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+
+
+def test_compilation_order_is_deterministic() -> None:
+    first = compile_context(context_state(), provider(), live=True)
+    second = compile_context(
+        context_state(reverse_graph_nodes=True),
+        provider(),
+        live=True,
+    )
+    assert first.payload == second.payload
+    assert first.context_id == second.context_id
+
+
+def test_context_reset_round_trip_preserves_all_state_and_context_ids() -> None:
+    state = context_state(reverse_graph_nodes=True)
+    restored = ContextState.model_validate_json(state.model_dump_json())
+    first = compile_context(state, provider(), live=True)
+    second = compile_context(restored, provider(), live=True)
+
+    assert restored.checkpoint.checkpoint_id == state.checkpoint.checkpoint_id
+    assert restored.signed_scope_epoch == state.signed_scope_epoch
+    assert restored.checkpoint.pending_action_ids == ("action.pending",)
+    assert restored.checkpoint.unknown_outcome_action_ids == ("action.unknown",)
+    assert first.context_id == second.context_id
+    assert first.payload == second.payload
+
+
+def test_scope_epoch_is_bound_to_external_authority_and_current_minimum() -> None:
+    state = context_state()
+    with pytest.raises(ContextScopeError, match="at least one"):
+        ContextCompiler(scope_anchors=())
+
+    stale_compiler = compiler(minimum_epoch=8)
+    with pytest.raises(ContextScopeError, match="trusted minimum"):
+        compile_context(
+            state,
+            provider(),
+            live=True,
+            context_compiler=stale_compiler,
+        )
+
+    other_authority = state.model_copy(
+        update={
+            "checkpoint": state.checkpoint.model_copy(
+                update={"authority_digest": "sha256:" + "99" * 32}
+            )
+        }
+    )
+    with pytest.raises(ContextScopeError, match="no external"):
+        compile_context(other_authority, provider(), live=True)
+
+
+def test_scope_signature_tamper_expiry_and_epoch_mismatch_fail_closed() -> None:
+    state = context_state()
+    signature = state.signed_scope_epoch.signature
+    replacement = "A" if signature.signature[0] != "A" else "B"
+    tampered = state.signed_scope_epoch.model_copy(
+        update={
+            "signature": signature.model_copy(
+                update={"signature": replacement + signature.signature[1:]}
+            )
+        }
+    )
+    tampered_state = state.model_copy(update={"signed_scope_epoch": tampered})
+    with pytest.raises(ContextScopeError, match="rejected"):
+        compile_context(tampered_state, provider(), live=True)
+
+    with pytest.raises(ContextScopeError, match="expired"):
+        compiler().compile(
+            state,
+            provider(),
+            live=True,
+            verification_time=NOW + timedelta(hours=3),
+        )
+
+    mismatched = state.model_copy(
+        update={
+            "checkpoint": state.checkpoint.model_copy(update={"scope_epoch": 6})
+        }
+    )
+    with pytest.raises(ValidationError, match="signed scope epoch"):
+        ContextState.model_validate(mismatched.model_dump(mode="python"))
+
+
+def test_checkpoint_binding_covers_cursors_actions_budget_and_engagement() -> None:
+    state = context_state()
+    changed_checkpoint = state.checkpoint.model_copy(
+        update={"pending_action_ids": ("action.changed",)}
+    )
+    changed = state.model_copy(update={"checkpoint": changed_checkpoint})
+    with pytest.raises(RetrievalAccessError, match="checkpoint.*unauthentic"):
+        compile_context(changed, provider(), live=True)
+
+    relabeled = state.model_copy(update={"engagement_id": "engagement.b"})
+    with pytest.raises(RetrievalAccessError, match="checkpoint.*unauthentic"):
+        compile_context(
+            relabeled,
+            provider(),
+            live=True,
+            context_compiler=compiler(
+                retrieval_keys={"engagement.b": b"b" * 32}
+            ),
+        )
+
+
+def test_goal_digest_and_invalid_unicode_cannot_cross_a_reset() -> None:
+    state = context_state()
+    changed_goal = state.model_copy(update={"goal": "Different aggregate goal"})
+    with pytest.raises(ValidationError, match="goal digest"):
+        ContextState.model_validate(changed_goal.model_dump(mode="python"))
+
+    invalid_goal = state.model_copy(update={"goal": "bad\ud800goal"})
+    with pytest.raises(ValidationError, match="unicode string|valid UTF-8"):
+        ContextState.model_validate(invalid_goal.model_dump(mode="python"))
+
+    invalid_hypothesis = state.active_hypotheses[0].model_copy(
+        update={"statement": "bad\ud800hypothesis"}
+    )
+    invalid_research = state.model_copy(
+        update={"active_hypotheses": (invalid_hypothesis,)}
+    )
+    with pytest.raises((ValidationError, ContextError), match="unicode string|valid UTF-8"):
+        compile_context(invalid_research, provider(), live=False)
+
+
+def test_missing_mandatory_fields_fail_closed() -> None:
+    complete = context_state().model_dump(mode="python")
+    for field in (
+        "engagement_id",
+        "goal",
+        "checkpoint",
+        "checkpoint_binding_tag",
+        "signed_scope_epoch",
+        "active_hypotheses",
+        "important_negative_results",
+        "graph_slices",
+        "retrieved_views",
+    ):
+        incomplete = dict(complete)
+        del incomplete[field]
+        with pytest.raises(ValidationError, match=field):
+            ContextState.model_validate(incomplete)
+
+    graph_document = dict(complete["graph_slices"])
+    del graph_document["chain"]
+    incomplete = dict(complete)
+    incomplete["graph_slices"] = graph_document
+    with pytest.raises(ValidationError, match="chain"):
+        ContextState.model_validate(incomplete)
+
+
+def test_checkpoint_graph_and_research_mismatches_fail_closed() -> None:
+    state = context_state()
+    missing_graph = state.model_copy(
+        update={
+            "graph_slices": state.graph_slices.model_copy(update={"chain": None}),
+        }
+    )
+    with pytest.raises(ValidationError, match="chain graph slice is required"):
+        ContextState.model_validate(missing_graph.model_dump(mode="python"))
+
+    checkpoint = state.checkpoint.model_copy(update={"active_hypothesis_ids": ()})
+    mismatch = state.model_copy(update={"checkpoint": checkpoint})
+    with pytest.raises(ValidationError, match="exactly match"):
+        ContextState.model_validate(mismatch.model_dump(mode="python"))
+
+    with pytest.raises(ValidationError, match="chain graph slice is required"):
+        compile_context(missing_graph, provider(), live=False)
+
+
+def test_unicode_overflow_is_counted_by_utf8_bytes_without_truncation() -> None:
+    goal = "한" * 4_000
+    original = context_state()
+    checkpoint = original.checkpoint.model_copy(
+        update={"goal_digest": content_id_for(goal.encode())}
+    )
+    state = original.model_copy(
+        update={
+            "goal": goal,
+            "checkpoint": checkpoint,
+            "checkpoint_binding_tag": checkpoint_binding_tag_for(
+                checkpoint,
+                engagement_id="engagement.1",
+                binding_key=DEFAULT_RETRIEVAL_KEY,
+            ),
+        }
+    )
+    with pytest.raises(ContextBudgetError, match="exceeds the input allocation"):
+        compile_context(state, provider(context_window=10_000), live=False)
+    assert state.goal == "한" * 4_000
+
+
+@pytest.mark.parametrize(
+    ("updates", "detail"),
+    [
+        ({"actual_snapshot": None}, "actual_snapshot"),
+        ({"runtime_version": None}, "runtime_version"),
+        ({"tokenizer_id": None}, "tokenizer_id"),
+        ({"context_window": None}, "context_window"),
+        ({"prompt_digest": None}, "prompt_digest"),
+        ({"tool_schema_digest": None}, "tool_schema_digest"),
+        ({"snapshot_exact": False}, "exactness flags"),
+        ({"context_window_exact": False}, "exactness flags"),
+        ({"prompt_overhead_exact": False}, "exactness flags"),
+    ],
+)
+def test_live_compilation_rejects_ambiguous_provider_metadata(
+    updates: dict[str, object], detail: str
+) -> None:
+    ambiguous = provider().model_copy(update=updates)
+    with pytest.raises(ProviderMetadataError, match=detail):
+        compile_context(context_state(), ambiguous, live=True)
+
+
+def test_lab_uses_explicit_conservative_fallback_for_missing_window() -> None:
+    ambiguous = provider(context_window=None).model_copy(
+        update={
+            "actual_snapshot": None,
+            "runtime_version": None,
+            "tokenizer_id": None,
+            "prompt_digest": None,
+            "tool_schema_digest": None,
+            "snapshot_exact": False,
+            "context_window_exact": False,
+            "prompt_overhead_exact": False,
+        }
+    )
+    compiled = compile_context(
+        context_state(),
+        ambiguous,
+        live=False,
+        context_compiler=compiler(lab_context_window=50_000),
+    )
+    assert compiled.allocation.context_window == 50_000
+    document = json.loads(compiled.payload)
+    assert document["context_allocation"]["effective_prompt_overhead_tokens"] == 1024
+    assert compiled.input_tokens == len(compiled.payload) + 1024
+
+
+def test_lab_ambiguous_window_never_expands_past_conservative_fallback() -> None:
+    ambiguous = provider(context_window=500_000).model_copy(
+        update={
+            "context_window_exact": False,
+            "prompt_overhead_exact": False,
+        }
+    )
+    compiled = compile_context(
+        context_state(),
+        ambiguous,
+        live=False,
+        context_compiler=compiler(
+            lab_context_window=50_000,
+            lab_unknown_prompt_overhead_tokens=2048,
+        ),
+    )
+    assert compiled.allocation.context_window == 50_000
+    assert compiled.input_tokens == len(compiled.payload) + 2048
+
+
+def test_scope_verification_time_must_be_explicitly_aware() -> None:
+    with pytest.raises(ContextScopeError, match="timezone"):
+        compiler().compile(
+            context_state(),
+            provider(),
+            live=True,
+            verification_time=NOW.replace(tzinfo=None),
+        )
+
+
+def test_line_ranges_reference_full_output_and_continue_without_loss() -> None:
+    backend = MemoryBackend()
+    body = "첫째\n둘째\n셋째\n".encode()
+    record = backend.add(body)
+    retriever = BoundedRetriever(backend, cursor_key=b"c" * 32, max_page_lines=2)
+
+    first = retriever.read_range(
+        engagement_id="engagement.1",
+        content_id=record.content_id,
+        unit=RetrievalUnit.LINES,
+        start=0,
+        count=2,
+    )
+    repeated = retriever.read_range(
+        engagement_id="engagement.1",
+        content_id=record.content_id,
+        unit=RetrievalUnit.LINES,
+        start=0,
+        count=2,
+    )
+    assert first.value == "첫째\n둘째\n"
+    assert first.content_id == content_id_for(body)
+    assert first.full_byte_length == len(body)
+    assert (first.start, first.end, first.total_units) == (0, 2, 3)
+    assert first.next_cursor is not None
+    assert first.next_cursor == repeated.next_cursor
+
+    final = retriever.continue_range(
+        engagement_id="engagement.1",
+        cursor=first.next_cursor,
+    )
+    assert final.value == "셋째\n"
+    assert (final.start, final.end, final.total_units) == (2, 3, 3)
+    assert final.next_cursor is None
+    assert (first.value + final.value).encode() == body
+
+
+def test_byte_ranges_preserve_arbitrary_original_bytes() -> None:
+    backend = MemoryBackend()
+    body = b"\xff\x00\x80binary\n"
+    record = backend.add(body, media_type="application/octet-stream")
+    retriever = BoundedRetriever(backend, cursor_key=b"d" * 32, max_page_bytes=4)
+
+    first = retriever.read_range(
+        engagement_id="engagement.1",
+        content_id=record.content_id,
+        unit=RetrievalUnit.BYTES,
+        start=0,
+        count=4,
+    )
+    assert base64.b64decode(first.value) == body[:4]
+    assert first.content_id == content_id_for(body)
+    with pytest.raises(RetrievalEncodingError, match="UTF-8"):
+        retriever.read_range(
+            engagement_id="engagement.1",
+            content_id=record.content_id,
+            unit=RetrievalUnit.LINES,
+            start=0,
+            count=1,
+        )
+
+
+def test_context_rejects_a_retrieved_view_bound_to_another_engagement() -> None:
+    backend = MemoryBackend()
+    record = backend.add(b"private\n", engagement_id="engagement.a")
+    view = BoundedRetriever(backend, cursor_key=b"j" * 32).read_range(
+        engagement_id="engagement.a",
+        content_id=record.content_id,
+        unit=RetrievalUnit.LINES,
+        start=0,
+        count=1,
+    )
+    state = context_state().model_copy(update={"retrieved_views": (view,)})
+    with pytest.raises(ValidationError, match="context engagement"):
+        ContextState.model_validate(state.model_dump(mode="python"))
+
+
+def test_retrieved_view_digest_and_range_cannot_be_forged() -> None:
+    backend = MemoryBackend()
+    record = backend.add(b"one\ntwo\n")
+    view = BoundedRetriever(backend, cursor_key=b"k" * 32).read_range(
+        engagement_id="engagement.1",
+        content_id=record.content_id,
+        unit=RetrievalUnit.LINES,
+        start=0,
+        count=1,
+    )
+    forged = view.model_dump(mode="python")
+    forged["value"] = "changed\n"
+    with pytest.raises(ValidationError, match="page digest"):
+        type(view).model_validate(forged)
+
+
+def test_retrieval_range_limits_fail_closed() -> None:
+    backend = MemoryBackend()
+    record = backend.add(b"one\ntwo\nthree\n")
+    retriever = BoundedRetriever(
+        backend,
+        cursor_key=b"e" * 32,
+        max_page_bytes=4,
+        max_page_lines=2,
+    )
+    with pytest.raises(RetrievalRangeError, match="configured bound"):
+        retriever.read_range(
+            engagement_id="engagement.1",
+            content_id=record.content_id,
+            unit=RetrievalUnit.BYTES,
+            start=0,
+            count=5,
+        )
+    with pytest.raises(RetrievalRangeError, match="configured bound"):
+        retriever.read_range(
+            engagement_id="engagement.1",
+            content_id=record.content_id,
+            unit=RetrievalUnit.LINES,
+            start=0,
+            count=3,
+        )
+    with pytest.raises(RetrievalRangeError, match="non-negative"):
+        retriever.read_range(
+            engagement_id="engagement.1",
+            content_id=record.content_id,
+            unit=RetrievalUnit.BYTES,
+            start=-1,
+            count=1,
+        )
+
+    large_line = backend.add(b"x" * 5 + b"\n")
+    with pytest.raises(RetrievalRangeError, match="byte bound"):
+        retriever.read_range(
+            engagement_id="engagement.1",
+            content_id=large_line.content_id,
+            unit=RetrievalUnit.LINES,
+            start=0,
+            count=1,
+        )
+
+
+def test_cursor_tamper_and_watermark_change_fail_closed() -> None:
+    backend = MemoryBackend()
+    record = backend.add(b"one\ntwo\n")
+    retriever = BoundedRetriever(backend, cursor_key=b"f" * 32, max_page_lines=1)
+    first = retriever.read_range(
+        engagement_id="engagement.1",
+        content_id=record.content_id,
+        unit=RetrievalUnit.LINES,
+        start=0,
+        count=1,
+    )
+    assert first.next_cursor is not None
+    replacement = "A" if first.next_cursor[-1] != "A" else "B"
+    tampered = first.next_cursor[:-1] + replacement
+    with pytest.raises(RetrievalCursorError, match="authentication"):
+        retriever.continue_range(engagement_id="engagement.1", cursor=tampered)
+
+    backend.records[("engagement.1", record.content_id)] = replace(record, watermark=11)
+    with pytest.raises(RetrievalCursorError, match="watermark"):
+        retriever.continue_range(
+            engagement_id="engagement.1",
+            cursor=first.next_cursor,
+        )
+
+
+def test_cursor_is_bound_to_the_original_run() -> None:
+    backend = MemoryBackend()
+    record = backend.add(b"one\ntwo\n")
+    retriever = BoundedRetriever(backend, cursor_key=b"u" * 32, max_page_lines=1)
+    first = retriever.read_range(
+        engagement_id="engagement.1",
+        content_id=record.content_id,
+        unit=RetrievalUnit.LINES,
+        start=0,
+        count=1,
+    )
+    assert first.next_cursor is not None
+    backend.records[("engagement.1", record.content_id)] = replace(
+        record,
+        run_id="run.2",
+    )
+    with pytest.raises(RetrievalCursorError, match="stored run"):
+        retriever.continue_range(
+            engagement_id="engagement.1",
+            cursor=first.next_cursor,
+        )
+
+
+def test_direct_and_cursor_access_are_strictly_engagement_scoped() -> None:
+    backend = MemoryBackend()
+    record = backend.add(b"private-a\nsecond\n", engagement_id="engagement.a")
+    retriever = BoundedRetriever(backend, cursor_key=b"g" * 32, max_page_lines=1)
+    first = retriever.read_range(
+        engagement_id="engagement.a",
+        content_id=record.content_id,
+        unit=RetrievalUnit.LINES,
+        start=0,
+        count=1,
+    )
+    assert first.next_cursor is not None
+
+    with pytest.raises(RetrievalAccessError, match="unavailable"):
+        retriever.read_range(
+            engagement_id="engagement.b",
+            content_id=record.content_id,
+            unit=RetrievalUnit.LINES,
+            start=0,
+            count=1,
+        )
+    with pytest.raises(RetrievalAccessError, match="unavailable"):
+        retriever.continue_range(
+            engagement_id="engagement.b",
+            cursor=first.next_cursor,
+        )
+
+
+def test_backend_cannot_substitute_other_engagement_or_changed_content() -> None:
+    class LyingBackend:
+        def __init__(self, record: RetrievedContent) -> None:
+            self.record = record
+
+        def load(self, *, engagement_id: str, content_id: str) -> RetrievedContent | None:
+            return self.record
+
+    original = RetrievedContent(
+        engagement_id="engagement.a",
+        run_id="run.1",
+        content_id=content_id_for(b"original"),
+        media_type="text/plain",
+        body=b"original",
+        watermark=1,
+    )
+    retriever = BoundedRetriever(LyingBackend(original), cursor_key=b"h" * 32)
+    with pytest.raises(RetrievalAccessError, match="unavailable"):
+        retriever.read_range(
+            engagement_id="engagement.b",
+            content_id=original.content_id,
+            unit=RetrievalUnit.BYTES,
+            start=0,
+            count=1,
+        )
+
+    changed = replace(original, body=b"changed!")
+    retriever = BoundedRetriever(LyingBackend(changed), cursor_key=b"i" * 32)
+    with pytest.raises(RetrievalAccessError, match="unavailable"):
+        retriever.read_range(
+            engagement_id="engagement.a",
+            content_id=original.content_id,
+            unit=RetrievalUnit.BYTES,
+            start=0,
+            count=1,
+        )
+
+
+def test_range_cursor_and_full_cas_ids_are_stable_across_reset() -> None:
+    backend = MemoryBackend()
+    body = b"one\ntwo\nthree\n"
+    record = backend.add(body)
+    first_retriever = BoundedRetriever(
+        backend,
+        cursor_key=DEFAULT_RETRIEVAL_KEY,
+        max_page_lines=2,
+    )
+    second_retriever = BoundedRetriever(
+        backend,
+        cursor_key=DEFAULT_RETRIEVAL_KEY,
+        max_page_lines=2,
+    )
+    first = first_retriever.read_range(
+        engagement_id="engagement.1",
+        content_id=record.content_id,
+        unit=RetrievalUnit.LINES,
+        start=0,
+        count=2,
+    )
+    after_reset = second_retriever.read_range(
+        engagement_id="engagement.1",
+        content_id=record.content_id,
+        unit=RetrievalUnit.LINES,
+        start=0,
+        count=2,
+    )
+    restored_view = RetrievedView.model_validate_json(first.model_dump_json())
+
+    assert first.content_id == content_id_for(body)
+    assert first.full_byte_length == len(body)
+    assert first.range_id == after_reset.range_id == restored_view.range_id
+    assert first.next_cursor == after_reset.next_cursor == restored_view.next_cursor
+    assert first.next_cursor_id == after_reset.next_cursor_id
+
+    state = context_state().model_copy(update={"retrieved_views": (first,)})
+    restored_state = ContextState.model_validate_json(state.model_dump_json())
+    context_compiler = compiler(
+        retrieval_keys={"engagement.1": DEFAULT_RETRIEVAL_KEY}
+    )
+    before = compile_context(
+        state,
+        provider(),
+        live=True,
+        context_compiler=context_compiler,
+    )
+    after = compile_context(
+        restored_state,
+        provider(),
+        live=True,
+        context_compiler=context_compiler,
+    )
+    assert before.context_id == after.context_id
+    assert before.payload == after.payload
+
+
+def test_context_requires_an_authentic_engagement_binding_for_every_view() -> None:
+    backend = MemoryBackend()
+    record = backend.add(b"private\nsecond\n")
+    view = BoundedRetriever(
+        backend,
+        cursor_key=DEFAULT_RETRIEVAL_KEY,
+        max_page_lines=1,
+    ).read_range(
+        engagement_id="engagement.1",
+        content_id=record.content_id,
+        unit=RetrievalUnit.LINES,
+        start=0,
+        count=1,
+    )
+    state = context_state().model_copy(update={"retrieved_views": (view,)})
+
+    with pytest.raises(RetrievalAccessError, match="no trusted"):
+        compile_context(
+            state,
+            provider(),
+            live=True,
+            context_compiler=compiler(retrieval_keys={}),
+        )
+
+    tag = view.binding_tag
+    replacement = "0" if tag[-1] != "0" else "1"
+    forged = view.model_copy(update={"binding_tag": tag[:-1] + replacement})
+    forged_state = state.model_copy(update={"retrieved_views": (forged,)})
+    with pytest.raises(RetrievalAccessError, match="unauthentic"):
+        compile_context(
+            forged_state,
+            provider(),
+            live=True,
+            context_compiler=compiler(
+                retrieval_keys={"engagement.1": DEFAULT_RETRIEVAL_KEY}
+            ),
+        )
+
+
+def test_cross_engagement_view_relabel_is_rejected_even_when_shape_is_valid() -> None:
+    backend = MemoryBackend()
+    body = b"same digest, separate engagement\nnext\n"
+    record_a = backend.add(body, engagement_id="engagement.a")
+    record_b = backend.add(body, engagement_id="engagement.b")
+    key_a = b"a" * 32
+    key_b = b"b" * 32
+    view_a = BoundedRetriever(backend, cursor_key=key_a, max_page_lines=1).read_range(
+        engagement_id="engagement.a",
+        content_id=record_a.content_id,
+        unit=RetrievalUnit.LINES,
+        start=0,
+        count=1,
+    )
+    view_b = BoundedRetriever(backend, cursor_key=key_b, max_page_lines=1).read_range(
+        engagement_id="engagement.b",
+        content_id=record_b.content_id,
+        unit=RetrievalUnit.LINES,
+        start=0,
+        count=1,
+    )
+    forged_b = view_b.model_copy(update={"binding_tag": view_a.binding_tag})
+    base = context_state()
+    state_b = base.model_copy(
+        update={
+            "engagement_id": "engagement.b",
+            "checkpoint_binding_tag": checkpoint_binding_tag_for(
+                base.checkpoint,
+                engagement_id="engagement.b",
+                binding_key=key_b,
+            ),
+            "retrieved_views": (forged_b,),
+        }
+    )
+    ContextState.model_validate(state_b.model_dump(mode="python"))
+
+    with pytest.raises(RetrievalAccessError, match="unauthentic"):
+        compile_context(
+            state_b,
+            provider(),
+            live=True,
+            context_compiler=compiler(retrieval_keys={"engagement.b": key_b}),
+        )
+
+
+def test_range_id_and_hard_oversize_bounds_cannot_be_forged() -> None:
+    backend = MemoryBackend()
+    record = backend.add(b"bounded\n")
+    view = BoundedRetriever(backend, cursor_key=b"r" * 32).read_range(
+        engagement_id="engagement.1",
+        content_id=record.content_id,
+        unit=RetrievalUnit.LINES,
+        start=0,
+        count=1,
+    )
+    forged = view.model_dump(mode="python")
+    forged["range_id"] = "sha256:" + "00" * 32
+    with pytest.raises(ValidationError, match="range ID"):
+        RetrievedView.model_validate(forged)
+
+    with pytest.raises(ValueError, match="max_page_bytes"):
+        BoundedRetriever(
+            backend,
+            cursor_key=b"s" * 32,
+            max_page_bytes=1_048_577,
+        )
+    with pytest.raises(ValueError, match="max_page_lines"):
+        BoundedRetriever(
+            backend,
+            cursor_key=b"s" * 32,
+            max_page_lines=50_001,
+        )
+
+
+def test_cursor_rejects_oversize_and_noncanonical_base64url() -> None:
+    backend = MemoryBackend()
+    record = backend.add(b"one\ntwo\n")
+    retriever = BoundedRetriever(backend, cursor_key=b"t" * 32, max_page_lines=1)
+    first = retriever.read_range(
+        engagement_id="engagement.1",
+        content_id=record.content_id,
+        unit=RetrievalUnit.LINES,
+        start=0,
+        count=1,
+    )
+    assert first.next_cursor is not None
+
+    with pytest.raises(RetrievalCursorError, match="malformed"):
+        retriever.continue_range(
+            engagement_id="engagement.1",
+            cursor="A" * 4097,
+        )
+
+    payload_part, signature_part = first.next_cursor.split(".", 1)
+    decoded = base64.urlsafe_b64decode(signature_part + "=" * (-len(signature_part) % 4))
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    alternate = next(
+        candidate
+        for candidate in alphabet
+        if candidate != signature_part[-1]
+        and base64.urlsafe_b64decode(
+            signature_part[:-1] + candidate + "=" * (-len(signature_part) % 4)
+        )
+        == decoded
+    )
+    noncanonical = f"{payload_part}.{signature_part[:-1]}{alternate}"
+    with pytest.raises(RetrievalCursorError, match="malformed"):
+        retriever.continue_range(
+            engagement_id="engagement.1",
+            cursor=noncanonical,
+        )
