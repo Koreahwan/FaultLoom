@@ -212,9 +212,15 @@ def completed_result(
     input_tokens: int = 100,
     output_tokens: int = 20,
     accepted_prompt_digest: str | None = None,
+    accepted_compiled_context_digest: str | None = None,
     accepted_tool_schema_digest: str | None = None,
     accepted_output_schema_digest: str | None = None,
     accepted_config_digest: str | None = None,
+    accepted_policy_ref: str | None = None,
+    accepted_data_policy_id: str | None = None,
+    accepted_data_consent_ref: str | None = None,
+    accepted_proxy_id: str | None = None,
+    accepted_proxy_contract_digest: str | None = None,
     plane: ProviderPlane = ProviderPlane.MODEL_PROVIDER,
     request_id: str | None = None,
     bytes_sent: int = 512,
@@ -231,15 +237,25 @@ def completed_result(
         bytes_received=bytes_received,
         observed_metadata=metadata or observed(model),
         usage=ProviderUsage(input_tokens=input_tokens, output_tokens=output_tokens),
-        accepted_prompt_digest=accepted_prompt_digest or intent.prompt_digest,
+        accepted_prompt_digest=accepted_prompt_digest or request.prompt_digest,
+        accepted_compiled_context_digest=(
+            accepted_compiled_context_digest or request.compiled_context_digest
+        ),
         accepted_tool_schema_digest=(
-            accepted_tool_schema_digest or provider_tool_schema_digest(intent.tools)
+            accepted_tool_schema_digest or request.tool_schema_digest
         ),
         accepted_output_schema_digest=(
-            accepted_output_schema_digest or intent.output_schema_digest
+            accepted_output_schema_digest or request.output_schema_digest
         ),
-        accepted_config_digest=accepted_config_digest or sha256_digest(
-            intent.generation_config
+        accepted_config_digest=accepted_config_digest or request.config_digest,
+        accepted_policy_ref=accepted_policy_ref or request.policy_ref,
+        accepted_data_policy_id=accepted_data_policy_id or request.data_policy_id,
+        accepted_data_consent_ref=(
+            accepted_data_consent_ref or request.data_consent_ref
+        ),
+        accepted_proxy_id=accepted_proxy_id or request.proxy_id,
+        accepted_proxy_contract_digest=(
+            accepted_proxy_contract_digest or request.proxy_contract_digest
         ),
     )
 
@@ -316,6 +332,7 @@ def test_completed_call_records_exact_identity_digests_and_accounting() -> None:
 
     assert receipt.outcome is ProviderCallOutcome.COMPLETED
     assert receipt.provider_id == model.provider_id
+    assert receipt.proxy_id == proxy.proxy_id
     assert receipt.requested_alias == "frontier"
     assert receipt.requested_snapshot == "frontier-2026-07-01"
     assert receipt.actual_snapshot == "frontier-2026-07-01"
@@ -341,7 +358,17 @@ def test_completed_call_records_exact_identity_digests_and_accounting() -> None:
 
     sent = proxy.requests[0]
     assert sent.plane is ProviderPlane.MODEL_PROVIDER
+    assert sent.proxy_id == proxy.proxy_id
+    assert sent.proxy_contract_digest == proxy.contract_digest
     assert sent.model_snapshot == model.exact_snapshot
+    assert sent.prompt_digest == intent.prompt_digest
+    assert sent.compiled_context_digest == intent.compiled_context_digest
+    assert sent.tool_schema_digest == provider_tool_schema_digest(intent.tools)
+    assert sent.output_schema_digest == intent.output_schema_digest
+    assert sent.config_digest == sha256_digest(intent.generation_config)
+    assert sent.policy_ref == intent.policy_ref
+    assert sent.data_policy_id == intent.data_policy_id
+    assert sent.data_consent_ref == intent.data_consent_ref
     assert sent.payload_digest == intent.prompt_digest
     assert sent.credential_ref.uri == "secret://engagement/provider-key"
     assert "compiled-prompt" not in canonical_json(sent)
@@ -505,8 +532,12 @@ def test_provider_echo_drift_is_rejected_after_send() -> None:
     ("field", "failure"),
     [
         ("prompt", FailureCode.PROMPT_DIGEST_MISMATCH),
+        ("context", FailureCode.COMPILED_CONTEXT_DRIFT),
         ("output", FailureCode.OUTPUT_SCHEMA_DRIFT),
         ("config", FailureCode.CONFIG_DRIFT),
+        ("policy", FailureCode.POLICY_DRIFT),
+        ("data_policy", FailureCode.POLICY_DRIFT),
+        ("consent", FailureCode.POLICY_DRIFT),
     ],
 )
 def test_prompt_output_schema_and_config_echo_drift_is_rejected(field: str, failure) -> None:
@@ -514,8 +545,16 @@ def test_prompt_output_schema_and_config_echo_drift_is_rejected(field: str, fail
     intent = call_intent()
     overrides = {
         "accepted_prompt_digest": digest("wrong") if field == "prompt" else None,
+        "accepted_compiled_context_digest": (
+            digest("wrong") if field == "context" else None
+        ),
         "accepted_output_schema_digest": digest("wrong") if field == "output" else None,
         "accepted_config_digest": digest("wrong") if field == "config" else None,
+        "accepted_policy_ref": "wrong-policy" if field == "policy" else None,
+        "accepted_data_policy_id": (
+            "wrong-data-policy" if field == "data_policy" else None
+        ),
+        "accepted_data_consent_ref": "wrong-consent" if field == "consent" else None,
     }
     proxy = FakeProxy(
         lambda request: completed_result(request, model, intent, **overrides)
@@ -759,6 +798,58 @@ def test_proxy_contract_drift_fails_before_dispatch() -> None:
     with pytest.raises(ProviderPlaneError, match="contract"):
         runtime.call(intent)
     assert proxy.requests == []
+
+
+def test_proxy_identity_drift_fails_before_dispatch() -> None:
+    model = profile()
+    intent = call_intent()
+    proxy = FakeProxy(lambda request: completed_result(request, model, intent))
+    runtime = adapter((model,), proxy)
+    proxy.proxy_id = "substituted-provider-proxy"
+
+    with pytest.raises(ProviderPlaneError, match="identity"):
+        runtime.call(intent)
+    assert proxy.requests == []
+
+
+def test_proxy_identity_toctou_is_unknown_and_requires_reconciliation() -> None:
+    model = profile()
+    intent = call_intent()
+    proxy: FakeProxy
+
+    def mutate_during_dispatch(request: ProviderProxyRequest) -> ProviderProxyResult:
+        proxy.proxy_id = "substituted-during-dispatch"
+        return completed_result(request, model, intent)
+
+    proxy = FakeProxy(mutate_during_dispatch)
+    receipt = adapter((model,), proxy).call(intent)
+
+    assert len(proxy.requests) == 1
+    assert receipt.proxy_id == "loopback-provider-proxy"
+    assert receipt.outcome is ProviderCallOutcome.UNKNOWN_OUTCOME
+    assert receipt.failure_code is FailureCode.PROXY_IDENTITY_MISMATCH
+    assert receipt.reconciliation_required is True
+    assert receipt.retry_disposition is RetryDisposition.RECONCILIATION_REQUIRED
+
+
+@pytest.mark.parametrize("field", ["accepted_proxy_id", "accepted_proxy_contract_digest"])
+def test_proxy_result_identity_drift_is_unknown(field: str) -> None:
+    model = profile()
+    intent = call_intent()
+    override = (
+        {field: "other-provider-proxy"}
+        if field == "accepted_proxy_id"
+        else {field: digest("other-provider-proxy-contract")}
+    )
+    proxy = FakeProxy(
+        lambda request: completed_result(request, model, intent, **override)
+    )
+
+    receipt = adapter((model,), proxy).call(intent)
+
+    assert receipt.outcome is ProviderCallOutcome.UNKNOWN_OUTCOME
+    assert receipt.failure_code is FailureCode.PROXY_IDENTITY_MISMATCH
+    assert receipt.reconciliation_required is True
 
 
 def test_attempt_replay_is_rejected_without_second_dispatch() -> None:

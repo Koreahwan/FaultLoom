@@ -108,13 +108,16 @@ class FailureCode(str, Enum):
     PROXY_FAILED = "proxy_failed"
     PROXY_EXCEPTION_UNKNOWN = "proxy_exception_unknown"
     PROXY_PLANE_MISMATCH = "proxy_plane_mismatch"
+    PROXY_IDENTITY_MISMATCH = "proxy_identity_mismatch"
     PROXY_CORRELATION_MISMATCH = "proxy_correlation_mismatch"
     METADATA_MISSING = "metadata_missing"
     METADATA_MISMATCH = "metadata_mismatch"
     PROMPT_DIGEST_MISMATCH = "prompt_digest_mismatch"
+    COMPILED_CONTEXT_DRIFT = "compiled_context_drift"
     TOOL_SCHEMA_DRIFT = "tool_schema_drift"
     OUTPUT_SCHEMA_DRIFT = "output_schema_drift"
     CONFIG_DRIFT = "config_drift"
+    POLICY_DRIFT = "policy_drift"
     USAGE_INVALID = "usage_invalid"
     TOKEN_BUDGET_EXCEEDED = "token_budget_exceeded"
     COST_BUDGET_EXCEEDED = "cost_budget_exceeded"
@@ -322,6 +325,8 @@ class ProviderUsage(_RuntimeModel):
 
 class ProviderProxyRequest(_RuntimeModel):
     plane: Literal[ProviderPlane.MODEL_PROVIDER] = ProviderPlane.MODEL_PROVIDER
+    proxy_id: Identifier
+    proxy_contract_digest: Sha256Digest
     request_id: Identifier
     run_id: Identifier
     authority_digest: Sha256Digest
@@ -329,7 +334,14 @@ class ProviderProxyRequest(_RuntimeModel):
     endpoint_id: Identifier
     provider_id: Identifier
     model_snapshot: ShortStr
+    prompt_digest: Sha256Digest
+    compiled_context_digest: Sha256Digest
+    tool_schema_digest: Sha256Digest
+    output_schema_digest: Sha256Digest
+    config_digest: Sha256Digest
+    policy_ref: Identifier
     data_policy_id: Identifier
+    data_consent_ref: Identifier
     credential_ref: SecretRef
     payload_digest: Sha256Digest
     payload_bytes: PositiveInt
@@ -351,9 +363,15 @@ class ProviderProxyResult(_RuntimeModel):
     observed_metadata: ProviderObservedMetadata | None = None
     usage: ProviderUsage | None = None
     accepted_prompt_digest: Sha256Digest | None = None
+    accepted_compiled_context_digest: Sha256Digest | None = None
     accepted_tool_schema_digest: Sha256Digest | None = None
     accepted_output_schema_digest: Sha256Digest | None = None
     accepted_config_digest: Sha256Digest | None = None
+    accepted_policy_ref: Identifier | None = None
+    accepted_data_policy_id: Identifier | None = None
+    accepted_data_consent_ref: Identifier | None = None
+    accepted_proxy_id: Identifier | None = None
+    accepted_proxy_contract_digest: Sha256Digest | None = None
 
     @model_validator(mode="after")
     def _outcome_contract(self) -> Self:
@@ -367,9 +385,15 @@ class ProviderProxyResult(_RuntimeModel):
             self.observed_metadata,
             self.usage,
             self.accepted_prompt_digest,
+            self.accepted_compiled_context_digest,
             self.accepted_tool_schema_digest,
             self.accepted_output_schema_digest,
             self.accepted_config_digest,
+            self.accepted_policy_ref,
+            self.accepted_data_policy_id,
+            self.accepted_data_consent_ref,
+            self.accepted_proxy_id,
+            self.accepted_proxy_contract_digest,
         )
         if self.outcome is ProxyOutcome.COMPLETED and any(
             value is None for value in completed_fields
@@ -397,6 +421,7 @@ class ProviderCallReceipt(_RuntimeModel):
     profile_id: Identifier
     profile_digest: Sha256Digest
     provider_id: Identifier
+    proxy_id: Identifier
     requested_alias: ShortStr | None = None
     requested_snapshot: ShortStr
     actual_snapshot: ShortStr | None = None
@@ -556,6 +581,10 @@ def _ceil_cost(tokens: int, rate: int) -> int:
 
 
 def _logical_request_digest(intent: ProviderCallIntent) -> str:
+    # This identity deliberately excludes the selected profile and proxy so an
+    # explicitly approved, checkpointed failover can remain the same logical
+    # call.  Derived contract digests are included as first-class values so the
+    # dispatch contract cannot be weakened by changing its representation.
     return sha256_digest(
         {
             "schema_version": SCHEMA_VERSION,
@@ -565,6 +594,8 @@ def _logical_request_digest(intent: ProviderCallIntent) -> str:
             "scope_epoch": intent.scope_epoch,
             "prompt_digest": intent.prompt_digest,
             "compiled_context_digest": intent.compiled_context_digest,
+            "tool_schema_digest": provider_tool_schema_digest(intent.tools),
+            "config_digest": sha256_digest(intent.generation_config),
             "prompt_bytes": intent.prompt_bytes,
             "input_tokens": intent.input_tokens,
             "tools": intent.tools,
@@ -599,6 +630,7 @@ class ProviderAdapter:
             raise ProviderPlaneError("provider adapter requires the model-provider plane")
         if not callable(getattr(proxy, "dispatch", None)):
             raise TypeError("provider adapter requires a provider-proxy dispatch port")
+        dispatch = proxy.dispatch
         contract_digest = getattr(proxy, "contract_digest", None)
         proxy_id = getattr(proxy, "proxy_id", None)
         if not isinstance(contract_digest, str) or re.fullmatch(
@@ -613,7 +645,11 @@ class ProviderAdapter:
         self._live = live
         self._clock = clock
         self._monotonic_clock = monotonic_clock
+        self._proxy_id = proxy_id
         self._proxy_contract_digest = contract_digest
+        self._proxy_dispatch = dispatch
+        self._proxy_dispatch_owner = getattr(dispatch, "__self__", None)
+        self._proxy_dispatch_function = getattr(dispatch, "__func__", dispatch)
 
     def call(self, intent: ProviderCallIntent) -> ProviderCallReceipt:
         intent = ProviderCallIntent.model_validate(intent.model_dump(mode="python"))
@@ -634,6 +670,8 @@ class ProviderAdapter:
         budget_digest = sha256_digest(intent.budget)
         logical_digest = _logical_request_digest(intent)
         proxy_request = ProviderProxyRequest(
+            proxy_id=self._proxy_id,
+            proxy_contract_digest=self._proxy_contract_digest,
             request_id=intent.attempt_id,
             run_id=intent.run_id,
             authority_digest=intent.authority_digest,
@@ -641,7 +679,14 @@ class ProviderAdapter:
             endpoint_id=profile.endpoint_id,
             provider_id=profile.provider_id,
             model_snapshot=profile.exact_snapshot,
+            prompt_digest=intent.prompt_digest,
+            compiled_context_digest=intent.compiled_context_digest,
+            tool_schema_digest=tool_digest,
+            output_schema_digest=intent.output_schema_digest,
+            config_digest=config_digest,
+            policy_ref=intent.policy_ref,
             data_policy_id=intent.data_policy_id,
+            data_consent_ref=intent.data_consent_ref,
             credential_ref=intent.credential_ref,
             payload_digest=intent.prompt_digest,
             payload_bytes=intent.prompt_bytes,
@@ -652,8 +697,13 @@ class ProviderAdapter:
         proxy_request_digest = sha256_digest(proxy_request)
         started_at = _trusted_now(self._clock)
         started_ns = self._monotonic_clock()
+        # Keep this check immediately adjacent to the pinned dispatch call.  A
+        # conforming out-of-process proxy also validates the identity embedded
+        # in ProviderProxyRequest; a concurrent in-process substitution is
+        # therefore either prevented or recorded as an unknown outcome.
+        self._validate_proxy_binding()
         try:
-            untrusted_result = self._proxy.dispatch(proxy_request)
+            untrusted_result = self._proxy_dispatch(proxy_request)
         except Exception:
             result = None
         else:
@@ -663,6 +713,7 @@ class ProviderAdapter:
                 )
             except (AttributeError, TypeError, ValueError):
                 result = None
+        proxy_binding_unchanged = self._proxy_binding_matches()
         completed_ns = self._monotonic_clock()
         completed_at = _trusted_now(self._clock)
         if completed_ns < started_ns:
@@ -678,7 +729,9 @@ class ProviderAdapter:
             config_digest=config_digest,
             budget_digest=budget_digest,
             logical_digest=logical_digest,
+            proxy_request=proxy_request,
             proxy_request_digest=proxy_request_digest,
+            proxy_binding_unchanged=proxy_binding_unchanged,
             started_at=started_at,
             completed_at=completed_at,
             elapsed_ns=completed_ns - started_ns,
@@ -686,11 +739,33 @@ class ProviderAdapter:
         self._journal.append(receipt)
         return receipt
 
+    def _proxy_binding_matches(self) -> bool:
+        current_dispatch = getattr(self._proxy, "dispatch", None)
+        return bool(
+            getattr(self._proxy, "plane", None) is ProviderPlane.MODEL_PROVIDER
+            and getattr(self._proxy, "proxy_id", None) == self._proxy_id
+            and getattr(self._proxy, "contract_digest", None)
+            == self._proxy_contract_digest
+            and getattr(current_dispatch, "__self__", None)
+            is self._proxy_dispatch_owner
+            and getattr(current_dispatch, "__func__", current_dispatch)
+            is self._proxy_dispatch_function
+        )
+
     def _validate_proxy_binding(self) -> None:
         if getattr(self._proxy, "plane", None) is not ProviderPlane.MODEL_PROVIDER:
             raise ProviderPlaneError("provider proxy plane changed after admission")
+        if getattr(self._proxy, "proxy_id", None) != self._proxy_id:
+            raise ProviderPlaneError("provider proxy identity changed after admission")
         if getattr(self._proxy, "contract_digest", None) != self._proxy_contract_digest:
             raise ProviderPlaneError("provider proxy contract changed after admission")
+        current_dispatch = getattr(self._proxy, "dispatch", None)
+        if (
+            getattr(current_dispatch, "__self__", None) is not self._proxy_dispatch_owner
+            or getattr(current_dispatch, "__func__", current_dispatch)
+            is not self._proxy_dispatch_function
+        ):
+            raise ProviderPlaneError("provider proxy dispatch port changed after admission")
 
     def _validate_pre_dispatch(
         self, intent: ProviderCallIntent, profile: ProviderModelProfile
@@ -800,13 +875,19 @@ class ProviderAdapter:
         config_digest: str,
         budget_digest: str,
         logical_digest: str,
+        proxy_request: ProviderProxyRequest,
         proxy_request_digest: str,
+        proxy_binding_unchanged: bool,
         started_at: datetime,
         completed_at: datetime,
         elapsed_ns: int,
     ) -> ProviderCallReceipt:
         outcome, failure, retry, reconciliation = self._classify_result(
-            intent, profile, result, tool_digest, config_digest
+            intent,
+            profile,
+            result,
+            proxy_request,
+            proxy_binding_unchanged,
         )
         metadata = None if result is None else result.observed_metadata
         usage = None if result is None else result.usage
@@ -826,6 +907,7 @@ class ProviderAdapter:
             "profile_id": profile.profile_id,
             "profile_digest": sha256_digest(profile),
             "provider_id": profile.provider_id,
+            "proxy_id": self._proxy_id,
             "requested_alias": profile.requested_alias,
             "requested_snapshot": profile.exact_snapshot,
             "actual_snapshot": None if metadata is None else metadata.actual_snapshot,
@@ -895,9 +977,16 @@ class ProviderAdapter:
         intent: ProviderCallIntent,
         profile: ProviderModelProfile,
         result: ProviderProxyResult | None,
-        tool_digest: str,
-        config_digest: str,
+        proxy_request: ProviderProxyRequest,
+        proxy_binding_unchanged: bool,
     ) -> tuple[ProviderCallOutcome, FailureCode | None, RetryDisposition, bool]:
+        if not proxy_binding_unchanged:
+            return (
+                ProviderCallOutcome.UNKNOWN_OUTCOME,
+                FailureCode.PROXY_IDENTITY_MISMATCH,
+                RetryDisposition.RECONCILIATION_REQUIRED,
+                True,
+            )
         if result is None:
             return (
                 ProviderCallOutcome.UNKNOWN_OUTCOME,
@@ -916,6 +1005,20 @@ class ProviderAdapter:
             return (
                 ProviderCallOutcome.UNKNOWN_OUTCOME,
                 FailureCode.PROXY_CORRELATION_MISMATCH,
+                RetryDisposition.RECONCILIATION_REQUIRED,
+                True,
+            )
+        if (
+            result.outcome is ProxyOutcome.COMPLETED
+            and (
+                result.accepted_proxy_id != proxy_request.proxy_id
+                or result.accepted_proxy_contract_digest
+                != proxy_request.proxy_contract_digest
+            )
+        ):
+            return (
+                ProviderCallOutcome.UNKNOWN_OUTCOME,
+                FailureCode.PROXY_IDENTITY_MISMATCH,
                 RetryDisposition.RECONCILIATION_REQUIRED,
                 True,
             )
@@ -949,7 +1052,7 @@ class ProviderAdapter:
             )
         assert result.outcome is ProxyOutcome.COMPLETED
         failure = self._completed_response_failure(
-            intent, profile, result, tool_digest, config_digest
+            intent, profile, result, proxy_request
         )
         if failure is not None:
             return (
@@ -970,8 +1073,7 @@ class ProviderAdapter:
         intent: ProviderCallIntent,
         profile: ProviderModelProfile,
         result: ProviderProxyResult,
-        tool_digest: str,
-        config_digest: str,
+        proxy_request: ProviderProxyRequest,
     ) -> FailureCode | None:
         metadata = result.observed_metadata
         usage = result.usage
@@ -1017,14 +1119,25 @@ class ProviderAdapter:
             > metadata.context_window
         ):
             return FailureCode.METADATA_MISMATCH
-        if result.accepted_prompt_digest != intent.prompt_digest:
+        if result.accepted_prompt_digest != proxy_request.prompt_digest:
             return FailureCode.PROMPT_DIGEST_MISMATCH
-        if result.accepted_tool_schema_digest != tool_digest:
+        if (
+            result.accepted_compiled_context_digest
+            != proxy_request.compiled_context_digest
+        ):
+            return FailureCode.COMPILED_CONTEXT_DRIFT
+        if result.accepted_tool_schema_digest != proxy_request.tool_schema_digest:
             return FailureCode.TOOL_SCHEMA_DRIFT
-        if result.accepted_output_schema_digest != intent.output_schema_digest:
+        if result.accepted_output_schema_digest != proxy_request.output_schema_digest:
             return FailureCode.OUTPUT_SCHEMA_DRIFT
-        if result.accepted_config_digest != config_digest:
+        if result.accepted_config_digest != proxy_request.config_digest:
             return FailureCode.CONFIG_DRIFT
+        if (
+            result.accepted_policy_ref != proxy_request.policy_ref
+            or result.accepted_data_policy_id != proxy_request.data_policy_id
+            or result.accepted_data_consent_ref != proxy_request.data_consent_ref
+        ):
+            return FailureCode.POLICY_DRIFT
         if usage.output_tokens > intent.generation_config.max_output_tokens:
             return FailureCode.TOKEN_BUDGET_EXCEEDED
         if (
