@@ -823,23 +823,30 @@ class EventLedger:
             created_at=str(row["created_at"]),
         )
 
+    def _events_in_transaction(
+        self, *, after_seq: int, limit: int
+    ) -> tuple[EventRecord, ...]:
+        if not self._connection.in_transaction:
+            raise StorageError("event reads require an active transaction")
+        rows = self._connection.execute(
+            "SELECT * FROM events WHERE seq > ? ORDER BY seq LIMIT ?", (after_seq, limit)
+        ).fetchall()
+        return tuple(self._record(row) for row in rows)
+
     def events(self, *, after_seq: int = 0, limit: int = 1000) -> tuple[EventRecord, ...]:
         self._require_open()
         if not isinstance(after_seq, int) or isinstance(after_seq, bool) or after_seq < 0:
             raise StorageError("after_seq is invalid")
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 10_000:
             raise StorageError("event limit is invalid")
-        with self._lock:
-            rows = self._connection.execute(
-                "SELECT * FROM events WHERE seq > ? ORDER BY seq LIMIT ?", (after_seq, limit)
-            ).fetchall()
-        records = tuple(self._record(row) for row in rows)
-        self._validate_paths()
+        with self.verified_checkpoint():
+            records = self._events_in_transaction(after_seq=after_seq, limit=limit)
         return records
 
     def _verify_snapshot(self, *, check_fts: bool) -> tuple[int, str]:
         if not self._connection.in_transaction:
             raise StorageError("ledger verification requires an active transaction")
+        self._validate_paths()
         self._verify_header()
         self._verify_schema()
         self._verify_metadata()
@@ -952,18 +959,22 @@ class EventLedger:
         with self.verified_checkpoint() as checkpoint:
             return checkpoint
 
+    def _event_hash_at_in_transaction(self, seq: int) -> str:
+        if not self._connection.in_transaction:
+            raise StorageError("event hash reads require an active transaction")
+        row = self._connection.execute(
+            "SELECT event_hash FROM events WHERE seq = ?", (seq,)
+        ).fetchone()
+        if row is None:
+            raise ChainIntegrityError("anchored event sequence is missing")
+        return str(row["event_hash"])
+
     def event_hash_at(self, seq: int) -> str:
         self._require_open()
         if not isinstance(seq, int) or isinstance(seq, bool) or seq <= 0:
             raise StorageError("event sequence is invalid")
-        with self._lock:
-            row = self._connection.execute(
-                "SELECT event_hash FROM events WHERE seq = ?", (seq,)
-            ).fetchone()
-        if row is None:
-            raise ChainIntegrityError("anchored event sequence is missing")
-        event_hash = str(row["event_hash"])
-        self._validate_paths()
+        with self.verified_checkpoint():
+            event_hash = self._event_hash_at_in_transaction(seq)
         return event_hash
 
     def _verify_auxiliary_state(self, events: dict[int, EventRecord]) -> None:
@@ -1153,32 +1164,38 @@ class EventLedger:
             _side_effect=insert,
         )
 
+    def _search_in_transaction(
+        self, query: str, *, limit: int
+    ) -> tuple[dict[str, Any], ...]:
+        if not self._connection.in_transaction:
+            raise StorageError("search reads require an active transaction")
+        try:
+            rows = self._connection.execute(
+                """
+                SELECT d.doc_id, d.source_event_seq AS event_seq,
+                       d.anchor_event_seq, d.artifact_sha256, d.title,
+                       snippet(search_fts, 1, '[', ']', '…', 24) AS snippet,
+                       bm25(search_fts) AS rank
+                FROM search_fts
+                JOIN search_documents AS d ON d.rowid = search_fts.rowid
+                WHERE search_fts MATCH ?
+                ORDER BY rank, d.rowid
+                LIMIT ?
+                """,
+                (query, limit),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise StorageError(f"search query failed closed: {exc}") from exc
+        return tuple(dict(row) for row in rows)
+
     def search(self, query: str, *, limit: int = 20) -> tuple[dict[str, Any], ...]:
         self._require_open()
         if not isinstance(query, str) or not query.strip() or len(query) > 2048:
             raise StorageError("search query is invalid")
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
             raise StorageError("search limit is invalid")
-        with self._lock:
-            try:
-                rows = self._connection.execute(
-                    """
-                    SELECT d.doc_id, d.source_event_seq AS event_seq,
-                           d.anchor_event_seq, d.artifact_sha256, d.title,
-                           snippet(search_fts, 1, '[', ']', '…', 24) AS snippet,
-                           bm25(search_fts) AS rank
-                    FROM search_fts
-                    JOIN search_documents AS d ON d.rowid = search_fts.rowid
-                    WHERE search_fts MATCH ?
-                    ORDER BY rank, d.rowid
-                    LIMIT ?
-                    """,
-                    (query, limit),
-                ).fetchall()
-            except sqlite3.Error as exc:
-                raise StorageError(f"search query failed closed: {exc}") from exc
-        results = tuple(dict(row) for row in rows)
-        self._validate_paths()
+        with self.verified_checkpoint():
+            results = self._search_in_transaction(query, limit=limit)
         return results
 
     def add_graph_node(
@@ -1277,23 +1294,22 @@ class EventLedger:
             _side_effect=insert,
         )
 
-    def neighbors(self, node_id: str, *, limit: int = 100) -> tuple[dict[str, Any], ...]:
-        self._require_open()
-        require_identifier(node_id, field="node_id")
-        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000:
-            raise StorageError("graph limit is invalid")
-        with self._lock:
-            rows = self._connection.execute(
-                """
-                SELECT edge_id, source_node_id, target_node_id, edge_kind,
-                       attributes_json, source_event_seq, anchor_event_seq
-                FROM graph_edges
-                WHERE source_node_id = ? OR target_node_id = ?
-                ORDER BY edge_id LIMIT ?
-                """,
-                (node_id, node_id, limit),
-            ).fetchall()
-        results = tuple(
+    def _neighbors_in_transaction(
+        self, node_id: str, *, limit: int
+    ) -> tuple[dict[str, Any], ...]:
+        if not self._connection.in_transaction:
+            raise StorageError("graph reads require an active transaction")
+        rows = self._connection.execute(
+            """
+            SELECT edge_id, source_node_id, target_node_id, edge_kind,
+                   attributes_json, source_event_seq, anchor_event_seq
+            FROM graph_edges
+            WHERE source_node_id = ? OR target_node_id = ?
+            ORDER BY edge_id LIMIT ?
+            """,
+            (node_id, node_id, limit),
+        ).fetchall()
+        return tuple(
             {
                 "edge_id": row["edge_id"],
                 "source_node_id": row["source_node_id"],
@@ -1305,5 +1321,12 @@ class EventLedger:
             }
             for row in rows
         )
-        self._validate_paths()
+
+    def neighbors(self, node_id: str, *, limit: int = 100) -> tuple[dict[str, Any], ...]:
+        self._require_open()
+        require_identifier(node_id, field="node_id")
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000:
+            raise StorageError("graph limit is invalid")
+        with self.verified_checkpoint():
+            results = self._neighbors_in_transaction(node_id, limit=limit)
         return results

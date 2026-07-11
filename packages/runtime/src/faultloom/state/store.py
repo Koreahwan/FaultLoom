@@ -278,7 +278,7 @@ class StateStore:
             return
         if ledger is None:
             return
-        if ledger.event_hash_at(floor.seq) != floor.head:
+        if ledger._event_hash_at_in_transaction(floor.seq) != floor.head:
             raise ChainIntegrityError("event chain does not contain the trusted anchor floor")
 
     def _synchronize_anchor_from_checkpoint(
@@ -302,7 +302,7 @@ class StateStore:
             if checkpoint.seq == 0:
                 if checkpoint.head != ZERO_HASH:
                     raise ChainIntegrityError("empty authenticated anchor is invalid")
-            elif ledger.event_hash_at(checkpoint.seq) != checkpoint.head:
+            elif ledger._event_hash_at_in_transaction(checkpoint.seq) != checkpoint.head:
                 raise ChainIntegrityError(
                     "event ledger diverged before its authenticated anchor"
                 )

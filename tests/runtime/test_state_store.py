@@ -92,6 +92,39 @@ def tamper_live_ledger(path: Path, mutation: str) -> None:
             raise AssertionError(f"unknown ledger mutation: {mutation}")
 
 
+def mutate_ledger_with_exact_trigger_restore(
+    path: Path,
+    *,
+    trigger: str,
+    statement: str,
+    parameters: tuple[object, ...] = (),
+) -> None:
+    """Commit a row mutation while restoring the exact append-only trigger."""
+
+    with sqlite3.connect(path, isolation_level=None, timeout=5.0) as connection:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?",
+            (trigger,),
+        ).fetchone()
+        assert row is not None
+        trigger_sql = row[0]
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(f"DROP TRIGGER {trigger}")
+            connection.execute(statement, parameters)
+            connection.execute(trigger_sql)
+            connection.execute("COMMIT")
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        restored = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?",
+            (trigger,),
+        ).fetchone()
+        assert restored == (trigger_sql,)
+
+
 def blob_path(root: Path, reference: ArtifactRef) -> Path:
     namespace = hashlib.sha256(reference.engagement_id.encode()).hexdigest()
     return (
@@ -344,6 +377,206 @@ def test_event_chain_round_trip_and_append_only_sql_triggers(tmp_path: Path) -> 
         with pytest.raises(sqlite3.DatabaseError, match="append-only"):
             ledger._connection.execute("DELETE FROM events WHERE seq = 1")
         assert [event.seq for event in ledger.events()] == [1, 2]
+
+
+def test_events_rejects_committed_payload_tamper_with_exact_trigger_restored(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    ledger = EventLedger(path, "eng.read-events-tamper", key())
+    ledger.append(
+        actor_stream="researcher",
+        event_type="baseline",
+        payload={"visible": "authentic"},
+    )
+    mutate_ledger_with_exact_trigger_restore(
+        path,
+        trigger="events_no_update",
+        statement="UPDATE events SET payload_json=? WHERE seq=1",
+        parameters=('{"visible":"forged"}',),
+    )
+
+    with pytest.raises(ChainIntegrityError, match="payload digest mismatch"):
+        ledger.events()
+    assert not ledger._connection.in_transaction
+    with pytest.raises(ChainIntegrityError, match="payload digest mismatch"):
+        ledger.close()
+    assert ledger._closed
+
+
+def test_event_hash_at_rejects_committed_hash_tamper_with_exact_trigger_restored(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    ledger = EventLedger(path, "eng.read-hash-tamper", key())
+    ledger.append(
+        actor_stream="researcher", event_type="baseline", payload={"value": 1}
+    )
+    mutate_ledger_with_exact_trigger_restore(
+        path,
+        trigger="events_no_update",
+        statement="UPDATE events SET event_hash=? WHERE seq=1",
+        parameters=("f" * 64,),
+    )
+
+    with pytest.raises(ChainIntegrityError, match="event hash mismatch"):
+        ledger.event_hash_at(1)
+    assert not ledger._connection.in_transaction
+    with pytest.raises(ChainIntegrityError, match="event hash mismatch"):
+        ledger.close()
+    assert ledger._closed
+
+
+def test_search_rejects_committed_title_tamper_with_exact_trigger_restored(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    ledger = EventLedger(path, "eng.read-search-tamper", key())
+    source = ledger.append(
+        actor_stream="researcher", event_type="baseline", payload={"value": 1}
+    )
+    ledger.add_search_document(
+        doc_id="doc.one",
+        event_seq=source.seq,
+        title="authentic title",
+        redacted_text="needle remains searchable",
+    )
+    mutate_ledger_with_exact_trigger_restore(
+        path,
+        trigger="search_documents_no_update",
+        statement="UPDATE search_documents SET title=? WHERE doc_id='doc.one'",
+        parameters=("forged title",),
+    )
+
+    with pytest.raises(ChainIntegrityError, match="FTS projection|search projection"):
+        ledger.search("needle")
+    assert not ledger._connection.in_transaction
+    with pytest.raises(ChainIntegrityError, match="FTS projection|search projection"):
+        ledger.close()
+    assert ledger._closed
+
+
+def test_neighbors_rejects_committed_edge_tamper_with_exact_trigger_restored(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    ledger = EventLedger(path, "eng.read-neighbors-tamper", key())
+    source = ledger.append(
+        actor_stream="researcher", event_type="baseline", payload={"value": 1}
+    )
+    ledger.add_graph_node(
+        node_id="node.one", node_kind="subject", attributes={}, event_seq=source.seq
+    )
+    ledger.add_graph_node(
+        node_id="node.two", node_kind="resource", attributes={}, event_seq=source.seq
+    )
+    ledger.add_graph_edge(
+        edge_id="edge.one",
+        source_node_id="node.one",
+        target_node_id="node.two",
+        edge_kind="authentic",
+        attributes={},
+        event_seq=source.seq,
+    )
+    mutate_ledger_with_exact_trigger_restore(
+        path,
+        trigger="graph_edges_no_update",
+        statement="UPDATE graph_edges SET edge_kind=? WHERE edge_id='edge.one'",
+        parameters=("forged",),
+    )
+
+    with pytest.raises(ChainIntegrityError, match="graph edge projection"):
+        ledger.neighbors("node.one")
+    assert not ledger._connection.in_transaction
+    with pytest.raises(ChainIntegrityError, match="graph edge projection"):
+        ledger.close()
+    assert ledger._closed
+
+
+def test_verified_public_ledger_reads_preserve_results_cursors_and_limits(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    with EventLedger(path, "eng.verified-reads", key()) as ledger:
+        events = tuple(
+            ledger.append(
+                actor_stream="researcher",
+                event_type="baseline",
+                payload={"value": value},
+            )
+            for value in range(1, 4)
+        )
+        assert [record.payload["value"] for record in ledger.events(limit=2)] == [1, 2]
+        assert [record.seq for record in ledger.events(after_seq=2, limit=1)] == [3]
+        assert ledger.events(after_seq=events[-1].seq) == ()
+        assert ledger.event_hash_at(2) == events[1].event_hash
+        assert not ledger._connection.in_transaction
+        with pytest.raises(ChainIntegrityError, match="sequence is missing"):
+            ledger.event_hash_at(999)
+        assert not ledger._connection.in_transaction
+
+        for suffix in ("one", "two"):
+            ledger.add_search_document(
+                doc_id=f"doc.{suffix}",
+                event_seq=events[0].seq,
+                title=f"title {suffix}",
+                redacted_text="common needle",
+            )
+        hits = ledger.search("needle", limit=1)
+        assert len(hits) == 1
+        assert hits[0]["doc_id"] == "doc.one"
+        assert ledger.search("absent") == ()
+        with pytest.raises(StorageError, match="search query failed closed"):
+            ledger.search('"')
+        assert not ledger._connection.in_transaction
+
+        for suffix in ("one", "two", "three"):
+            ledger.add_graph_node(
+                node_id=f"node.{suffix}",
+                node_kind="subject",
+                attributes={"suffix": suffix},
+                event_seq=events[0].seq,
+            )
+        for suffix, target in (("one", "two"), ("two", "three")):
+            ledger.add_graph_edge(
+                edge_id=f"edge.{suffix}",
+                source_node_id="node.one",
+                target_node_id=f"node.{target}",
+                edge_kind="reads",
+                attributes={"suffix": suffix},
+                event_seq=events[0].seq,
+            )
+        adjacent = ledger.neighbors("node.one", limit=1)
+        assert len(adjacent) == 1
+        assert adjacent[0]["edge_id"] == "edge.one"
+        assert ledger.neighbors("node.none") == ()
+        assert not ledger._connection.in_transaction
+
+
+def test_in_transaction_hash_lookup_supports_anchor_recovery_and_close_paths(
+    tmp_path: Path,
+) -> None:
+    store = state_store(tmp_path, "eng.internal-hash-read")
+    first = store.ledger.append(
+        actor_stream="researcher", event_type="baseline", payload={"value": 1}
+    )
+    with pytest.raises(StorageError, match="active transaction"):
+        store.ledger._event_hash_at_in_transaction(first.seq)
+    assert store.checkpoint().seq == first.seq
+
+    second = store.ledger.append(
+        actor_stream="researcher", event_type="baseline", payload={"value": 2}
+    )
+    assert store.checkpoint().seq == second.seq
+    third = store.ledger.append(
+        actor_stream="researcher", event_type="baseline", payload={"value": 3}
+    )
+    assert store.recover().anchor.seq == third.seq
+    store.ledger.append(
+        actor_stream="researcher", event_type="baseline", payload={"value": 4}
+    )
+    store.close()
+    assert store._closed
 
 
 def test_chain_detects_offline_database_tampering(tmp_path: Path) -> None:
