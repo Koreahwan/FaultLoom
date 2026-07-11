@@ -172,6 +172,7 @@ class StateStore:
                 self.ledger = EventLedger(
                     self.root / "engagements" / namespace / "state.sqlite3",
                     self.engagement_id,
+                    key,
                     transaction_lock=self._lock,
                     commit_callback=self._synchronize_anchor,
                     path_validator=self._revalidate_roots,

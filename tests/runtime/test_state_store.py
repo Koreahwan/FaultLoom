@@ -304,7 +304,7 @@ def test_key_is_redacted_and_not_pickleable() -> None:
 
 def test_event_chain_round_trip_and_append_only_sql_triggers(tmp_path: Path) -> None:
     path = tmp_path / "state.sqlite3"
-    with EventLedger(path, "eng.ledger") as ledger:
+    with EventLedger(path, "eng.ledger", key()) as ledger:
         one = ledger.append(
             actor_stream="researcher", event_type="delta", payload={"value": 1}
         )
@@ -322,7 +322,7 @@ def test_event_chain_round_trip_and_append_only_sql_triggers(tmp_path: Path) -> 
 
 def test_chain_detects_offline_database_tampering(tmp_path: Path) -> None:
     path = tmp_path / "state.sqlite3"
-    with EventLedger(path, "eng.tamper") as ledger:
+    with EventLedger(path, "eng.tamper", key()) as ledger:
         ledger.append(actor_stream="researcher", event_type="delta", payload={"safe": True})
     raw = sqlite3.connect(path)
     raw.execute("DROP TRIGGER events_no_update")
@@ -330,7 +330,7 @@ def test_chain_detects_offline_database_tampering(tmp_path: Path) -> None:
     raw.commit()
     raw.close()
     with pytest.raises(ChainIntegrityError, match="schema manifest|payload digest"):
-        EventLedger(path, "eng.tamper")
+        EventLedger(path, "eng.tamper", key())
 
 
 def test_derived_index_tampering_is_detected_against_chain_anchor(tmp_path: Path) -> None:
@@ -355,7 +355,7 @@ def test_derived_index_tampering_is_detected_against_chain_anchor(tmp_path: Path
     raw.commit()
     raw.close()
     with pytest.raises(ChainIntegrityError, match="schema manifest|search projection"):
-        EventLedger(path, "eng.index-tamper")
+        EventLedger(path, "eng.index-tamper", key())
 
 
 def test_artifact_registry_requires_reference_in_hashed_payload(tmp_path: Path) -> None:
@@ -364,7 +364,7 @@ def test_artifact_registry_requires_reference_in_hashed_payload(tmp_path: Path) 
         sha256=hashlib.sha256(b"raw").hexdigest(),
         byte_length=3,
     )
-    with EventLedger(tmp_path / "state.sqlite3", "eng.artifact-anchor") as ledger:
+    with EventLedger(tmp_path / "state.sqlite3", "eng.artifact-anchor", key()) as ledger:
         with pytest.raises(StorageError, match="exactly match"):
             ledger.append(
                 actor_stream="researcher",
@@ -380,7 +380,7 @@ def test_unregistered_payload_artifact_is_rejected(tmp_path: Path) -> None:
         sha256=hashlib.sha256(b"raw").hexdigest(),
         byte_length=3,
     )
-    with EventLedger(tmp_path / "state.sqlite3", "eng.unregistered") as ledger:
+    with EventLedger(tmp_path / "state.sqlite3", "eng.unregistered", key()) as ledger:
         with pytest.raises(StorageError, match="exactly match"):
             ledger.append(
                 actor_stream="researcher",
@@ -391,10 +391,10 @@ def test_unregistered_payload_artifact_is_rejected(tmp_path: Path) -> None:
 
 def test_ledger_rejects_cross_engagement_open(tmp_path: Path) -> None:
     path = tmp_path / "state.sqlite3"
-    with EventLedger(path, "eng.original"):
+    with EventLedger(path, "eng.original", key()):
         pass
     with pytest.raises(CrossEngagementError):
-        EventLedger(path, "eng.other")
+        EventLedger(path, "eng.other", key())
 
 
 @pytest.mark.parametrize(
@@ -409,7 +409,7 @@ def test_ledger_rejects_cross_engagement_open(tmp_path: Path) -> None:
 def test_event_canonical_profile_rejects_ambiguous_values(
     tmp_path: Path, payload: dict[object, object]
 ) -> None:
-    with EventLedger(tmp_path / "state.sqlite3", "eng.canonical") as ledger:
+    with EventLedger(tmp_path / "state.sqlite3", "eng.canonical", key()) as ledger:
         with pytest.raises(StorageError):
             ledger.append(actor_stream="researcher", event_type="delta", payload=payload)
 
@@ -506,7 +506,7 @@ def test_recovery_fails_if_ledger_artifact_is_missing(tmp_path: Path) -> None:
 
 
 def test_concurrent_appends_have_one_contiguous_chain(tmp_path: Path) -> None:
-    with EventLedger(tmp_path / "state.sqlite3", "eng.concurrent") as ledger:
+    with EventLedger(tmp_path / "state.sqlite3", "eng.concurrent", key()) as ledger:
         def append(index: int) -> int:
             return ledger.append(
                 actor_stream=f"actor.{index % 3}",
@@ -554,6 +554,154 @@ os._exit(0)
         assert len(report.verified_artifacts) == 2
 
 
+def test_authenticated_committed_tail_is_recovered_and_anchored_once(
+    tmp_path: Path,
+) -> None:
+    engagement_id = "eng.authenticated-tail"
+    with state_store(tmp_path, engagement_id) as store:
+        store.append_observation(
+            actor_stream="researcher",
+            event_type="observation",
+            raw_output=b"anchored",
+            metadata={},
+        )
+        trusted = store.checkpoint()
+
+    anchor_path = (
+        anchor_root(tmp_path)
+        / "anchors"
+        / f"{hashlib.sha256(engagement_id.encode()).hexdigest()}.anchor"
+    )
+    anchor_before = anchor_path.read_bytes()
+    script = r'''
+import os
+import sys
+
+source_root, database, engagement_id = sys.argv[1:]
+sys.path.insert(0, source_root)
+from faultloom.state import EngagementKey, EventLedger
+
+ledger = EventLedger(database, engagement_id, EngagementKey(bytes(range(32))))
+tail = ledger.append(
+    actor_stream="researcher",
+    event_type="crash.tail",
+    payload={"committed": True},
+)
+assert tail.seq == 2
+os._exit(0)
+'''
+    source_root = Path(__file__).parents[2] / "packages" / "runtime" / "src"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            script,
+            str(source_root),
+            str(database_path(tmp_path, engagement_id)),
+            engagement_id,
+        ],
+        env={},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert anchor_path.read_bytes() == anchor_before
+
+    with state_store(tmp_path, engagement_id, minimum_anchor=trusted) as recovered:
+        assert recovered.checkpoint().seq == trusted.seq + 1
+        assert [event.seq for event in recovered.ledger.events()] == [1, 2]
+    with state_store(tmp_path, engagement_id, minimum_anchor=trusted) as reopened:
+        assert reopened.checkpoint().seq == trusted.seq + 1
+        assert [event.seq for event in reopened.ledger.events()] == [1, 2]
+
+
+def test_keyless_public_hash_tail_is_rejected_without_anchor_advancement(
+    tmp_path: Path,
+) -> None:
+    engagement_id = "eng.keyless-forgery"
+    with state_store(tmp_path, engagement_id) as store:
+        store.append_observation(
+            actor_stream="researcher",
+            event_type="observation",
+            raw_output=b"legitimate",
+            metadata={},
+        )
+        trusted = store.checkpoint()
+
+    anchor_path = (
+        anchor_root(tmp_path)
+        / "anchors"
+        / f"{hashlib.sha256(engagement_id.encode()).hexdigest()}.anchor"
+    )
+    anchor_before = anchor_path.read_bytes()
+    script = r'''
+import datetime
+import hashlib
+import json
+import sqlite3
+import sys
+
+path, engagement_id = sys.argv[1:]
+connection = sqlite3.connect(path)
+last = connection.execute(
+    "SELECT seq, event_hash, event_auth_tag FROM events ORDER BY seq DESC LIMIT 1"
+).fetchone()
+seq = last[0] + 1
+payload_json = json.dumps({"forged": True}, sort_keys=True, separators=(",", ":"))
+payload_sha256 = hashlib.sha256(payload_json.encode()).hexdigest()
+created_at = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="microseconds")
+body = {
+    "actor_stream": "attacker",
+    "created_at": created_at,
+    "engagement_id": engagement_id,
+    "event_type": "forged.tail",
+    "payload_sha256": payload_sha256,
+    "prev_hash": last[1],
+    "schema_version": 2,
+    "seq": seq,
+}
+event_hash = hashlib.sha256(
+    json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+).hexdigest()
+connection.execute(
+    """INSERT INTO events(
+           seq, schema_version, engagement_id, actor_stream, event_type,
+           payload_json, payload_sha256, prev_hash, event_hash,
+           prev_auth_tag, event_auth_tag, created_at
+       ) VALUES (?, 2, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+    (
+        seq, engagement_id, "attacker", "forged.tail", payload_json,
+        payload_sha256, last[1], event_hash, last[2], "0" * 64, created_at,
+    ),
+)
+connection.commit()
+connection.close()
+'''
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            script,
+            str(database_path(tmp_path, engagement_id)),
+            engagement_id,
+        ],
+        env={},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+    with pytest.raises(ChainIntegrityError, match="authentication tag mismatch"):
+        state_store(tmp_path, engagement_id, minimum_anchor=trusted)
+    assert anchor_path.read_bytes() == anchor_before
+
+
 @pytest.mark.parametrize("sidecar_suffix", ["-wal", "-shm"])
 def test_append_rejects_identical_sqlite_sidecar_replacement_before_return(
     tmp_path: Path, sidecar_suffix: str
@@ -570,7 +718,9 @@ def test_append_rejects_identical_sqlite_sidecar_replacement_before_return(
             )
             state["replaced"] = True
 
-    ledger = EventLedger(path, "eng.sidecar-append", commit_callback=replace_after_commit)
+    ledger = EventLedger(
+        path, "eng.sidecar-append", key(), commit_callback=replace_after_commit
+    )
     ledger.append(actor_stream="researcher", event_type="baseline", payload={"value": 1})
     state["armed"] = True
     with pytest.raises(StorageError, match="event ledger sidecar"):
@@ -598,6 +748,7 @@ def test_append_rejects_sidecar_swap_after_stale_stat_before_return(
     ledger = EventLedger(
         path,
         "eng.sidecar-stale-stat-append",
+        key(),
         commit_callback=arm_after_commit,
     )
     ledger.append(actor_stream="researcher", event_type="baseline", payload={"value": 1})
@@ -628,7 +779,7 @@ def test_checkpoint_rejects_identical_sqlite_sidecar_replacement_before_return(
 ) -> None:
     path = tmp_path / "ledger" / "state.sqlite3"
     path.parent.mkdir(mode=0o700)
-    ledger = EventLedger(path, "eng.sidecar-checkpoint")
+    ledger = EventLedger(path, "eng.sidecar-checkpoint", key())
     ledger.append(actor_stream="researcher", event_type="delta", payload={"value": 1})
     verify_chain = ledger.verify_chain
 
@@ -658,7 +809,7 @@ def test_checkpoint_rejects_sidecar_swap_after_stale_stat_before_return(
     path = tmp_path / "ledger" / "state.sqlite3"
     path.parent.mkdir(mode=0o700)
     state = {"armed": False, "replaced": False}
-    ledger = EventLedger(path, "eng.sidecar-stale-stat-checkpoint")
+    ledger = EventLedger(path, "eng.sidecar-stale-stat-checkpoint", key())
     ledger.append(actor_stream="researcher", event_type="delta", payload={"value": 1})
     install_stale_sidecar_stat_swap(
         monkeypatch,
@@ -706,6 +857,7 @@ def test_close_rejects_identical_sqlite_sidecar_replacement_and_releases_resourc
     ledger = EventLedger(
         path,
         "eng.sidecar-close",
+        key(),
         path_validator=replace_after_final_preclose_validation,
     )
     ledger.append(actor_stream="researcher", event_type="delta", payload={"value": 1})
@@ -726,7 +878,7 @@ def test_sqlite_sidecar_create_remove_and_reopen_lifecycle_is_allowed(
     assert not any(sidecar.exists() for sidecar in sidecars)
 
     for generation in (1, 2):
-        ledger = EventLedger(path, "eng.sidecar-lifecycle")
+        ledger = EventLedger(path, "eng.sidecar-lifecycle", key())
         for sidecar in sidecars:
             metadata = sidecar.stat()
             assert stat.S_IMODE(metadata.st_mode) == 0o600
@@ -753,7 +905,7 @@ def test_terminal_symlink_roots_are_rejected(tmp_path: Path) -> None:
     ledger_link = tmp_path / "ledger-link"
     ledger_link.symlink_to(real / "state.sqlite3")
     with pytest.raises(StorageError, match="symlink"):
-        EventLedger(ledger_link, "eng.link")
+        EventLedger(ledger_link, "eng.link", key())
 
 
 @pytest.mark.parametrize("root_kind", ["state", "anchor"])
@@ -1189,7 +1341,7 @@ def test_quarantine_rename_is_recoverable_after_directory_fsync_failure(
 
 def test_unknown_schema_trigger_and_fts_drift_fail_closed(tmp_path: Path) -> None:
     path = tmp_path / "state.sqlite3"
-    with EventLedger(path, "eng.schema") as ledger:
+    with EventLedger(path, "eng.schema", key()) as ledger:
         event = ledger.append(
             actor_stream="researcher", event_type="delta", payload={"n": 1}
         )
@@ -1208,10 +1360,10 @@ def test_unknown_schema_trigger_and_fts_drift_fail_closed(tmp_path: Path) -> Non
     raw.commit()
     raw.close()
     with pytest.raises(StorageError, match="schema version"):
-        EventLedger(path, "eng.schema")
+        EventLedger(path, "eng.schema", key())
     raw = sqlite3.connect(path)
     assert raw.execute("PRAGMA user_version").fetchone()[0] == 99
-    raw.execute("PRAGMA user_version=1")
+    raw.execute(f"PRAGMA user_version={ledger_module.SCHEMA_VERSION}")
     raw.execute("DROP TABLE future_v99")
     raw.execute("DROP TRIGGER events_no_update")
     raw.execute(
@@ -1220,7 +1372,7 @@ def test_unknown_schema_trigger_and_fts_drift_fail_closed(tmp_path: Path) -> Non
     raw.commit()
     raw.close()
     with pytest.raises(ChainIntegrityError, match="schema manifest"):
-        EventLedger(path, "eng.schema")
+        EventLedger(path, "eng.schema", key())
     raw = sqlite3.connect(path)
     raw.execute("DROP TRIGGER events_no_update")
     raw.execute(original_trigger)
@@ -1228,10 +1380,10 @@ def test_unknown_schema_trigger_and_fts_drift_fail_closed(tmp_path: Path) -> Non
     raw.commit()
     raw.close()
     with pytest.raises(ChainIntegrityError, match="FTS projection"):
-        EventLedger(path, "eng.schema")
-    with EventLedger(path, "eng.schema", rebuild_fts=True) as repaired:
+        EventLedger(path, "eng.schema", key())
+    with EventLedger(path, "eng.schema", key(), rebuild_fts=True) as repaired:
         assert repaired.search("needle")[0]["doc_id"] == "doc.one"
-    with EventLedger(path, "eng.schema") as verified:
+    with EventLedger(path, "eng.schema", key()) as verified:
         verified.verify_chain()
 
 
@@ -1325,7 +1477,7 @@ def test_projection_row_deletion_is_detected_from_anchored_events(
     raw.commit()
     raw.close()
     with pytest.raises(ChainIntegrityError, match=message):
-        EventLedger(path, "eng.projection-completeness")
+        EventLedger(path, "eng.projection-completeness", key())
 
 
 def test_unknown_cas_entries_insecure_modes_and_ancestor_symlinks_fail_closed(

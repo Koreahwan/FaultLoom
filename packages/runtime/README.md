@@ -8,10 +8,13 @@ and graph projections.
 
 Every `StateStore` requires an `anchor_root` outside the mutable state root.
 The authenticated anchor records the latest `{sequence, event hash}` and an
-engagement-key commitment. Appends do not return until both the SQLite commit
-and anchor replacement have been synced. If a crash lands between those two
-steps, reopening verifies the anchored prefix before advancing a lagging
-anchor. A ledger behind its anchor fails closed.
+engagement-key commitment. Each event also carries a domain-separated chain
+MAC derived from the engagement key, so a lagging anchor advances only across
+records that can be independently authenticated. Appends do not return until
+both the SQLite commit and anchor replacement have been synced. If a crash
+lands between those two steps, reopening verifies the anchored prefix and the
+authenticated tail before advancing the anchor. A ledger behind its anchor
+fails closed.
 
 An authenticated anchor proves integrity, not freshness. An operator that
 needs to detect restoration of both the state and anchor stores must retain an

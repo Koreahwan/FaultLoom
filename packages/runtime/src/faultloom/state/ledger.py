@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .canonical import canonical_json
-from .cas import ArtifactRef
+from .cas import ArtifactRef, EngagementKey
 from .filesystem import (
     DirectoryBinding,
     NOFOLLOW,
@@ -34,7 +34,7 @@ from .types import (
 
 
 ZERO_HASH = "0" * 64
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 APPLICATION_ID = 0x464C4F4D
 
 
@@ -104,6 +104,8 @@ class EventRecord:
     payload_sha256: str
     prev_hash: str
     event_hash: str
+    prev_auth_tag: str
+    event_auth_tag: str
     created_at: str
     schema_version: int = SCHEMA_VERSION
 
@@ -116,7 +118,7 @@ CREATE TABLE IF NOT EXISTS ledger_metadata (
 
 CREATE TABLE IF NOT EXISTS events (
     seq INTEGER PRIMARY KEY,
-    schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 2),
     engagement_id TEXT NOT NULL,
     actor_stream TEXT NOT NULL,
     event_type TEXT NOT NULL,
@@ -124,6 +126,8 @@ CREATE TABLE IF NOT EXISTS events (
     payload_sha256 TEXT NOT NULL CHECK (length(payload_sha256) = 64),
     prev_hash TEXT NOT NULL CHECK (length(prev_hash) = 64),
     event_hash TEXT NOT NULL UNIQUE CHECK (length(event_hash) = 64),
+    prev_auth_tag TEXT NOT NULL CHECK (length(prev_auth_tag) = 64),
+    event_auth_tag TEXT NOT NULL UNIQUE CHECK (length(event_auth_tag) = 64),
     created_at TEXT NOT NULL
 );
 
@@ -211,6 +215,7 @@ class EventLedger:
         self,
         path: Path,
         engagement_id: str,
+        key: EngagementKey,
         *,
         rebuild_fts: bool = False,
         transaction_lock: AbstractContextManager[Any] | None = None,
@@ -218,6 +223,12 @@ class EventLedger:
         path_validator: Callable[[], None] | None = None,
     ) -> None:
         self.engagement_id = require_identifier(engagement_id, field="engagement_id")
+        key_material = key._copy_for_cipher()
+        self._event_auth_key = hmac.digest(
+            key_material,
+            b"faultloom-event-auth-key-v1\0" + self.engagement_id.encode("utf-8"),
+            "sha256",
+        )
         self._transaction_lock = transaction_lock or nullcontext()
         self._commit_callback = commit_callback
         self._path_validator = path_validator
@@ -532,6 +543,12 @@ class EventLedger:
         expected = {
             "engagement_id": self.engagement_id,
             "schema_version": str(SCHEMA_VERSION),
+            "event_auth_key_commitment": hmac.digest(
+                self._event_auth_key,
+                b"faultloom-event-auth-key-commitment-v1\0"
+                + self.engagement_id.encode("utf-8"),
+                "sha256",
+            ).hex(),
         }
         if not rows:
             if not allow_create:
@@ -545,8 +562,12 @@ class EventLedger:
             except Exception:
                 self._connection.execute("ROLLBACK")
                 raise
-        elif rows != expected:
+        elif rows.get("engagement_id") != self.engagement_id:
             raise CrossEngagementError("ledger metadata does not match this engagement")
+        elif rows != expected:
+            raise ChainIntegrityError(
+                "ledger metadata authentication key or schema does not match"
+            )
 
     @staticmethod
     def _event_digest(
@@ -570,6 +591,21 @@ class EventLedger:
             "seq": seq,
         }
         return hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
+
+    def _event_auth_digest(
+        self, *, prev_auth_tag: str, event_hash: str
+    ) -> str:
+        try:
+            authenticated = bytes.fromhex(prev_auth_tag) + bytes.fromhex(event_hash)
+        except ValueError as exc:
+            raise ChainIntegrityError("event authentication input is malformed") from exc
+        if len(authenticated) != 64:
+            raise ChainIntegrityError("event authentication input is malformed")
+        return hmac.digest(
+            self._event_auth_key,
+            b"faultloom-event-record-v1\0" + authenticated,
+            "sha256",
+        ).hex()
 
     def append(
         self,
@@ -615,10 +651,14 @@ class EventLedger:
                 try:
                     self._connection.execute("BEGIN IMMEDIATE")
                     last = self._connection.execute(
-                        "SELECT seq, event_hash FROM events ORDER BY seq DESC LIMIT 1"
+                        """SELECT seq, event_hash, event_auth_tag
+                           FROM events ORDER BY seq DESC LIMIT 1"""
                     ).fetchone()
                     seq = 1 if last is None else int(last["seq"]) + 1
                     prev_hash = ZERO_HASH if last is None else str(last["event_hash"])
+                    prev_auth_tag = (
+                        ZERO_HASH if last is None else str(last["event_auth_tag"])
+                    )
                     event_hash = self._event_digest(
                         seq=seq,
                         engagement_id=self.engagement_id,
@@ -628,12 +668,17 @@ class EventLedger:
                         prev_hash=prev_hash,
                         created_at=timestamp,
                     )
+                    event_auth_tag = self._event_auth_digest(
+                        prev_auth_tag=prev_auth_tag,
+                        event_hash=event_hash,
+                    )
                     self._connection.execute(
                         """
                         INSERT INTO events(
                             seq, schema_version, engagement_id, actor_stream, event_type,
-                            payload_json, payload_sha256, prev_hash, event_hash, created_at
-                        ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+                            payload_json, payload_sha256, prev_hash, event_hash,
+                            prev_auth_tag, event_auth_tag, created_at
+                        ) VALUES (?, 2, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             seq,
@@ -644,6 +689,8 @@ class EventLedger:
                             payload_sha256,
                             prev_hash,
                             event_hash,
+                            prev_auth_tag,
+                            event_auth_tag,
                             timestamp,
                         ),
                     )
@@ -690,6 +737,8 @@ class EventLedger:
             payload_sha256=payload_sha256,
             prev_hash=prev_hash,
             event_hash=event_hash,
+            prev_auth_tag=prev_auth_tag,
+            event_auth_tag=event_auth_tag,
             created_at=timestamp,
         )
         self._validate_paths()
@@ -713,6 +762,8 @@ class EventLedger:
             payload_sha256=str(row["payload_sha256"]),
             prev_hash=str(row["prev_hash"]),
             event_hash=str(row["event_hash"]),
+            prev_auth_tag=str(row["prev_auth_tag"]),
+            event_auth_tag=str(row["event_auth_tag"]),
             created_at=str(row["created_at"]),
         )
 
@@ -756,6 +807,7 @@ class EventLedger:
 
     def _verify_rows(self, rows: list[sqlite3.Row]) -> str:
         previous = ZERO_HASH
+        previous_auth_tag = ZERO_HASH
         for expected_seq, row in enumerate(rows, 1):
             record = self._record(row)
             if record.seq != expected_seq or record.schema_version != SCHEMA_VERSION:
@@ -779,7 +831,20 @@ class EventLedger:
             )
             if not hmac.compare_digest(expected_hash, record.event_hash):
                 raise ChainIntegrityError(f"event hash mismatch at sequence {record.seq}")
+            if not hmac.compare_digest(record.prev_auth_tag, previous_auth_tag):
+                raise ChainIntegrityError(
+                    f"event authentication link mismatch at sequence {record.seq}"
+                )
+            expected_auth_tag = self._event_auth_digest(
+                prev_auth_tag=record.prev_auth_tag,
+                event_hash=record.event_hash,
+            )
+            if not hmac.compare_digest(expected_auth_tag, record.event_auth_tag):
+                raise ChainIntegrityError(
+                    f"event authentication tag mismatch at sequence {record.seq}"
+                )
             previous = record.event_hash
+            previous_auth_tag = record.event_auth_tag
         self._verify_auxiliary_state({record.seq: record for record in map(self._record, rows)})
         return previous
 
