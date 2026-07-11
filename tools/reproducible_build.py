@@ -781,6 +781,8 @@ def _safe_repository_path(value: str, *, context: str) -> PurePosixPath:
     path = PurePosixPath(value)
     if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
         raise BuildPolicyError(f"{context} escapes the repository: {value!r}")
+    if path.as_posix() != value:
+        raise BuildPolicyError(f"{context} is not a canonical repository path: {value!r}")
     return path
 
 
@@ -889,11 +891,11 @@ def discover_projects(
             project_directory = PurePosixPath(manifest.path).parent
             raw_license_files = project.get("license-files")
             license_files: list[Path] = []
-            if raw_license_files is not None:
-                if not isinstance(raw_license_files, list) or not raw_license_files:
-                    raise BuildPolicyError(
-                        f"project license-files must be a non-empty string list in {manifest.path}"
-                    )
+            if not isinstance(raw_license_files, list) or not raw_license_files:
+                raise BuildPolicyError(
+                    f"project license-files must be a non-empty string list in {manifest.path}"
+                )
+            else:
                 seen_license_names: set[str] = set()
                 for raw_license_file in raw_license_files:
                     if not isinstance(raw_license_file, str) or any(
@@ -916,22 +918,22 @@ def discover_projects(
                         f"{project_relative_license.as_posix()}",
                         context=f"project license file in {manifest.path}",
                     )
+                    license_name = relative_license.name
+                    if license_name not in {"LICENSE", "NOTICE"}:
+                        raise BuildPolicyError(
+                            f"project license-files may contain only LICENSE and NOTICE in {manifest.path}"
+                        )
                     if relative_license.as_posix() not in by_path:
                         raise BuildPolicyError(
                             f"project license file is missing or unsafe: {relative_license}"
                         )
-                    folded_name = relative_license.name.casefold()
-                    if folded_name not in {"license", "notice"}:
-                        raise BuildPolicyError(
-                            f"project license-files may contain only LICENSE and NOTICE in {manifest.path}"
-                        )
-                    if folded_name in seen_license_names:
+                    if license_name in seen_license_names:
                         raise BuildPolicyError(
                             f"project license-files contain a duplicate name in {manifest.path}"
                         )
-                    seen_license_names.add(folded_name)
+                    seen_license_names.add(license_name)
                     license_files.append(root / relative_license.as_posix())
-                if seen_license_names != {"license", "notice"}:
+                if seen_license_names != {"LICENSE", "NOTICE"}:
                     raise BuildPolicyError(
                         f"project license-files must contain LICENSE and NOTICE in {manifest.path}"
                     )
@@ -939,6 +941,18 @@ def discover_projects(
             readme: Path | None = None
             readme_content_type: str | None = None
             if isinstance(readme_value, str):
+                if any(token in readme_value for token in ("*", "?", "[")):
+                    raise BuildPolicyError(
+                        f"project readme must use an exact path in {manifest.path}"
+                    )
+                project_relative_readme = _safe_repository_path(
+                    readme_value,
+                    context=f"project-relative readme in {manifest.path}",
+                )
+                if len(project_relative_readme.parts) != 1:
+                    raise BuildPolicyError(
+                        f"project readme must name a direct project file in {manifest.path}"
+                    )
                 readme_suffix = PurePosixPath(readme_value).suffix.casefold()
                 if readme_suffix == ".md":
                     readme_content_type = "text/markdown"
@@ -948,10 +962,6 @@ def discover_projects(
                     raise BuildPolicyError(
                         f"project readme must be a .md or .rst file in {manifest.path}"
                     )
-                project_relative_readme = _safe_repository_path(
-                    readme_value,
-                    context=f"project-relative readme in {manifest.path}",
-                )
                 readme_path = _safe_repository_path(
                     f"{project_directory.as_posix()}/"
                     f"{project_relative_readme.as_posix()}",

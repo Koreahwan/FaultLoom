@@ -114,6 +114,10 @@ project-root files `LICENSE` and `NOTICE`. Empty lists,
 absolute paths, traversal, globs, missing files, and case-folded duplicate
 basenames fail closed. This stricter project policy ensures every public wheel
 carries both policy files even though PEP 639 itself permits an empty list.
+Paths must already be in canonical POSIX spelling: normalization never turns
+`./`, repeated separators, trailing separators, or case variants into an
+accepted declaration. Project readmes are likewise exact, glob-free files
+directly beside `pyproject.toml`; nested and normalized aliases fail closed.
 
 This graph is still operator-declared until an admitted wheelhouse supplies
 independent package metadata. SBOM and provenance therefore label non-empty

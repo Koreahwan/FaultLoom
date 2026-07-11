@@ -159,12 +159,16 @@ name = "faultloom-demo"
 version = "0.1.0"
 description = "Synthetic package"
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.12,<3.13"
 dependencies = [
 {dependencies}]
 """,
     )
     write(root / "packages/demo/README.md", "# Demo\n")
+    write(root / "packages/demo/LICENSE", "project license\n")
+    write(root / "packages/demo/NOTICE", "project notice\n")
     write(root / "packages/demo/src/faultloom_demo/__init__.py", 'VALUE = "fixture"\n')
     run_git(root, "init", "-q")
     run_git(root, "config", "user.email", "fixture@faultloom.invalid")
@@ -177,17 +181,6 @@ class ReproducibleBuildTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             make_repository(root)
-            project = root / "packages/demo/pyproject.toml"
-            contents = project.read_text(encoding="utf-8").replace(
-                'description = "Synthetic package"',
-                'description = "Synthetic package"\n'
-                'license = "Apache-2.0"\n'
-                'license-files = ["LICENSE", "NOTICE"]',
-            )
-            write(project, contents)
-            write(root / "packages/demo/LICENSE", "project license\n")
-            write(root / "packages/demo/NOTICE", "project notice\n")
-            commit_all(root, "Declare exact project license files")
 
             output = root / "output"
             build_once(root, output, EPOCH)
@@ -211,9 +204,13 @@ class ReproducibleBuildTests(unittest.TestCase):
 
     def test_project_license_files_fail_closed(self) -> None:
         variants = (
+            (None, "must be a non-empty string list"),
             ('license-files = ["../LICENSE", "NOTICE"]', "escapes the repository"),
             ('license-files = ["/LICENSE", "NOTICE"]', "escapes the repository"),
             ('license-files = ["//LICENSE", "NOTICE"]', "escapes the repository"),
+            ('license-files = ["./LICENSE", "NOTICE"]', "not a canonical repository path"),
+            ('license-files = ["LICENSE/", "NOTICE"]', "not a canonical repository path"),
+            ('license-files = ["LICENSE", "./NOTICE"]', "not a canonical repository path"),
             ('license-files = ["LICEN*", "NOTICE"]', "must use exact paths"),
             ('license-files = []', "must be a non-empty string list"),
             (
@@ -221,8 +218,10 @@ class ReproducibleBuildTests(unittest.TestCase):
                 "must name direct project files",
             ),
             ('license-files = ["LICENSE"]', "must contain LICENSE and NOTICE"),
-            ('license-files = ["LICENSE", "license", "NOTICE"]', "duplicate name"),
-            ('license-files = ["LICENSE", "MISSING"]', "missing or unsafe"),
+            ('license-files = ["license", "NOTICE"]', "may contain only LICENSE and NOTICE"),
+            ('license-files = ["LICENSE", "notice"]', "may contain only LICENSE and NOTICE"),
+            ('license-files = ["LICENSE", "LICENSE", "NOTICE"]', "duplicate name"),
+            ('license-files = ["LICENSE", "MISSING"]', "may contain only LICENSE and NOTICE"),
         )
         for declaration, error in variants:
             with self.subTest(declaration=declaration):
@@ -230,10 +229,15 @@ class ReproducibleBuildTests(unittest.TestCase):
                     root = Path(raw)
                     make_repository(root)
                     project = root / "packages/demo/pyproject.toml"
-                    contents = project.read_text(encoding="utf-8").replace(
-                        'description = "Synthetic package"',
-                        f'description = "Synthetic package"\n{declaration}',
-                    )
+                    contents = project.read_text(encoding="utf-8")
+                    if declaration is None:
+                        contents = contents.replace(
+                            'license-files = ["LICENSE", "NOTICE"]\n', ""
+                        )
+                    else:
+                        contents = contents.replace(
+                            'license-files = ["LICENSE", "NOTICE"]', declaration
+                        )
                     write(project, contents)
                     write(root / "packages/demo/LICENSE", "project license\n")
                     write(root / "packages/demo/NOTICE", "project notice\n")
@@ -241,6 +245,14 @@ class ReproducibleBuildTests(unittest.TestCase):
                     commit_all(root, "Declare invalid project license files")
                     with self.assertRaisesRegex(BuildPolicyError, error):
                         discover_projects(root, load_policy(root))
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            make_repository(root)
+            (root / "packages/demo/NOTICE").unlink()
+            commit_all(root, "Remove a declared project license file")
+            with self.assertRaisesRegex(BuildPolicyError, "missing or unsafe"):
+                discover_projects(root, load_policy(root))
 
     def test_synthetic_package_build_is_byte_reproducible(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -827,10 +839,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "faultloom-other"
 version = "0.2.0"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.12,<3.13"
 dependencies = []
 """,
             )
+            write(root / "packages/other/LICENSE", "project license\n")
+            write(root / "packages/other/NOTICE", "project notice\n")
             write(root / "packages/other/src/faultloom_other/__init__.py", "VALUE = 2\n")
             commit_all(root, "Add mismatched internal dependency")
             policy = load_policy(root)
@@ -861,10 +877,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "faultloom-build-tool"
 version = "0.2.0"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.12,<3.13"
 dependencies = []
 """,
             )
+            write(root / "packages/build-tool/LICENSE", "project license\n")
+            write(root / "packages/build-tool/NOTICE", "project notice\n")
             write(
                 root / "packages/build-tool/src/faultloom_build_tool/__init__.py",
                 "VALUE = 2\n",
@@ -945,6 +965,26 @@ dependencies = []
             ('readme = "README.md"', 'readme = "/README.md"', "escapes the repository"),
             (
                 'readme = "README.md"',
+                'readme = "./README.md"',
+                "not a canonical repository path",
+            ),
+            (
+                'readme = "README.md"',
+                'readme = "README.md/"',
+                "not a canonical repository path",
+            ),
+            (
+                'readme = "README.md"',
+                'readme = "docs/README.md"',
+                "must name a direct project file",
+            ),
+            (
+                'readme = "README.md"',
+                'readme = "[README].md"',
+                "must use an exact path",
+            ),
+            (
+                'readme = "README.md"',
                 'readme = {file = "README.md", content-type = "text/markdown"}',
                 "table forms are unsupported",
             ),
@@ -1006,8 +1046,8 @@ dependencies = []
             make_repository(root)
             project = root / "packages/demo/pyproject.toml"
             contents = project.read_text(encoding="utf-8").replace(
-                'description = "Synthetic package"',
-                'description = "Synthetic package"\nlicense = {text = "Proprietary"}',
+                'license = "Apache-2.0"',
+                'license = {text = "Proprietary"}',
             )
             write(project, contents)
             commit_all(root, "Contradict the repository license")
