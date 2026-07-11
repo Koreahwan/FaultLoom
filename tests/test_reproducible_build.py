@@ -176,7 +176,136 @@ dependencies = [
     commit_all(root, "Synthetic build fixture")
 
 
+def add_gateway_fixture(root: Path, *, add_policy: bool = True) -> None:
+    write(
+        root / "Cargo.toml",
+        """[workspace]
+members = ["gateway"]
+resolver = "3"
+
+[profile.release]
+codegen-units = 1
+debug = 0
+incremental = false
+lto = "fat"
+opt-level = 3
+panic = "abort"
+strip = "symbols"
+""",
+    )
+    write(
+        root / "Cargo.lock",
+        """version = 4
+
+[[package]]
+name = "faultloom-gateway"
+version = "0.1.0"
+""",
+    )
+    write(
+        root / "gateway/Cargo.toml",
+        """[package]
+name = "faultloom-gateway"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96.1"
+description = "Fail-closed target egress kernel for FaultLoom"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "faultloom_gateway"
+path = "src/lib.rs"
+
+[[bin]]
+name = "faultloom-gateway"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+""",
+    )
+    write(root / "gateway/src/lib.rs", "#![forbid(unsafe_code)]\npub fn status() {}\n")
+    write(root / "gateway/src/main.rs", "#![forbid(unsafe_code)]\nfn main() {}\n")
+    if add_policy:
+        policy = root / "build-policy.toml"
+        contents = policy.read_text(encoding="utf-8")
+        contents += """
+
+[gateway]
+workspace_manifest = "Cargo.toml"
+manifest = "gateway/Cargo.toml"
+lock = "Cargo.lock"
+package = "faultloom-gateway"
+binary = "faultloom-gateway"
+version = "0.1.0"
+target = "x86_64-unknown-linux-gnu"
+cargo_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+"""
+        write(policy, contents)
+    commit_all(root, "Add synthetic Gateway fixture")
+
+
 class ReproducibleBuildTests(unittest.TestCase):
+    def test_tracked_cargo_requires_explicit_gateway_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            make_repository(root)
+            add_gateway_fixture(root, add_policy=False)
+            with self.assertRaisesRegex(BuildPolicyError, "explicit.*gateway"):
+                validate_repository_policy(root, load_policy(root))
+
+    def test_gateway_cannot_be_silently_omitted_without_staged_toolchain(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            make_repository(root)
+            add_gateway_fixture(root)
+            with self.assertRaisesRegex(BuildPolicyError, "staged Rust and Cargo"):
+                build_once(root, root / "output", EPOCH)
+
+    def test_gateway_manifest_lock_and_build_controls_fail_closed(self) -> None:
+        variants = (
+            (
+                "dependency",
+                "gateway/Cargo.toml",
+                lambda value: value.replace(
+                    "[dependencies]\n", '[dependencies]\nserde = "1"\n'
+                ),
+                "unsupported field or dependency",
+            ),
+            (
+                "lock dependency",
+                "Cargo.lock",
+                lambda value: value + 'dependencies = ["serde"]\n',
+                "exactly one source-less package",
+            ),
+            (
+                "build script",
+                "gateway/build.rs",
+                lambda _value: "fn main() {}\n",
+                "build scripts.*forbidden",
+            ),
+            (
+                "Cargo config",
+                ".cargo/config.toml",
+                lambda _value: "[build]\nrustc-wrapper = \"marker\"\n",
+                "Cargo configuration.*forbidden",
+            ),
+        )
+        for label, relative, mutate, message in variants:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                make_repository(root)
+                add_gateway_fixture(root)
+                path = root / relative
+                current = path.read_text(encoding="utf-8") if path.exists() else ""
+                write(path, mutate(current))
+                commit_all(root, f"Inject {label}")
+                with self.assertRaisesRegex(BuildPolicyError, message):
+                    validate_repository_policy(root, load_policy(root))
+
     def test_exact_project_license_files_are_packaged_from_the_project(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -2001,6 +2130,28 @@ dependencies = []
             with self.assertRaisesRegex(VerificationError, "binary digest mismatch"):
                 verify_toolchains(root, "fixture", environment)
             self.assertFalse(marker.exists())
+
+    def test_unpinned_cargo_binary_is_rejected_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            root = base / "source"
+            root.mkdir()
+            make_repository(root)
+            add_gateway_fixture(root)
+            rustc = base / "toolchain/bin/rustc"
+            cargo = base / "toolchain/bin/cargo"
+            cargo_marker = base / "executed-cargo"
+            write(rustc, "#!/bin/sh\nexit 1\n")
+            write(cargo, f"#!/bin/sh\ntouch '{cargo_marker}'\n")
+            rustc.chmod(0o755)
+            cargo.chmod(0o755)
+            pin_synthetic_rustc(root, rustc)
+            environment = os.environ.copy()
+            environment["FAULTLOOM_RUSTC"] = str(rustc)
+            environment["FAULTLOOM_CARGO"] = str(cargo)
+            with self.assertRaisesRegex(VerificationError, "cargo binary digest mismatch"):
+                verify_toolchains(root, "fixture", environment)
+            self.assertFalse(cargo_marker.exists())
 
     def test_non_compiling_fake_rustc_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

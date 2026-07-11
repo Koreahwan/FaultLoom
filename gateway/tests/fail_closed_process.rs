@@ -29,14 +29,7 @@ fn request(target: std::net::SocketAddr) -> DispatchRequest {
     }
 }
 
-#[test]
-fn separate_process_denies_untrusted_proofs_without_target_egress() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("owned listener");
-    listener
-        .set_nonblocking(true)
-        .expect("nonblocking listener");
-    let encoded =
-        encode_request(&request(listener.local_addr().expect("address"))).expect("encoded request");
+fn run_frame(encoded: &[u8]) -> GatewayResponse {
     let mut process = Command::new(env!("CARGO_BIN_EXE_faultloom-gateway"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -45,7 +38,7 @@ fn separate_process_denies_untrusted_proofs_without_target_egress() {
         .expect("spawn Gateway process");
     {
         let mut stdin = process.stdin.take().expect("Gateway stdin");
-        write_frame(&mut stdin, &encoded).expect("write request frame");
+        write_frame(&mut stdin, encoded).expect("write request frame");
     }
     let mut stdout = process.stdout.take().expect("Gateway stdout");
     let response_frame = read_frame(&mut stdout)
@@ -56,14 +49,24 @@ fn separate_process_denies_untrusted_proofs_without_target_egress() {
         .read_to_end(&mut trailing)
         .expect("read trailing output");
     assert!(trailing.is_empty());
-    let status = process.wait().expect("Gateway exit");
-    assert!(status.success());
+    assert!(process.wait().expect("Gateway exit").success());
+    decode_response(&response_frame).expect("typed Gateway response")
+}
+
+#[test]
+fn separate_process_denies_untrusted_proofs_without_target_egress() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("owned listener");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let encoded =
+        encode_request(&request(listener.local_addr().expect("address"))).expect("encoded request");
     assert!(matches!(
-        decode_response(&response_frame),
-        Ok(GatewayResponse::Denied(DeniedResponse {
+        run_frame(&encoded),
+        GatewayResponse::Denied(DeniedResponse {
             reason: DenialCode::ScopeVerifierUnavailable,
             ..
-        }))
+        })
     ));
     assert_eq!(
         listener.accept().expect_err("no target egress").kind(),
@@ -87,24 +90,58 @@ fn process_returns_a_typed_denial_for_unknown_action_kind() {
     let action_kind_offset = action_kind_offset + 2 + lease_length + 8;
     encoded[action_kind_offset] = 200;
 
-    let mut process = Command::new(env!("CARGO_BIN_EXE_faultloom-gateway"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn Gateway process");
-    {
-        let mut stdin = process.stdin.take().expect("Gateway stdin");
-        write_frame(&mut stdin, &encoded).expect("write request frame");
-    }
-    let response_frame = read_frame(&mut process.stdout.take().expect("Gateway stdout"))
-        .expect("read response")
-        .expect("response frame");
-    assert!(process.wait().expect("Gateway exit").success());
+    let response = run_frame(&encoded);
     assert!(matches!(
-        decode_response(&response_frame),
-        Ok(GatewayResponse::Denied(DeniedResponse {
+        response,
+        GatewayResponse::Denied(DeniedResponse {
             reason: DenialCode::UnknownActionKind,
             ..
-        }))
+        })
     ));
+    let GatewayResponse::Denied(denied) = response else {
+        unreachable!("matched denied response")
+    };
+    assert_eq!(denied.request_digest, Digest::of(&encoded));
+}
+
+#[test]
+fn denial_digest_binds_the_entire_canonical_request() {
+    let base = request("127.0.0.1:9".parse().expect("address"));
+    let mut variants = vec![base.clone()];
+    let mut target = base.clone();
+    target.target = "127.0.0.1:10".parse().expect("address");
+    variants.push(target);
+    let mut intent = base.clone();
+    intent.intent_digest = Digest::of(b"different-intent");
+    variants.push(intent);
+    let mut decision = base.clone();
+    decision.decision_digest = Digest::of(b"different-decision");
+    variants.push(decision);
+    let mut scope = base.clone();
+    scope.scope_proof = b"different-scope-proof".to_vec();
+    variants.push(scope);
+    let mut lease = base.clone();
+    lease.lease_proof = b"different-lease-proof".to_vec();
+    variants.push(lease);
+    let mut compiler = base;
+    compiler.compiler_proof = b"different-compiler-proof".to_vec();
+    variants.push(compiler);
+
+    let mut denial_digests = std::collections::HashSet::new();
+    for variant in variants {
+        let encoded = encode_request(&variant).expect("canonical request");
+        let response = run_frame(&encoded);
+        let GatewayResponse::Denied(denied) = response else {
+            panic!("production Gateway must deny without verifiers");
+        };
+        assert_eq!(denied.request_digest, Digest::of(&encoded));
+        denial_digests.insert(denied.request_digest);
+    }
+    assert_eq!(denial_digests.len(), 7);
+
+    let identical = encode_request(&request("127.0.0.1:9".parse().expect("address")))
+        .expect("canonical request");
+    let first = run_frame(&identical);
+    let second = run_frame(&identical);
+    assert_eq!(first, second);
 }

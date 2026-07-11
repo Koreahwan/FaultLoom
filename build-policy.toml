@@ -12,6 +12,16 @@ license_files = ["LICENSE", "NOTICE"]
 release_enabled = false
 ci_external_trust_anchor = false
 
+[gateway]
+workspace_manifest = "Cargo.toml"
+manifest = "gateway/Cargo.toml"
+lock = "Cargo.lock"
+package = "faultloom-gateway"
+binary = "faultloom-gateway"
+version = "0.1.0"
+target = "x86_64-unknown-linux-gnu"
+cargo_sha256 = "a73b2c25573d251489101c0d8f19ad3702eb9761166de5ed8437b472b6c038ce"
+
 [hooks]
 sbom = "tools/build_metadata_hook.py"
 provenance = "tools/build_metadata_hook.py"

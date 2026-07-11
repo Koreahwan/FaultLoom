@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -27,8 +28,20 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-BUILDER_ID = "faultloom-stdlib-builder/0.1"
+from tools.rust_toolchain import (
+    RustToolchainError,
+    RustToolchainSpec,
+    StagedRustToolchain,
+    rustc_closure_sha256,
+    sha256_file,
+    stage_verified_toolchain,
+)
+
+
+BUILDER_ID = "faultloom-core-builder/0.2"
 MINIMUM_ZIP_EPOCH = 315532800  # 1980-01-01T00:00:00Z
 PINNED_ACTION_REFERENCE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*"
@@ -164,6 +177,18 @@ jobs:
 
 
 @dataclass(frozen=True)
+class GatewayPolicy:
+    workspace_manifest: Path
+    manifest: Path
+    lock: Path
+    package: str
+    binary: str
+    version: str
+    target: str
+    cargo_sha256: str
+
+
+@dataclass(frozen=True)
 class Policy:
     python_version: str
     python_runtime_verification: str
@@ -179,6 +204,7 @@ class Policy:
     provenance_hook: Path
     release_enabled: bool
     ci_external_trust_anchor: bool
+    gateway: GatewayPolicy | None
 
 
 @dataclass(frozen=True)
@@ -200,6 +226,25 @@ class TrackedFile:
     mode: str
     path: str
     object_id: str
+
+
+@dataclass(frozen=True)
+class NativeArtifact:
+    artifact_name: str
+    component_name: str
+    version: str
+    target: str
+    purl: str
+    sha256: str
+    size: int
+    source_commit: str
+    source_tree: str
+    cargo_lock_sha256: str
+    recipe_sha256: str
+    rustc_sha256: str
+    rustc_closure_sha256: str
+    cargo_sha256: str
+    host_environment_verification: str
 
 
 def _normalized_name(value: str) -> str:
@@ -262,6 +307,48 @@ def load_policy(root: Path, *, revision: str = "HEAD") -> Policy:
         provenance_hook = _safe_repository_path(
             hooks["provenance"], context="build policy provenance hook"
         )
+        gateway_raw = raw.get("gateway")
+        gateway = None
+        if gateway_raw is not None:
+            if not isinstance(gateway_raw, dict) or set(gateway_raw) != {
+                "workspace_manifest",
+                "manifest",
+                "lock",
+                "package",
+                "binary",
+                "version",
+                "target",
+                "cargo_sha256",
+            }:
+                raise BuildPolicyError(
+                    "[gateway] must contain the exact deterministic build fields"
+                )
+            gateway = GatewayPolicy(
+                workspace_manifest=(
+                    root
+                    / _safe_repository_path(
+                        gateway_raw["workspace_manifest"],
+                        context="Gateway workspace manifest",
+                    ).as_posix()
+                ),
+                manifest=(
+                    root
+                    / _safe_repository_path(
+                        gateway_raw["manifest"], context="Gateway manifest"
+                    ).as_posix()
+                ),
+                lock=(
+                    root
+                    / _safe_repository_path(
+                        gateway_raw["lock"], context="Gateway lock"
+                    ).as_posix()
+                ),
+                package=gateway_raw["package"],
+                binary=gateway_raw["binary"],
+                version=gateway_raw["version"],
+                target=gateway_raw["target"],
+                cargo_sha256=gateway_raw["cargo_sha256"],
+            )
         policy = Policy(
             python_version=raw["python_version"],
             python_runtime_verification=raw["python_runtime_verification"],
@@ -279,6 +366,7 @@ def load_policy(root: Path, *, revision: str = "HEAD") -> Policy:
             provenance_hook=root / provenance_hook.as_posix(),
             release_enabled=raw["release_enabled"],
             ci_external_trust_anchor=raw["ci_external_trust_anchor"],
+            gateway=gateway,
         )
     except (KeyError, TypeError) as exc:
         raise BuildPolicyError(f"invalid build policy field: {exc}") from exc
@@ -323,6 +411,32 @@ def load_policy(root: Path, *, revision: str = "HEAD") -> Policy:
         raise BuildPolicyError(
             "rustc_closure_sha256 must be a lowercase SHA-256 digest"
         )
+    if policy.gateway is not None:
+        gateway_strings = (
+            policy.gateway.package,
+            policy.gateway.binary,
+            policy.gateway.version,
+            policy.gateway.target,
+            policy.gateway.cargo_sha256,
+        )
+        if not all(isinstance(item, str) for item in gateway_strings):
+            raise BuildPolicyError("Gateway policy values must be strings")
+        if policy.gateway.workspace_manifest.relative_to(root) != Path("Cargo.toml"):
+            raise BuildPolicyError("Gateway workspace_manifest must be Cargo.toml")
+        if policy.gateway.manifest.relative_to(root) != Path("gateway/Cargo.toml"):
+            raise BuildPolicyError("Gateway manifest must be gateway/Cargo.toml")
+        if policy.gateway.lock.relative_to(root) != Path("Cargo.lock"):
+            raise BuildPolicyError("Gateway lock must be Cargo.lock")
+        if policy.gateway.package != "faultloom-gateway":
+            raise BuildPolicyError("Gateway package must be faultloom-gateway")
+        if policy.gateway.binary != "faultloom-gateway":
+            raise BuildPolicyError("Gateway binary must be faultloom-gateway")
+        if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", policy.gateway.version) is None:
+            raise BuildPolicyError("Gateway version must be an exact numeric release")
+        if policy.gateway.target != policy.rustc_host:
+            raise BuildPolicyError("Gateway target must equal the pinned Rust host")
+        if re.fullmatch(r"[0-9a-f]{64}", policy.gateway.cargo_sha256) is None:
+            raise BuildPolicyError("Gateway cargo_sha256 must be a lowercase SHA-256 digest")
     license_keys: dict[str, str] = {}
     for license_path in policy.license_files:
         basename = license_path.name
@@ -716,7 +830,120 @@ def validate_repository_policy(
         raise BuildPolicyError(
             "CI workflow must match the canonical clean-checkout gate template"
         )
+    _validate_gateway_repository(
+        root,
+        policy,
+        entries=entries,
+        head_bytes=head_bytes,
+    )
     return {"python": policy.python_version, "rust": policy.rust_version}
+
+
+def _validate_gateway_repository(
+    root: Path,
+    policy: Policy,
+    *,
+    entries: dict[str, TrackedFile],
+    head_bytes: Any,
+) -> None:
+    manifests = {path for path in entries if PurePosixPath(path).name == "Cargo.toml"}
+    locks = {path for path in entries if PurePosixPath(path).name == "Cargo.lock"}
+    unsafe_controls = sorted(
+        path
+        for path in entries
+        if PurePosixPath(path).name == "build.rs"
+        or (
+            ".cargo" in PurePosixPath(path).parts
+            and PurePosixPath(path).name in {"config", "config.toml"}
+        )
+    )
+    gateway = policy.gateway
+    if gateway is None:
+        if manifests or locks or unsafe_controls:
+            raise BuildPolicyError(
+                "tracked Cargo inputs require an explicit [gateway] build policy"
+            )
+        return
+    if unsafe_controls:
+        raise BuildPolicyError(
+            f"Gateway build scripts and Cargo configuration are forbidden: {unsafe_controls}"
+        )
+    expected_manifests = {
+        gateway.workspace_manifest.relative_to(root).as_posix(),
+        gateway.manifest.relative_to(root).as_posix(),
+    }
+    expected_locks = {gateway.lock.relative_to(root).as_posix()}
+    if manifests != expected_manifests or locks != expected_locks:
+        raise BuildPolicyError(
+            "Gateway Cargo manifests and lock must exactly match the admitted policy"
+        )
+
+    workspace = _read_toml_bytes(
+        head_bytes("Cargo.toml"), "Gateway workspace Cargo.toml at HEAD"
+    )
+    expected_workspace = {
+        "workspace": {"members": ["gateway"], "resolver": "3"},
+        "profile": {
+            "release": {
+                "codegen-units": 1,
+                "debug": 0,
+                "incremental": False,
+                "lto": "fat",
+                "opt-level": 3,
+                "panic": "abort",
+                "strip": "symbols",
+            }
+        },
+    }
+    if workspace != expected_workspace:
+        raise BuildPolicyError(
+            "Gateway workspace manifest must use the exact deterministic release profile"
+        )
+
+    manifest = _read_toml_bytes(
+        head_bytes("gateway/Cargo.toml"), "Gateway package Cargo.toml at HEAD"
+    )
+    expected_manifest = {
+        "package": {
+            "name": gateway.package,
+            "version": gateway.version,
+            "edition": "2024",
+            "rust-version": policy.rust_version,
+            "description": "Fail-closed target egress kernel for FaultLoom",
+            "license": "Apache-2.0",
+            "publish": False,
+        },
+        "lib": {"name": "faultloom_gateway", "path": "src/lib.rs"},
+        "bin": [{"name": gateway.binary, "path": "src/main.rs"}],
+        "dependencies": {},
+        "lints": {"rust": {"unsafe_code": "forbid"}},
+    }
+    if manifest != expected_manifest:
+        raise BuildPolicyError(
+            "Gateway package manifest contains an unsupported field or dependency"
+        )
+
+    lock = _read_toml_bytes(head_bytes("Cargo.lock"), "Gateway Cargo.lock at HEAD")
+    if lock != {
+        "version": 4,
+        "package": [{"name": gateway.package, "version": gateway.version}],
+    }:
+        raise BuildPolicyError(
+            "Gateway lock must contain exactly one source-less package and no dependencies"
+        )
+    required_sources = {"gateway/src/lib.rs", "gateway/src/main.rs"}
+    if not required_sources <= entries.keys():
+        raise BuildPolicyError("Gateway library or binary source is missing from HEAD")
+
+
+def rust_toolchain_spec(policy: Policy) -> RustToolchainSpec:
+    return RustToolchainSpec(
+        version=policy.rust_version,
+        host=policy.rustc_host,
+        rustc_sha256=policy.rustc_sha256,
+        rustc_closure_sha256=policy.rustc_closure_sha256,
+        cargo_sha256=(None if policy.gateway is None else policy.gateway.cargo_sha256),
+    )
 
 
 def parse_release_lock(
@@ -1573,12 +1800,266 @@ def _deterministic_gzip(data: bytes, epoch: int) -> bytes:
     return bytes(output)
 
 
+def _gateway_recipe(gateway: GatewayPolicy) -> dict[str, Any]:
+    return {
+        "builder": "cargo",
+        "command": [
+            "build",
+            "--manifest-path",
+            "<immutable-source>/Cargo.toml",
+            "--package",
+            gateway.package,
+            "--bin",
+            gateway.binary,
+            "--release",
+            "--frozen",
+            "--locked",
+            "--offline",
+            "--target",
+            gateway.target,
+        ],
+        "environment": {
+            "CARGO_HOME": "<private-empty-directory>",
+            "CARGO_INCREMENTAL": "0",
+            "CARGO_NET_OFFLINE": "true",
+            "CARGO_TARGET_DIR": "<private-target-directory>",
+            "HOME": "<private-empty-directory>",
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PATH": "/usr/bin:/bin",
+            "RUSTC": "<content-verified-staged-rustc>",
+            "RUSTFLAGS": "--remap-path-prefix=<immutable-source>=/faultloom-core",
+            "SOURCE_DATE_EPOCH": "<git-commit-epoch>",
+            "TZ": "UTC",
+        },
+        "network": "offline_requested_not_os_enforced",
+        "source": "verified_immutable_git_tree",
+        "working_directory": "/",
+    }
+
+
+def _materialize_source_archive(source_archive: bytes, destination: Path) -> None:
+    with tarfile.open(fileobj=io.BytesIO(source_archive), mode="r:gz") as archive:
+        for member in archive.getmembers():
+            path = PurePosixPath(member.name)
+            if (
+                not path.parts
+                or path.parts[0] != "faultloom-core"
+                or path.is_absolute()
+                or ".." in path.parts
+            ):
+                raise BuildPolicyError("source archive has an unsafe Gateway build path")
+            relative = path.parts[1:]
+            target = destination.joinpath(*relative)
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            if not member.isfile():
+                raise BuildPolicyError("source archive has a non-regular Gateway build input")
+            source = archive.extractfile(member)
+            if source is None:
+                raise BuildPolicyError("cannot read a Gateway build input from source archive")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("xb") as handle:
+                handle.write(source.read())
+            target.chmod(0o755 if member.mode & 0o111 else 0o644)
+
+
+def _read_gateway_elf(path: Path, *, target: str) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise BuildPolicyError(f"cannot open the Gateway build output safely: {exc}") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size == 0:
+            raise BuildPolicyError("Gateway build output is not a non-empty regular file")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    stable_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns")
+    if any(getattr(before, field) != getattr(after, field) for field in stable_fields):
+        raise BuildPolicyError("Gateway build output changed while it was being read")
+    if stat.S_IMODE(before.st_mode) & 0o111 == 0:
+        raise BuildPolicyError("Gateway build output is not executable")
+    data = b"".join(chunks)
+    if target != "x86_64-unknown-linux-gnu":
+        raise BuildPolicyError("Gateway ELF validation supports only the admitted Linux target")
+    if (
+        len(data) < 64
+        or data[:4] != b"\x7fELF"
+        or data[4] != 2
+        or data[5] != 1
+        or int.from_bytes(data[16:18], "little") not in {2, 3}
+        or int.from_bytes(data[18:20], "little") != 0x3E
+        or int.from_bytes(data[20:24], "little") != 1
+    ):
+        raise BuildPolicyError("Gateway build output is not an x86-64 little-endian ELF")
+    return data
+
+
+def _require_gateway_toolchain(
+    policy: Policy, toolchain: StagedRustToolchain | None
+) -> StagedRustToolchain:
+    if policy.gateway is None:
+        raise BuildPolicyError("internal error: Gateway toolchain requested without policy")
+    if toolchain is None or toolchain.cargo is None:
+        raise BuildPolicyError(
+            "Gateway artifacts require the content-verified staged Rust and Cargo toolchain"
+        )
+    expected = rust_toolchain_spec(policy)
+    if toolchain.spec != expected:
+        raise BuildPolicyError("Gateway toolchain does not match the immutable build policy")
+    for name, path, digest in (
+        ("rustc", toolchain.rustc, expected.rustc_sha256),
+        ("cargo", toolchain.cargo, expected.cargo_sha256),
+    ):
+        if not path.is_absolute() or not path.is_file() or path.is_symlink():
+            raise BuildPolicyError(f"Gateway {name} is not a regular absolute staged file")
+        if digest is None or sha256_file(path) != digest:
+            raise BuildPolicyError(f"Gateway {name} digest changed before the build")
+    if toolchain.cargo.parent.parent != toolchain.rustc.parent.parent:
+        raise BuildPolicyError("Gateway Cargo and rustc do not share one staged toolchain")
+    if rustc_closure_sha256(toolchain.rustc, expected.host) != expected.rustc_closure_sha256:
+        raise BuildPolicyError("Gateway staged Rust closure changed before the build")
+    return toolchain
+
+
+def build_gateway_release(
+    root: Path,
+    policy: Policy,
+    epoch: int,
+    *,
+    revision: str,
+    source: dict[str, str],
+    source_archive: bytes,
+    toolchain: StagedRustToolchain | None,
+) -> tuple[str, bytes, NativeArtifact]:
+    gateway = policy.gateway
+    if gateway is None:
+        raise BuildPolicyError("internal error: Gateway build requested without policy")
+    admitted = _require_gateway_toolchain(policy, toolchain)
+    for ambient in (Path("/.cargo/config"), Path("/.cargo/config.toml")):
+        if ambient.exists():
+            raise BuildPolicyError(
+                f"ambient root Cargo configuration prevents an isolated build: {ambient}"
+            )
+    with tempfile.TemporaryDirectory(prefix="faultloom-gateway-build-") as raw:
+        build_root = Path(raw)
+        snapshot = build_root / "immutable-source"
+        snapshot.mkdir()
+        _materialize_source_archive(source_archive, snapshot)
+        cargo_home = build_root / "cargo-home"
+        target_dir = build_root / "target"
+        home = build_root / "home"
+        cargo_home.mkdir()
+        target_dir.mkdir()
+        home.mkdir()
+        environment = {
+            "CARGO_HOME": str(cargo_home),
+            "CARGO_INCREMENTAL": "0",
+            "CARGO_NET_OFFLINE": "true",
+            "CARGO_TARGET_DIR": str(target_dir),
+            "HOME": str(home),
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PATH": "/usr/bin:/bin",
+            "RUSTC": str(admitted.rustc),
+            "RUSTFLAGS": f"--remap-path-prefix={snapshot}=/faultloom-core",
+            "SOURCE_DATE_EPOCH": str(epoch),
+            "TZ": "UTC",
+        }
+        command = [
+            str(admitted.cargo),
+            "build",
+            "--manifest-path",
+            str(snapshot / "Cargo.toml"),
+            "--package",
+            gateway.package,
+            "--bin",
+            gateway.binary,
+            "--release",
+            "--frozen",
+            "--locked",
+            "--offline",
+            "--target",
+            gateway.target,
+        ]
+        result = subprocess.run(
+            command,
+            cwd=Path("/"),
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise BuildPolicyError(
+                "locked offline Gateway build failed: "
+                f"{result.stdout}{result.stderr}"
+            )
+        binary = target_dir / gateway.target / "release" / gateway.binary
+        data = _read_gateway_elf(binary, target=gateway.target)
+        lock_sha256 = _sha256((snapshot / "Cargo.lock").read_bytes())
+    if sha256_file(admitted.rustc) != policy.rustc_sha256:
+        raise BuildPolicyError("Gateway staged rustc changed during the build")
+    if sha256_file(admitted.cargo) != gateway.cargo_sha256:
+        raise BuildPolicyError("Gateway staged Cargo changed during the build")
+    if rustc_closure_sha256(admitted.rustc, policy.rustc_host) != policy.rustc_closure_sha256:
+        raise BuildPolicyError("Gateway staged Rust closure changed during the build")
+
+    artifact_name = f"{gateway.binary}-{gateway.version}-{gateway.target}"
+    recipe_sha256 = _sha256(_canonical_json(_gateway_recipe(gateway)))
+    native = NativeArtifact(
+        artifact_name=artifact_name,
+        component_name=gateway.package,
+        version=gateway.version,
+        target=gateway.target,
+        purl=f"pkg:cargo/{gateway.package}@{gateway.version}",
+        sha256=_sha256(data),
+        size=len(data),
+        source_commit=source["commit"],
+        source_tree=source["tree"],
+        cargo_lock_sha256=lock_sha256,
+        recipe_sha256=recipe_sha256,
+        rustc_sha256=policy.rustc_sha256,
+        rustc_closure_sha256=policy.rustc_closure_sha256,
+        cargo_sha256=gateway.cargo_sha256,
+        host_environment_verification="linker_libc_kernel_unverified",
+    )
+    return artifact_name, data, native
+
+
 def _component(project: Project) -> dict[str, Any]:
     return {
         "name": project.name,
         "version": project.version,
         "dependencies": list(project.dependencies),
         "purl": f"pkg:pypi/{_normalized_name(project.name)}@{project.version}",
+    }
+
+
+def _native_component(artifact: NativeArtifact) -> dict[str, Any]:
+    return {
+        "artifact_name": artifact.artifact_name,
+        "component_name": artifact.component_name,
+        "version": artifact.version,
+        "target": artifact.target,
+        "purl": artifact.purl,
+        "sha256": artifact.sha256,
+        "size": artifact.size,
+        "source_commit": artifact.source_commit,
+        "source_tree": artifact.source_tree,
+        "cargo_lock_sha256": artifact.cargo_lock_sha256,
+        "recipe_sha256": artifact.recipe_sha256,
+        "rustc_sha256": artifact.rustc_sha256,
+        "rustc_closure_sha256": artifact.rustc_closure_sha256,
+        "cargo_sha256": artifact.cargo_sha256,
+        "host_environment_verification": artifact.host_environment_verification,
     }
 
 
@@ -1592,12 +2073,15 @@ def make_build_context(
     epoch: int,
     *,
     source: dict[str, str] | None = None,
+    native_artifacts: tuple[NativeArtifact, ...] = (),
 ) -> dict[str, Any]:
+    source_identity = git_identity(root) if source is None else dict(source)
+    native_context = [_native_component(item) for item in native_artifacts]
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "builder": BUILDER_ID,
         "source_date_epoch": epoch,
-        "source": git_identity(root) if source is None else dict(source),
+        "source": source_identity,
         "toolchains": {
             "python": policy.python_version,
             "python_runtime_verification": policy.python_runtime_verification,
@@ -1605,7 +2089,17 @@ def make_build_context(
             "rustc_host": policy.rustc_host,
             "rustc_sha256": policy.rustc_sha256,
             "rustc_closure_sha256": policy.rustc_closure_sha256,
-            "rust_runtime_verification": "policy_declared_unverified",
+            "cargo_sha256": (
+                None if policy.gateway is None else policy.gateway.cargo_sha256
+            ),
+            "rust_runtime_verification": (
+                "rustc_cargo_closure_digests_and_locked_offline_build_verified"
+                if native_artifacts
+                else "policy_declared_unverified"
+            ),
+            "host_environment_verification": (
+                "linker_libc_kernel_unverified" if native_artifacts else "not_used"
+            ),
         },
         "ci_policy": {
             "workflow": ".github/workflows/ci.yml",
@@ -1625,6 +2119,7 @@ def make_build_context(
             ),
         },
         "components": [_component(project) for project in projects],
+        "native_artifacts": native_context,
         "locked_dependencies": [
             {
                 "name": name,
@@ -1723,12 +2218,51 @@ def render_metadata_from_head(
         return output_path.read_bytes()
 
 
-def _write_artifact(path: Path, data: bytes) -> None:
+def _write_artifact(path: Path, data: bytes, *, mode: int = 0o644) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("xb") as handle:
         handle.write(data)
         handle.flush()
         os.fsync(handle.fileno())
+    path.chmod(mode)
+
+
+def build_primary_artifacts(
+    root: Path,
+    policy: Policy,
+    projects: tuple[Project, ...],
+    epoch: int,
+    *,
+    revision: str,
+    source: dict[str, str],
+    toolchain: StagedRustToolchain | None,
+) -> tuple[dict[str, bytes], dict[str, int], tuple[NativeArtifact, ...]]:
+    artifacts: dict[str, bytes] = {}
+    modes: dict[str, int] = {}
+    for project in projects:
+        name, data = build_wheel(root, project, policy, epoch, revision=revision)
+        artifacts[name] = data
+        modes[name] = 0o644
+    source_name, source_data = build_source_archive(root, epoch, revision=revision)
+    artifacts[source_name] = source_data
+    modes[source_name] = 0o644
+    native: tuple[NativeArtifact, ...] = ()
+    if policy.gateway is not None:
+        name, data, descriptor = build_gateway_release(
+            root,
+            policy,
+            epoch,
+            revision=revision,
+            source=source,
+            source_archive=source_data,
+            toolchain=toolchain,
+        )
+        if name in artifacts:
+            raise BuildPolicyError(f"duplicate primary artifact name: {name}")
+        artifacts[name] = data
+        modes[name] = 0o755
+        native = (descriptor,)
+    return artifacts, modes, native
 
 
 def build_once(
@@ -1738,6 +2272,7 @@ def build_once(
     *,
     release: bool = False,
     revision: str | None = None,
+    toolchain: StagedRustToolchain | None = None,
 ) -> dict[str, str]:
     root = root.resolve()
     output = output.resolve()
@@ -1768,16 +2303,17 @@ def build_once(
         raise BuildPolicyError(f"output directory is not empty: {output}")
     output.mkdir(parents=True, exist_ok=True)
 
-    artifacts: dict[str, bytes] = {}
-    for project in projects:
-        name, data = build_wheel(
-            root, project, policy, epoch, revision=revision
-        )
-        artifacts[name] = data
-    source_name, source_data = build_source_archive(root, epoch, revision=revision)
-    artifacts[source_name] = source_data
+    artifacts, artifact_modes, native_artifacts = build_primary_artifacts(
+        root,
+        policy,
+        projects,
+        epoch,
+        revision=revision,
+        source=source,
+        toolchain=toolchain,
+    )
     for name, data in sorted(artifacts.items()):
-        _write_artifact(output / name, data)
+        _write_artifact(output / name, data, mode=artifact_modes[name])
 
     context = make_build_context(
         root,
@@ -1788,6 +2324,7 @@ def build_once(
         artifacts,
         epoch,
         source=source,
+        native_artifacts=native_artifacts,
     )
     context_path = output / ".build-context.json"
     _write_artifact(context_path, _canonical_json(context))
@@ -1823,9 +2360,12 @@ def build_once(
     return dict(sorted(checksums.items()))
 
 
-def _directory_bytes(directory: Path) -> dict[str, bytes]:
+def _directory_bytes(directory: Path) -> dict[str, tuple[int, bytes]]:
     return {
-        path.relative_to(directory).as_posix(): path.read_bytes()
+        path.relative_to(directory).as_posix(): (
+            stat.S_IMODE(path.stat().st_mode),
+            path.read_bytes(),
+        )
         for path in sorted(directory.rglob("*"))
         if path.is_file()
     }
@@ -1838,6 +2378,7 @@ def build_reproducibly(
     *,
     release: bool = False,
     revision: str | None = None,
+    toolchain: StagedRustToolchain | None = None,
 ) -> dict[str, str]:
     root = root.resolve()
     require_clean_checkout(root)
@@ -1850,10 +2391,20 @@ def build_reproducibly(
         first = Path(first_raw)
         second = Path(second_raw)
         first_manifest = build_once(
-            root, first, epoch, release=release, revision=revision
+            root,
+            first,
+            epoch,
+            release=release,
+            revision=revision,
+            toolchain=toolchain,
         )
         second_manifest = build_once(
-            root, second, epoch, release=release, revision=revision
+            root,
+            second,
+            epoch,
+            release=release,
+            revision=revision,
+            toolchain=toolchain,
         )
         if _directory_bytes(first) != _directory_bytes(second):
             raise BuildPolicyError("two builds from the same checkout were not byte-identical")
@@ -1863,6 +2414,7 @@ def build_reproducibly(
         for path in sorted(first.iterdir()):
             if path.is_file():
                 shutil.copyfile(path, output / path.name)
+                (output / path.name).chmod(stat.S_IMODE(path.stat().st_mode))
         return first_manifest
 
 
@@ -1887,14 +2439,52 @@ def main() -> int:
     parser.add_argument("--source-date-epoch", type=int)
     parser.add_argument("--release", action="store_true")
     parser.add_argument("--verify-reproducible", action="store_true")
+    parser.add_argument(
+        "--rust-toolchain",
+        default=os.environ.get("FAULTLOOM_RUST_TOOLCHAIN", "stable"),
+        help="preinstalled rustup alias; content must match build-policy.toml",
+    )
     args = parser.parse_args()
     try:
         epoch = _epoch_from_args(args.source_date_epoch)
-        if args.verify_reproducible:
-            manifest = build_reproducibly(args.root, args.out, epoch, release=args.release)
+        root = args.root.resolve()
+        require_clean_checkout(root)
+        source = git_identity(root)
+        policy = load_policy(root, revision=source["commit"])
+        validate_repository_policy(root, policy, revision=source["commit"])
+
+        def run(toolchain: StagedRustToolchain | None) -> dict[str, str]:
+            if args.verify_reproducible:
+                return build_reproducibly(
+                    root,
+                    args.out,
+                    epoch,
+                    release=args.release,
+                    revision=source["commit"],
+                    toolchain=toolchain,
+                )
+            return build_once(
+                root,
+                args.out,
+                epoch,
+                release=args.release,
+                revision=source["commit"],
+                toolchain=toolchain,
+            )
+
+        if policy.gateway is None:
+            manifest = run(None)
         else:
-            manifest = build_once(args.root, args.out, epoch, release=args.release)
-    except BuildPolicyError as exc:
+            environment = os.environ.copy()
+            environment["CARGO_NET_OFFLINE"] = "true"
+            with stage_verified_toolchain(
+                rust_toolchain_spec(policy),
+                alias=args.rust_toolchain,
+                environment=environment,
+                root=root,
+            ) as toolchain:
+                manifest = run(toolchain)
+    except (BuildPolicyError, RustToolchainError) as exc:
         print(f"build refused: {exc}", file=sys.stderr)
         return 1
     print(json.dumps({"ok": True, "artifacts": manifest}, indent=2, sort_keys=True))

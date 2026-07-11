@@ -2,7 +2,9 @@
 
 FaultLoom Core's release-candidate builder has no download or package-install
 operation. It uses the version-selected Python standard library to assemble pure-Python
-wheels and a tracked-source archive without invoking a package build backend.
+wheels and a tracked-source archive without invoking a package build backend. It also
+builds the separately named `faultloom-gateway-0.1.0-x86_64-unknown-linux-gnu`
+release ELF with pinned Cargo and rustc from an immutable source snapshot.
 Build inputs are read from immutable blobs in the checked-out Git `HEAD`, not
 from worktree files. Ignored and untracked files therefore cannot enter an
 artifact. `assume-unchanged` and `skip-worktree` index flags are rejected so a
@@ -32,8 +34,10 @@ The verifier requests offline behavior through package-manager environment
 flags, validates the dependency lock and pinned CI action revisions, resolves
 the selected compiler from the preinstalled rustup toolchain directory,
 compiles and runs a randomized native
-Rust probe, builds twice with `SOURCE_DATE_EPOCH` set to
-the checked-out commit time, and byte-compares every artifact. Offline flags
+Rust probe, invokes Cargo with `--frozen --locked --offline`, builds twice with
+`SOURCE_DATE_EPOCH` set to the checked-out commit time, and compares every artifact
+byte and file mode. The verifier then independently rebuilds all primary artifacts a
+third time while reconciling metadata. Offline flags
 are not network isolation: provenance records `offline_requested` with
 `enforced = false`. Release mode requires a separately enforced isolation
 boundary and fails closed while that boundary is absent.
@@ -45,8 +49,11 @@ compares it with `rustc_sha256` before execution. It also reconciles
 the host sysroot. The verifier copies that closure into a private staged
 snapshot, checks the staged compiler and closure again, removes write bits,
 and invokes only the staged compiler with a minimal environment that excludes
-loader and compiler override variables. It reconciles the verbose host/version
-identity, runs the semantic probe, and re-hashes the staged closure afterward.
+loader and compiler override variables. Gateway builds additionally require Cargo
+from that same toolchain; its binary is checked against `[gateway].cargo_sha256`,
+copied into the private stage, and its verbose version, host, commit, and date are
+validated. The verifier reconciles the compiler identity, runs the semantic probe,
+and re-hashes rustc, Cargo, and the staged closure after all builds.
 The modes are a mutation guard, not an OS-enforced immutable mount; admission
 therefore also requires the canonical CI workflow below to exclude arbitrary
 repository-controlled code before the gate. Release remains disabled until an
@@ -65,10 +72,26 @@ the canonical workflow SHA-256 and `external_trust_anchor = false`. Branch
 protection must require a trusted
 workflow or ruleset outside the candidate revision before this check can serve
 as release evidence; release mode remains disabled while that receipt is absent.
-The verifier reconstructs the full
-CycloneDX component/dependency graph and SLSA provenance predicate from Git
-inputs and rejects partial or marker-only metadata. Artifacts include root
-`LICENSE` and `NOTICE` files and `SHA256SUMS`.
+The verifier reconstructs the full CycloneDX component/dependency graph and SLSA
+provenance predicate from Git inputs and rejects partial or marker-only metadata.
+The Gateway is an independent `pkg:cargo/faultloom-gateway@0.1.0` application
+component and provenance subject, bound to the Git commit/tree, Cargo lock digest,
+build-recipe digest, target, rustc closure, and exact rustc/Cargo digests. Host linker,
+libc, dynamic-loader, and kernel bytes remain explicitly `unverified`; therefore this
+is still a reproducibility candidate rather than a hermetic release receipt. Artifacts
+include root `LICENSE` and `NOTICE` files and `SHA256SUMS`.
+
+The explicit `[gateway]` policy admits exactly the root workspace manifest, lock,
+Gateway package manifest, dependency-free package, and deterministic release profile.
+Tracked Cargo inputs without that policy, additional manifests or locks, build scripts,
+Cargo configuration, dependency sections, and lock drift fail before Cargo executes.
+The standalone builder uses the same staged toolchain path and cannot silently emit a
+Python-only artifact set when the Gateway policy is present:
+
+```bash
+SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" \
+  python3 tools/reproducible_build.py --out dist --verify-reproducible
+```
 
 The public-tree leakage gate runs against a temporary materialization of the
 same immutable `HEAD` objects used by the source archive. Clean filters or

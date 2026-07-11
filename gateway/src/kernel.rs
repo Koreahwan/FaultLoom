@@ -50,13 +50,17 @@ where
         }
     }
 
-    pub(crate) fn handle(&self, request: DispatchRequest) -> GatewayResponse {
+    pub(crate) fn handle(
+        &self,
+        request: DispatchRequest,
+        request_frame_digest: Digest,
+    ) -> GatewayResponse {
         if let Err(reason) = request.validate() {
-            return denied(&request, reason);
+            return denied(&request, request_frame_digest, reason);
         }
         let scope = match self.scope.verify(&request) {
             Ok(approval) => approval,
-            Err(reason) => return denied(&request, reason),
+            Err(reason) => return denied(&request, request_frame_digest, reason),
         };
         if scope.intent_digest != request.intent_digest
             || scope.decision_digest != request.decision_digest
@@ -67,29 +71,41 @@ where
             || scope.action_class != request.action_class
             || scope.required_features != request.required_features
         {
-            return denied(&request, DenialCode::VerificationBindingMismatch);
+            return denied(
+                &request,
+                request_frame_digest,
+                DenialCode::VerificationBindingMismatch,
+            );
         }
         let lease = match self.lease.verify(&request) {
             Ok(approval) => approval,
-            Err(reason) => return denied(&request, reason),
+            Err(reason) => return denied(&request, request_frame_digest, reason),
         };
         if lease.intent_digest != request.intent_digest
             || lease.lease_id != request.lease_id
             || lease.scope_epoch != request.scope_epoch
             || lease.maximum_dispatches != 1
         {
-            return denied(&request, DenialCode::VerificationBindingMismatch);
+            return denied(
+                &request,
+                request_frame_digest,
+                DenialCode::VerificationBindingMismatch,
+            );
         }
         let compiled = match self.compiler.compile(&request) {
             Ok(compiled) => compiled,
-            Err(reason) => return denied(&request, reason),
+            Err(reason) => return denied(&request, request_frame_digest, reason),
         };
         if compiled.intent_digest != request.intent_digest
             || compiled.action_kind != request.action_kind
             || compiled.target != scope.target
             || compiled.bytes.is_empty()
         {
-            return denied(&request, DenialCode::VerificationBindingMismatch);
+            return denied(
+                &request,
+                request_frame_digest,
+                DenialCode::VerificationBindingMismatch,
+            );
         }
 
         let dispatched_at_millis = self.clock.now_millis();
@@ -109,10 +125,14 @@ where
     }
 }
 
-fn denied(request: &DispatchRequest, reason: DenialCode) -> GatewayResponse {
+fn denied(
+    request: &DispatchRequest,
+    request_frame_digest: Digest,
+    reason: DenialCode,
+) -> GatewayResponse {
     GatewayResponse::Denied(DeniedResponse {
         action_id: request.action_id.clone(),
-        request_digest: Digest::of(&request.payload),
+        request_digest: request_frame_digest,
         reason,
     })
 }
@@ -211,7 +231,7 @@ mod tests {
     use std::thread;
 
     use super::*;
-    use crate::ipc::{ActionClass, ActionKind, RequiredFeature};
+    use crate::ipc::{ActionClass, ActionKind, RequiredFeature, encode_request};
     use crate::policy::{
         CompiledAction, LeaseApproval, ScopeApproval, UnavailableActionCompiler,
         UnavailableLeaseVerifier, UnavailableScopeVerifier,
@@ -291,6 +311,21 @@ mod tests {
         }
     }
 
+    fn handle<S, L, C, T, K>(
+        gateway: &Gateway<S, L, C, T, K>,
+        request: DispatchRequest,
+    ) -> GatewayResponse
+    where
+        S: ScopeVerifier,
+        L: LeaseVerifier,
+        C: ActionCompiler,
+        T: TargetTransport,
+        K: Clock,
+    {
+        let frame = encode_request(&request).expect("canonical request frame");
+        gateway.handle(request, Digest::of(&frame))
+    }
+
     #[test]
     fn production_kernel_denies_before_opening_target_socket() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("owned listener");
@@ -304,7 +339,10 @@ mod tests {
             TcpTargetTransport::new(),
             SystemClock,
         );
-        let response = gateway.handle(request(listener.local_addr().expect("listener address")));
+        let response = handle(
+            &gateway,
+            request(listener.local_addr().expect("listener address")),
+        );
         assert!(matches!(
             response,
             GatewayResponse::Denied(DeniedResponse {
@@ -338,8 +376,8 @@ mod tests {
             TcpTargetTransport::new(),
             FixedClock::new(),
         );
-        let first = gateway.handle(request(target));
-        let second = gateway.handle(request(target));
+        let first = handle(&gateway, request(target));
+        let second = handle(&gateway, request(target));
         server.join().expect("loopback server");
         assert_eq!(first, second);
         let GatewayResponse::Receipt { receipt, .. } = first else {
@@ -375,7 +413,7 @@ mod tests {
             UnknownTransport(dispatches.clone()),
             FixedClock::new(),
         );
-        let response = gateway.handle(request("127.0.0.1:9".parse().expect("address")));
+        let response = handle(&gateway, request("127.0.0.1:9".parse().expect("address")));
         assert_eq!(dispatches.load(Ordering::SeqCst), 1);
         let GatewayResponse::Receipt { receipt, .. } = response else {
             panic!("expected a dispatch receipt");
@@ -413,7 +451,7 @@ mod tests {
             FixedClock::new(),
         );
         assert!(matches!(
-            gateway.handle(request("127.0.0.1:9".parse().expect("address"))),
+            handle(&gateway, request("127.0.0.1:9".parse().expect("address")),),
             GatewayResponse::Denied(DeniedResponse {
                 reason: DenialCode::VerificationBindingMismatch,
                 ..
@@ -434,7 +472,7 @@ mod tests {
             FixedClock::new(),
         );
         assert!(matches!(
-            gateway.handle(invalid_scope),
+            handle(&gateway, invalid_scope),
             GatewayResponse::Denied(DeniedResponse {
                 reason: DenialCode::ScopeDenied,
                 ..
@@ -444,7 +482,7 @@ mod tests {
         let mut invalid_lease = request(target);
         invalid_lease.lease_proof = b"forged".to_vec();
         assert!(matches!(
-            gateway.handle(invalid_lease),
+            handle(&gateway, invalid_lease),
             GatewayResponse::Denied(DeniedResponse {
                 reason: DenialCode::LeaseDenied,
                 ..
@@ -462,7 +500,7 @@ mod tests {
             FixedClock::new(),
         );
         assert!(matches!(
-            gateway.handle(request("127.0.0.1:9".parse().expect("address"))),
+            handle(&gateway, request("127.0.0.1:9".parse().expect("address")),),
             GatewayResponse::Denied(DeniedResponse {
                 reason: DenialCode::CompilerUnavailable,
                 ..

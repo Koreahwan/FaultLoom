@@ -35,13 +35,14 @@ def _load_context(path: Path) -> dict[str, Any]:
         "components",
         "dependency_graph",
         "locked_dependencies",
+        "native_artifacts",
         "network",
         "source",
         "source_date_epoch",
         "subjects",
         "toolchains",
     }
-    if value.get("schema_version") != 1 or not required <= value.keys():
+    if value.get("schema_version") != 2 or not required <= value.keys():
         raise HookError("unsupported or incomplete build context")
     if not isinstance(value["subjects"], list) or not value["subjects"]:
         raise HookError("build context must contain at least one subject")
@@ -72,14 +73,119 @@ def _load_context(path: Path) -> dict[str, Any]:
     ):
         raise HookError("build context has an invalid CI trust-anchor claim")
     toolchains = value["toolchains"]
+    native_artifacts = value["native_artifacts"]
+    if not isinstance(native_artifacts, list):
+        raise HookError("build context native_artifacts must be a list")
+    expected_rust_verification = (
+        "rustc_cargo_closure_digests_and_locked_offline_build_verified"
+        if native_artifacts
+        else "policy_declared_unverified"
+    )
+    expected_host_verification = (
+        "linker_libc_kernel_unverified" if native_artifacts else "not_used"
+    )
     if (
         not isinstance(toolchains, dict)
         or toolchains.get("python_runtime_verification")
         != "version_only_unverified"
         or toolchains.get("rust_runtime_verification")
-        != "policy_declared_unverified"
+        != expected_rust_verification
+        or toolchains.get("host_environment_verification")
+        != expected_host_verification
+        or re.fullmatch(r"[0-9a-f]{64}", toolchains.get("rustc_sha256", ""))
+        is None
+        or re.fullmatch(
+            r"[0-9a-f]{64}", toolchains.get("rustc_closure_sha256", "")
+        )
+        is None
     ):
-        raise HookError("build context has an invalid Python runtime verification claim")
+        raise HookError("build context has an invalid toolchain verification claim")
+    if native_artifacts:
+        if re.fullmatch(r"[0-9a-f]{64}", toolchains.get("cargo_sha256", "")) is None:
+            raise HookError("native artifacts require a pinned Cargo digest")
+    elif toolchains.get("cargo_sha256") is not None:
+        raise HookError("Cargo may not be claimed when no native artifact was built")
+
+    source = value["source"]
+    if (
+        not isinstance(source, dict)
+        or re.fullmatch(r"[0-9a-f]{40}", source.get("commit", "")) is None
+        or re.fullmatch(r"[0-9a-f]{40}", source.get("tree", "")) is None
+    ):
+        raise HookError("build context has an invalid source identity")
+    subjects: dict[str, dict[str, Any]] = {}
+    for subject in value["subjects"]:
+        if (
+            not isinstance(subject, dict)
+            or set(subject) != {"name", "sha256", "size"}
+            or not isinstance(subject["name"], str)
+            or not subject["name"]
+            or re.fullmatch(r"[0-9a-f]{64}", subject["sha256"]) is None
+            or not isinstance(subject["size"], int)
+            or isinstance(subject["size"], bool)
+            or subject["size"] <= 0
+            or subject["name"] in subjects
+        ):
+            raise HookError("build context has an invalid or duplicate subject")
+        subjects[subject["name"]] = subject
+    native_names: set[str] = set()
+    native_purls: set[str] = set()
+    required_native = {
+        "artifact_name",
+        "component_name",
+        "version",
+        "target",
+        "purl",
+        "sha256",
+        "size",
+        "source_commit",
+        "source_tree",
+        "cargo_lock_sha256",
+        "recipe_sha256",
+        "rustc_sha256",
+        "rustc_closure_sha256",
+        "cargo_sha256",
+        "host_environment_verification",
+    }
+    for native in native_artifacts:
+        if not isinstance(native, dict) or set(native) != required_native:
+            raise HookError("native artifact descriptor is incomplete or has unknown fields")
+        subject = subjects.get(native["artifact_name"])
+        digest_fields = (
+            "sha256",
+            "cargo_lock_sha256",
+            "recipe_sha256",
+            "rustc_sha256",
+            "rustc_closure_sha256",
+            "cargo_sha256",
+        )
+        if (
+            subject is None
+            or subject["sha256"] != native["sha256"]
+            or subject["size"] != native["size"]
+            or native["source_commit"] != source["commit"]
+            or native["source_tree"] != source["tree"]
+            or native["rustc_sha256"] != toolchains["rustc_sha256"]
+            or native["rustc_closure_sha256"]
+            != toolchains["rustc_closure_sha256"]
+            or native["cargo_sha256"] != toolchains["cargo_sha256"]
+            or native["host_environment_verification"]
+            != "linker_libc_kernel_unverified"
+            or any(
+                re.fullmatch(r"[0-9a-f]{64}", native[field]) is None
+                for field in digest_fields
+            )
+            or native["artifact_name"] in native_names
+            or native["purl"] in native_purls
+            or not isinstance(native["component_name"], str)
+            or not isinstance(native["version"], str)
+            or not isinstance(native["target"], str)
+            or native["purl"]
+            != f"pkg:cargo/{native['component_name']}@{native['version']}"
+        ):
+            raise HookError("native artifact is not bound to its subject, source, and toolchain")
+        native_names.add(native["artifact_name"])
+        native_purls.add(native["purl"])
     return value
 
 
@@ -92,6 +198,7 @@ def make_sbom(context: dict[str, Any]) -> dict[str, Any]:
     components = []
     dependency_edges = []
     internal_purls = {component["purl"] for component in context["components"]}
+    root_dependencies = set(internal_purls)
     for component in context["components"]:
         components.append(
             {
@@ -137,7 +244,44 @@ def make_sbom(context: dict[str, Any]) -> dict[str, Any]:
             name, version = requirement.split("==", 1)
             depends_on.append(f"pkg:pypi/{_normalized_name(name)}@{version}")
         dependency_edges.append({"ref": purl, "dependsOn": sorted(depends_on)})
-    dependency_edges.append({"ref": root_ref, "dependsOn": sorted(internal_purls)})
+    for native in context["native_artifacts"]:
+        root_dependencies.add(native["purl"])
+        components.append(
+            {
+                "type": "application",
+                "name": native["component_name"],
+                "version": native["version"],
+                "purl": native["purl"],
+                "bom-ref": native["purl"],
+                "hashes": [{"alg": "SHA-256", "content": native["sha256"]}],
+                "licenses": [{"license": {"id": "Apache-2.0"}}],
+                "properties": [
+                    {"name": "faultloom:artifactName", "value": native["artifact_name"]},
+                    {"name": "faultloom:target", "value": native["target"]},
+                    {
+                        "name": "faultloom:sourceCommit",
+                        "value": native["source_commit"],
+                    },
+                    {"name": "faultloom:sourceTree", "value": native["source_tree"]},
+                    {
+                        "name": "faultloom:buildRecipeSha256",
+                        "value": native["recipe_sha256"],
+                    },
+                    {
+                        "name": "faultloom:cargoLockSha256",
+                        "value": native["cargo_lock_sha256"],
+                    },
+                    {"name": "faultloom:rustcSha256", "value": native["rustc_sha256"]},
+                    {"name": "faultloom:cargoSha256", "value": native["cargo_sha256"]},
+                    {
+                        "name": "faultloom:hostEnvironmentVerification",
+                        "value": native["host_environment_verification"],
+                    },
+                ],
+            }
+        )
+        dependency_edges.append({"ref": native["purl"], "dependsOn": []})
+    dependency_edges.append({"ref": root_ref, "dependsOn": sorted(root_dependencies)})
     return {
         "bomFormat": "CycloneDX",
         "specVersion": "1.5",
@@ -169,6 +313,10 @@ def make_sbom(context: dict[str, Any]) -> dict[str, Any]:
                 {
                     "name": "faultloom:rustRuntimeVerification",
                     "value": context["toolchains"]["rust_runtime_verification"],
+                },
+                {
+                    "name": "faultloom:hostEnvironmentVerification",
+                    "value": context["toolchains"]["host_environment_verification"],
                 },
             ],
             "component": {
@@ -208,19 +356,43 @@ def make_provenance(context: dict[str, Any]) -> dict[str, Any]:
                 },
             }
         )
+    for native in context["native_artifacts"]:
+        resolved_dependencies.extend(
+            [
+                {
+                    "uri": (
+                        "urn:faultloom:rust-toolchain:"
+                        f"{context['toolchains']['rust']}:{native['target']}"
+                    ),
+                    "digest": {"sha256": native["rustc_closure_sha256"]},
+                    "annotations": {
+                        "faultloom:rustcSha256": native["rustc_sha256"],
+                        "faultloom:cargoSha256": native["cargo_sha256"],
+                        "faultloom:hostEnvironmentVerification": native[
+                            "host_environment_verification"
+                        ],
+                    },
+                },
+                {
+                    "uri": "git+https://faultloom.invalid/core#path=Cargo.lock",
+                    "digest": {"sha256": native["cargo_lock_sha256"]},
+                },
+            ]
+        )
     return {
         "_type": "https://in-toto.io/Statement/v1",
         "subject": subjects,
         "predicateType": "https://slsa.dev/provenance/v1",
         "predicate": {
             "buildDefinition": {
-                "buildType": "https://faultloom.invalid/build-types/stdlib-wheel/v1",
+                "buildType": "https://faultloom.invalid/build-types/core-artifacts/v2",
                 "externalParameters": {"sourceDateEpoch": context["source_date_epoch"]},
                 "internalParameters": {
                     "toolchains": context["toolchains"],
                     "ciPolicy": context["ci_policy"],
                     "network": context["network"],
                     "dependencyGraph": context["dependency_graph"],
+                    "nativeArtifacts": context["native_artifacts"],
                 },
                 "resolvedDependencies": resolved_dependencies,
             },

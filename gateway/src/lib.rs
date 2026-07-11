@@ -25,7 +25,7 @@ pub fn run_fail_closed_stdio(mut input: impl Read, mut output: impl Write) -> io
     );
     while let Some(frame) = read_frame(&mut input)? {
         let response = match decode_request(&frame) {
-            Ok(request) => gateway.handle(request),
+            Ok(request) => gateway.handle(request, Digest::of(&frame)),
             Err(error) => GatewayResponse::Denied(DeniedResponse {
                 action_id: error.action_id.unwrap_or_else(|| "invalid".to_owned()),
                 request_digest: Digest::of(&frame),
