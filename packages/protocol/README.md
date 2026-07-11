@@ -19,6 +19,12 @@ state and pass that value back as the corresponding `minimum_*` argument. A
 signed older artifact is valid cryptographically but is rejected below that
 trusted monotonic watermark.
 
+Verifier controls are validated before operator dispatch. `now` is either
+`None` or an exact, timezone-aware base `datetime`; `maximum_clock_skew` is an
+exact non-negative `timedelta`; monotonic watermarks are exact positive `int`
+values; and expected binding values are exact `str` values. Subclasses are
+rejected so they cannot override truthiness, arithmetic, or comparisons.
+
 `GatewayEpochReceiptIssuer` is a host-side T13 capability, not a wire model.
 It first calls the ordinary Ed25519 `verify_scope_epoch` path with an explicit
 pinned public key, expected grant, and monotonic epoch, then authenticates the

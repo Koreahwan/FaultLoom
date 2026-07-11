@@ -223,6 +223,40 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _verification_controls(
+    now: datetime | None,
+    maximum_clock_skew: timedelta,
+    *,
+    minimum_sequences: tuple[object, ...],
+    expected_strings: tuple[tuple[str, object, bool], ...],
+) -> datetime:
+    if now is None:
+        verified_at = _utc_now()
+    elif type(now) is not datetime:
+        raise ValueError("verification time must be None or an exact datetime")
+    else:
+        verified_at = now
+    if verified_at.tzinfo is None or verified_at.utcoffset() is None:
+        raise ValueError("verification time must include a timezone")
+    if (
+        type(maximum_clock_skew) is not timedelta
+        or maximum_clock_skew < timedelta(0)
+    ):
+        raise ValueError("maximum_clock_skew must be an exact non-negative timedelta")
+    for minimum_sequence in minimum_sequences:
+        if (
+            type(minimum_sequence) is not int
+            or not 1 <= minimum_sequence <= MAX_INT64
+        ):
+            raise ValueError("minimum trusted sequence must be within signed int64")
+    for label, value, optional in expected_strings:
+        if value is None and optional:
+            continue
+        if type(value) is not str:
+            raise ValueError(f"{label} must be an exact string")
+    return verified_at
+
+
 def sign_authority_grant(
     grant: AuthorityGrant,
     signer: AuthoritySigner,
@@ -370,8 +404,13 @@ def verify_authority_grant(
     expected_grant_id: str | None = None,
     maximum_clock_skew: timedelta = timedelta(minutes=5),
 ) -> AuthorityGrant:
+    now = _verification_controls(
+        now,
+        maximum_clock_skew,
+        minimum_sequences=(minimum_version,),
+        expected_strings=(("expected_grant_id", expected_grant_id, True),),
+    )
     envelope = SignedAuthorityGrant.model_validate(envelope.model_dump(mode="python"))
-    now = now or _utc_now()
     grant = _verify(
         envelope.payload,
         envelope.signature,
@@ -403,8 +442,13 @@ def verify_scope_epoch(
     expected_grant_id: str | None = None,
     maximum_clock_skew: timedelta = timedelta(minutes=5),
 ) -> ScopeEpoch:
+    now = _verification_controls(
+        now,
+        maximum_clock_skew,
+        minimum_sequences=(minimum_epoch,),
+        expected_strings=(("expected_grant_id", expected_grant_id, True),),
+    )
     envelope = SignedScopeEpoch.model_validate(envelope.model_dump(mode="python"))
-    now = now or _utc_now()
     epoch = _verify(
         envelope.payload,
         envelope.signature,
@@ -437,8 +481,19 @@ def verify_engagement_bundle(
     expected_grant_id: str | None = None,
     maximum_clock_skew: timedelta = timedelta(minutes=5),
 ) -> EngagementBundle:
+    now = _verification_controls(
+        now,
+        maximum_clock_skew,
+        minimum_sequences=(
+            minimum_version,
+            minimum_authority_version,
+        ),
+        expected_strings=(
+            ("expected_engagement_id", expected_engagement_id, True),
+            ("expected_grant_id", expected_grant_id, True),
+        ),
+    )
     envelope = SignedEngagementBundle.model_validate(envelope.model_dump(mode="python"))
-    now = now or _utc_now()
     bundle = _verify(
         envelope.payload,
         envelope.signature,
@@ -479,8 +534,18 @@ def verify_run_result_bundle(
     expected_authority_digest: str,
     maximum_clock_skew: timedelta = timedelta(minutes=5),
 ) -> RunResultBundle:
+    now = _verification_controls(
+        now,
+        maximum_clock_skew,
+        minimum_sequences=(minimum_version,),
+        expected_strings=(
+            ("expected_engagement_id", expected_engagement_id, True),
+            ("expected_run_id", expected_run_id, False),
+            ("expected_run_manifest_digest", expected_run_manifest_digest, False),
+            ("expected_authority_digest", expected_authority_digest, False),
+        ),
+    )
     envelope = SignedRunResultBundle.model_validate(envelope.model_dump(mode="python"))
-    now = now or _utc_now()
     bundle = _verify(
         envelope.payload,
         envelope.signature,
