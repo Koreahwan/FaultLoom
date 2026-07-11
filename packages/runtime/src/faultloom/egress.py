@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from threading import RLock
+from threading import RLock, local
 from typing import Annotated, Literal, Protocol
 from urllib.parse import urlsplit
 
@@ -754,6 +754,7 @@ class TrustedAuthorityState:
             raise TypeError("trusted authority requires a durable SQLite egress state store")
         self._state_store = state_store
         self._lock = RLock()
+        self._dispatch_local = local()
 
     @property
     def authority_digest(self) -> str:
@@ -804,15 +805,27 @@ class TrustedAuthorityState:
 
     @contextmanager
     def dispatch_guard(
-        self, *, expected: _AuthorityGeneration, now: datetime
-    ) -> Iterator[None]:
+        self, *, expected: _AuthorityGeneration, clock: Clock
+    ) -> Iterator[Callable[[], datetime]]:
         """Hold the generation stable across the concrete send boundary."""
 
         with self._lock:
-            _, _, generation = self._verify_generation_locked(now)
-            if generation != expected:
-                raise ValueError("authority generation changed before dispatch")
-            yield
+            if getattr(self._dispatch_local, "depth", 0) != 0:
+                raise RuntimeError("nested authority dispatch guard is forbidden")
+            self._dispatch_local.depth = 1
+
+            def revalidate() -> datetime:
+                now = _trusted_now(clock)
+                _, _, generation = self._verify_generation_locked(now)
+                if generation != expected:
+                    raise ValueError("authority generation changed before dispatch")
+                return now
+
+            try:
+                revalidate()
+                yield revalidate
+            finally:
+                self._dispatch_local.depth = 0
 
     def _generation_locked(self) -> _AuthorityGeneration:
         authority_digest = sha256_digest(self._authority)
@@ -860,6 +873,8 @@ class TrustedAuthorityState:
         return grant, epoch, self._generation_locked()
 
     def install_scope_epoch(self, scope_epoch: SignedScopeEpoch, *, now: datetime) -> None:
+        if getattr(self._dispatch_local, "depth", 0):
+            raise RuntimeError("scope epoch mutation during dispatch is forbidden")
         candidate = SignedScopeEpoch.model_validate(scope_epoch.model_dump(mode="python"))
         with self._lock:
             previous = self._scope_epoch
@@ -1461,8 +1476,10 @@ class ProviderProxy:
             }
         )
         try:
-            dispatch_now = _trusted_now(self._clock)
-            with self._authority.dispatch_guard(expected=generation, now=dispatch_now):
+            dispatch_now = now
+            with self._authority.dispatch_guard(
+                expected=generation, clock=self._clock
+            ) as revalidate:
                 try:
                     current_component_digest = _execution_component_digest(
                         EgressPlane.MODEL_PROVIDER, self._resolver, self._transport
@@ -1486,6 +1503,7 @@ class ProviderProxy:
                     and current_authorization_digest
                     == compiled.dispatch_authorization_digest
                 )
+                dispatch_now = revalidate()
                 if binding_matches:
                     try:
                         result = _validated_transport_result(
@@ -1887,8 +1905,10 @@ class KnowledgeFetcher:
                 now=admitted_at,
             )
         try:
-            dispatch_now = _trusted_now(self._clock)
-            with self._authority.dispatch_guard(expected=generation, now=dispatch_now):
+            dispatch_now = admitted_at
+            with self._authority.dispatch_guard(
+                expected=generation, clock=self._clock
+            ) as revalidate:
                 try:
                     current_component_digest = _execution_component_digest(
                         EgressPlane.KNOWLEDGE, self._resolver, self._transport
@@ -1912,6 +1932,7 @@ class KnowledgeFetcher:
                     and current_authorization_digest
                     == compiled.dispatch_authorization_digest
                 )
+                dispatch_now = revalidate()
                 if binding_matches:
                     try:
                         result = _validated_transport_result(

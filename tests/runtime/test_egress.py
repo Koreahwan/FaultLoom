@@ -7,7 +7,7 @@ import shutil
 import sqlite3
 import stat
 import tempfile
-from threading import Thread
+from threading import Event, Thread
 
 import pytest
 from pydantic import ValidationError
@@ -1525,6 +1525,164 @@ def test_concurrent_revocation_after_reservation_prevents_dispatch(
         ).dispatch(knowledge_request(authority))
 
     assert receipt.denial_code is DenialCode.AUTHORITY_NOT_CURRENT
+    assert transport.requests == []
+
+
+@pytest.mark.parametrize("kind", ["provider", "knowledge"])
+def test_dispatch_guard_resamples_clock_after_lock_wait(
+    kind: str, tmp_path: Path
+) -> None:
+    authority = grant()
+    state = authority_state(authority, tmp_path / "state.sqlite3")
+
+    class BoundaryClock:
+        def __init__(self) -> None:
+            self.armed = False
+            self.expired = False
+            self.sampled = Event()
+
+        def __call__(self) -> datetime:
+            if not self.armed:
+                return DISPATCH_TIME
+            if self.expired:
+                return authority.expires_at
+            self.sampled.set()
+            return authority.expires_at - timedelta(microseconds=1)
+
+    boundary_clock = BoundaryClock()
+    reserve = state.state_store.reserve_dispatch
+    holder_threads: list[Thread] = []
+
+    def reserve_then_hold_authority(**kwargs: object) -> str:
+        reservation = reserve(**kwargs)
+        acquired = Event()
+        boundary_clock.armed = True
+
+        def expire_while_locked() -> None:
+            with state._lock:  # type: ignore[attr-defined]
+                acquired.set()
+                boundary_clock.sampled.wait(timeout=0.25)
+                boundary_clock.expired = True
+
+        thread = Thread(target=expire_while_locked)
+        thread.start()
+        assert acquired.wait(timeout=10)
+        holder_threads.append(thread)
+        return reservation
+
+    state.state_store.reserve_dispatch = (  # type: ignore[method-assign]
+        reserve_then_hold_authority
+    )
+    if kind == "provider":
+        transport = MemoryProviderTransport()
+        receipt = provider_proxy(
+            authority,
+            tmp_path / "unused.sqlite3",
+            transport=transport,
+            state=state,
+            proxy_clock=boundary_clock,
+        ).dispatch(provider_request(authority))
+    else:
+        transport = MemoryKnowledgeTransport()
+        receipt = knowledge_fetcher(
+            authority,
+            tmp_path / "unused.sqlite3",
+            transport=transport,
+            state=state,
+            fetch_clock=boundary_clock,
+        ).dispatch(knowledge_request(authority))
+
+    for thread in holder_threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+    assert boundary_clock.expired is True
+    assert receipt.denial_code is DenialCode.AUTHORITY_NOT_CURRENT
+    assert transport.requests == []
+
+
+@pytest.mark.parametrize("kind", ["provider", "knowledge"])
+def test_dispatch_guard_revalidates_expiry_immediately_before_transport(
+    kind: str, tmp_path: Path
+) -> None:
+    authority = grant()
+
+    class BoundaryClock:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.values = (
+                DISPATCH_TIME,
+                DISPATCH_TIME,
+                authority.expires_at - timedelta(microseconds=1),
+                authority.expires_at,
+            )
+
+        def __call__(self) -> datetime:
+            index = min(self.calls, len(self.values) - 1)
+            self.calls += 1
+            return self.values[index]
+
+    boundary_clock = BoundaryClock()
+    if kind == "provider":
+        transport = MemoryProviderTransport()
+        receipt = provider_proxy(
+            authority,
+            tmp_path / "state.sqlite3",
+            transport=transport,
+            proxy_clock=boundary_clock,
+        ).dispatch(provider_request(authority))
+    else:
+        transport = MemoryKnowledgeTransport()
+        receipt = knowledge_fetcher(
+            authority,
+            tmp_path / "state.sqlite3",
+            transport=transport,
+            fetch_clock=boundary_clock,
+        ).dispatch(knowledge_request(authority))
+
+    assert boundary_clock.calls >= 4
+    assert receipt.denial_code is DenialCode.AUTHORITY_NOT_CURRENT
+    assert transport.requests == []
+
+
+@pytest.mark.parametrize("kind", ["provider", "knowledge"])
+def test_reentrant_scope_epoch_install_is_fenced_during_dispatch(
+    kind: str, tmp_path: Path
+) -> None:
+    authority = grant()
+    state = authority_state(authority, tmp_path / "state.sqlite3")
+    revoked_epoch = signed_authority(authority, scope_epoch=8, revoked=True)[1]
+
+    if kind == "provider":
+        transport = MemoryProviderTransport()
+    else:
+        transport = MemoryKnowledgeTransport()
+    dispatch = transport.dispatch
+
+    def dispatch_after_reentrant_revoke(request: object) -> EgressTransportResult:
+        try:
+            state.install_scope_epoch(revoked_epoch, now=DISPATCH_TIME)
+        except AuthorityRevokedError:
+            pass
+        return dispatch(request)  # type: ignore[arg-type]
+
+    transport.dispatch = dispatch_after_reentrant_revoke  # type: ignore[method-assign]
+    if kind == "provider":
+        receipt = provider_proxy(
+            authority,
+            tmp_path / "unused.sqlite3",
+            transport=transport,
+            state=state,
+        ).dispatch(provider_request(authority))
+    else:
+        receipt = knowledge_fetcher(
+            authority,
+            tmp_path / "unused.sqlite3",
+            transport=transport,
+            state=state,
+        ).dispatch(knowledge_request(authority))
+
+    assert state.scope_epoch_number == 7
+    assert receipt.outcome is EgressOutcome.UNKNOWN_OUTCOME
     assert transport.requests == []
 
 
