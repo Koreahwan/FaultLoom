@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from faultloom_protocol import (
@@ -28,6 +28,9 @@ FIXTURE = (
 )
 SIGNED_ENVELOPE_FIXTURE = FIXTURE.with_name("scope_epoch_signed_envelope_v0_1.json")
 GATEWAY_RECEIPT_FIXTURE = FIXTURE.with_name("scope_epoch_gateway_receipt_v0_1.hex")
+GOLDEN_VERIFICATION_TIME = datetime(
+    2030, 1, 2, 3, 4, 5, 678901, tzinfo=timezone.utc
+)
 
 
 def test_scope_epoch_golden_bytes_digest_and_signature() -> None:
@@ -57,7 +60,7 @@ def test_scope_epoch_golden_bytes_digest_and_signature() -> None:
             schema_version="0.1.0", payload=payload, signature=expected_block
         ),
         expected_public,
-        now=expected_block.signed_at,
+        now=GOLDEN_VERIFICATION_TIME,
         minimum_epoch=7,
         expected_grant_id="grant.golden",
     ) == payload
@@ -83,7 +86,7 @@ def test_gateway_receipt_matches_the_rust_channel_golden() -> None:
         gateway_boot_id="gateway-boot:test-1",
         gateway_challenge=bytes(range(0x80, 0xA0)),
     )
-    verified_at = envelope.signature.signed_at.replace(microsecond=679_000)
+    verified_at = GOLDEN_VERIFICATION_TIME.replace(microsecond=679_000)
     receipt = issuer.issue_scope_epoch_receipt(
         envelope,
         public_key,
