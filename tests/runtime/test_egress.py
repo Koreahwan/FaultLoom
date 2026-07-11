@@ -1716,6 +1716,19 @@ def test_retry_alias_correlation_survives_crash_before_transport(tmp_path: Path)
         dispatch_authorization_digest=D1,
         reserved_at=DISPATCH_TIME,
     ) == "reserved"
+    checkpoint = state.state_store.checkpoint()
+    state.state_store.close()
+    reopened_state = authority_state(
+        authority,
+        tmp_path / "state.sqlite3",
+        minimum_anchor=checkpoint,
+    )
+    proxy = provider_proxy(
+        authority,
+        tmp_path / "unused-after-crash.sqlite3",
+        transport=transport,
+        state=reopened_state,
+    )
 
     changed = provider_request(
         authority,
