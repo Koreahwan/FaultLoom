@@ -3,6 +3,7 @@ pub mod ipc;
 mod kernel;
 mod policy;
 pub mod scope;
+mod t13_epoch;
 mod transport;
 
 use std::io::{self, Read, Write};
@@ -98,5 +99,23 @@ mod source_boundary_tests {
             .expect("ActionClass body");
         assert!(!action_class.contains("HighLoad"));
         assert!(!action_class.contains("Destructive"));
+    }
+
+    #[test]
+    fn model_facing_dispatch_rpc_cannot_supply_boot_keys_or_epoch_receipts() {
+        let ipc = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ipc.rs"))
+            .expect("read IPC source");
+        for forbidden in [
+            "FLER",
+            "channel_key",
+            "gateway_challenge",
+            "SignedEpochEnvelope",
+            "verifier_receipt",
+        ] {
+            assert!(
+                !ipc.contains(forbidden),
+                "dispatch RPC unexpectedly exposes trusted epoch channel token {forbidden}"
+            );
+        }
     }
 }

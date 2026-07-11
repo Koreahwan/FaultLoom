@@ -34,13 +34,27 @@ into an implicit hostname-only allow.
 
 Epoch admission is intentionally a sealed trust boundary. The Rust kernel accepts
 only an opaque epoch produced by a verifier implementation inside the Gateway
-crate, binds it to the exact canonical signed-envelope digest, verifier receipt,
-key ID, sequence, validity interval, and grant ID, and rejects tamper, replay, and
-rollback. External crates cannot implement the sealed verifier trait or construct
-a verified epoch. The production verifier remains `UnavailableEpochVerifier`; the
-standalone binary therefore remains fail closed until a non-model T13 Ed25519
-verifier is implemented inside this boundary and wired through a sealed local
-channel. Caller assertion is not treated as signature evidence.
+crate. The T13 protocol process first verifies the exact canonical
+`SignedScopeEpoch` bytes with `cryptography` and an explicitly pinned Ed25519
+public key. It then authenticates a short-lived, one-use receipt with a fresh
+32-byte Gateway boot key. The receipt binds the canonical envelope and digest,
+protocol/schema/purpose, authority key and grant IDs, epoch and sequence,
+issuance/expiry/revocation fields, Gateway boot ID and fresh challenge, and a
+nonce. The kernel independently pins allowed authority key IDs, authenticates
+the receipt, and atomically consumes its nonce while advancing the monotonic
+epoch. Tamper, wrong/unknown/revoked keys, replay, rollback, stale receipts, and
+receipts captured before a Gateway restart are rejected. Failed admissions do
+not consume the nonce or mutate epoch state.
+
+The boot key, challenge, and receipt issuer are host-side capabilities and are
+not represented by the model/plugin dispatch RPC. External crates cannot
+implement the sealed verifier trait or construct a verified epoch. The
+standalone binary continues to use `UnavailableEpochVerifier`, and therefore
+remains fail closed until T18/T19 integration injects fresh boot material and
+wires the host-side verifier into the lease/compiler/executor path. Caller
+assertion is never treated as signature evidence. Because the receipt issuer
+adds public T13 protocol code, T13 must be formally reopened and independently
+reverified; an earlier T13 `fully_done` receipt does not cover this delta.
 
 Advancing or revoking an epoch atomically invalidates approved parent actions and
 cancels registered queued actions, open connections, WebSockets, callback leases,

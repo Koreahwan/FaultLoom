@@ -14,6 +14,7 @@ from .compatibility import (
     protocol_range_contains,
     require_protocol_compatible,
 )
+from .gateway_receipt import GatewayEpochReceiptIssuer
 from .models import *  # noqa: F403
 from .models import REQUIRED_MODEL_TYPES, WIRE_MODEL_TYPES, schema_catalog
 from .signing import (
@@ -62,6 +63,7 @@ __all__ = [
     "REQUIRED_MODEL_TYPES",
     "WIRE_MODEL_TYPES",
     "schema_catalog",
+    "GatewayEpochReceiptIssuer",
     "AuthoritySigner",
     "Ed25519PublicKeyRecord",
     "SignatureBlock",

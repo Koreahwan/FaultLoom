@@ -9,6 +9,7 @@ from faultloom_protocol import (
     ActionClass,
     AuthorityRevokedError,
     AuthoritySigner,
+    GatewayEpochReceiptIssuer,
     SignatureExpiredError,
     SignatureNotYetValidError,
     SignatureRollbackError,
@@ -150,6 +151,24 @@ def test_scope_epoch_rollback_and_revocation_are_enforced() -> None:
     with pytest.raises(AuthorityRevokedError, match="operator stop"):
         verify_scope_epoch(revoked_envelope, signer.public_key_record, now=NOW)
 
+    issuer = GatewayEpochReceiptIssuer(
+        channel_key_id="gateway-channel:revocation-test",
+        channel_key=bytes(range(32)),
+        gateway_boot_id="gateway-boot:revocation-test",
+        gateway_challenge=bytes(range(32, 64)),
+    )
+    verified_at = NOW.replace(microsecond=679_000)
+    receipt = issuer.issue_scope_epoch_receipt(
+        revoked_envelope,
+        signer.public_key_record,
+        minimum_epoch=8,
+        expected_grant_id="grant.1",
+        verified_at=verified_at,
+        receipt_expires_at=verified_at + timedelta(seconds=1),
+        nonce=bytes(range(16)),
+    )
+    assert receipt.startswith(b"FLER\x01")
+
 
 def test_private_signer_is_not_a_serializable_protocol_model() -> None:
     signer = AuthoritySigner.from_private_bytes(bytes(range(32)))
@@ -157,3 +176,49 @@ def test_private_signer_is_not_a_serializable_protocol_model() -> None:
     assert "private_key=<redacted>" in representation
     assert bytes(range(32)).hex() not in representation
     assert not hasattr(signer, "model_dump")
+
+
+def test_gateway_receipt_boot_material_and_unicode_revocation_are_bounded() -> None:
+    with pytest.raises(ValueError, match="high-entropy"):
+        GatewayEpochReceiptIssuer(
+            channel_key_id="gateway-channel:weak",
+            channel_key=bytes(32),
+            gateway_boot_id="gateway-boot:weak",
+            gateway_challenge=bytes(range(32)),
+        )
+    with pytest.raises(ValueError, match="independently generated"):
+        GatewayEpochReceiptIssuer(
+            channel_key_id="gateway-channel:reused",
+            channel_key=bytes(range(32)),
+            gateway_boot_id="gateway-boot:reused",
+            gateway_challenge=bytes(range(32)),
+        )
+
+    epoch = sample_models()["ScopeEpoch"].model_copy(
+        update={
+            "epoch": 8,
+            "revoked": True,
+            "revocation_reason": "철회" * 1_000,
+        }
+    )
+    signer = AuthoritySigner.generate()
+    envelope = sign_scope_epoch(epoch, signer, signed_at=NOW)
+    issuer = GatewayEpochReceiptIssuer(
+        channel_key_id="gateway-channel:unicode-revocation",
+        channel_key=bytes(range(32)),
+        gateway_boot_id="gateway-boot:unicode-revocation",
+        gateway_challenge=bytes(range(32, 64)),
+    )
+    verified_at = NOW.replace(microsecond=679_000)
+    receipt = issuer.issue_scope_epoch_receipt(
+        envelope,
+        signer.public_key_record,
+        minimum_epoch=8,
+        expected_grant_id="grant.1",
+        verified_at=verified_at,
+        receipt_expires_at=verified_at + timedelta(seconds=1),
+        nonce=bytes(range(16)),
+    )
+
+    assert receipt.startswith(b"FLER\x01")
+    assert len(receipt) < 36_864

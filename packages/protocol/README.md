@@ -19,6 +19,15 @@ state and pass that value back as the corresponding `minimum_*` argument. A
 signed older artifact is valid cryptographically but is rejected below that
 trusted monotonic watermark.
 
+`GatewayEpochReceiptIssuer` is a host-side T13 capability, not a wire model.
+It first calls the ordinary Ed25519 `verify_scope_epoch` path with an explicit
+pinned public key, expected grant, and monotonic epoch, then authenticates the
+exact canonical envelope for one Gateway boot. Its 32-byte boot key must be
+injected out of band, rotated on every Gateway start, and never exposed to a
+model, pack, adapter, or dispatch RPC. Receipts expire within five seconds and
+are consumed once by the Gateway kernel. The cross-language envelope and
+receipt fixtures under `tests/fixtures` are normative for this local channel.
+
 An `EngagementBundle` embeds the complete `SignedAuthorityGrant`; verification
 checks both signatures, current grant validity, and target, pack, identity, and
 adapter authorization. Result verification requires the caller's expected run

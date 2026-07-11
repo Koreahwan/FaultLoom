@@ -8,10 +8,15 @@ use crate::ipc::{ActionClass, DenialCode, DispatchRequest, FlowKind, valid_ident
 use crate::policy::{ScopeApproval, ScopeVerifier};
 
 const MAX_SIGNED_EPOCH_BYTES: usize = 16_384;
+const MAX_EPOCH_RECEIPT_BYTES: usize = MAX_SIGNED_EPOCH_BYTES * 2 + 4_096;
 
-mod epoch_verifier_private {
+pub(crate) mod epoch_verifier_private {
     pub trait Sealed {}
 }
+
+pub use crate::t13_epoch::{
+    AuthorityKeyStatus, ChannelTrustError, PinnedAuthorityKey, T13ReceiptEpochVerifier,
+};
 
 pub trait ScopeClock {
     fn now_millis(&self) -> u64;
@@ -30,6 +35,7 @@ impl ScopeClock for SystemScopeClock {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SignedEpochEnvelope {
     canonical_bytes: Vec<u8>,
+    verifier_receipt: Option<Vec<u8>>,
 }
 
 impl SignedEpochEnvelope {
@@ -37,15 +43,34 @@ impl SignedEpochEnvelope {
         if canonical_bytes.is_empty() || canonical_bytes.len() > MAX_SIGNED_EPOCH_BYTES {
             return Err(EpochAdmissionError::InvalidEnvelope);
         }
-        Ok(Self { canonical_bytes })
+        Ok(Self {
+            canonical_bytes,
+            verifier_receipt: None,
+        })
+    }
+
+    pub fn with_verifier_receipt(
+        canonical_bytes: Vec<u8>,
+        verifier_receipt: Vec<u8>,
+    ) -> Result<Self, EpochAdmissionError> {
+        let mut envelope = Self::new(canonical_bytes)?;
+        if verifier_receipt.is_empty() || verifier_receipt.len() > MAX_EPOCH_RECEIPT_BYTES {
+            return Err(EpochAdmissionError::InvalidVerificationReceipt);
+        }
+        envelope.verifier_receipt = Some(verifier_receipt);
+        Ok(envelope)
     }
 
     pub fn canonical_bytes(&self) -> &[u8] {
         &self.canonical_bytes
     }
 
-    fn digest(&self) -> Digest {
+    pub(crate) fn digest(&self) -> Digest {
         Digest::of(&self.canonical_bytes)
+    }
+
+    pub fn verifier_receipt_bytes(&self) -> Option<&[u8]> {
+        self.verifier_receipt.as_deref()
     }
 }
 
@@ -62,12 +87,13 @@ pub struct VerifiedScopeEpoch {
     envelope_digest: Digest,
     payload_digest: Digest,
     verifier_receipt_digest: Digest,
+    gateway_boot_id: String,
+    verification_nonce: [u8; 16],
 }
 
-#[cfg(test)]
 impl VerifiedScopeEpoch {
     #[allow(clippy::too_many_arguments)]
-    fn from_trusted_verifier(
+    pub(crate) fn from_trusted_verifier(
         grant_id: String,
         epoch: u64,
         issued_at_millis: u64,
@@ -79,6 +105,8 @@ impl VerifiedScopeEpoch {
         envelope_digest: Digest,
         payload_digest: Digest,
         verifier_receipt_digest: Digest,
+        gateway_boot_id: String,
+        verification_nonce: [u8; 16],
     ) -> Self {
         Self {
             grant_id,
@@ -92,7 +120,17 @@ impl VerifiedScopeEpoch {
             envelope_digest,
             payload_digest,
             verifier_receipt_digest,
+            gateway_boot_id,
+            verification_nonce,
         }
+    }
+
+    pub fn grant_id(&self) -> &str {
+        &self.grant_id
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 }
 
@@ -123,6 +161,8 @@ pub enum EpochAdmissionError {
     InvalidEnvelope,
     VerifierUnavailable,
     VerificationFailed,
+    UnknownKey,
+    TrustAnchorRevoked,
     GrantMismatch,
     NotYetValid,
     Expired,
@@ -524,6 +564,7 @@ struct AdmittedEpoch {
 #[derive(Default)]
 struct ScopeState {
     current_epoch: Option<AdmittedEpoch>,
+    consumed_epoch_nonces: BTreeSet<[u8; 16]>,
     approved_actions: BTreeMap<String, u64>,
     resources: BTreeMap<String, ScopedResource>,
     cancellation_log: Vec<CancellationRecord>,
@@ -555,13 +596,15 @@ where
         &self,
         envelope: &SignedEpochEnvelope,
     ) -> Result<EpochTransition, EpochAdmissionError> {
-        let now = self.clock.now_millis();
-        let verified = self.verifier.verify(envelope, now)?;
-        self.validate_verified_epoch(envelope, &verified, now)?;
+        // Serialize verification with the state transition so a short-lived
+        // receipt cannot expire while waiting for the epoch lock.
         let mut state = self
             .state
             .lock()
             .map_err(|_| EpochAdmissionError::StateUnavailable)?;
+        let now = self.clock.now_millis();
+        let verified = self.verifier.verify(envelope, now)?;
+        self.validate_verified_epoch(envelope, &verified, now)?;
         let previous_epoch = state.current_epoch.as_ref().map(|epoch| epoch.epoch);
         if let Some(current) = &state.current_epoch {
             if verified.epoch < current.epoch {
@@ -570,6 +613,12 @@ where
             if verified.epoch == current.epoch {
                 return Err(EpochAdmissionError::Replay);
             }
+        }
+        if state
+            .consumed_epoch_nonces
+            .contains(&verified.verification_nonce)
+        {
+            return Err(EpochAdmissionError::Replay);
         }
         let cause = if verified.revoked {
             CancellationCause::ScopeRevoked
@@ -585,6 +634,9 @@ where
             revoked: verified.revoked,
             binding_digest,
         });
+        state
+            .consumed_epoch_nonces
+            .insert(verified.verification_nonce);
         Ok(EpochTransition {
             previous_epoch,
             current_epoch: verified.epoch,
@@ -602,6 +654,7 @@ where
         if verified.envelope_digest != envelope.digest()
             || verified.payload_digest == Digest::ZERO
             || verified.verifier_receipt_digest == Digest::ZERO
+            || !valid_identifier(&verified.gateway_boot_id)
             || !valid_identifier(&verified.key_id)
             || verified.signature_sequence != verified.epoch
             || verified.epoch == 0
@@ -1019,6 +1072,8 @@ mod tests {
                 envelope.digest(),
                 Digest::of(b"signed-payload"),
                 Digest::of(b"t13-verification-receipt"),
+                "gateway-boot:fixture".to_owned(),
+                [self.epoch as u8; 16],
             ))
         }
     }
@@ -1026,6 +1081,42 @@ mod tests {
     #[derive(Clone)]
     struct SequenceVerifier {
         accepted: Vec<(Digest, u64, bool)>,
+    }
+
+    struct AtomicAdmissionVerifier {
+        accepted: Vec<(Digest, String, u64, [u8; 16])>,
+    }
+
+    impl super::epoch_verifier_private::Sealed for AtomicAdmissionVerifier {}
+
+    impl EpochVerifier for AtomicAdmissionVerifier {
+        fn verify(
+            &self,
+            envelope: &SignedEpochEnvelope,
+            _now_millis: u64,
+        ) -> Result<VerifiedScopeEpoch, EpochAdmissionError> {
+            let digest = envelope.digest();
+            let (_, grant_id, epoch, nonce) = self
+                .accepted
+                .iter()
+                .find(|(candidate, _, _, _)| *candidate == digest)
+                .ok_or(EpochAdmissionError::VerificationFailed)?;
+            Ok(VerifiedScopeEpoch::from_trusted_verifier(
+                grant_id.clone(),
+                *epoch,
+                900,
+                2_000,
+                false,
+                None,
+                "authority-key:1".to_owned(),
+                *epoch,
+                digest,
+                Digest::of(b"signed-payload"),
+                Digest::of(envelope.canonical_bytes()),
+                "gateway-boot:fixture".to_owned(),
+                *nonce,
+            ))
+        }
     }
 
     impl super::epoch_verifier_private::Sealed for SequenceVerifier {}
@@ -1054,6 +1145,8 @@ mod tests {
                 digest,
                 Digest::of(b"signed-payload"),
                 Digest::of(b"t13-verification-receipt"),
+                "gateway-boot:fixture".to_owned(),
+                [*epoch as u8; 16],
             ))
         }
     }
@@ -1469,6 +1562,8 @@ mod tests {
                     envelope.digest(),
                     Digest::of(b"payload"),
                     Digest::ZERO,
+                    "gateway-boot:fixture".to_owned(),
+                    [8; 16],
                 ))
             }
         }
@@ -1478,6 +1573,82 @@ mod tests {
         assert_eq!(
             forged.admit_epoch(&signed_seven),
             Err(EpochAdmissionError::InvalidVerificationReceipt)
+        );
+    }
+
+    #[test]
+    fn epoch_and_nonce_commit_atomically_only_after_all_admission_checks() {
+        let wrong_grant = SignedEpochEnvelope::new(b"wrong-grant".to_vec()).unwrap();
+        let first = SignedEpochEnvelope::new(b"first".to_vec()).unwrap();
+        let reused = SignedEpochEnvelope::new(b"reused".to_vec()).unwrap();
+        let second = SignedEpochEnvelope::new(b"second".to_vec()).unwrap();
+        let nonce_one = [0x31; 16];
+        let nonce_two = [0x32; 16];
+        let verifier = AtomicAdmissionVerifier {
+            accepted: vec![
+                (wrong_grant.digest(), "grant:other".to_owned(), 7, nonce_one),
+                (first.digest(), "grant:owned".to_owned(), 7, nonce_one),
+                (reused.digest(), "grant:owned".to_owned(), 8, nonce_one),
+                (second.digest(), "grant:owned".to_owned(), 8, nonce_two),
+            ],
+        };
+        let kernel =
+            DeterministicScopeKernel::new(policy(), verifier, FixedClock::new(1_000)).unwrap();
+
+        assert_eq!(
+            kernel.admit_epoch(&wrong_grant),
+            Err(EpochAdmissionError::GrantMismatch)
+        );
+        assert_eq!(kernel.admit_epoch(&first).unwrap().current_epoch, 7);
+        assert_eq!(
+            kernel.admit_epoch(&reused),
+            Err(EpochAdmissionError::Replay)
+        );
+        assert_eq!(kernel.admit_epoch(&second).unwrap().current_epoch, 8);
+    }
+
+    #[test]
+    fn authenticated_t13_receipt_enters_the_kernel_and_replays_fail_closed() {
+        const NOW: u64 = 1_893_553_445_679;
+        const AUTHORITY_KEY_ID: &str =
+            "ed25519:sha256:56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c";
+        let canonical = include_bytes!(
+            "../../packages/protocol/tests/fixtures/scope_epoch_signed_envelope_v0_1.json"
+        )
+        .strip_suffix(b"\n")
+        .unwrap()
+        .to_vec();
+        let receipt_hex = include_str!(
+            "../../packages/protocol/tests/fixtures/scope_epoch_gateway_receipt_v0_1.hex"
+        )
+        .trim();
+        let receipt = (0..receipt_hex.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&receipt_hex[index..index + 2], 16).unwrap())
+            .collect();
+        let envelope = SignedEpochEnvelope::with_verifier_receipt(canonical, receipt).unwrap();
+        let authority = PinnedAuthorityKey::active(AUTHORITY_KEY_ID.to_owned()).unwrap();
+        let verifier = T13ReceiptEpochVerifier::from_gateway_held_key(
+            "gateway-channel:test".to_owned(),
+            std::array::from_fn(|index| index as u8),
+            "gateway-boot:test-1".to_owned(),
+            std::array::from_fn(|index| index as u8 + 0x80),
+            vec![authority],
+        )
+        .unwrap();
+        let mut golden_policy = policy();
+        golden_policy.grant_id = "grant.golden".to_owned();
+        golden_policy.execution_windows = vec![TimeWindow {
+            starts_at_millis: NOW - 1_000,
+            ends_at_millis: NOW + 60_000,
+        }];
+        let kernel =
+            DeterministicScopeKernel::new(golden_policy, verifier, FixedClock::new(NOW)).unwrap();
+
+        assert_eq!(kernel.admit_epoch(&envelope).unwrap().current_epoch, 7);
+        assert_eq!(
+            kernel.admit_epoch(&envelope),
+            Err(EpochAdmissionError::Replay)
         );
     }
 
