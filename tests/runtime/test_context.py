@@ -844,6 +844,152 @@ def test_backend_cannot_substitute_other_engagement_or_changed_content() -> None
         )
 
 
+def test_backend_subclass_cannot_change_body_between_validation_and_view() -> None:
+    original = b"AAAA"
+    changed = b"BBBB"
+
+    class SideEffectingContent(RetrievedContent):
+        def __getattribute__(self, name: str):
+            if name == "body":
+                accesses = object.__getattribute__(self, "_body_accesses")
+                object.__setattr__(self, "_body_accesses", accesses + 1)
+                return original if accesses < 2 else changed
+            return super().__getattribute__(name)
+
+    record = SideEffectingContent(
+        engagement_id="engagement.1",
+        run_id="run.1",
+        content_id=content_id_for(original),
+        media_type="application/octet-stream",
+        body=original,
+        watermark=1,
+    )
+    object.__setattr__(record, "_body_accesses", 0)
+
+    class Backend:
+        def load(
+            self, *, engagement_id: str, content_id: str
+        ) -> RetrievedContent | None:
+            return record
+
+    retriever = BoundedRetriever(Backend(), cursor_key=DEFAULT_RETRIEVAL_KEY)
+    with pytest.raises(RetrievalError, match="invalid record"):
+        retriever.read_range(
+            engagement_id="engagement.1",
+            content_id=content_id_for(original),
+            unit=RetrievalUnit.BYTES,
+            start=0,
+            count=4,
+        )
+    assert object.__getattribute__(record, "_body_accesses") == 0
+
+
+def test_backend_snapshot_is_detached_from_post_validation_mutation() -> None:
+    original = b"original"
+    record = RetrievedContent(
+        engagement_id="engagement.1",
+        run_id="run.1",
+        content_id=content_id_for(original),
+        media_type="application/octet-stream",
+        body=original,
+        watermark=1,
+    )
+
+    class Backend:
+        def load(
+            self, *, engagement_id: str, content_id: str
+        ) -> RetrievedContent | None:
+            return record
+
+    class MutatingAfterLoadRetriever(BoundedRetriever):
+        def _load(self, *, engagement_id: str, content_id: str):
+            snapshot = super()._load(
+                engagement_id=engagement_id,
+                content_id=content_id,
+            )
+            object.__setattr__(record, "body", b"changed!")
+            return snapshot
+
+    view = MutatingAfterLoadRetriever(
+        Backend(), cursor_key=DEFAULT_RETRIEVAL_KEY
+    ).read_range(
+        engagement_id="engagement.1",
+        content_id=content_id_for(original),
+        unit=RetrievalUnit.BYTES,
+        start=0,
+        count=len(original),
+    )
+    assert base64.b64decode(view.value) == original
+    assert view.full_byte_length == len(original)
+    compile_context(
+        context_state().model_copy(update={"retrieved_views": (view,)}),
+        provider(),
+        live=True,
+    )
+
+
+@pytest.mark.parametrize("body", [bytearray(b"mutable"), memoryview(b"aliased")])
+def test_backend_rejects_non_bytes_body(body: object) -> None:
+    record = RetrievedContent(
+        engagement_id="engagement.1",
+        run_id="run.1",
+        content_id=content_id_for(bytes(body)),
+        media_type="application/octet-stream",
+        body=body,  # type: ignore[arg-type]
+        watermark=1,
+    )
+
+    class Backend:
+        def load(
+            self, *, engagement_id: str, content_id: str
+        ) -> RetrievedContent | None:
+            return record
+
+    with pytest.raises(RetrievalError, match="exact immutable bytes"):
+        BoundedRetriever(Backend(), cursor_key=b"v" * 32).read_range(
+            engagement_id="engagement.1",
+            content_id=record.content_id,
+            unit=RetrievalUnit.BYTES,
+            start=0,
+            count=1,
+        )
+
+
+def test_backend_rejects_bytes_subclass_before_oversize_conversion() -> None:
+    class OversizeOnConversion(bytes):
+        conversion_attempted = False
+
+        def __bytes__(self) -> bytes:
+            type(self).conversion_attempted = True
+            return b"x" * 1_048_577
+
+    body = OversizeOnConversion(b"safe")
+    record = RetrievedContent(
+        engagement_id="engagement.1",
+        run_id="run.1",
+        content_id=content_id_for(b"safe"),
+        media_type="application/octet-stream",
+        body=body,
+        watermark=1,
+    )
+
+    class Backend:
+        def load(
+            self, *, engagement_id: str, content_id: str
+        ) -> RetrievedContent | None:
+            return record
+
+    with pytest.raises(RetrievalError, match="exact immutable bytes"):
+        BoundedRetriever(Backend(), cursor_key=b"w" * 32).read_range(
+            engagement_id="engagement.1",
+            content_id=record.content_id,
+            unit=RetrievalUnit.BYTES,
+            start=0,
+            count=1,
+        )
+    assert not OversizeOnConversion.conversion_attempted
+
+
 def test_backend_rejects_control_characters_in_media_type() -> None:
     backend = MemoryBackend()
     record = backend.add(b"data", media_type="text/plain\nforged")

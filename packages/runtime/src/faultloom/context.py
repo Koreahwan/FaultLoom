@@ -617,6 +617,17 @@ class RetrievedContent:
     watermark: int
 
 
+@dataclass(frozen=True, slots=True)
+class _RetrievedContentSnapshot:
+    engagement_id: str
+    run_id: str
+    content_id: str
+    media_type: str
+    body: bytes
+    full_byte_length: int
+    watermark: int
+
+
 class RetrievalBackend(Protocol):
     def load(self, *, engagement_id: str, content_id: str) -> RetrievedContent | None:
         """Return content only when it belongs to ``engagement_id``."""
@@ -700,16 +711,47 @@ class BoundedRetriever:
             count=count,
         )
 
-    def _load(self, *, engagement_id: str, content_id: str) -> RetrievedContent:
-        content = self._backend.load(engagement_id=engagement_id, content_id=content_id)
-        if content is None:
+    def _load(self, *, engagement_id: str, content_id: str) -> _RetrievedContentSnapshot:
+        untrusted = self._backend.load(
+            engagement_id=engagement_id,
+            content_id=content_id,
+        )
+        if untrusted is None:
             raise RetrievalAccessError("retrieval unavailable for engagement")
-        if not isinstance(content, RetrievedContent):
+        if type(untrusted) is not RetrievedContent:
             raise RetrievalError("retrieval backend returned an invalid record")
-        if not isinstance(content.body, bytes):
-            raise RetrievalError("stored output must be bytes")
-        if not isinstance(content.media_type, str):
-            raise RetrievalError("stored media type is invalid")
+
+        stored_engagement_id = untrusted.engagement_id
+        stored_run_id = untrusted.run_id
+        stored_content_id = untrusted.content_id
+        stored_media_type = untrusted.media_type
+        stored_body = untrusted.body
+        stored_watermark = untrusted.watermark
+        if not all(
+            type(value) is str
+            for value in (
+                stored_engagement_id,
+                stored_run_id,
+                stored_content_id,
+                stored_media_type,
+            )
+        ):
+            raise RetrievalError("retrieval backend returned an invalid record")
+        if type(stored_body) is not bytes:
+            raise RetrievalError("stored output must contain exact immutable bytes")
+        if type(stored_watermark) is not int or stored_watermark <= 0:
+            raise RetrievalError("stored watermark is invalid")
+
+        body = bytes(stored_body)
+        content = _RetrievedContentSnapshot(
+            engagement_id=stored_engagement_id,
+            run_id=stored_run_id,
+            content_id=stored_content_id,
+            media_type=stored_media_type,
+            body=body,
+            full_byte_length=len(body),
+            watermark=stored_watermark,
+        )
         valid_identity = (
             content.engagement_id == engagement_id
             and content.content_id == content_id
@@ -725,20 +767,18 @@ class BoundedRetriever:
             or any(not 32 <= ord(character) <= 126 for character in content.media_type)
         ):
             raise RetrievalError("stored media type is invalid")
-        if type(content.watermark) is not int or content.watermark <= 0:
-            raise RetrievalError("stored watermark is invalid")
         return content
 
     def _view(
         self,
-        content: RetrievedContent,
+        content: _RetrievedContentSnapshot,
         *,
         unit: RetrievalUnit,
         start: int,
         count: int,
     ) -> RetrievedView:
         if unit is RetrievalUnit.BYTES:
-            total_units = len(content.body)
+            total_units = content.full_byte_length
             if start > total_units:
                 raise RetrievalRangeError("byte range starts beyond the full output")
             end = min(start + count, total_units)
@@ -787,7 +827,7 @@ class BoundedRetriever:
             "content_id": content.content_id,
             "range_id": range_id,
             "media_type": content.media_type,
-            "full_byte_length": len(content.body),
+            "full_byte_length": content.full_byte_length,
             "unit": unit,
             "start": start,
             "end": end,
@@ -806,7 +846,7 @@ class BoundedRetriever:
             content_id=content.content_id,
             range_id=range_id,
             media_type=content.media_type,
-            full_byte_length=len(content.body),
+            full_byte_length=content.full_byte_length,
             unit=unit,
             start=start,
             end=end,
