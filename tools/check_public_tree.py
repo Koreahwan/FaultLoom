@@ -19,7 +19,8 @@ PRIVATE_NAMES = {
     "customer.json",
     "submission-outbox",
 }
-IGNORED_PARTS = {".git", ".pytest_cache", "__pycache__", "target", "dist", "build"}
+GENERATED_PARTS = {".pytest_cache", "__pycache__", "target", "dist", "build"}
+IGNORED_PARTS = {".git", *GENERATED_PARTS}
 RULE_FIXTURE_PATHS = {"tools/check_public_tree.py", "tests/test_public_tree_gate.py"}
 ABSOLUTE_PATH_PATTERNS = (
     re.compile(r"/mnt/[a-z]/users/", re.IGNORECASE),
@@ -52,13 +53,13 @@ class Violation:
     detail: str
 
 
-def _iter_files(root: Path):
+def _iter_files(root: Path, *, ignored_parts: set[str]):
     for path in sorted(root.rglob("*")):
         try:
             relative = path.relative_to(root)
         except ValueError:
             continue
-        if any(part in IGNORED_PARTS for part in relative.parts):
+        if any(part in ignored_parts for part in relative.parts):
             continue
         yield path, relative
 
@@ -77,14 +78,14 @@ def _python_imports(path: Path) -> set[str]:
     return imports
 
 
-def scan(root: Path) -> list[Violation]:
+def _scan(root: Path, *, ignored_parts: set[str]) -> list[Violation]:
     root = root.resolve()
     violations: list[Violation] = []
     missing = REQUIRED_POLICY_FILES - {path.name for path in root.iterdir() if path.is_file()}
     for name in sorted(missing):
         violations.append(Violation(name, "missing_policy_file", "required public policy file"))
 
-    for path, relative in _iter_files(root):
+    for path, relative in _iter_files(root, ignored_parts=ignored_parts):
         display = relative.as_posix()
         if path.is_symlink():
             violations.append(Violation(display, "symlink_forbidden", "public repositories are self-contained"))
@@ -126,6 +127,18 @@ def scan(root: Path) -> list[Violation]:
                         Violation(display, "direct_target_network_import", imported)
                     )
     return violations
+
+
+def scan(root: Path) -> list[Violation]:
+    """Scan a worktree while ignoring untracked generated output."""
+
+    return _scan(root, ignored_parts=IGNORED_PARTS)
+
+
+def scan_tracked_snapshot(root: Path) -> list[Violation]:
+    """Scan every file materialized from an immutable tracked tree."""
+
+    return _scan(root, ignored_parts={".git"})
 
 
 def main() -> int:

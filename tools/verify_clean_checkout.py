@@ -25,7 +25,7 @@ from pathlib import Path, PurePosixPath
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tools.check_public_tree import Violation, scan
+from tools.check_public_tree import Violation, scan_tracked_snapshot
 from tools.reproducible_build import (
     BuildPolicyError,
     NETWORK_EXECUTION,
@@ -290,7 +290,7 @@ def scan_immutable_head(root: Path, *, revision: str = "HEAD") -> list[Violation
     """Run the public-tree gate over bytes read from the immutable HEAD tree."""
 
     with immutable_head_snapshot(root, revision=revision) as snapshot:
-        return scan(snapshot)
+        return scan_tracked_snapshot(snapshot)
 
 
 def run_immutable_tests(

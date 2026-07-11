@@ -1788,6 +1788,20 @@ dependencies = []
             violations = scan_immutable_head(root)
             self.assertIn("absolute_user_path", {item.rule for item in violations})
 
+    def test_public_tree_gate_scans_tracked_generated_directories(self) -> None:
+        for relative in ("dist/customer.json", "target/.env"):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                make_repository(root)
+                write(root / relative, "tracked private fixture\n")
+                commit_all(root, f"Add tracked private fixture at {relative}")
+                self.assertEqual(scan(root), [])
+                violations = scan_immutable_head(root)
+                self.assertIn(
+                    (relative, "private_name"),
+                    {(item.path, item.rule) for item in violations},
+                )
+
     def test_tracked_package_symlink_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
