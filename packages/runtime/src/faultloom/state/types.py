@@ -31,4 +31,3 @@ def require_sha256(value: str, *, field: str = "sha256") -> str:
     if not isinstance(value, str) or not SHA256_RE.fullmatch(value):
         raise StorageError(f"{field} is not a lowercase SHA-256 digest")
     return value
-

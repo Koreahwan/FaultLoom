@@ -8,7 +8,6 @@ import hmac
 import json
 import os
 import secrets
-import stat
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -17,6 +16,14 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .canonical import canonical_json
+from .filesystem import (
+    NOFOLLOW,
+    PRIVATE_FILE_MODE,
+    inode_identity,
+    open_private_directory,
+    open_root_directory,
+    require_private_file,
+)
 from .types import (
     ChainIntegrityError,
     CrossEngagementError,
@@ -31,8 +38,7 @@ NONCE_BYTES = 12
 DEFAULT_MAX_ARTIFACT_BYTES = 256 * 1024 * 1024
 MAX_REFERENCE_BYTES = 2**31
 MAX_PAGE_BYTES = 1024 * 1024
-NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
-DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+MAX_NONCE_ATTEMPTS = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,22 +117,7 @@ class EngagementKey:
 
 
 def _open_directory(parent_fd: int, name: str, *, create: bool) -> int:
-    if "/" in name or name in {"", ".", ".."}:
-        raise StorageError("unsafe CAS directory component")
-    if create:
-        try:
-            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
-        except FileExistsError:
-            pass
-    try:
-        descriptor = os.open(name, os.O_RDONLY | DIRECTORY | NOFOLLOW, dir_fd=parent_fd)
-    except OSError as exc:
-        raise StorageError(f"cannot safely open CAS directory component {name!r}") from exc
-    opened = os.fstat(descriptor)
-    if not stat.S_ISDIR(opened.st_mode):
-        os.close(descriptor)
-        raise StorageError("CAS path component is not a directory")
-    return descriptor
+    return open_private_directory(parent_fd, name, create=create)
 
 
 def _write_all(descriptor: int, data: bytes) -> None:
@@ -168,27 +159,29 @@ class EncryptedCAS:
             raise StorageError("max_artifact_bytes is invalid")
         self.max_artifact_bytes = max_artifact_bytes
         self._key = key
-        self._cipher = AESGCM(key._copy_for_cipher())
-        self._cursor_key = hmac.digest(
-            key._copy_for_cipher(), b"faultloom-cas-cursor-v1", "sha256"
+        key_material = key._copy_for_cipher()
+        engagement_context = self.engagement_id.encode("utf-8")
+        aead_key = hmac.digest(
+            key_material,
+            b"faultloom-cas-aead-v1\0" + engagement_context,
+            "sha256",
         )
-        root = Path(root)
-        root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if root.is_symlink():
-            raise StorageError("CAS root must not be a symlink")
-        os.chmod(root, 0o700)
-        self._root_fd = os.open(root, os.O_RDONLY | DIRECTORY | NOFOLLOW)
-        opened = os.fstat(self._root_fd)
-        if not stat.S_ISDIR(opened.st_mode):
-            os.close(self._root_fd)
-            raise StorageError("CAS root is not a directory")
+        self._cipher = AESGCM(aead_key)
+        self._cursor_key = hmac.digest(
+            key_material,
+            b"faultloom-cas-cursor-v1\0" + engagement_context,
+            "sha256",
+        )
+        self._root_fd = open_root_directory(Path(root), create=True)
         namespace = hashlib.sha256(self.engagement_id.encode("utf-8")).hexdigest()
         self._namespace_fd = _open_directory(self._root_fd, namespace, create=True)
+        self._nonces_fd = _open_directory(self._namespace_fd, "nonces", create=True)
         self._closed = False
 
     def close(self) -> None:
         if self._closed:
             return
+        os.close(self._nonces_fd)
         os.close(self._namespace_fd)
         os.close(self._root_fd)
         self._closed = True
@@ -242,8 +235,10 @@ class EncryptedCAS:
                 raise ChainIntegrityError("encrypted artifact is missing") from exc
             try:
                 opened = os.fstat(descriptor)
-                if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
-                    raise ChainIntegrityError("encrypted artifact is not a private regular file")
+                try:
+                    require_private_file(opened, context="encrypted artifact")
+                except StorageError as exc:
+                    raise ChainIntegrityError(str(exc)) from exc
                 maximum = self.max_artifact_bytes + len(MAGIC) + NONCE_BYTES + 16
                 return _read_all(descriptor, maximum=maximum)
             finally:
@@ -256,6 +251,14 @@ class EncryptedCAS:
             raise ChainIntegrityError("encrypted artifact envelope is invalid")
         nonce_start = len(MAGIC)
         nonce = envelope[nonce_start : nonce_start + NONCE_BYTES]
+        nonce_name = f"{nonce.hex()}.nonce"
+        try:
+            reservation = os.stat(
+                nonce_name, dir_fd=self._nonces_fd, follow_symlinks=False
+            )
+            require_private_file(reservation, context="artifact nonce reservation")
+        except (OSError, StorageError) as exc:
+            raise ChainIntegrityError("artifact nonce is not durably reserved") from exc
         ciphertext = envelope[nonce_start + NONCE_BYTES :]
         try:
             plaintext = self._cipher.decrypt(nonce, ciphertext, self._aad(reference))
@@ -267,6 +270,51 @@ class EncryptedCAS:
         if not hmac.compare_digest(actual, reference.sha256):
             raise ChainIntegrityError("artifact plaintext digest mismatch")
         return plaintext
+
+    def _reserve_nonce(self) -> bytes:
+        for _ in range(MAX_NONCE_ATTEMPTS):
+            nonce = secrets.token_bytes(NONCE_BYTES)
+            name = f"{nonce.hex()}.nonce"
+            try:
+                descriptor = os.open(
+                    name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW,
+                    PRIVATE_FILE_MODE,
+                    dir_fd=self._nonces_fd,
+                )
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                raise StorageError("cannot reserve an encryption nonce") from exc
+            try:
+                require_private_file(os.fstat(descriptor), context="nonce reservation")
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.fsync(self._nonces_fd)
+            return nonce
+        raise StorageError("encryption nonce generator repeated a reserved nonce")
+
+    def _existing(self, reference: ArtifactRef) -> bool:
+        try:
+            os.stat(reference.sha256[:2], dir_fd=self._namespace_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        try:
+            shard_fd = self._open_shard(reference.sha256, create=False)
+            try:
+                os.stat(
+                    self._filename(reference.sha256),
+                    dir_fd=shard_fd,
+                    follow_symlinks=False,
+                )
+            finally:
+                os.close(shard_fd)
+        except FileNotFoundError:
+            return False
+        envelope = self._read_envelope(reference)
+        self._decrypt(reference, envelope)
+        return True
 
     def put(self, data: bytes, *, media_type: str = "application/octet-stream") -> ArtifactRef:
         self._require_open()
@@ -280,7 +328,9 @@ class EncryptedCAS:
             byte_length=len(data),
             media_type=media_type,
         )
-        nonce = secrets.token_bytes(NONCE_BYTES)
+        if self._existing(reference):
+            return reference
+        nonce = self._reserve_nonce()
         envelope = MAGIC + nonce + self._cipher.encrypt(nonce, data, self._aad(reference))
         shard_fd = self._open_shard(reference.sha256, create=True)
         temporary = f".tmp-{secrets.token_hex(16)}"
@@ -290,26 +340,36 @@ class EncryptedCAS:
                 descriptor = os.open(
                     temporary,
                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW,
-                    0o600,
+                    PRIVATE_FILE_MODE,
                     dir_fd=shard_fd,
                 )
+                require_private_file(os.fstat(descriptor), context="temporary CAS artifact")
                 _write_all(descriptor, envelope)
                 os.fsync(descriptor)
             finally:
                 if descriptor is not None:
                     os.close(descriptor)
-            os.replace(
-                temporary,
-                self._filename(reference.sha256),
-                src_dir_fd=shard_fd,
-                dst_dir_fd=shard_fd,
-            )
+            try:
+                os.link(
+                    temporary,
+                    self._filename(reference.sha256),
+                    src_dir_fd=shard_fd,
+                    dst_dir_fd=shard_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                if not self._existing(reference):
+                    raise ChainIntegrityError("existing content address is invalid")
+            os.fsync(shard_fd)
+            os.unlink(temporary, dir_fd=shard_fd)
+            temporary = ""
             os.fsync(shard_fd)
         finally:
-            try:
-                os.unlink(temporary, dir_fd=shard_fd)
-            except FileNotFoundError:
-                pass
+            if temporary:
+                try:
+                    os.unlink(temporary, dir_fd=shard_fd)
+                except FileNotFoundError:
+                    pass
             os.close(shard_fd)
         return reference
 
@@ -403,21 +463,13 @@ class EncryptedCAS:
 
         self._require_open()
         result: list[str] = []
-        for shard in os.listdir(self._namespace_fd):
-            if len(shard) != 2 or any(character not in "0123456789abcdef" for character in shard):
-                continue
+        for shard in self._validated_shards():
             shard_fd = _open_directory(self._namespace_fd, shard, create=False)
             try:
-                for filename in os.listdir(shard_fd):
-                    if not filename.endswith(".flcas"):
-                        continue
+                finals, _ = self._validated_shard_entries(shard_fd, shard)
+                for filename in finals:
                     digest = filename.removesuffix(".flcas")
-                    if len(digest) == 64 and digest.startswith(shard):
-                        require_sha256(digest)
-                        entry = os.stat(filename, dir_fd=shard_fd, follow_symlinks=False)
-                        if not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
-                            raise ChainIntegrityError("CAS contains a non-private artifact entry")
-                        result.append(digest)
+                    result.append(digest)
             finally:
                 os.close(shard_fd)
         return tuple(sorted(result))
@@ -427,68 +479,268 @@ class EncryptedCAS:
 
         self._require_open()
         result: list[tuple[str, str]] = []
-        for shard in os.listdir(self._namespace_fd):
-            if len(shard) != 2 or any(character not in "0123456789abcdef" for character in shard):
-                continue
+        for shard in self._validated_shards():
             shard_fd = _open_directory(self._namespace_fd, shard, create=False)
             try:
-                for filename in os.listdir(shard_fd):
-                    if not filename.startswith(".tmp-"):
-                        continue
-                    suffix = filename.removeprefix(".tmp-")
-                    if len(suffix) != 32 or any(
-                        character not in "0123456789abcdef" for character in suffix
-                    ):
-                        raise ChainIntegrityError("CAS contains an unknown temporary entry")
-                    entry = os.stat(filename, dir_fd=shard_fd, follow_symlinks=False)
-                    if not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
-                        raise ChainIntegrityError(
-                            "CAS temporary entry is not a private regular file"
-                        )
+                _, temporary = self._validated_shard_entries(shard_fd, shard)
+                for filename in temporary:
                     result.append((shard, filename))
             finally:
                 os.close(shard_fd)
         return tuple(sorted(result))
 
+    @staticmethod
+    def _is_lower_hex(value: str, length: int) -> bool:
+        return len(value) == length and all(
+            character in "0123456789abcdef" for character in value
+        )
+
+    def _validate_nonce_registry(self) -> None:
+        for filename in os.listdir(self._nonces_fd):
+            stem = filename.removesuffix(".nonce")
+            if not filename.endswith(".nonce") or not self._is_lower_hex(stem, 24):
+                raise ChainIntegrityError("CAS nonce registry contains an unknown entry")
+            try:
+                metadata = os.stat(filename, dir_fd=self._nonces_fd, follow_symlinks=False)
+                require_private_file(metadata, context="CAS nonce reservation")
+            except (OSError, StorageError) as exc:
+                raise ChainIntegrityError("CAS nonce reservation is not private") from exc
+            if metadata.st_size != 0:
+                raise ChainIntegrityError("CAS nonce reservation has unexpected content")
+
+    def _validate_orphan_quarantine(self) -> None:
+        try:
+            orphan_fd = _open_directory(self._namespace_fd, "orphaned", create=False)
+        except StorageError as exc:
+            try:
+                os.stat("orphaned", dir_fd=self._namespace_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            raise ChainIntegrityError("CAS orphan quarantine is unsafe") from exc
+        try:
+            for recovery_id in os.listdir(orphan_fd):
+                try:
+                    require_identifier(recovery_id, field="recovery_id")
+                    recovery_fd = _open_directory(orphan_fd, recovery_id, create=False)
+                except StorageError as exc:
+                    raise ChainIntegrityError(
+                        "CAS orphan quarantine contains an unknown entry"
+                    ) from exc
+                try:
+                    for filename in os.listdir(recovery_fd):
+                        digest = filename.removesuffix(".flcas")
+                        interrupted = filename.removesuffix(".interrupted")
+                        valid = (
+                            filename.endswith(".flcas")
+                            and self._is_lower_hex(digest, 64)
+                        ) or (
+                            filename.endswith(".interrupted")
+                            and len(interrupted) == 35
+                            and interrupted[2] == "-"
+                            and self._is_lower_hex(interrupted[:2], 2)
+                            and self._is_lower_hex(interrupted[3:], 32)
+                        )
+                        if not valid:
+                            raise ChainIntegrityError(
+                                "CAS orphan quarantine contains an unknown file"
+                            )
+                        try:
+                            metadata = os.stat(
+                                filename, dir_fd=recovery_fd, follow_symlinks=False
+                            )
+                            require_private_file(
+                                metadata, context="quarantined CAS artifact"
+                            )
+                        except (OSError, StorageError) as exc:
+                            raise ChainIntegrityError(
+                                "quarantined CAS artifact is not private"
+                            ) from exc
+                finally:
+                    os.close(recovery_fd)
+        finally:
+            os.close(orphan_fd)
+
+    def _validated_shards(self) -> tuple[str, ...]:
+        self._validate_nonce_registry()
+        self._validate_orphan_quarantine()
+        shards: list[str] = []
+        for entry in os.listdir(self._namespace_fd):
+            if entry in {"nonces", "orphaned"}:
+                continue
+            if not self._is_lower_hex(entry, 2):
+                raise ChainIntegrityError("CAS namespace contains an unknown entry")
+            shards.append(entry)
+        return tuple(sorted(shards))
+
+    def _validated_shard_entries(
+        self, shard_fd: int, shard: str
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        finals: list[str] = []
+        temporary: list[str] = []
+        identities: dict[tuple[int, int], list[tuple[str, str, int]]] = {}
+        for filename in os.listdir(shard_fd):
+            digest = filename.removesuffix(".flcas")
+            suffix = filename.removeprefix(".tmp-")
+            if (
+                filename.endswith(".flcas")
+                and self._is_lower_hex(digest, 64)
+                and digest.startswith(shard)
+            ):
+                kind = "final"
+                finals.append(filename)
+            elif filename.startswith(".tmp-") and self._is_lower_hex(suffix, 32):
+                kind = "temporary"
+                temporary.append(filename)
+            else:
+                raise ChainIntegrityError("CAS shard contains an unknown entry")
+            try:
+                metadata = os.stat(filename, dir_fd=shard_fd, follow_symlinks=False)
+                require_private_file(
+                    metadata,
+                    context="CAS shard entry",
+                    allowed_links=(1, 2),
+                )
+            except (OSError, StorageError) as exc:
+                raise ChainIntegrityError("CAS shard entry is not private") from exc
+            identities.setdefault(inode_identity(metadata), []).append(
+                (kind, filename, metadata.st_nlink)
+            )
+        for names in identities.values():
+            link_count = names[0][2]
+            if link_count == 1 and len(names) == 1:
+                continue
+            kinds = sorted(name[0] for name in names)
+            if link_count != 2 or len(names) != 2 or kinds != ["final", "temporary"]:
+                raise ChainIntegrityError("CAS shard contains an unexpected hard link")
+        return tuple(sorted(finals)), tuple(sorted(temporary))
+
+    @staticmethod
+    def _rename_checked(
+        source_fd: int,
+        source: str,
+        target_fd: int,
+        target: str,
+        *,
+        context: str,
+    ) -> None:
+        descriptor = os.open(source, os.O_RDONLY | NOFOLLOW, dir_fd=source_fd)
+        try:
+            before = os.fstat(descriptor)
+            require_private_file(before, context=context)
+            named_before = os.stat(source, dir_fd=source_fd, follow_symlinks=False)
+            if inode_identity(named_before) != inode_identity(before):
+                raise ChainIntegrityError(f"{context} changed before quarantine")
+            try:
+                os.stat(target, dir_fd=target_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise ChainIntegrityError(f"{context} quarantine collision")
+            try:
+                os.rename(source, target, src_dir_fd=source_fd, dst_dir_fd=target_fd)
+                os.fsync(target_fd)
+                os.fsync(source_fd)
+            except OSError as exc:
+                raise StorageError(f"cannot durably quarantine {context}") from exc
+            target_descriptor = os.open(target, os.O_RDONLY | NOFOLLOW, dir_fd=target_fd)
+            try:
+                after = os.fstat(target_descriptor)
+                require_private_file(after, context=f"quarantined {context}")
+                if inode_identity(after) != inode_identity(before):
+                    raise ChainIntegrityError(f"{context} changed during quarantine")
+            finally:
+                os.close(target_descriptor)
+        finally:
+            os.close(descriptor)
+
     def quarantine_temporary(
         self, shard: str, filename: str, *, recovery_id: str
-    ) -> None:
+    ) -> str:
         self._require_open()
-        if (
-            len(shard) != 2
-            or any(character not in "0123456789abcdef" for character in shard)
-            or not filename.startswith(".tmp-")
+        if not self._is_lower_hex(shard, 2) or not (
+            filename.startswith(".tmp-")
+            and self._is_lower_hex(filename.removeprefix(".tmp-"), 32)
         ):
             raise StorageError("temporary CAS entry identity is invalid")
         require_identifier(recovery_id, field="recovery_id")
         source_fd = _open_directory(self._namespace_fd, shard, create=False)
-        orphan_fd = _open_directory(self._namespace_fd, "orphaned", create=True)
-        recovery_fd = _open_directory(orphan_fd, recovery_id, create=True)
-        target = f"{shard}-{filename.removeprefix('.tmp-')}.interrupted"
         try:
             descriptor = os.open(filename, os.O_RDONLY | NOFOLLOW, dir_fd=source_fd)
             try:
                 entry = os.fstat(descriptor)
-                if not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
-                    raise ChainIntegrityError("interrupted write changed during recovery")
+                require_private_file(
+                    entry,
+                    context="interrupted CAS write",
+                    allowed_links=(1, 2),
+                )
+                if entry.st_nlink == 2:
+                    finals, temporary = self._validated_shard_entries(source_fd, shard)
+                    if filename not in temporary:
+                        raise ChainIntegrityError(
+                            "interrupted publication is not discoverable"
+                        )
+                    matching = []
+                    for final in finals:
+                        metadata = os.stat(
+                            final, dir_fd=source_fd, follow_symlinks=False
+                        )
+                        if inode_identity(metadata) == inode_identity(entry):
+                            matching.append(final)
+                    if len(matching) != 1:
+                        raise ChainIntegrityError(
+                            "interrupted publication has no unique final entry"
+                        )
+                    final = matching[0]
+                    named_temporary = os.stat(
+                        filename, dir_fd=source_fd, follow_symlinks=False
+                    )
+                    named_final = os.stat(
+                        final, dir_fd=source_fd, follow_symlinks=False
+                    )
+                    expected_identity = inode_identity(entry)
+                    if (
+                        inode_identity(named_temporary) != expected_identity
+                        or inode_identity(named_final) != expected_identity
+                        or named_temporary.st_nlink != 2
+                        or named_final.st_nlink != 2
+                    ):
+                        raise ChainIntegrityError(
+                            "interrupted publication changed before reconciliation"
+                        )
+                    os.unlink(filename, dir_fd=source_fd)
+                    os.fsync(source_fd)
+                    reconciled = os.fstat(descriptor)
+                    final_after = os.stat(
+                        final, dir_fd=source_fd, follow_symlinks=False
+                    )
+                    if (
+                        inode_identity(reconciled) != expected_identity
+                        or inode_identity(final_after) != expected_identity
+                        or reconciled.st_nlink != 1
+                        or final_after.st_nlink != 1
+                    ):
+                        raise ChainIntegrityError(
+                            "interrupted publication changed during reconciliation"
+                        )
+                    return "published"
             finally:
                 os.close(descriptor)
+            orphan_fd = _open_directory(self._namespace_fd, "orphaned", create=True)
+            recovery_fd = _open_directory(orphan_fd, recovery_id, create=True)
+            target = f"{shard}-{filename.removeprefix('.tmp-')}.interrupted"
             try:
-                os.link(
+                self._rename_checked(
+                    source_fd,
                     filename,
+                    recovery_fd,
                     target,
-                    src_dir_fd=source_fd,
-                    dst_dir_fd=recovery_fd,
-                    follow_symlinks=False,
+                    context="interrupted CAS write",
                 )
-            except FileExistsError as exc:
-                raise ChainIntegrityError("interrupted-write quarantine collision") from exc
-            os.unlink(filename, dir_fd=source_fd)
-            os.fsync(source_fd)
-            os.fsync(recovery_fd)
+            finally:
+                os.close(recovery_fd)
+                os.close(orphan_fd)
+            return "quarantined"
         finally:
-            os.close(recovery_fd)
-            os.close(orphan_fd)
             os.close(source_fd)
 
     def quarantine_orphan(self, digest: str, *, recovery_id: str) -> None:
@@ -496,36 +748,19 @@ class EncryptedCAS:
         require_sha256(digest)
         require_identifier(recovery_id, field="recovery_id")
         source_fd = self._open_shard(digest, create=False)
-        orphan_fd = _open_directory(self._namespace_fd, "orphaned", create=True)
-        recovery_fd = _open_directory(orphan_fd, recovery_id, create=True)
         try:
+            orphan_fd = _open_directory(self._namespace_fd, "orphaned", create=True)
+            recovery_fd = _open_directory(orphan_fd, recovery_id, create=True)
             try:
-                descriptor = os.open(
+                self._rename_checked(
+                    source_fd,
                     self._filename(digest),
-                    os.O_RDONLY | NOFOLLOW,
-                    dir_fd=source_fd,
+                    recovery_fd,
+                    self._filename(digest),
+                    context="orphaned CAS artifact",
                 )
-                try:
-                    entry = os.fstat(descriptor)
-                    if not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
-                        raise ChainIntegrityError("orphan is not a private regular file")
-                finally:
-                    os.close(descriptor)
-                os.link(
-                    self._filename(digest),
-                    self._filename(digest),
-                    src_dir_fd=source_fd,
-                    dst_dir_fd=recovery_fd,
-                    follow_symlinks=False,
-                )
-                os.unlink(self._filename(digest), dir_fd=source_fd)
-            except FileNotFoundError as exc:
-                raise ChainIntegrityError("orphan disappeared during recovery") from exc
-            except FileExistsError as exc:
-                raise ChainIntegrityError("orphan quarantine collision") from exc
-            os.fsync(source_fd)
-            os.fsync(recovery_fd)
+            finally:
+                os.close(recovery_fd)
+                os.close(orphan_fd)
         finally:
-            os.close(recovery_fd)
-            os.close(orphan_fd)
             os.close(source_fd)

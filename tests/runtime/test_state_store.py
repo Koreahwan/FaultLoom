@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import pickle
+import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
 from faultloom.state import (
+    AnchorCheckpoint,
     ArtifactRef,
     ChainIntegrityError,
     CrossEngagementError,
@@ -21,6 +25,7 @@ from faultloom.state import (
     StateStore,
     StorageError,
 )
+import faultloom.state.cas as cas_module
 
 
 KEY_BYTES = bytes(range(32))
@@ -30,19 +35,49 @@ def key() -> EngagementKey:
     return EngagementKey(KEY_BYTES)
 
 
+def state_root(root: Path) -> Path:
+    return root / "state"
+
+
+def anchor_root(root: Path) -> Path:
+    return root / "anchor"
+
+
+def state_store(
+    root: Path,
+    engagement_id: str,
+    engagement_key: EngagementKey | None = None,
+    *,
+    minimum_anchor: AnchorCheckpoint | None = None,
+) -> StateStore:
+    return StateStore(
+        state_root(root),
+        engagement_id,
+        engagement_key or key(),
+        anchor_root=anchor_root(root),
+        minimum_anchor=minimum_anchor,
+    )
+
+
 def database_path(root: Path, engagement_id: str) -> Path:
     namespace = hashlib.sha256(engagement_id.encode()).hexdigest()
-    return root / "engagements" / namespace / "state.sqlite3"
+    return state_root(root) / "engagements" / namespace / "state.sqlite3"
 
 
 def blob_path(root: Path, reference: ArtifactRef) -> Path:
     namespace = hashlib.sha256(reference.engagement_id.encode()).hexdigest()
-    return root / "cas" / namespace / reference.sha256[:2] / f"{reference.sha256}.flcas"
+    return (
+        state_root(root)
+        / "cas"
+        / namespace
+        / reference.sha256[:2]
+        / f"{reference.sha256}.flcas"
+    )
 
 
 def test_full_raw_output_is_encrypted_and_retrievable_without_truncation(tmp_path: Path) -> None:
     raw = (b"line with a unique raw marker\n" * 1200) + b"tail"
-    with StateStore(tmp_path, "eng.alpha", key()) as store:
+    with state_store(tmp_path, "eng.alpha") as store:
         event, reference = store.append_observation(
             actor_stream="researcher",
             event_type="tool.observation",
@@ -108,6 +143,34 @@ def test_same_content_can_have_multiple_descriptive_media_types(tmp_path: Path) 
         assert len(cas.blob_digests()) == 1
 
 
+def test_content_id_is_deterministic_but_initial_encryption_is_randomized(
+    tmp_path: Path,
+) -> None:
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    with EncryptedCAS(first_root, "eng.random", key()) as first:
+        one = first.put(b"same")
+        first_path = (
+            first_root
+            / hashlib.sha256(b"eng.random").hexdigest()
+            / one.sha256[:2]
+            / f"{one.sha256}.flcas"
+        )
+        ciphertext = first_path.read_bytes()
+        again = first.put(b"same")
+        assert first_path.read_bytes() == ciphertext
+    with EncryptedCAS(second_root, "eng.random", key()) as second:
+        two = second.put(b"same")
+        second_path = (
+            second_root
+            / hashlib.sha256(b"eng.random").hexdigest()
+            / two.sha256[:2]
+            / f"{two.sha256}.flcas"
+        )
+    assert one.sha256 == again.sha256 == two.sha256
+    assert ciphertext != second_path.read_bytes()
+
+
 def test_key_is_redacted_and_not_pickleable() -> None:
     engagement_key = key()
     assert repr(engagement_key) == "EngagementKey(<redacted>)"
@@ -143,13 +206,13 @@ def test_chain_detects_offline_database_tampering(tmp_path: Path) -> None:
     raw.execute("UPDATE events SET payload_json = '{\"safe\":false}' WHERE seq = 1")
     raw.commit()
     raw.close()
-    with pytest.raises(ChainIntegrityError, match="payload digest"):
+    with pytest.raises(ChainIntegrityError, match="schema manifest|payload digest"):
         EventLedger(path, "eng.tamper")
 
 
 def test_derived_index_tampering_is_detected_against_chain_anchor(tmp_path: Path) -> None:
     path = database_path(tmp_path, "eng.index-tamper")
-    with StateStore(tmp_path, "eng.index-tamper", key()) as store:
+    with state_store(tmp_path, "eng.index-tamper") as store:
         event, reference = store.append_observation(
             actor_stream="researcher",
             event_type="observation",
@@ -168,7 +231,7 @@ def test_derived_index_tampering_is_detected_against_chain_anchor(tmp_path: Path
     raw.execute("UPDATE search_documents SET redacted_text='tampered'")
     raw.commit()
     raw.close()
-    with pytest.raises(ChainIntegrityError, match="search projection"):
+    with pytest.raises(ChainIntegrityError, match="schema manifest|search projection"):
         EventLedger(path, "eng.index-tamper")
 
 
@@ -179,12 +242,27 @@ def test_artifact_registry_requires_reference_in_hashed_payload(tmp_path: Path) 
         byte_length=3,
     )
     with EventLedger(tmp_path / "state.sqlite3", "eng.artifact-anchor") as ledger:
-        with pytest.raises(StorageError, match="present in the event payload"):
+        with pytest.raises(StorageError, match="exactly match"):
             ledger.append(
                 actor_stream="researcher",
                 event_type="observation",
                 payload={"missing": True},
                 artifacts=(reference,),
+            )
+
+
+def test_unregistered_payload_artifact_is_rejected(tmp_path: Path) -> None:
+    reference = ArtifactRef(
+        engagement_id="eng.unregistered",
+        sha256=hashlib.sha256(b"raw").hexdigest(),
+        byte_length=3,
+    )
+    with EventLedger(tmp_path / "state.sqlite3", "eng.unregistered") as ledger:
+        with pytest.raises(StorageError, match="exactly match"):
+            ledger.append(
+                actor_stream="researcher",
+                event_type="observation",
+                payload={"artifact_ref": reference.to_dict()},
             )
 
 
@@ -214,7 +292,7 @@ def test_event_canonical_profile_rejects_ambiguous_values(
 
 
 def test_search_projection_and_graph_are_append_only(tmp_path: Path) -> None:
-    with StateStore(tmp_path, "eng.index", key()) as store:
+    with state_store(tmp_path, "eng.index") as store:
         event, reference = store.append_observation(
             actor_stream="researcher",
             event_type="observation",
@@ -255,7 +333,7 @@ def test_search_projection_and_graph_are_append_only(tmp_path: Path) -> None:
 
 
 def test_recovery_quarantines_uncommitted_cas_write(tmp_path: Path) -> None:
-    with StateStore(tmp_path, "eng.recover", key()) as store:
+    with state_store(tmp_path, "eng.recover") as store:
         committed_event, committed = store.append_observation(
             actor_stream="researcher",
             event_type="observation",
@@ -265,21 +343,23 @@ def test_recovery_quarantines_uncommitted_cas_write(tmp_path: Path) -> None:
         assert committed_event.seq == 1
         orphan = store.cas.put(b"crashed before ledger commit")
         report = store.recover()
-        assert report.verified_artifacts == (committed.sha256,)
+        assert committed.sha256 in report.verified_artifacts
+        assert len(report.verified_artifacts) == 2
         assert report.quarantined_orphans == (orphan.sha256,)
         assert report.recovery_id is not None
-        assert store.cas.blob_digests() == (committed.sha256,)
+        assert store.cas.blob_digests() == report.verified_artifacts
         assert store.cas.get(committed) == b"committed"
 
 
 def test_recovery_quarantines_interrupted_prepublication_write(tmp_path: Path) -> None:
     engagement_id = "eng.interrupted"
     namespace = hashlib.sha256(engagement_id.encode()).hexdigest()
-    with StateStore(tmp_path, engagement_id, key()) as store:
-        shard = tmp_path / "cas" / namespace / "ab"
-        shard.mkdir()
+    with state_store(tmp_path, engagement_id) as store:
+        shard = state_root(tmp_path) / "cas" / namespace / "ab"
+        shard.mkdir(mode=0o700)
         temporary = shard / (".tmp-" + "1" * 32)
         temporary.write_bytes(b"partial encrypted envelope")
+        temporary.chmod(0o600)
         report = store.recover()
         assert report.quarantined_interrupted_writes == (
             "ab/.tmp-" + "1" * 32,
@@ -290,7 +370,7 @@ def test_recovery_quarantines_interrupted_prepublication_write(tmp_path: Path) -
 
 
 def test_recovery_fails_if_ledger_artifact_is_missing(tmp_path: Path) -> None:
-    with StateStore(tmp_path, "eng.missing", key()) as store:
+    with state_store(tmp_path, "eng.missing") as store:
         _, reference = store.append_observation(
             actor_stream="researcher",
             event_type="observation",
@@ -323,7 +403,13 @@ def test_committed_wal_event_survives_abrupt_process_exit(tmp_path: Path) -> Non
 import os
 from pathlib import Path
 from faultloom.state import EngagementKey, StateStore
-store = StateStore(Path({str(tmp_path)!r}), 'eng.crash', EngagementKey(bytes(range(32))))
+base = Path({str(tmp_path)!r})
+store = StateStore(
+    base / 'state',
+    'eng.crash',
+    EngagementKey(bytes(range(32))),
+    anchor_root=base / 'anchor',
+)
 store.append_observation(
     actor_stream='researcher', event_type='observation', raw_output=b'durable', metadata={{}}
 )
@@ -339,10 +425,10 @@ os._exit(0)
         timeout=20,
     )
     assert completed.returncode == 0
-    with StateStore(tmp_path, "eng.crash", key()) as reopened:
+    with state_store(tmp_path, "eng.crash") as reopened:
         assert reopened.ledger.events()[0].seq == 1
         report = reopened.recover()
-        assert len(report.verified_artifacts) == 1
+        assert len(report.verified_artifacts) == 2
 
 
 def test_terminal_symlink_roots_are_rejected(tmp_path: Path) -> None:
@@ -366,3 +452,576 @@ def test_artifact_reference_schema_is_strict() -> None:
     value["unexpected"] = True
     with pytest.raises(StorageError, match="keys"):
         ArtifactRef.from_dict(value)
+
+
+def test_authenticated_anchor_rejects_database_snapshot_rollback(tmp_path: Path) -> None:
+    with state_store(tmp_path, "eng.rollback") as store:
+        store.append_observation(
+            actor_stream="researcher",
+            event_type="observation",
+            raw_output=b"one",
+            metadata={},
+        )
+    snapshot = tmp_path / "state-snapshot"
+    shutil.copytree(state_root(tmp_path), snapshot)
+    with state_store(tmp_path, "eng.rollback") as store:
+        store.append_observation(
+            actor_stream="researcher",
+            event_type="observation",
+            raw_output=b"two",
+            metadata={},
+        )
+        assert store.checkpoint().seq == 2
+    shutil.rmtree(state_root(tmp_path))
+    shutil.copytree(snapshot, state_root(tmp_path))
+    with pytest.raises(ChainIntegrityError, match="behind its authenticated anchor"):
+        state_store(tmp_path, "eng.rollback")
+
+
+def test_direct_ledger_mutation_advances_anchor_and_rejects_rollback(
+    tmp_path: Path,
+) -> None:
+    engagement_id = "eng.direct-anchor"
+    with state_store(tmp_path, engagement_id) as store:
+        event, _ = store.append_observation(
+            actor_stream="researcher",
+            event_type="observation",
+            raw_output=b"one",
+            metadata={},
+        )
+    snapshot = tmp_path / "state-before-direct-mutation"
+    shutil.copytree(state_root(tmp_path), snapshot)
+    with state_store(tmp_path, engagement_id) as store:
+        node_event = store.ledger.add_graph_node(
+            node_id="node.direct",
+            node_kind="subject",
+            attributes={},
+            event_seq=event.seq,
+        )
+        checkpoint = store.anchor.load_optional()
+        assert checkpoint is not None
+        assert checkpoint.seq == node_event.seq == 2
+        assert checkpoint.head == node_event.event_hash
+    shutil.rmtree(state_root(tmp_path))
+    shutil.copytree(snapshot, state_root(tmp_path))
+    with pytest.raises(ChainIntegrityError, match="behind its authenticated anchor"):
+        state_store(tmp_path, engagement_id)
+
+
+def test_existing_state_without_authenticated_anchor_fails_closed(tmp_path: Path) -> None:
+    engagement_id = "eng.missing-anchor"
+    with state_store(tmp_path, engagement_id) as store:
+        store.append_observation(
+            actor_stream="researcher",
+            event_type="observation",
+            raw_output=b"anchored",
+            metadata={},
+        )
+    namespace = hashlib.sha256(engagement_id.encode()).hexdigest()
+    anchor = anchor_root(tmp_path) / "anchors" / f"{namespace}.anchor"
+    anchor.unlink()
+    with pytest.raises(ChainIntegrityError, match="missing for existing"):
+        state_store(tmp_path, engagement_id)
+
+
+def test_trusted_anchor_floor_detects_whole_store_rollback(tmp_path: Path) -> None:
+    with state_store(tmp_path, "eng.floor") as store:
+        store.append_observation(
+            actor_stream="researcher",
+            event_type="observation",
+            raw_output=b"one",
+            metadata={},
+        )
+        old_checkpoint = store.checkpoint()
+    state_snapshot = tmp_path / "state-old"
+    anchor_snapshot = tmp_path / "anchor-old"
+    shutil.copytree(state_root(tmp_path), state_snapshot)
+    shutil.copytree(anchor_root(tmp_path), anchor_snapshot)
+    with state_store(tmp_path, "eng.floor") as store:
+        store.append_observation(
+            actor_stream="researcher",
+            event_type="observation",
+            raw_output=b"two",
+            metadata={},
+        )
+        trusted = store.checkpoint()
+    assert trusted.seq == old_checkpoint.seq + 1
+    shutil.rmtree(state_root(tmp_path))
+    shutil.rmtree(anchor_root(tmp_path))
+    shutil.copytree(state_snapshot, state_root(tmp_path))
+    shutil.copytree(anchor_snapshot, anchor_root(tmp_path))
+    with state_store(tmp_path, "eng.floor") as restored:
+        assert restored.checkpoint() == old_checkpoint
+    with pytest.raises(ChainIntegrityError, match="older than the trusted floor"):
+        state_store(tmp_path, "eng.floor", minimum_anchor=trusted)
+
+
+def test_committed_wal_tail_truncation_is_detected_by_anchor(tmp_path: Path) -> None:
+    script = f"""
+import os
+from pathlib import Path
+from faultloom.state import EngagementKey, StateStore
+base = Path({str(tmp_path)!r})
+store = StateStore(
+    base / 'state', 'eng.wal-anchor', EngagementKey(bytes(range(32))),
+    anchor_root=base / 'anchor',
+)
+store.append_observation(
+    actor_stream='researcher', event_type='observation', raw_output=b'one', metadata={{}}
+)
+store.append_observation(
+    actor_stream='researcher', event_type='observation', raw_output=b'two', metadata={{}}
+)
+os._exit(0)
+"""
+    environment = os.environ.copy()
+    source_root = Path(__file__).parents[2] / "packages" / "runtime" / "src"
+    environment["PYTHONPATH"] = str(source_root)
+    completed = subprocess.run(
+        [sys.executable, "-c", script], env=environment, check=False, timeout=20
+    )
+    assert completed.returncode == 0
+    database = database_path(tmp_path, "eng.wal-anchor")
+    wal = Path(f"{database}-wal")
+    data = wal.read_bytes()
+    assert len(data) > 1
+    wal.write_bytes(data[:-1])
+    Path(f"{database}-shm").unlink(missing_ok=True)
+    with pytest.raises(ChainIntegrityError, match="behind its authenticated anchor"):
+        state_store(tmp_path, "eng.wal-anchor")
+
+
+def test_wrong_key_cannot_replace_existing_content_address(tmp_path: Path) -> None:
+    with state_store(tmp_path, "eng.key") as store:
+        _, reference = store.append_observation(
+            actor_stream="researcher",
+            event_type="observation",
+            raw_output=b"same-content",
+            metadata={},
+        )
+    path = blob_path(tmp_path, reference)
+    before = path.read_bytes()
+    with pytest.raises(ChainIntegrityError, match="anchor key|tag"):
+        state_store(tmp_path, "eng.key", EngagementKey(b"x" * 32))
+    assert path.read_bytes() == before
+    with EncryptedCAS(
+        state_root(tmp_path) / "cas", "eng.key", EngagementKey(b"x" * 32)
+    ) as wrong:
+        with pytest.raises(ChainIntegrityError, match="authentication"):
+            wrong.put(b"same-content")
+    assert path.read_bytes() == before
+
+
+def test_recovery_waits_for_inflight_observation_transaction(tmp_path: Path) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    recovery_done = threading.Event()
+    result: dict[str, object] = {}
+    with state_store(tmp_path, "eng.serialized") as store:
+        original = store.ledger.append
+
+        def delayed_append(*args: object, **kwargs: object) -> object:
+            entered.set()
+            assert release.wait(5)
+            return original(*args, **kwargs)
+
+        store.ledger.append = delayed_append  # type: ignore[method-assign]
+
+        def writer() -> None:
+            result["event"] = store.append_observation(
+                actor_stream="researcher",
+                event_type="observation",
+                raw_output=b"in-flight",
+                metadata={},
+            )[0]
+
+        def recoverer() -> None:
+            result["recovery"] = store.recover()
+            recovery_done.set()
+
+        writer_thread = threading.Thread(target=writer)
+        recovery_thread = threading.Thread(target=recoverer)
+        writer_thread.start()
+        assert entered.wait(5)
+        recovery_thread.start()
+        assert not recovery_done.wait(0.2)
+        release.set()
+        writer_thread.join(5)
+        recovery_thread.join(5)
+        store.ledger.append = original  # type: ignore[method-assign]
+        assert not writer_thread.is_alive()
+        assert not recovery_thread.is_alive()
+        report = store.recover()
+        assert report.quarantined_orphans == ()
+        assert len(store.ledger.events()) == 1
+
+
+def test_independent_processes_share_one_engagement_transaction_lock(
+    tmp_path: Path,
+) -> None:
+    script = f"""
+import sys
+from pathlib import Path
+from faultloom.state import EngagementKey, StateStore
+base = Path({str(tmp_path)!r})
+worker = int(sys.argv[1])
+with StateStore(
+    base / 'state', 'eng.processes', EngagementKey(bytes(range(32))),
+    anchor_root=base / 'anchor',
+) as store:
+    for index in range(10):
+        store.append_observation(
+            actor_stream=f'worker.{{worker}}',
+            event_type='observation',
+            raw_output=f'{{worker}}:{{index}}'.encode(),
+            metadata={{'worker': worker, 'index': index}},
+        )
+"""
+    environment = os.environ.copy()
+    source_root = Path(__file__).parents[2] / "packages" / "runtime" / "src"
+    environment["PYTHONPATH"] = str(source_root)
+    processes = [
+        subprocess.Popen([sys.executable, "-c", script, str(worker)], env=environment)
+        for worker in range(2)
+    ]
+    assert [process.wait(timeout=30) for process in processes] == [0, 0]
+    with state_store(tmp_path, "eng.processes") as store:
+        events = store.ledger.events(limit=100)
+        assert [event.seq for event in events] == list(range(1, 21))
+        assert store.checkpoint().seq == 20
+        report = store.recover()
+        assert report.quarantined_orphans == ()
+
+
+def test_interrupted_cas_publication_link_is_reconciled(tmp_path: Path) -> None:
+    with state_store(tmp_path, "eng.publish-crash") as store:
+        _, reference = store.append_observation(
+            actor_stream="researcher",
+            event_type="observation",
+            raw_output=b"published",
+            metadata={},
+        )
+        final = blob_path(tmp_path, reference)
+        temporary = final.parent / (".tmp-" + "a" * 32)
+        os.link(final, temporary)
+        assert final.stat().st_nlink == 2
+        report = store.recover()
+        label = f"{reference.sha256[:2]}/{temporary.name}"
+        assert report.reconciled_publications == (label,)
+        assert not temporary.exists()
+        assert final.stat().st_nlink == 1
+        assert store.cas.get(reference) == b"published"
+
+
+def test_quarantine_name_swap_is_detected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engagement_id = "eng.swap"
+    namespace = hashlib.sha256(engagement_id.encode()).hexdigest()
+    with state_store(tmp_path, engagement_id) as store:
+        shard = state_root(tmp_path) / "cas" / namespace / "ab"
+        shard.mkdir(mode=0o700)
+        source = shard / (".tmp-" + "1" * 32)
+        source.write_bytes(b"checked")
+        source.chmod(0o600)
+        real_rename = os.rename
+
+        def swap_then_rename(
+            source_name: str,
+            target_name: str,
+            *,
+            src_dir_fd: int,
+            dst_dir_fd: int,
+        ) -> None:
+            os.unlink(source_name, dir_fd=src_dir_fd)
+            descriptor = os.open(
+                source_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=src_dir_fd,
+            )
+            try:
+                os.write(descriptor, b"replacement")
+            finally:
+                os.close(descriptor)
+            real_rename(
+                source_name,
+                target_name,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+            )
+
+        monkeypatch.setattr(cas_module.os, "rename", swap_then_rename)
+        with pytest.raises(ChainIntegrityError, match="changed during quarantine"):
+            store.recover()
+
+
+def test_quarantine_rename_is_recoverable_after_directory_fsync_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with state_store(tmp_path, "eng.quarantine-crash") as store:
+        orphan = store.cas.put(b"orphan")
+        real_fsync = os.fsync
+        calls = 0
+
+        def fail_first_fsync(descriptor: int) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("simulated crash boundary")
+            real_fsync(descriptor)
+
+        monkeypatch.setattr(cas_module.os, "fsync", fail_first_fsync)
+        with pytest.raises(StorageError, match="durably quarantine"):
+            store.recover()
+        monkeypatch.setattr(cas_module.os, "fsync", real_fsync)
+        report = store.recover()
+        assert orphan.sha256 not in store.cas.blob_digests()
+        assert report.quarantined_orphans == ()
+
+
+def test_unknown_schema_trigger_and_fts_drift_fail_closed(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    with EventLedger(path, "eng.schema") as ledger:
+        event = ledger.append(
+            actor_stream="researcher", event_type="delta", payload={"n": 1}
+        )
+        ledger.add_search_document(
+            doc_id="doc.one",
+            event_seq=event.seq,
+            title="title",
+            redacted_text="needle",
+        )
+    raw = sqlite3.connect(path)
+    original_trigger = raw.execute(
+        "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='events_no_update'"
+    ).fetchone()[0]
+    raw.execute("PRAGMA user_version=99")
+    raw.execute("CREATE TABLE future_v99(value TEXT)")
+    raw.commit()
+    raw.close()
+    with pytest.raises(StorageError, match="schema version"):
+        EventLedger(path, "eng.schema")
+    raw = sqlite3.connect(path)
+    assert raw.execute("PRAGMA user_version").fetchone()[0] == 99
+    raw.execute("PRAGMA user_version=1")
+    raw.execute("DROP TABLE future_v99")
+    raw.execute("DROP TRIGGER events_no_update")
+    raw.execute(
+        "CREATE TRIGGER events_no_update BEFORE UPDATE ON events BEGIN SELECT 1; END"
+    )
+    raw.commit()
+    raw.close()
+    with pytest.raises(ChainIntegrityError, match="schema manifest"):
+        EventLedger(path, "eng.schema")
+    raw = sqlite3.connect(path)
+    raw.execute("DROP TRIGGER events_no_update")
+    raw.execute(original_trigger)
+    raw.execute("DELETE FROM search_fts WHERE rowid=1")
+    raw.commit()
+    raw.close()
+    with pytest.raises(ChainIntegrityError, match="FTS projection"):
+        EventLedger(path, "eng.schema")
+    with EventLedger(path, "eng.schema", rebuild_fts=True) as repaired:
+        assert repaired.search("needle")[0]["doc_id"] == "doc.one"
+    with EventLedger(path, "eng.schema") as verified:
+        verified.verify_chain()
+
+
+@pytest.mark.parametrize(
+    ("trigger", "statement", "message"),
+    [
+        (
+            "artifacts_no_delete",
+            "DELETE FROM artifacts",
+            "artifact registry is incomplete",
+        ),
+        (
+            "search_documents_no_delete",
+            "DELETE FROM search_documents",
+            "search projection is incomplete",
+        ),
+        (
+            "graph_edges_no_delete",
+            "DELETE FROM graph_edges",
+            "graph edge projection is incomplete",
+        ),
+        (
+            "graph_nodes_no_delete",
+            "DELETE FROM graph_nodes",
+            "graph node projection is incomplete",
+        ),
+    ],
+)
+def test_projection_row_deletion_is_detected_from_anchored_events(
+    tmp_path: Path,
+    trigger: str,
+    statement: str,
+    message: str,
+) -> None:
+    path = database_path(tmp_path, "eng.projection-completeness")
+    with state_store(tmp_path, "eng.projection-completeness") as store:
+        event, reference = store.append_observation(
+            actor_stream="researcher",
+            event_type="observation",
+            raw_output=b"raw",
+            metadata={},
+        )
+        if statement == "DELETE FROM search_documents":
+            store.index_observation(
+                doc_id="doc.one",
+                event=event,
+                reference=reference,
+                title="title",
+                redacted_text="needle",
+            )
+        if statement in {"DELETE FROM graph_edges", "DELETE FROM graph_nodes"}:
+            store.ledger.add_graph_node(
+                node_id="node.one",
+                node_kind="subject",
+                attributes={},
+                event_seq=event.seq,
+            )
+            store.ledger.add_graph_node(
+                node_id="node.two",
+                node_kind="resource",
+                attributes={},
+                event_seq=event.seq,
+            )
+            store.ledger.add_graph_edge(
+                edge_id="edge.one",
+                source_node_id="node.one",
+                target_node_id="node.two",
+                edge_kind="reads",
+                attributes={},
+                event_seq=event.seq,
+            )
+    raw = sqlite3.connect(path)
+    trigger_sql = raw.execute(
+        "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?",
+        (trigger,),
+    ).fetchone()[0]
+    raw.execute(f"DROP TRIGGER {trigger}")
+    if statement == "DELETE FROM search_documents":
+        raw.execute("DELETE FROM search_fts")
+    if statement == "DELETE FROM graph_nodes":
+        raw.execute("PRAGMA foreign_keys=OFF")
+        edge_trigger = raw.execute(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' "
+            "AND name='graph_edges_no_delete'"
+        ).fetchone()[0]
+        raw.execute("DROP TRIGGER graph_edges_no_delete")
+        raw.execute("DELETE FROM graph_edges")
+        raw.execute(edge_trigger)
+    raw.execute(statement)
+    raw.execute(trigger_sql)
+    raw.commit()
+    raw.close()
+    with pytest.raises(ChainIntegrityError, match=message):
+        EventLedger(path, "eng.projection-completeness")
+
+
+def test_unknown_cas_entries_insecure_modes_and_ancestor_symlinks_fail_closed(
+    tmp_path: Path,
+) -> None:
+    with state_store(tmp_path, "eng.strict-fs") as store:
+        namespace = hashlib.sha256(b"eng.strict-fs").hexdigest()
+        unknown = state_root(tmp_path) / "cas" / namespace / "unexpected.txt"
+        unknown.write_bytes(b"PLAINTEXT-SECRET")
+        unknown.chmod(0o600)
+        with pytest.raises(ChainIntegrityError, match="unknown entry"):
+            store.recover()
+        unknown.unlink()
+        _, reference = store.append_observation(
+            actor_stream="researcher",
+            event_type="observation",
+            raw_output=b"private",
+            metadata={},
+        )
+        blob = blob_path(tmp_path, reference)
+        blob.chmod(0o644)
+        with pytest.raises(ChainIntegrityError, match="private|0600"):
+            store.cas.get(reference)
+    outer = tmp_path / "outer"
+    redirected = tmp_path / "redirected"
+    outer.mkdir(mode=0o700)
+    redirected.mkdir(mode=0o700)
+    (outer / "link").symlink_to(redirected, target_is_directory=True)
+    with pytest.raises(StorageError, match="symlink"):
+        StateStore(
+            outer / "link" / "state",
+            "eng.linked",
+            key(),
+            anchor_root=tmp_path / "safe-anchor",
+        )
+
+
+def test_nonce_registry_rejects_repeated_rng_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cas_module.secrets, "token_bytes", lambda length: b"N" * length)
+    with EncryptedCAS(tmp_path, "eng.nonce", key()) as cas:
+        first = cas.put(b"first")
+        with pytest.raises(StorageError, match="repeated a reserved nonce"):
+            cas.put(b"second")
+        assert cas.get(first) == b"first"
+
+
+def test_same_base_key_derives_distinct_aead_keys_per_engagement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cas_module.secrets, "token_bytes", lambda length: b"N" * length)
+    first_plaintext = b"A" * 32
+    second_plaintext = b"B" * 32
+    with EncryptedCAS(tmp_path / "one", "eng.derive-one", key()) as first:
+        first_ref = first.put(first_plaintext)
+    with EncryptedCAS(tmp_path / "two", "eng.derive-two", key()) as second:
+        second_ref = second.put(second_plaintext)
+    first_namespace = hashlib.sha256(b"eng.derive-one").hexdigest()
+    second_namespace = hashlib.sha256(b"eng.derive-two").hexdigest()
+    first_envelope = (
+        tmp_path
+        / "one"
+        / first_namespace
+        / first_ref.sha256[:2]
+        / f"{first_ref.sha256}.flcas"
+    ).read_bytes()
+    second_envelope = (
+        tmp_path
+        / "two"
+        / second_namespace
+        / second_ref.sha256[:2]
+        / f"{second_ref.sha256}.flcas"
+    ).read_bytes()
+    ciphertext_start = len(cas_module.MAGIC) + cas_module.NONCE_BYTES
+    assert first_envelope[len(cas_module.MAGIC) : ciphertext_start] == b"N" * 12
+    assert second_envelope[len(cas_module.MAGIC) : ciphertext_start] == b"N" * 12
+    first_ciphertext = first_envelope[ciphertext_start:-16]
+    second_ciphertext = second_envelope[ciphertext_start:-16]
+    reused_keystream_signal = bytes(
+        left ^ right for left, right in zip(first_ciphertext, second_ciphertext)
+    )
+    assert reused_keystream_signal != bytes(
+        left ^ right for left, right in zip(first_plaintext, second_plaintext)
+    )
+
+
+def test_observation_metadata_is_typed_and_never_plaintext_in_sqlite(
+    tmp_path: Path,
+) -> None:
+    marker = "SUPER-SECRET-METADATA-9f37"
+    with state_store(tmp_path, "eng.metadata") as store:
+        event, _ = store.append_observation(
+            actor_stream="researcher",
+            event_type="observation",
+            raw_output=b"raw",
+            metadata={"token": marker},
+        )
+        metadata_reference = ArtifactRef.from_dict(event.payload["metadata_ref"])
+        metadata = json.loads(store.cas.get(metadata_reference))
+        assert metadata == {"schema_version": 1, "values": {"token": marker}}
+    database = database_path(tmp_path, "eng.metadata")
+    for suffix in ("", "-wal", "-shm"):
+        candidate = Path(f"{database}{suffix}")
+        if candidate.exists():
+            assert marker.encode() not in candidate.read_bytes()

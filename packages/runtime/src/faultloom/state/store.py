@@ -1,18 +1,25 @@
-"""Composition root for event, artifact, retrieval, and recovery state."""
+"""Composition root for anchored event, artifact, retrieval, and recovery state."""
 
 from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import os
 import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .anchor import AnchorCheckpoint, AuthenticatedAnchor, EngagementLock, ZERO_HASH
+from .canonical import canonical_json
 from .cas import ArtifactRef, EncryptedCAS, EngagementKey
+from .filesystem import open_private_directory, open_root_directory
 from .ledger import EventLedger, EventRecord
-from .types import ChainIntegrityError, StorageError, require_identifier
+from .types import ChainIntegrityError, CrossEngagementError, StorageError, require_identifier
+
+
+METADATA_MEDIA_TYPE = "application/vnd.faultloom.observation-metadata+json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,28 +29,146 @@ class RecoveryReport:
     verified_artifacts: tuple[str, ...]
     quarantined_orphans: tuple[str, ...]
     quarantined_interrupted_writes: tuple[str, ...]
+    reconciled_publications: tuple[str, ...]
     recovery_id: str | None
+    anchor: AnchorCheckpoint
+
+
+def _absolute_root(path: Path, *, field: str) -> Path:
+    value = Path(path)
+    if not value.is_absolute() or any(part in {"", ".", ".."} for part in value.parts[1:]):
+        raise StorageError(f"{field} must be an absolute canonical path")
+    return value
+
+
+def _require_separate_roots(state_root: Path, anchor_root: Path) -> None:
+    common = Path(os.path.commonpath((state_root, anchor_root)))
+    if common in {state_root, anchor_root}:
+        raise StorageError("anchor_root must be outside the mutable state root")
+
+
+def _open_optional_directory(parent_fd: int, name: str) -> int | None:
+    try:
+        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    return open_private_directory(parent_fd, name, create=False)
+
+
+def _engagement_state_exists(root_fd: int, namespace: str) -> bool:
+    for container_name in ("engagements", "cas"):
+        container_fd = _open_optional_directory(root_fd, container_name)
+        if container_fd is None:
+            continue
+        try:
+            namespace_fd = _open_optional_directory(container_fd, namespace)
+            if namespace_fd is None:
+                continue
+            try:
+                if os.listdir(namespace_fd):
+                    return True
+            finally:
+                os.close(namespace_fd)
+        finally:
+            os.close(container_fd)
+    return False
 
 
 class StateStore:
-    """Engagement-scoped durable state with encrypted raw observations."""
+    """Engagement-scoped durable state with encrypted raw observations.
 
-    def __init__(self, root: Path, engagement_id: str, key: EngagementKey) -> None:
+    ``anchor_root`` must live outside ``root`` and must be backed up or retained
+    independently. A caller that needs rollback resistance across anchor-store
+    restoration must also retain and pass ``minimum_anchor`` from fresher
+    trusted state. Authentication alone cannot prove that an old valid anchor
+    is fresh.
+    """
+
+    def __init__(
+        self,
+        root: Path,
+        engagement_id: str,
+        key: EngagementKey,
+        *,
+        anchor_root: Path,
+        minimum_anchor: AnchorCheckpoint | None = None,
+    ) -> None:
         self.engagement_id = require_identifier(engagement_id, field="engagement_id")
-        root = Path(root)
-        root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if root.is_symlink():
-            raise StorageError("state root must not be a symlink")
-        namespace = hashlib.sha256(self.engagement_id.encode("utf-8")).hexdigest()
-        engagement_root = root / "engagements" / namespace
-        engagement_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self.cas = EncryptedCAS(root / "cas", self.engagement_id, key)
-        try:
-            self.ledger = EventLedger(engagement_root / "state.sqlite3", self.engagement_id)
-        except Exception:
-            self.cas.close()
-            raise
+        self.root = _absolute_root(Path(root), field="root")
+        self.anchor_root = _absolute_root(Path(anchor_root), field="anchor_root")
+        _require_separate_roots(self.root, self.anchor_root)
+        if minimum_anchor is not None and minimum_anchor.engagement_id != self.engagement_id:
+            raise CrossEngagementError("minimum anchor belongs to another engagement")
+        self._minimum_anchor = minimum_anchor
+        self._lock = EngagementLock(self.anchor_root, self.engagement_id)
+        self.anchor: AuthenticatedAnchor | None = None
+        self.cas: EncryptedCAS | None = None
+        self.ledger: EventLedger | None = None
         self._closed = False
+        namespace = hashlib.sha256(self.engagement_id.encode("utf-8")).hexdigest()
+        try:
+            with self._lock:
+                state_root_fd = open_root_directory(self.root, create=True)
+                try:
+                    existing_state = _engagement_state_exists(state_root_fd, namespace)
+                finally:
+                    os.close(state_root_fd)
+                self.anchor = AuthenticatedAnchor(
+                    self.anchor_root, self.engagement_id, key
+                )
+                checkpoint = self.anchor.load_optional()
+                if checkpoint is None:
+                    if existing_state:
+                        raise ChainIntegrityError(
+                            "authenticated anchor is missing for existing engagement state"
+                        )
+                    checkpoint = AnchorCheckpoint(
+                        engagement_id=self.engagement_id,
+                        seq=0,
+                        head=ZERO_HASH,
+                    )
+                    self.anchor.write(checkpoint)
+                self._validate_minimum(checkpoint, ledger=None)
+                state_root_fd = open_root_directory(self.root, create=False)
+                try:
+                    engagements_fd = open_private_directory(
+                        state_root_fd, "engagements", create=True
+                    )
+                    try:
+                        engagement_fd = open_private_directory(
+                            engagements_fd, namespace, create=True
+                        )
+                        os.close(engagement_fd)
+                    finally:
+                        os.close(engagements_fd)
+                    cas_fd = open_private_directory(state_root_fd, "cas", create=True)
+                    os.close(cas_fd)
+                finally:
+                    os.close(state_root_fd)
+                self.cas = EncryptedCAS(
+                    self.root / "cas", self.engagement_id, key
+                )
+                try:
+                    self.ledger = EventLedger(
+                        self.root / "engagements" / namespace / "state.sqlite3",
+                        self.engagement_id,
+                        transaction_lock=self._lock,
+                        commit_callback=self._synchronize_anchor,
+                    )
+                except Exception:
+                    self.cas.close()
+                    self.cas = None
+                    raise
+                self._synchronize_anchor()
+        except Exception:
+            if self.ledger is not None:
+                self.ledger.close()
+            if self.cas is not None:
+                self.cas.close()
+            if self.anchor is not None:
+                self.anchor.close()
+            self._lock.close()
+            raise
 
     def __enter__(self) -> StateStore:
         return self
@@ -51,12 +176,76 @@ class StateStore:
     def __exit__(self, *_: object) -> None:
         self.close()
 
+    def _components(self) -> tuple[EventLedger, EncryptedCAS, AuthenticatedAnchor]:
+        if self._closed or self.ledger is None or self.cas is None or self.anchor is None:
+            raise StorageError("state store is closed")
+        return self.ledger, self.cas, self.anchor
+
     def close(self) -> None:
         if self._closed:
             return
-        self.ledger.close()
-        self.cas.close()
+        ledger, cas, anchor = self._components()
+        with self._lock:
+            self._synchronize_anchor()
+            ledger.close()
+        cas.close()
+        anchor.close()
+        self._lock.close()
         self._closed = True
+
+    def _validate_minimum(
+        self, checkpoint: AnchorCheckpoint, *, ledger: EventLedger | None
+    ) -> None:
+        floor = self._minimum_anchor
+        if floor is None:
+            return
+        if checkpoint.seq < floor.seq:
+            raise ChainIntegrityError("authenticated anchor is older than the trusted floor")
+        if checkpoint.seq == floor.seq:
+            if checkpoint.head != floor.head:
+                raise ChainIntegrityError("authenticated anchor diverges from the trusted floor")
+            return
+        if floor.seq == 0:
+            if floor.head != ZERO_HASH:
+                raise ChainIntegrityError("trusted empty anchor has an invalid head")
+            return
+        if ledger is None:
+            return
+        if ledger.event_hash_at(floor.seq) != floor.head:
+            raise ChainIntegrityError("event chain does not contain the trusted anchor floor")
+
+    def _synchronize_anchor(self) -> AnchorCheckpoint:
+        ledger, _, anchor_store = self._components()
+        checkpoint = anchor_store.load_optional()
+        if checkpoint is None:
+            raise ChainIntegrityError("authenticated anchor disappeared")
+        seq, head = ledger.chain_checkpoint()
+        if checkpoint.seq > seq:
+            raise ChainIntegrityError("event ledger is behind its authenticated anchor")
+        if checkpoint.seq == seq:
+            if checkpoint.head != head:
+                raise ChainIntegrityError("event ledger head differs from its authenticated anchor")
+        else:
+            if checkpoint.seq == 0:
+                if checkpoint.head != ZERO_HASH:
+                    raise ChainIntegrityError("empty authenticated anchor is invalid")
+            elif ledger.event_hash_at(checkpoint.seq) != checkpoint.head:
+                raise ChainIntegrityError("event ledger diverged before its authenticated anchor")
+            checkpoint = AnchorCheckpoint(
+                engagement_id=self.engagement_id,
+                seq=seq,
+                head=head,
+            )
+            anchor_store.write(checkpoint)
+            persisted = anchor_store.load_optional()
+            if persisted != checkpoint:
+                raise ChainIntegrityError("authenticated anchor update was not durable")
+        self._validate_minimum(checkpoint, ledger=ledger)
+        return checkpoint
+
+    def checkpoint(self) -> AnchorCheckpoint:
+        with self._lock:
+            return self._synchronize_anchor()
 
     def append_observation(
         self,
@@ -67,20 +256,33 @@ class StateStore:
         metadata: Mapping[str, Any],
         media_type: str = "application/octet-stream",
     ) -> tuple[EventRecord, ArtifactRef]:
-        """Persist full raw bytes before appending their evidence-bearing event."""
+        """Encrypt raw output and typed metadata before anchoring their references."""
 
-        reference = self.cas.put(raw_output, media_type=media_type)
-        payload = {
-            "artifact_ref": reference.to_dict(),
-            "metadata": dict(metadata),
-        }
-        event = self.ledger.append(
-            actor_stream=actor_stream,
-            event_type=event_type,
-            payload=payload,
-            artifacts=(reference,),
-        )
-        return event, reference
+        if not isinstance(metadata, Mapping):
+            raise StorageError("observation metadata must be an object")
+        metadata_bytes = canonical_json(
+            {"schema_version": 1, "values": dict(metadata)}
+        ).encode("utf-8")
+        with self._lock:
+            self._synchronize_anchor()
+            ledger, cas, _ = self._components()
+            reference = cas.put(raw_output, media_type=media_type)
+            metadata_reference = cas.put(
+                metadata_bytes, media_type=METADATA_MEDIA_TYPE
+            )
+            payload = {
+                "artifact_ref": reference.to_dict(),
+                "metadata_ref": metadata_reference.to_dict(),
+                "metadata_schema_version": 1,
+            }
+            event = ledger.append(
+                actor_stream=actor_stream,
+                event_type=event_type,
+                payload=payload,
+                artifacts=(reference, metadata_reference),
+            )
+            self._synchronize_anchor()
+            return event, reference
 
     def index_observation(
         self,
@@ -95,53 +297,71 @@ class StateStore:
             raise StorageError("event belongs to another engagement")
         if reference.engagement_id != self.engagement_id:
             raise StorageError("artifact belongs to another engagement")
-        self.ledger.add_search_document(
-            doc_id=doc_id,
-            event_seq=event.seq,
-            artifact_sha256=reference.sha256,
-            title=title,
-            redacted_text=redacted_text,
-        )
+        with self._lock:
+            self._synchronize_anchor()
+            ledger, _, _ = self._components()
+            ledger.add_search_document(
+                doc_id=doc_id,
+                event_seq=event.seq,
+                artifact_sha256=reference.sha256,
+                title=title,
+                redacted_text=redacted_text,
+            )
+            self._synchronize_anchor()
 
     def recover(self) -> RecoveryReport:
-        """Verify durable state and quarantine uncommitted CAS writes."""
+        """Verify anchored state and atomically quarantine uncommitted CAS writes."""
 
-        chain_head = self.ledger.verify_chain()
-        interrupted = self.cas.temporary_entries()
-        interrupted_labels = tuple(f"{shard}/{name}" for shard, name in interrupted)
-        pre_recovery_id: str | None = None
-        if interrupted:
-            stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-            pre_recovery_id = f"recovery-{stamp}-{secrets.token_hex(4)}"
-            for shard, filename in interrupted:
-                self.cas.quarantine_temporary(
-                    shard, filename, recovery_id=pre_recovery_id
-                )
-        references = self.ledger.referenced_artifacts()
-        verified: list[str] = []
-        for reference in references:
-            self.cas.get(reference)
-            verified.append(reference.sha256)
-        referenced = set(verified)
-        live = set(self.cas.blob_digests())
-        missing = referenced - live
-        if missing:
-            raise ChainIntegrityError(
-                f"ledger references missing encrypted artifacts: {sorted(missing)}"
-            )
-        orphans = sorted(live - referenced)
-        recovery_id: str | None = pre_recovery_id
-        if orphans:
-            if recovery_id is None:
+        with self._lock:
+            checkpoint = self._synchronize_anchor()
+            ledger, cas, _ = self._components()
+            interrupted = cas.temporary_entries()
+            interrupted_labels: list[str] = []
+            reconciled: list[str] = []
+            pre_recovery_id: str | None = None
+            if interrupted:
                 stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-                recovery_id = f"recovery-{stamp}-{secrets.token_hex(4)}"
-            for digest in orphans:
-                self.cas.quarantine_orphan(digest, recovery_id=recovery_id)
-        return RecoveryReport(
-            engagement_id=self.engagement_id,
-            chain_head=chain_head,
-            verified_artifacts=tuple(sorted(verified)),
-            quarantined_orphans=tuple(orphans),
-            quarantined_interrupted_writes=interrupted_labels,
-            recovery_id=recovery_id,
-        )
+                pre_recovery_id = f"recovery-{stamp}-{secrets.token_hex(4)}"
+                for shard, filename in interrupted:
+                    label = f"{shard}/{filename}"
+                    result = cas.quarantine_temporary(
+                        shard, filename, recovery_id=pre_recovery_id
+                    )
+                    if result == "published":
+                        reconciled.append(label)
+                    else:
+                        interrupted_labels.append(label)
+            references = ledger.referenced_artifacts()
+            verified: list[str] = []
+            for reference in references:
+                cas.get(reference)
+                verified.append(reference.sha256)
+            referenced = set(verified)
+            live = set(cas.blob_digests())
+            missing = referenced - live
+            if missing:
+                raise ChainIntegrityError(
+                    f"ledger references missing encrypted artifacts: {sorted(missing)}"
+                )
+            orphans = sorted(live - referenced)
+            recovery_id: str | None = (
+                pre_recovery_id if interrupted_labels else None
+            )
+            if orphans:
+                if recovery_id is None:
+                    stamp = dt.datetime.now(dt.timezone.utc).strftime(
+                        "%Y%m%dT%H%M%S%fZ"
+                    )
+                    recovery_id = f"recovery-{stamp}-{secrets.token_hex(4)}"
+                for digest in orphans:
+                    cas.quarantine_orphan(digest, recovery_id=recovery_id)
+            return RecoveryReport(
+                engagement_id=self.engagement_id,
+                chain_head=checkpoint.head,
+                verified_artifacts=tuple(sorted(verified)),
+                quarantined_orphans=tuple(orphans),
+                quarantined_interrupted_writes=tuple(interrupted_labels),
+                reconciled_publications=tuple(reconciled),
+                recovery_id=recovery_id,
+                anchor=checkpoint,
+            )

@@ -8,15 +8,21 @@ import hmac
 import json
 import os
 import sqlite3
-import stat
 import threading
 from collections.abc import Iterable, Mapping
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 from .canonical import canonical_json
 from .cas import ArtifactRef
+from .filesystem import (
+    NOFOLLOW,
+    PRIVATE_FILE_MODE,
+    open_root_directory,
+    require_private_file,
+)
 from .types import (
     ChainIntegrityError,
     CrossEngagementError,
@@ -28,10 +34,27 @@ from .types import (
 
 ZERO_HASH = "0" * 64
 SCHEMA_VERSION = 1
+APPLICATION_ID = 0x464C4F4D
 
 
 def _now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="microseconds")
+
+
+def _validate_ledger_directory(parent_fd: int, database_name: str) -> None:
+    allowed = {database_name, f"{database_name}-wal", f"{database_name}-shm"}
+    entries = set(os.listdir(parent_fd))
+    unknown = entries - allowed
+    if unknown:
+        raise ChainIntegrityError(
+            f"event ledger directory contains unknown entries: {sorted(unknown)}"
+        )
+    for filename in entries:
+        try:
+            metadata = os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
+            require_private_file(metadata, context=f"event ledger file {filename!r}")
+        except (OSError, StorageError) as exc:
+            raise ChainIntegrityError(f"event ledger file {filename!r} is unsafe") from exc
 
 
 def _payload_contains_artifact(value: Any, reference: ArtifactRef) -> bool:
@@ -43,6 +66,31 @@ def _payload_contains_artifact(value: Any, reference: ArtifactRef) -> bool:
     if isinstance(value, (list, tuple)):
         return any(_payload_contains_artifact(child, reference) for child in value)
     return False
+
+
+def _payload_artifacts(value: Any) -> tuple[ArtifactRef, ...]:
+    """Extract typed artifact references from a canonical event payload."""
+
+    if isinstance(value, Mapping):
+        candidate = dict(value)
+        if set(candidate) == {
+            "engagement_id",
+            "sha256",
+            "byte_length",
+            "media_type",
+            "schema_version",
+        }:
+            return (ArtifactRef.from_dict(candidate),)
+        result: list[ArtifactRef] = []
+        for child in value.values():
+            result.extend(_payload_artifacts(child))
+        return tuple(result)
+    if isinstance(value, (list, tuple)):
+        result = []
+        for child in value:
+            result.extend(_payload_artifacts(child))
+        return tuple(result)
+    return ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,9 +108,6 @@ class EventRecord:
 
 
 SCHEMA = """
-PRAGMA application_id = 0x464C4F4D;
-PRAGMA user_version = 1;
-
 CREATE TABLE IF NOT EXISTS ledger_metadata (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -161,50 +206,95 @@ BEFORE DELETE ON graph_edges BEGIN SELECT RAISE(ABORT, 'append-only graph edges'
 class EventLedger:
     """One append-only database per engagement."""
 
-    def __init__(self, path: Path, engagement_id: str) -> None:
+    def __init__(
+        self,
+        path: Path,
+        engagement_id: str,
+        *,
+        rebuild_fts: bool = False,
+        transaction_lock: AbstractContextManager[Any] | None = None,
+        commit_callback: Callable[[], None] | None = None,
+    ) -> None:
         self.engagement_id = require_identifier(engagement_id, field="engagement_id")
+        self._transaction_lock = transaction_lock or nullcontext()
+        self._commit_callback = commit_callback
         path = Path(path)
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if path.parent.is_symlink() or path.is_symlink():
-            raise StorageError("ledger path must not contain a terminal symlink")
-        parent_before = path.parent.stat(follow_symlinks=False)
-        if not stat.S_ISDIR(parent_before.st_mode):
-            raise StorageError("ledger parent is not a directory")
-        if not path.exists():
+        if not path.is_absolute() or path.name in {"", ".", ".."} or "/" in path.name:
+            raise StorageError("ledger path must be an absolute private file path")
+        self._parent_fd = open_root_directory(path.parent, create=True)
+        created = False
+        try:
             descriptor = os.open(
-                path,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
+                path.name,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | NOFOLLOW,
+                PRIVATE_FILE_MODE,
+                dir_fd=self._parent_fd,
             )
+            created = True
+        except FileExistsError:
+            try:
+                descriptor = os.open(
+                    path.name,
+                    os.O_RDWR | NOFOLLOW,
+                    dir_fd=self._parent_fd,
+                )
+            except OSError as exc:
+                os.close(self._parent_fd)
+                raise StorageError(
+                    "cannot safely open event ledger; symlinks are forbidden"
+                ) from exc
+        try:
+            opened = os.fstat(descriptor)
+            require_private_file(opened, context="event ledger")
+            if not created and opened.st_size == 0:
+                raise StorageError("existing event ledger is empty")
+        except Exception:
             os.close(descriptor)
-        opened = path.stat(follow_symlinks=False)
-        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
-            raise StorageError("ledger must be a private regular file")
-        os.chmod(path, 0o600)
+            os.close(self._parent_fd)
+            raise
+        os.close(descriptor)
+        _validate_ledger_directory(self._parent_fd, path.name)
         self.path = path
-        self._connection = sqlite3.connect(
-            path,
-            isolation_level=None,
-            check_same_thread=False,
-            timeout=5.0,
-        )
-        after = path.stat(follow_symlinks=False)
+        stable_path = f"/proc/self/fd/{self._parent_fd}/{path.name}"
+        try:
+            self._connection = sqlite3.connect(
+                stable_path,
+                isolation_level=None,
+                check_same_thread=False,
+                timeout=5.0,
+            )
+        except sqlite3.Error as exc:
+            os.close(self._parent_fd)
+            raise StorageError("cannot connect to event ledger") from exc
+        after = os.stat(path.name, dir_fd=self._parent_fd, follow_symlinks=False)
         if (opened.st_dev, opened.st_ino) != (after.st_dev, after.st_ino):
             self._connection.close()
+            os.close(self._parent_fd)
             raise StorageError("ledger file changed while opening")
         self._connection.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         try:
+            if not created:
+                self._verify_header()
             self._connection.execute("PRAGMA journal_mode=WAL")
             self._connection.execute("PRAGMA synchronous=FULL")
             self._connection.execute("PRAGMA foreign_keys=ON")
             self._connection.execute("PRAGMA trusted_schema=OFF")
             self._connection.execute("PRAGMA busy_timeout=5000")
-            self._connection.executescript(SCHEMA)
-            self._initialize_metadata()
-            self.verify_chain()
+            _validate_ledger_directory(self._parent_fd, path.name)
+            if created:
+                self._connection.executescript(SCHEMA)
+                self._connection.execute(f"PRAGMA application_id={APPLICATION_ID}")
+                self._connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            self._verify_header()
+            self._verify_schema()
+            self._initialize_metadata(allow_create=created)
+            self.verify_chain(check_fts=not rebuild_fts)
+            if rebuild_fts:
+                self.rebuild_fts()
         except (sqlite3.Error, StorageError) as exc:
             self._connection.close()
+            os.close(self._parent_fd)
             if isinstance(exc, StorageError):
                 raise
             raise StorageError(f"cannot initialize event ledger: {exc}") from exc
@@ -222,19 +312,50 @@ class EventLedger:
         with self._lock:
             self._connection.execute("PRAGMA wal_checkpoint(FULL)")
             self._connection.close()
+            os.close(self._parent_fd)
             self._closed = True
 
     def _require_open(self) -> None:
         if self._closed:
             raise StorageError("event ledger is closed")
 
-    def _initialize_metadata(self) -> None:
+    def _verify_header(self) -> None:
+        application_id = self._connection.execute("PRAGMA application_id").fetchone()[0]
+        user_version = self._connection.execute("PRAGMA user_version").fetchone()[0]
+        if application_id != APPLICATION_ID or user_version != SCHEMA_VERSION:
+            raise StorageError("event ledger application or schema version is unsupported")
+
+    @staticmethod
+    def _schema_manifest(connection: sqlite3.Connection) -> tuple[tuple[object, ...], ...]:
+        rows = connection.execute(
+            """
+            SELECT type, name, tbl_name, sql
+            FROM sqlite_schema
+            WHERE name NOT LIKE 'sqlite_%'
+            ORDER BY type, name
+            """
+        ).fetchall()
+        return tuple(tuple(row) for row in rows)
+
+    def _verify_schema(self) -> None:
+        expected = sqlite3.connect(":memory:")
+        try:
+            expected.executescript(SCHEMA)
+            manifest = self._schema_manifest(expected)
+        finally:
+            expected.close()
+        if self._schema_manifest(self._connection) != manifest:
+            raise ChainIntegrityError("event ledger schema manifest is not exact")
+
+    def _initialize_metadata(self, *, allow_create: bool) -> None:
         rows = dict(self._connection.execute("SELECT key, value FROM ledger_metadata"))
         expected = {
             "engagement_id": self.engagement_id,
             "schema_version": str(SCHEMA_VERSION),
         }
         if not rows:
+            if not allow_create:
+                raise ChainIntegrityError("existing event ledger metadata is missing")
             self._connection.execute("BEGIN IMMEDIATE")
             try:
                 self._connection.executemany(
@@ -297,75 +418,89 @@ class EventLedger:
         if parsed.tzinfo is None or parsed.utcoffset() is None:
             raise StorageError("created_at must be timezone-aware")
         artifact_values = tuple(artifacts)
+        payload_artifacts = _payload_artifacts(payload_value)
+        registered = {canonical_json(reference.to_dict()) for reference in artifact_values}
+        discovered = {canonical_json(reference.to_dict()) for reference in payload_artifacts}
+        if len(registered) != len(artifact_values):
+            raise StorageError("event contains duplicate registered artifacts")
+        if registered != discovered:
+            raise StorageError(
+                "event payload artifact references must exactly match registered artifacts"
+            )
         for reference in artifact_values:
             if reference.engagement_id != self.engagement_id:
                 raise CrossEngagementError("event artifact belongs to another engagement")
-            if not _payload_contains_artifact(payload_value, reference):
-                raise StorageError("registered artifact must be present in the event payload")
-        with self._lock:
-            try:
-                self._connection.execute("BEGIN IMMEDIATE")
-                last = self._connection.execute(
-                    "SELECT seq, event_hash FROM events ORDER BY seq DESC LIMIT 1"
-                ).fetchone()
-                seq = 1 if last is None else int(last["seq"]) + 1
-                prev_hash = ZERO_HASH if last is None else str(last["event_hash"])
-                event_hash = self._event_digest(
-                    seq=seq,
-                    engagement_id=self.engagement_id,
-                    actor_stream=actor_stream,
-                    event_type=event_type,
-                    payload_sha256=payload_sha256,
-                    prev_hash=prev_hash,
-                    created_at=timestamp,
-                )
-                self._connection.execute(
-                    """
-                    INSERT INTO events(
-                        seq, schema_version, engagement_id, actor_stream, event_type,
-                        payload_json, payload_sha256, prev_hash, event_hash, created_at
-                    ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        seq,
-                        self.engagement_id,
-                        actor_stream,
-                        event_type,
-                        payload_json,
-                        payload_sha256,
-                        prev_hash,
-                        event_hash,
-                        timestamp,
-                    ),
-                )
-                for reference in artifact_values:
-                    existing = self._connection.execute(
-                        "SELECT byte_length FROM artifacts WHERE sha256 = ?", (reference.sha256,)
+        with self._transaction_lock:
+            with self._lock:
+                try:
+                    self._connection.execute("BEGIN IMMEDIATE")
+                    last = self._connection.execute(
+                        "SELECT seq, event_hash FROM events ORDER BY seq DESC LIMIT 1"
                     ).fetchone()
-                    if existing is None:
-                        self._connection.execute(
-                            """
-                            INSERT INTO artifacts(sha256, byte_length, media_type, first_event_seq)
-                            VALUES (?, ?, ?, ?)
-                            """,
-                            (
-                                reference.sha256,
-                                reference.byte_length,
-                                reference.media_type,
-                                seq,
-                            ),
-                        )
-                    elif int(existing["byte_length"]) != reference.byte_length:
-                        raise ChainIntegrityError("artifact digest collision in ledger metadata")
-                if _side_effect is not None:
-                    _side_effect(self._connection, seq)
-                self._connection.execute("COMMIT")
-            except Exception as exc:
-                if self._connection.in_transaction:
-                    self._connection.execute("ROLLBACK")
-                if isinstance(exc, StorageError):
-                    raise
-                raise StorageError(f"cannot append event: {exc}") from exc
+                    seq = 1 if last is None else int(last["seq"]) + 1
+                    prev_hash = ZERO_HASH if last is None else str(last["event_hash"])
+                    event_hash = self._event_digest(
+                        seq=seq,
+                        engagement_id=self.engagement_id,
+                        actor_stream=actor_stream,
+                        event_type=event_type,
+                        payload_sha256=payload_sha256,
+                        prev_hash=prev_hash,
+                        created_at=timestamp,
+                    )
+                    self._connection.execute(
+                        """
+                        INSERT INTO events(
+                            seq, schema_version, engagement_id, actor_stream, event_type,
+                            payload_json, payload_sha256, prev_hash, event_hash, created_at
+                        ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            seq,
+                            self.engagement_id,
+                            actor_stream,
+                            event_type,
+                            payload_json,
+                            payload_sha256,
+                            prev_hash,
+                            event_hash,
+                            timestamp,
+                        ),
+                    )
+                    for reference in artifact_values:
+                        existing = self._connection.execute(
+                            "SELECT byte_length FROM artifacts WHERE sha256 = ?",
+                            (reference.sha256,),
+                        ).fetchone()
+                        if existing is None:
+                            self._connection.execute(
+                                """
+                                INSERT INTO artifacts(
+                                    sha256, byte_length, media_type, first_event_seq
+                                ) VALUES (?, ?, ?, ?)
+                                """,
+                                (
+                                    reference.sha256,
+                                    reference.byte_length,
+                                    reference.media_type,
+                                    seq,
+                                ),
+                            )
+                        elif int(existing["byte_length"]) != reference.byte_length:
+                            raise ChainIntegrityError(
+                                "artifact digest collision in ledger metadata"
+                            )
+                    if _side_effect is not None:
+                        _side_effect(self._connection, seq)
+                    self._connection.execute("COMMIT")
+                    if self._commit_callback is not None:
+                        self._commit_callback()
+                except Exception as exc:
+                    if self._connection.in_transaction:
+                        self._connection.execute("ROLLBACK")
+                    if isinstance(exc, StorageError):
+                        raise
+                    raise StorageError(f"cannot append event: {exc}") from exc
         return EventRecord(
             seq=seq,
             engagement_id=self.engagement_id,
@@ -411,13 +546,29 @@ class EventLedger:
             ).fetchall()
         return tuple(self._record(row) for row in rows)
 
-    def verify_chain(self) -> str:
+    def verify_chain(self, *, check_fts: bool = True) -> str:
         self._require_open() if hasattr(self, "_closed") else None
         with self._lock:
+            self._verify_header()
+            self._verify_schema()
+            _validate_ledger_directory(self._parent_fd, self.path.name)
             integrity = self._connection.execute("PRAGMA quick_check").fetchone()[0]
             if integrity != "ok":
                 raise ChainIntegrityError(f"SQLite integrity check failed: {integrity}")
+            foreign_keys = self._connection.execute("PRAGMA foreign_key_check").fetchall()
+            if foreign_keys:
+                raise ChainIntegrityError("SQLite foreign-key integrity check failed")
+            if check_fts:
+                try:
+                    self._connection.execute(
+                        "INSERT INTO search_fts(search_fts, rank) VALUES('integrity-check', 1)"
+                    )
+                except sqlite3.Error as exc:
+                    raise ChainIntegrityError("FTS projection integrity check failed") from exc
             rows = self._connection.execute("SELECT * FROM events ORDER BY seq").fetchall()
+            return self._verify_rows(rows)
+
+    def _verify_rows(self, rows: list[sqlite3.Row]) -> str:
         previous = ZERO_HASH
         for expected_seq, row in enumerate(rows, 1):
             record = self._record(row)
@@ -446,6 +597,47 @@ class EventLedger:
         self._verify_auxiliary_state({record.seq: record for record in map(self._record, rows)})
         return previous
 
+    def rebuild_fts(self) -> None:
+        """Explicitly rebuild the derived FTS index after primary-state verification."""
+
+        self.verify_chain(check_fts=False)
+        with self._transaction_lock:
+            with self._lock:
+                try:
+                    self._connection.execute(
+                        "INSERT INTO search_fts(search_fts) VALUES('rebuild')"
+                    )
+                except sqlite3.Error as exc:
+                    raise StorageError(
+                        "cannot deterministically rebuild FTS projection"
+                    ) from exc
+        self.verify_chain(check_fts=True)
+
+    def chain_checkpoint(self) -> tuple[int, str]:
+        """Return the verified current sequence and head hash."""
+
+        head = self.verify_chain()
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT seq, event_hash FROM events ORDER BY seq DESC LIMIT 1"
+            ).fetchone()
+        if row is None:
+            return 0, ZERO_HASH
+        if str(row["event_hash"]) != head:
+            raise ChainIntegrityError("event ledger changed while reading its checkpoint")
+        return int(row["seq"]), head
+
+    def event_hash_at(self, seq: int) -> str:
+        if not isinstance(seq, int) or isinstance(seq, bool) or seq <= 0:
+            raise StorageError("event sequence is invalid")
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT event_hash FROM events WHERE seq = ?", (seq,)
+            ).fetchone()
+        if row is None:
+            raise ChainIntegrityError("anchored event sequence is missing")
+        return str(row["event_hash"])
+
     def _verify_auxiliary_state(self, events: dict[int, EventRecord]) -> None:
         with self._lock:
             artifacts = self._connection.execute(
@@ -469,6 +661,32 @@ class EventLedger:
                        attributes_json, source_event_seq, anchor_event_seq FROM graph_edges
                 """
             ).fetchall()
+        expected_artifacts: dict[str, tuple[int, str, int]] = {}
+        expected_documents: dict[int, dict[str, Any]] = {}
+        expected_nodes: dict[int, dict[str, Any]] = {}
+        expected_edges: dict[int, dict[str, Any]] = {}
+        for event_seq, event in events.items():
+            for reference in _payload_artifacts(event.payload):
+                if reference.engagement_id != self.engagement_id:
+                    raise CrossEngagementError(
+                        "event payload contains a foreign artifact reference"
+                    )
+                expected = expected_artifacts.setdefault(
+                    reference.sha256,
+                    (reference.byte_length, reference.media_type, event_seq),
+                )
+                if expected[0] != reference.byte_length:
+                    raise ChainIntegrityError(
+                        "one artifact digest has inconsistent byte lengths"
+                    )
+            if event.event_type == "index.search":
+                expected_documents[event_seq] = event.payload
+            elif event.event_type == "index.graph_node":
+                expected_nodes[event_seq] = event.payload
+            elif event.event_type == "index.graph_edge":
+                expected_edges[event_seq] = event.payload
+
+        actual_artifacts: dict[str, tuple[int, str, int]] = {}
         for row in artifacts:
             reference = ArtifactRef(
                 engagement_id=self.engagement_id,
@@ -479,38 +697,54 @@ class EventLedger:
             event = events.get(int(row["first_event_seq"]))
             if event is None or not _payload_contains_artifact(event.payload, reference):
                 raise ChainIntegrityError("artifact registry is not anchored in its first event")
+            actual_artifacts[reference.sha256] = (
+                reference.byte_length,
+                reference.media_type,
+                int(row["first_event_seq"]),
+            )
+        if actual_artifacts != expected_artifacts:
+            raise ChainIntegrityError(
+                "artifact registry is incomplete or differs from the event chain"
+            )
+
+        actual_documents: dict[int, dict[str, Any]] = {}
         for row in documents:
-            event = events.get(int(row["anchor_event_seq"]))
-            expected = {
+            actual_documents[int(row["anchor_event_seq"])] = {
                 "artifact_sha256": row["artifact_sha256"],
                 "doc_id": row["doc_id"],
                 "redacted_text": row["redacted_text"],
                 "source_event_seq": row["source_event_seq"],
                 "title": row["title"],
             }
-            if event is None or event.event_type != "index.search" or event.payload != expected:
-                raise ChainIntegrityError("search projection is not anchored in the event chain")
+        if actual_documents != expected_documents:
+            raise ChainIntegrityError(
+                "search projection is incomplete or differs from the event chain"
+            )
+
+        actual_nodes: dict[int, dict[str, Any]] = {}
         for row in nodes:
             try:
                 attributes = json.loads(row["attributes_json"])
             except json.JSONDecodeError as exc:
                 raise ChainIntegrityError("graph node attributes are invalid JSON") from exc
-            event = events.get(int(row["anchor_event_seq"]))
-            expected = {
+            actual_nodes[int(row["anchor_event_seq"])] = {
                 "attributes": attributes,
                 "node_id": row["node_id"],
                 "node_kind": row["node_kind"],
                 "source_event_seq": row["source_event_seq"],
             }
-            if event is None or event.event_type != "index.graph_node" or event.payload != expected:
-                raise ChainIntegrityError("graph node is not anchored in the event chain")
+        if actual_nodes != expected_nodes:
+            raise ChainIntegrityError(
+                "graph node projection is incomplete or differs from the event chain"
+            )
+
+        actual_edges: dict[int, dict[str, Any]] = {}
         for row in edges:
             try:
                 attributes = json.loads(row["attributes_json"])
             except json.JSONDecodeError as exc:
                 raise ChainIntegrityError("graph edge attributes are invalid JSON") from exc
-            event = events.get(int(row["anchor_event_seq"]))
-            expected = {
+            actual_edges[int(row["anchor_event_seq"])] = {
                 "attributes": attributes,
                 "edge_id": row["edge_id"],
                 "edge_kind": row["edge_kind"],
@@ -518,8 +752,10 @@ class EventLedger:
                 "source_node_id": row["source_node_id"],
                 "target_node_id": row["target_node_id"],
             }
-            if event is None or event.event_type != "index.graph_edge" or event.payload != expected:
-                raise ChainIntegrityError("graph edge is not anchored in the event chain")
+        if actual_edges != expected_edges:
+            raise ChainIntegrityError(
+                "graph edge projection is incomplete or differs from the event chain"
+            )
 
     def referenced_artifacts(self) -> tuple[ArtifactRef, ...]:
         self._require_open()

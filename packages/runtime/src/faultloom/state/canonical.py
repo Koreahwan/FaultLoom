@@ -38,4 +38,3 @@ def _validate(value: Any, *, path: str = "$") -> None:
 def canonical_json(value: Any) -> str:
     _validate(value)
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-

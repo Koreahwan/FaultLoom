@@ -1,6 +1,7 @@
 """FaultLoom public runtime."""
 
 from .state import (
+    AnchorCheckpoint,
     ArtifactRef,
     ChainIntegrityError,
     CrossEngagementError,
@@ -15,6 +16,7 @@ from .state import (
 )
 
 __all__ = [
+    "AnchorCheckpoint",
     "ArtifactRef",
     "ChainIntegrityError",
     "CrossEngagementError",
@@ -27,4 +29,3 @@ __all__ = [
     "StateStore",
     "StorageError",
 ]
-
