@@ -337,26 +337,61 @@ class EventLedger:
         self.close()
 
     def close(self) -> None:
+        self.close_verified()
+
+    def close_verified(
+        self,
+        finalizer: Callable[[tuple[int, str]], None] | None = None,
+    ) -> None:
+        """Authenticate the final snapshot and hold its writer lock through cleanup."""
+
         if self._closed:
             return
         failure: Exception | None = None
-        try:
-            with self._lock:
-                self._validate_paths()
-                self._connection.execute("PRAGMA wal_checkpoint(FULL)")
-                self._validate_paths()
-        except Exception as exc:
-            failure = exc
-        try:
-            self._connection.close()
-        except Exception as exc:
-            if failure is None:
+
+        def remember(exc: Exception) -> None:
+            nonlocal failure
+            if failure is not None:
+                return
+            if isinstance(exc, sqlite3.Error):
+                failure = StorageError(f"cannot close event ledger: {exc}")
+            else:
                 failure = exc
+
+        try:
+            with self._transaction_lock:
+                with self._lock:
+                    try:
+                        self._validate_paths()
+                        self._connection.execute("PRAGMA wal_checkpoint(FULL)")
+                        self._connection.execute("BEGIN IMMEDIATE")
+                        checkpoint = self._verify_snapshot(check_fts=True)
+                        if finalizer is not None:
+                            finalizer(checkpoint)
+                        if self._verify_snapshot(check_fts=True) != checkpoint:
+                            raise ChainIntegrityError(
+                                "event ledger changed while closing"
+                            )
+                        self._validate_paths()
+                    except Exception as exc:
+                        remember(exc)
+                    try:
+                        # Closing an active read-only writer transaction is the
+                        # linearization point: competing writers cannot change
+                        # the authenticated snapshot before finalizer returns.
+                        self._connection.close()
+                    except Exception as exc:
+                        remember(exc)
+        except Exception as exc:
+            remember(exc)
+            try:
+                self._connection.close()
+            except Exception as close_exc:
+                remember(close_exc)
         try:
             self._validate_paths(allow_removed_sidecars=True)
         except Exception as exc:
-            if failure is None:
-                failure = exc
+            remember(exc)
         finally:
             self._close_sidecar_descriptors()
             self._parent_binding.close()
@@ -1050,13 +1085,13 @@ class EventLedger:
                 "graph edge projection is incomplete or differs from the event chain"
             )
 
-    def referenced_artifacts(self) -> tuple[ArtifactRef, ...]:
-        self._require_open()
-        with self._lock:
-            rows = self._connection.execute(
-                "SELECT sha256, byte_length, media_type FROM artifacts ORDER BY sha256"
-            ).fetchall()
-        references = tuple(
+    def _referenced_artifacts_in_transaction(self) -> tuple[ArtifactRef, ...]:
+        if not self._connection.in_transaction:
+            raise StorageError("artifact references require an active transaction")
+        rows = self._connection.execute(
+            "SELECT sha256, byte_length, media_type FROM artifacts ORDER BY sha256"
+        ).fetchall()
+        return tuple(
             ArtifactRef(
                 engagement_id=self.engagement_id,
                 sha256=str(row["sha256"]),
@@ -1065,7 +1100,10 @@ class EventLedger:
             )
             for row in rows
         )
-        self._validate_paths()
+
+    def referenced_artifacts(self) -> tuple[ArtifactRef, ...]:
+        with self.verified_checkpoint():
+            references = self._referenced_artifacts_in_transaction()
         return references
 
     def add_search_document(

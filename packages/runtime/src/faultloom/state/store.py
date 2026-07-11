@@ -229,10 +229,19 @@ class StateStore:
             if failure is None:
                 failure = exc
 
+        def finalize_verified_snapshot(snapshot: tuple[int, str]) -> None:
+            self._synchronize_anchor_from_checkpoint(
+                ledger, anchor, snapshot
+            )
+            cas.close()
+            anchor.close()
+
         try:
             with self._lock:
+                # Preserve the ordinary checkpoint boundary, then independently
+                # authenticate the close snapshot under its own writer lock.
                 self._synchronize_anchor()
-                ledger.close()
+                ledger.close_verified(finalize_verified_snapshot)
         except Exception as exc:
             remember(exc)
         for component in (ledger, cas, anchor, self._lock):
@@ -272,42 +281,53 @@ class StateStore:
         if ledger.event_hash_at(floor.seq) != floor.head:
             raise ChainIntegrityError("event chain does not contain the trusted anchor floor")
 
+    def _synchronize_anchor_from_checkpoint(
+        self,
+        ledger: EventLedger,
+        anchor_store: AuthenticatedAnchor,
+        snapshot: tuple[int, str],
+    ) -> AnchorCheckpoint:
+        seq, head = snapshot
+        checkpoint = anchor_store.load_optional()
+        if checkpoint is None:
+            raise ChainIntegrityError("authenticated anchor disappeared")
+        if checkpoint.seq > seq:
+            raise ChainIntegrityError("event ledger is behind its authenticated anchor")
+        if checkpoint.seq == seq:
+            if checkpoint.head != head:
+                raise ChainIntegrityError(
+                    "event ledger head differs from its authenticated anchor"
+                )
+        else:
+            if checkpoint.seq == 0:
+                if checkpoint.head != ZERO_HASH:
+                    raise ChainIntegrityError("empty authenticated anchor is invalid")
+            elif ledger.event_hash_at(checkpoint.seq) != checkpoint.head:
+                raise ChainIntegrityError(
+                    "event ledger diverged before its authenticated anchor"
+                )
+            candidate = AnchorCheckpoint(
+                engagement_id=self.engagement_id,
+                seq=seq,
+                head=head,
+            )
+            self._validate_minimum(candidate, ledger=ledger)
+            anchor_store.write(candidate)
+            persisted = anchor_store.load_optional()
+            if persisted != candidate:
+                raise ChainIntegrityError(
+                    "authenticated anchor update was not durable"
+                )
+            checkpoint = candidate
+        self._validate_minimum(checkpoint, ledger=ledger)
+        return checkpoint
+
     def _synchronize_anchor(self) -> AnchorCheckpoint:
         ledger, _, anchor_store = self._components()
-        with ledger.verified_checkpoint() as (seq, head):
-            checkpoint = anchor_store.load_optional()
-            if checkpoint is None:
-                raise ChainIntegrityError("authenticated anchor disappeared")
-            if checkpoint.seq > seq:
-                raise ChainIntegrityError("event ledger is behind its authenticated anchor")
-            if checkpoint.seq == seq:
-                if checkpoint.head != head:
-                    raise ChainIntegrityError(
-                        "event ledger head differs from its authenticated anchor"
-                    )
-            else:
-                if checkpoint.seq == 0:
-                    if checkpoint.head != ZERO_HASH:
-                        raise ChainIntegrityError("empty authenticated anchor is invalid")
-                elif ledger.event_hash_at(checkpoint.seq) != checkpoint.head:
-                    raise ChainIntegrityError(
-                        "event ledger diverged before its authenticated anchor"
-                    )
-                candidate = AnchorCheckpoint(
-                    engagement_id=self.engagement_id,
-                    seq=seq,
-                    head=head,
-                )
-                self._validate_minimum(candidate, ledger=ledger)
-                anchor_store.write(candidate)
-                persisted = anchor_store.load_optional()
-                if persisted != candidate:
-                    raise ChainIntegrityError(
-                        "authenticated anchor update was not durable"
-                    )
-                checkpoint = candidate
-            self._validate_minimum(checkpoint, ledger=ledger)
-            return checkpoint
+        with ledger.verified_checkpoint() as snapshot:
+            return self._synchronize_anchor_from_checkpoint(
+                ledger, anchor_store, snapshot
+            )
 
     def checkpoint(self) -> AnchorCheckpoint:
         with self._lock:
@@ -379,55 +399,61 @@ class StateStore:
         """Verify anchored state and atomically quarantine uncommitted CAS writes."""
 
         with self._lock:
-            checkpoint = self._synchronize_anchor()
-            ledger, cas, _ = self._components()
-            interrupted = cas.temporary_entries()
-            interrupted_labels: list[str] = []
-            reconciled: list[str] = []
-            pre_recovery_id: str | None = None
-            if interrupted:
-                stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-                pre_recovery_id = f"recovery-{stamp}-{secrets.token_hex(4)}"
-                for shard, filename in interrupted:
-                    label = f"{shard}/{filename}"
-                    result = cas.quarantine_temporary(
-                        shard, filename, recovery_id=pre_recovery_id
-                    )
-                    if result == "published":
-                        reconciled.append(label)
-                    else:
-                        interrupted_labels.append(label)
-            references = ledger.referenced_artifacts()
-            verified: list[str] = []
-            for reference in references:
-                cas.get(reference)
-                verified.append(reference.sha256)
-            referenced = set(verified)
-            live = set(cas.blob_digests())
-            missing = referenced - live
-            if missing:
-                raise ChainIntegrityError(
-                    f"ledger references missing encrypted artifacts: {sorted(missing)}"
+            ledger, cas, anchor_store = self._components()
+            with ledger.verified_checkpoint() as snapshot:
+                checkpoint = self._synchronize_anchor_from_checkpoint(
+                    ledger, anchor_store, snapshot
                 )
-            orphans = sorted(live - referenced)
-            recovery_id: str | None = (
-                pre_recovery_id if interrupted_labels else None
-            )
-            if orphans:
-                if recovery_id is None:
+                interrupted = cas.temporary_entries()
+                interrupted_labels: list[str] = []
+                reconciled: list[str] = []
+                pre_recovery_id: str | None = None
+                if interrupted:
                     stamp = dt.datetime.now(dt.timezone.utc).strftime(
                         "%Y%m%dT%H%M%S%fZ"
                     )
-                    recovery_id = f"recovery-{stamp}-{secrets.token_hex(4)}"
-                for digest in orphans:
-                    cas.quarantine_orphan(digest, recovery_id=recovery_id)
-            return RecoveryReport(
-                engagement_id=self.engagement_id,
-                chain_head=checkpoint.head,
-                verified_artifacts=tuple(sorted(verified)),
-                quarantined_orphans=tuple(orphans),
-                quarantined_interrupted_writes=tuple(interrupted_labels),
-                reconciled_publications=tuple(reconciled),
-                recovery_id=recovery_id,
-                anchor=checkpoint,
-            )
+                    pre_recovery_id = f"recovery-{stamp}-{secrets.token_hex(4)}"
+                    for shard, filename in interrupted:
+                        label = f"{shard}/{filename}"
+                        result = cas.quarantine_temporary(
+                            shard, filename, recovery_id=pre_recovery_id
+                        )
+                        if result == "published":
+                            reconciled.append(label)
+                        else:
+                            interrupted_labels.append(label)
+                references = ledger._referenced_artifacts_in_transaction()
+                verified: list[str] = []
+                for reference in references:
+                    cas.get(reference)
+                    verified.append(reference.sha256)
+                referenced = set(verified)
+                live = set(cas.blob_digests())
+                missing = referenced - live
+                if missing:
+                    raise ChainIntegrityError(
+                        "ledger references missing encrypted artifacts: "
+                        f"{sorted(missing)}"
+                    )
+                orphans = sorted(live - referenced)
+                recovery_id: str | None = (
+                    pre_recovery_id if interrupted_labels else None
+                )
+                if orphans:
+                    if recovery_id is None:
+                        stamp = dt.datetime.now(dt.timezone.utc).strftime(
+                            "%Y%m%dT%H%M%S%fZ"
+                        )
+                        recovery_id = f"recovery-{stamp}-{secrets.token_hex(4)}"
+                    for digest in orphans:
+                        cas.quarantine_orphan(digest, recovery_id=recovery_id)
+                return RecoveryReport(
+                    engagement_id=self.engagement_id,
+                    chain_head=checkpoint.head,
+                    verified_artifacts=tuple(sorted(verified)),
+                    quarantined_orphans=tuple(orphans),
+                    quarantined_interrupted_writes=tuple(interrupted_labels),
+                    reconciled_publications=tuple(reconciled),
+                    recovery_id=recovery_id,
+                    anchor=checkpoint,
+                )

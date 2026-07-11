@@ -761,7 +761,8 @@ def test_live_ledger_integrity_is_rechecked_before_verify_checkpoint_and_append(
             "SELECT seq, event_hash FROM events ORDER BY seq"
         ).fetchall()
     assert rows == [(1, first.event_hash)]
-    ledger.close()
+    with pytest.raises(StorageError, match=message):
+        ledger.close()
     with pytest.raises(StorageError, match=message):
         EventLedger(path, f"eng.live-{mutation}", key())
 
@@ -886,6 +887,143 @@ def test_anchor_decision_holds_sqlite_writer_lock_until_persisted(
         assert connection.execute("SELECT count(*) FROM events").fetchone()[0] == 2
     with pytest.raises(ChainIntegrityError, match="metadata authentication key"):
         store.close()
+
+
+def test_recovery_holds_verified_writer_snapshot_through_cas_decisions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engagement_id = "eng.recovery-transaction"
+    store = state_store(tmp_path, engagement_id)
+    event, raw_reference = store.append_observation(
+        actor_stream="researcher",
+        event_type="observation",
+        raw_output=b"must-remain-retrievable",
+        metadata={"source": "loopback"},
+    )
+    metadata_reference = ArtifactRef.from_dict(event.payload["metadata_ref"])
+    orphan = store.cas.put(b"one-unreferenced-object")
+    path = database_path(tmp_path, engagement_id)
+    anchor_path = (
+        anchor_root(tmp_path)
+        / "anchors"
+        / f"{hashlib.sha256(engagement_id.encode()).hexdigest()}.anchor"
+    )
+    anchor_before = anchor_path.read_bytes()
+    with sqlite3.connect(path) as connection:
+        trigger = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' "
+            "AND name='artifacts_no_delete'"
+        ).fetchone()[0]
+
+    started = threading.Event()
+    finished = threading.Event()
+    failures: list[BaseException] = []
+
+    def delete_projection_while_recovery_runs() -> None:
+        try:
+            with sqlite3.connect(path, timeout=5.0) as connection:
+                started.set()
+                connection.execute("DROP TRIGGER artifacts_no_delete")
+                connection.execute("DELETE FROM artifacts")
+                connection.execute(trigger)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            failures.append(exc)
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=delete_projection_while_recovery_runs)
+    original_temporary_entries = store.cas.temporary_entries
+    writer_blocked: list[bool] = []
+
+    def temporary_entries_while_writer_waits():
+        worker.start()
+        assert started.wait(timeout=2.0)
+        writer_blocked.append(not finished.wait(timeout=0.25))
+        return original_temporary_entries()
+
+    monkeypatch.setattr(store.cas, "temporary_entries", temporary_entries_while_writer_waits)
+    report = store.recover()
+    worker.join(timeout=5.0)
+    assert not worker.is_alive()
+    assert failures == []
+    assert writer_blocked == [True]
+    assert report.quarantined_orphans == (orphan.sha256,)
+    assert raw_reference.sha256 in store.cas.blob_digests()
+    assert metadata_reference.sha256 in store.cas.blob_digests()
+    assert anchor_path.read_bytes() == anchor_before
+
+    with pytest.raises(ChainIntegrityError, match="artifact registry is incomplete"):
+        store.checkpoint()
+    with pytest.raises(ChainIntegrityError, match="artifact registry is incomplete"):
+        store.close()
+
+
+def test_close_holds_verified_writer_snapshot_through_component_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engagement_id = "eng.close-transaction"
+    store = state_store(tmp_path, engagement_id)
+    first = store.ledger.append(
+        actor_stream="researcher", event_type="baseline", payload={"value": 1}
+    )
+    assert store.checkpoint().seq == first.seq
+    path = database_path(tmp_path, engagement_id)
+    anchor_path = (
+        anchor_root(tmp_path)
+        / "anchors"
+        / f"{hashlib.sha256(engagement_id.encode()).hexdigest()}.anchor"
+    )
+    anchor_before = anchor_path.read_bytes()
+    with sqlite3.connect(path) as connection:
+        trigger = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' "
+            "AND name='ledger_metadata_no_update'"
+        ).fetchone()[0]
+
+    started = threading.Event()
+    finished = threading.Event()
+    failures: list[BaseException] = []
+
+    def tamper_while_close_finishes_components() -> None:
+        try:
+            with sqlite3.connect(path, timeout=5.0) as connection:
+                started.set()
+                connection.execute("DROP TRIGGER ledger_metadata_no_update")
+                connection.execute(
+                    "UPDATE ledger_metadata SET value=? "
+                    "WHERE key='event_auth_key_commitment'",
+                    ("0" * 64,),
+                )
+                connection.execute(trigger)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            failures.append(exc)
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=tamper_while_close_finishes_components)
+    original_cas_close = store.cas.close
+    writer_blocked: list[bool] = []
+    invoked = False
+
+    def close_cas_while_writer_waits() -> None:
+        nonlocal invoked
+        if not invoked:
+            invoked = True
+            worker.start()
+            assert started.wait(timeout=2.0)
+            writer_blocked.append(not finished.wait(timeout=0.25))
+        original_cas_close()
+
+    monkeypatch.setattr(store.cas, "close", close_cas_while_writer_waits)
+    store.close()
+    worker.join(timeout=5.0)
+    assert not worker.is_alive()
+    assert failures == []
+    assert writer_blocked == [True]
+    assert store._closed
+    assert anchor_path.read_bytes() == anchor_before
+    with pytest.raises(ChainIntegrityError, match="metadata authentication key"):
+        state_store(tmp_path, engagement_id)
 
 
 @pytest.mark.parametrize("sidecar_suffix", ["-wal", "-shm"])
