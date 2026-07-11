@@ -6,7 +6,9 @@ import argparse
 import ipaddress
 import json
 import os
+import stat
 import sys
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TypeVar
@@ -27,10 +29,25 @@ EXIT_USAGE = 2
 EXIT_UNAVAILABLE = 3
 EXIT_AUTHORITY = 4
 MAX_PROTOCOL_FILE_BYTES = 1024 * 1024
+MAX_PROTOCOL_JSON_DEPTH = 128
+PROTOCOL_READ_CHUNK_BYTES = 64 * 1024
 TRUSTED_KEY_ENV = "FAULTLOOM_TRUSTED_AUTHORITY_KEY"
 PACK_IDS = {"web": "pack.web", "llm": "pack.llm"}
 
 ModelT = TypeVar("ModelT", bound=ProtocolModel)
+
+_FILE_STAT_FIELDS = (
+    "st_dev",
+    "st_ino",
+    "st_mode",
+    "st_nlink",
+    "st_uid",
+    "st_gid",
+    "st_size",
+    "st_mtime_ns",
+    "st_ctime_ns",
+)
+_DIRECTORY_STAT_FIELDS = ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid")
 
 
 class CliError(RuntimeError):
@@ -39,6 +56,17 @@ class CliError(RuntimeError):
     def __init__(self, message: str, *, exit_code: int) -> None:
         super().__init__(message)
         self.exit_code = exit_code
+
+
+@dataclass(frozen=True)
+class _BoundProtocolFile:
+    path: Path
+    descriptor: int
+    directory_descriptors: tuple[int, ...]
+    directory_names: tuple[str, ...]
+    directory_stats: tuple[os.stat_result, ...]
+    leaf_name: str
+    initial_stat: os.stat_result
 
 
 def _utc_now() -> datetime:
@@ -64,23 +92,273 @@ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]
     return result
 
 
-def _read_protocol_file(path: Path, model_type: type[ModelT]) -> ModelT:
+def _stat_matches(
+    left: os.stat_result,
+    right: os.stat_result,
+    fields: tuple[str, ...],
+) -> bool:
+    return all(getattr(left, field) == getattr(right, field) for field in fields)
+
+
+def _close_descriptors(descriptors: list[int] | tuple[int, ...]) -> None:
+    for descriptor in reversed(descriptors):
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _protocol_file_error(path: Path, reason: str) -> CliError:
+    return CliError(
+        f"unsafe or unreadable protocol file {path}: {reason}",
+        exit_code=EXIT_AUTHORITY,
+    )
+
+
+def _secure_open_flags_available() -> bool:
+    return all(
+        hasattr(os, name)
+        for name in (
+            "O_CLOEXEC",
+            "O_DIRECTORY",
+            "O_NOCTTY",
+            "O_NOFOLLOW",
+            "O_NONBLOCK",
+        )
+    )
+
+
+def _path_parts(path: Path) -> tuple[str, tuple[str, ...]]:
+    if path.is_absolute() and path.anchor != "/":
+        raise _protocol_file_error(path, "path has a noncanonical absolute anchor")
+    parts = path.parts[1:] if path.is_absolute() else path.parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise _protocol_file_error(path, "path must name a file without traversal")
+    return ("/" if path.is_absolute() else "."), tuple(parts)
+
+
+def _require_regular_single_link(
+    path: Path,
+    metadata: os.stat_result,
+) -> None:
+    if not stat.S_ISREG(metadata.st_mode):
+        raise _protocol_file_error(path, "input is not a regular file")
+    if metadata.st_nlink != 1:
+        raise _protocol_file_error(path, "input must have exactly one hard link")
+
+
+def _open_bound_protocol_file(path: Path) -> _BoundProtocolFile:
+    if not _secure_open_flags_available():
+        raise _protocol_file_error(path, "secure descriptor flags are unavailable")
+
+    root, parts = _path_parts(path)
+    directory_descriptors: list[int] = []
+    directory_names: list[str] = []
+    directory_stats: list[os.stat_result] = []
+    file_descriptor: int | None = None
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    file_flags = (
+        os.O_RDONLY
+        | os.O_CLOEXEC
+        | os.O_NOCTTY
+        | os.O_NOFOLLOW
+        | os.O_NONBLOCK
+    )
+
     try:
-        content = path.read_bytes()
+        root_descriptor = os.open(root, directory_flags)
+        directory_descriptors.append(root_descriptor)
+        directory_stats.append(os.fstat(root_descriptor))
+
+        for component in parts[:-1]:
+            parent_descriptor = directory_descriptors[-1]
+            before = os.stat(
+                component,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISDIR(before.st_mode):
+                raise _protocol_file_error(path, "path component is not a real directory")
+            child_descriptor = os.open(component, directory_flags, dir_fd=parent_descriptor)
+            try:
+                child_stat = os.fstat(child_descriptor)
+            except OSError:
+                os.close(child_descriptor)
+                raise
+            if not _stat_matches(before, child_stat, _DIRECTORY_STAT_FIELDS):
+                os.close(child_descriptor)
+                raise _protocol_file_error(path, "path component changed while opening")
+            directory_names.append(component)
+            directory_descriptors.append(child_descriptor)
+            directory_stats.append(child_stat)
+
+        leaf_name = parts[-1]
+        parent_descriptor = directory_descriptors[-1]
+        before = os.stat(
+            leaf_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        _require_regular_single_link(path, before)
+        file_descriptor = os.open(leaf_name, file_flags, dir_fd=parent_descriptor)
+        opened = os.fstat(file_descriptor)
+        _require_regular_single_link(path, opened)
+        if not _stat_matches(before, opened, _FILE_STAT_FIELDS):
+            raise _protocol_file_error(path, "input changed while opening")
+        if opened.st_size > MAX_PROTOCOL_FILE_BYTES:
+            raise _protocol_file_error(
+                path,
+                f"input exceeds {MAX_PROTOCOL_FILE_BYTES} bytes",
+            )
+        return _BoundProtocolFile(
+            path=path,
+            descriptor=file_descriptor,
+            directory_descriptors=tuple(directory_descriptors),
+            directory_names=tuple(directory_names),
+            directory_stats=tuple(directory_stats),
+            leaf_name=leaf_name,
+            initial_stat=opened,
+        )
+    except CliError:
+        if file_descriptor is not None:
+            _close_descriptors([file_descriptor])
+        _close_descriptors(directory_descriptors)
+        raise
+    except (OSError, ValueError) as exc:
+        if file_descriptor is not None:
+            _close_descriptors([file_descriptor])
+        _close_descriptors(directory_descriptors)
+        raise _protocol_file_error(path, str(exc)) from exc
+
+
+def _close_bound_protocol_file(bound: _BoundProtocolFile) -> None:
+    _close_descriptors([bound.descriptor])
+    _close_descriptors(bound.directory_descriptors)
+
+
+def _read_bound_protocol_file(bound: _BoundProtocolFile) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        while total <= MAX_PROTOCOL_FILE_BYTES:
+            requested = min(
+                PROTOCOL_READ_CHUNK_BYTES,
+                MAX_PROTOCOL_FILE_BYTES + 1 - total,
+            )
+            chunk = os.read(bound.descriptor, requested)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
     except OSError as exc:
-        raise CliError(
-            f"cannot read protocol file {path}: {exc}", exit_code=EXIT_AUTHORITY
-        ) from exc
-    if len(content) > MAX_PROTOCOL_FILE_BYTES:
-        raise CliError(
-            f"protocol file exceeds {MAX_PROTOCOL_FILE_BYTES} bytes: {path}",
-            exit_code=EXIT_AUTHORITY,
+        raise _protocol_file_error(bound.path, str(exc)) from exc
+
+    if total > MAX_PROTOCOL_FILE_BYTES:
+        raise _protocol_file_error(
+            bound.path,
+            f"input exceeds {MAX_PROTOCOL_FILE_BYTES} bytes",
         )
     try:
+        current = os.fstat(bound.descriptor)
+    except OSError as exc:
+        raise _protocol_file_error(bound.path, str(exc)) from exc
+    if total != bound.initial_stat.st_size or not _stat_matches(
+        bound.initial_stat,
+        current,
+        _FILE_STAT_FIELDS,
+    ):
+        raise _protocol_file_error(bound.path, "input changed while reading")
+    return b"".join(chunks)
+
+
+def _reconcile_bound_protocol_file(bound: _BoundProtocolFile) -> None:
+    try:
+        for index, descriptor in enumerate(bound.directory_descriptors):
+            current = os.fstat(descriptor)
+            initial = bound.directory_stats[index]
+            if not _stat_matches(initial, current, _DIRECTORY_STAT_FIELDS):
+                raise _protocol_file_error(bound.path, "bound directory changed")
+            if index > 0:
+                path_stat = os.stat(
+                    bound.directory_names[index - 1],
+                    dir_fd=bound.directory_descriptors[index - 1],
+                    follow_symlinks=False,
+                )
+                if not _stat_matches(initial, path_stat, _DIRECTORY_STAT_FIELDS):
+                    raise _protocol_file_error(bound.path, "path component changed")
+
+        current_file = os.fstat(bound.descriptor)
+        path_file = os.stat(
+            bound.leaf_name,
+            dir_fd=bound.directory_descriptors[-1],
+            follow_symlinks=False,
+        )
+        _require_regular_single_link(bound.path, path_file)
+        if not _stat_matches(bound.initial_stat, current_file, _FILE_STAT_FIELDS):
+            raise _protocol_file_error(bound.path, "bound input metadata changed")
+        if not _stat_matches(bound.initial_stat, path_file, _FILE_STAT_FIELDS):
+            raise _protocol_file_error(bound.path, "input path changed during capture")
+    except CliError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise _protocol_file_error(bound.path, str(exc)) from exc
+
+
+def _capture_protocol_file_pair(
+    authority_path: Path,
+    key_path: Path,
+) -> tuple[bytes, bytes]:
+    authority = _open_bound_protocol_file(authority_path)
+    try:
+        key = _open_bound_protocol_file(key_path)
+        try:
+            authority_content = _read_bound_protocol_file(authority)
+            key_content = _read_bound_protocol_file(key)
+            _reconcile_bound_protocol_file(authority)
+            _reconcile_bound_protocol_file(key)
+            return authority_content, key_content
+        finally:
+            _close_bound_protocol_file(key)
+    finally:
+        _close_bound_protocol_file(authority)
+
+
+def _validate_json_depth(text: str) -> None:
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > MAX_PROTOCOL_JSON_DEPTH:
+                raise ValueError(
+                    f"JSON nesting exceeds {MAX_PROTOCOL_JSON_DEPTH} levels"
+                )
+        elif character in "]}":
+            depth -= 1
+
+
+def _parse_protocol_file(
+    path: Path,
+    content: bytes,
+    model_type: type[ModelT],
+) -> ModelT:
+    try:
         text = content.decode("utf-8")
+        _validate_json_depth(text)
         json.loads(text, object_pairs_hook=_reject_duplicate_keys)
         return model_type.model_validate_json(text)
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
         raise CliError(
             f"invalid {model_type.__name__} file {path}: {exc}",
             exit_code=EXIT_AUTHORITY,
@@ -106,13 +384,32 @@ def _network_is_loopback(value: str) -> bool:
 
 
 def _hostname_is_loopback(value: str) -> bool:
-    normalized = value.rstrip(".").casefold()
-    if normalized == "localhost" or normalized.endswith(".localhost"):
-        return True
-    try:
-        return ipaddress.ip_address(normalized).is_loopback
-    except ValueError:
+    if (
+        not value
+        or not value.isascii()
+        or value != value.lower()
+        or any(ord(character) < 33 or ord(character) > 126 for character in value)
+        or "%" in value
+    ):
         return False
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        pass
+    else:
+        return address.is_loopback and str(address) == value
+
+    if len(value) > 253 or value.endswith("."):
+        return False
+    labels = value.split(".")
+    for label in labels:
+        if not 1 <= len(label) <= 63:
+            return False
+        if label.startswith("-") or label.endswith("-"):
+            return False
+        if any(character not in "abcdefghijklmnopqrstuvwxyz0123456789-" for character in label):
+            return False
+    return labels[-1] == "localhost"
 
 
 def _target_is_loopback(target: object) -> bool:
@@ -146,9 +443,20 @@ def _doctor(arguments: argparse.Namespace) -> int:
 
 
 def _run(arguments: argparse.Namespace) -> int:
-    envelope = _read_protocol_file(arguments.authority, SignedAuthorityGrant)
-    public_key = _read_protocol_file(
-        _trusted_key_path(arguments), Ed25519PublicKeyRecord
+    key_path = _trusted_key_path(arguments)
+    authority_content, key_content = _capture_protocol_file_pair(
+        arguments.authority,
+        key_path,
+    )
+    envelope = _parse_protocol_file(
+        arguments.authority,
+        authority_content,
+        SignedAuthorityGrant,
+    )
+    public_key = _parse_protocol_file(
+        key_path,
+        key_content,
+        Ed25519PublicKeyRecord,
     )
     now = _utc_now()
     try:
