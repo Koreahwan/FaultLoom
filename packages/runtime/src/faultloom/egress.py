@@ -4,28 +4,30 @@ The target Gateway, model-provider proxy, and knowledge fetcher are separate
 egress planes.  This module owns only the deterministic policy boundary for
 the latter two planes.  Concrete transports are injected and receive an
 immutable, policy-compiled request; callers cannot supply a destination URL.
-Signed authority and epoch state is reverified for every dispatch, while a
-SQLite/WAL hold prevents uncertain requests from being replayed implicitly.
+Signed authority and epoch state is reverified for every dispatch, while an
+externally anchored authenticated SQLite hold prevents implicit replay.
 """
 
 from __future__ import annotations
 
+import base64
+import hmac
 import ipaddress
-import os
 import re
 import sqlite3
 from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from enum import Enum
-from pathlib import Path
 from threading import RLock
 from typing import Annotated, Literal, Protocol
 from urllib.parse import urlsplit
 
+from cryptography.exceptions import InvalidSignature
 from pydantic import Field, model_validator
 
 from faultloom_protocol import (
     AuthorityGrant,
+    AuthoritySigner,
     AuthorityRevokedError,
     Ed25519PublicKeyRecord,
     ProtocolModel,
@@ -37,10 +39,16 @@ from faultloom_protocol import (
     SignatureVerificationError,
     SignedAuthorityGrant,
     SignedScopeEpoch,
+    canonical_json_bytes,
     load_public_key,
     sha256_digest,
     verify_authority_grant,
     verify_scope_epoch,
+)
+from faultloom.egress_state import (
+    EgressStateCheckpoint,
+    EgressStateIntegrityError,
+    SqliteEgressStateStore,
 )
 from faultloom_protocol.base import (
     AwareDatetime,
@@ -111,6 +119,71 @@ class ReconciliationDisposition(str, Enum):
 
     RETRY_AUTHORIZED = "retry_authorized"
     EFFECT_CONFIRMED = "effect_confirmed"
+
+
+class ReconciliationAuthorization(ProtocolModel):
+    """Exact one-use authority to resolve one uncertain semantic action."""
+
+    capability_id: Identifier
+    sequence: PositiveInt
+    plane: Literal[EgressPlane.MODEL_PROVIDER, EgressPlane.KNOWLEDGE]
+    action_digest: Sha256Digest
+    request_digest: Sha256Digest
+    authority_digest: Sha256Digest
+    scope_epoch: PositiveInt
+    disposition: ReconciliationDisposition
+    issued_at: AwareDatetime
+    expires_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def _valid_window(self) -> "ReconciliationAuthorization":
+        if self.expires_at <= self.issued_at:
+            raise ValueError("reconciliation authorization expiry must follow issuance")
+        return self
+
+
+class SignedReconciliationAuthorization(ProtocolModel):
+    payload: ReconciliationAuthorization
+    key_id: NonEmptyStr
+    payload_digest: Sha256Digest
+    signature: NonEmptyStr
+
+
+def _reconciliation_signing_bytes(
+    payload: ReconciliationAuthorization, *, key_id: str, payload_digest: str
+) -> bytes:
+    return canonical_json_bytes(
+        {
+            "domain": "faultloom-egress-reconciliation-v1",
+            "key_id": key_id,
+            "payload": payload,
+            "payload_digest": payload_digest,
+            "schema_version": SCHEMA_VERSION,
+        }
+    )
+
+
+def sign_reconciliation_authorization(
+    payload: ReconciliationAuthorization, signer: AuthoritySigner
+) -> SignedReconciliationAuthorization:
+    """Sign an operator/control-plane reconciliation decision."""
+
+    candidate = ReconciliationAuthorization.model_validate(
+        payload.model_dump(mode="python")
+    )
+    payload_digest = sha256_digest(candidate)
+    signature = signer.sign(
+        _reconciliation_signing_bytes(
+            candidate, key_id=signer.key_id, payload_digest=payload_digest
+        )
+    )
+    return SignedReconciliationAuthorization(
+        schema_version=SCHEMA_VERSION,
+        payload=candidate,
+        key_id=signer.key_id,
+        payload_digest=payload_digest,
+        signature=signature,
+    )
 
 
 def _origin_host(origin: str) -> str:
@@ -263,6 +336,7 @@ class KnowledgeSource(ProtocolModel):
 class DestinationResolution(ProtocolModel):
     """Resolver result pinned into the transport request for one dispatch."""
 
+    plane: Literal[EgressPlane.MODEL_PROVIDER, EgressPlane.KNOWLEDGE]
     origin: ShortStr
     cname_chain: tuple[ShortStr, ...] = ()
     addresses: tuple[ShortStr, ...]
@@ -283,6 +357,9 @@ class DestinationResolution(ProtocolModel):
 
 
 class DestinationResolver(Protocol):
+    plane: EgressPlane
+    resolver_id: Identifier
+
     def resolve(self, origin: str) -> DestinationResolution: ...
 
 
@@ -355,6 +432,7 @@ class CompiledKnowledgeRequest(ProtocolModel):
     data_policy_id: Identifier
     resolved_addresses: tuple[ShortStr, ...]
     resolution_digest: Sha256Digest
+    maximum_request_bytes: PositiveInt
     maximum_response_bytes: PositiveInt
     follow_redirects: Literal[False] = False
 
@@ -377,6 +455,7 @@ class EgressReceipt(ProtocolModel):
     scope_epoch: PositiveInt
     policy_digest: Sha256Digest
     destination_digest: Sha256Digest | None
+    execution_component_digest: Sha256Digest | None
     outcome: EgressOutcome
     denial_code: DenialCode | None
     response_digest: Sha256Digest | None
@@ -394,6 +473,9 @@ class EgressReceipt(ProtocolModel):
             raise ValueError("only unknown outcomes require reconciliation")
         if self.outcome is EgressOutcome.DENIED and (self.bytes_sent or self.bytes_received):
             raise ValueError("denied receipts cannot report transport bytes")
+        payload = self.model_dump(mode="python", exclude={"receipt_digest"})
+        if not hmac.compare_digest(self.receipt_digest, sha256_digest(payload)):
+            raise ValueError("egress receipt digest does not match its fields")
         return self
 
 
@@ -401,6 +483,7 @@ class ProviderTransport(Protocol):
     """Transport that must pin resolved_addresses and keep redirects disabled."""
 
     plane: EgressPlane
+    transport_id: Identifier
 
     def dispatch(self, request: CompiledProviderRequest) -> EgressTransportResult: ...
 
@@ -409,6 +492,7 @@ class KnowledgeTransport(Protocol):
     """Transport that must pin resolved_addresses and keep redirects disabled."""
 
     plane: EgressPlane
+    transport_id: Identifier
 
     def dispatch(self, request: CompiledKnowledgeRequest) -> EgressTransportResult: ...
 
@@ -559,6 +643,7 @@ def _receipt(
     scope_epoch: int,
     policy_digest: str,
     destination_digest: str | None,
+    execution_component_digest: str | None = None,
     outcome: EgressOutcome,
     denial_code: DenialCode | None,
     result: EgressTransportResult | None,
@@ -578,6 +663,7 @@ def _receipt(
         "scope_epoch": scope_epoch,
         "policy_digest": policy_digest,
         "destination_digest": destination_digest,
+        "execution_component_digest": execution_component_digest,
         "outcome": outcome,
         "denial_code": denial_code,
         "response_digest": response_digest,
@@ -603,273 +689,6 @@ class _ReservationResult(str, Enum):
     CONFLICT = "conflict"
 
 
-class SqliteEgressStateStore:
-    """Durable monotonic authority watermarks and at-most-once dispatch holds."""
-
-    def __init__(self, path: str | Path) -> None:
-        raw_path = os.fspath(path)
-        if raw_path == ":memory:" or raw_path.startswith("file:"):
-            raise ValueError("egress state requires a durable filesystem SQLite path")
-        self._path = Path(path)
-        if not self._path.parent.is_dir() or self._path.parent.is_symlink():
-            raise ValueError("egress state parent must be an existing non-symlink directory")
-        if self._path.is_symlink() or (self._path.exists() and not self._path.is_file()):
-            raise ValueError("egress state path must be a regular file, not a symlink")
-        self._lock = RLock()
-        self._initialized = False
-        with self._connect() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS authority_watermark (
-                    trust_domain TEXT PRIMARY KEY,
-                    key_id TEXT NOT NULL,
-                    grant_id TEXT NOT NULL,
-                    grant_version INTEGER NOT NULL CHECK (grant_version > 0),
-                    scope_epoch INTEGER NOT NULL CHECK (scope_epoch > 0),
-                    revoked INTEGER NOT NULL CHECK (revoked IN (0, 1)),
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS dispatch_hold (
-                    plane TEXT NOT NULL,
-                    run_id TEXT NOT NULL,
-                    request_id TEXT NOT NULL,
-                    request_digest TEXT NOT NULL,
-                    state TEXT NOT NULL,
-                    attempts INTEGER NOT NULL CHECK (attempts > 0),
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (plane, run_id, request_id)
-                )
-                """
-            )
-        self._initialized = True
-        os.chmod(self._path, 0o600)
-
-    @property
-    def path(self) -> Path:
-        return self._path
-
-    def _connect(self) -> sqlite3.Connection:
-        if self._initialized and (
-            not self._path.is_file() or self._path.is_symlink()
-        ):
-            raise RuntimeError("durable egress state disappeared or changed type")
-        connection = sqlite3.connect(
-            self._path,
-            timeout=5.0,
-            isolation_level=None,
-        )
-        connection.execute("PRAGMA busy_timeout = 5000")
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA synchronous = FULL")
-        return connection
-
-    def observe_authority(
-        self,
-        *,
-        trust_domain: str,
-        key_id: str,
-        grant_id: str,
-        grant_version: int,
-        scope_epoch: int,
-        revoked: bool,
-        observed_at: datetime,
-    ) -> None:
-        timestamp = observed_at.isoformat()
-        with self._lock, self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                """
-                SELECT key_id, grant_id, grant_version, scope_epoch, revoked
-                FROM authority_watermark WHERE trust_domain = ?
-                """,
-                (trust_domain,),
-            ).fetchone()
-            if row is None:
-                connection.execute(
-                    """
-                    INSERT INTO authority_watermark
-                    (
-                        trust_domain,
-                        key_id,
-                        grant_id,
-                        grant_version,
-                        scope_epoch,
-                        revoked,
-                        updated_at
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        trust_domain,
-                        key_id,
-                        grant_id,
-                        grant_version,
-                        scope_epoch,
-                        int(revoked),
-                        timestamp,
-                    ),
-                )
-                connection.commit()
-                return
-            stored_key, stored_grant, stored_version, stored_epoch, stored_revoked = row
-            if stored_key != key_id or stored_grant != grant_id:
-                connection.rollback()
-                raise ValueError("authority trust domain key or grant binding changed")
-            if grant_version < stored_version or scope_epoch < stored_epoch:
-                connection.rollback()
-                raise ValueError("authority or scope epoch rollback was rejected")
-            if stored_revoked and not revoked:
-                connection.rollback()
-                raise AuthorityRevokedError("authority was already revoked")
-            connection.execute(
-                """
-                UPDATE authority_watermark
-                SET grant_version = ?, scope_epoch = ?, revoked = ?, updated_at = ?
-                WHERE trust_domain = ?
-                """,
-                (
-                    max(grant_version, stored_version),
-                    max(scope_epoch, stored_epoch),
-                    int(bool(stored_revoked) or revoked),
-                    timestamp,
-                    trust_domain,
-                ),
-            )
-            connection.commit()
-
-    def reserve_dispatch(
-        self,
-        *,
-        plane: EgressPlane,
-        run_id: str,
-        request_id: str,
-        request_digest: str,
-        reserved_at: datetime,
-    ) -> _ReservationResult:
-        timestamp = reserved_at.isoformat()
-        with self._lock, self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                """
-                SELECT request_digest, state, attempts FROM dispatch_hold
-                WHERE plane = ? AND run_id = ? AND request_id = ?
-                """,
-                (plane.value, run_id, request_id),
-            ).fetchone()
-            if row is None:
-                connection.execute(
-                    """
-                    INSERT INTO dispatch_hold
-                    (plane, run_id, request_id, request_digest, state, attempts, updated_at)
-                    VALUES (?, ?, ?, ?, 'pending', 1, ?)
-                    """,
-                    (plane.value, run_id, request_id, request_digest, timestamp),
-                )
-                connection.commit()
-                return _ReservationResult.RESERVED
-            stored_digest, state, attempts = row
-            if stored_digest != request_digest:
-                connection.rollback()
-                return _ReservationResult.CONFLICT
-            if state != ReconciliationDisposition.RETRY_AUTHORIZED.value:
-                connection.rollback()
-                return _ReservationResult.REPLAY
-            connection.execute(
-                """
-                UPDATE dispatch_hold SET state = 'pending', attempts = ?, updated_at = ?
-                WHERE plane = ? AND run_id = ? AND request_id = ?
-                """,
-                (attempts + 1, timestamp, plane.value, run_id, request_id),
-            )
-            connection.commit()
-            return _ReservationResult.RESERVED
-
-    def finish_dispatch(
-        self,
-        *,
-        plane: EgressPlane,
-        run_id: str,
-        request_id: str,
-        request_digest: str,
-        outcome: EgressOutcome,
-        finished_at: datetime,
-    ) -> None:
-        if outcome not in {
-            EgressOutcome.COMPLETED,
-            EgressOutcome.FAILED,
-            EgressOutcome.UNKNOWN_OUTCOME,
-        }:
-            raise ValueError("only dispatched outcomes can finish an egress hold")
-        with self._lock, self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            cursor = connection.execute(
-                """
-                UPDATE dispatch_hold SET state = ?, updated_at = ?
-                WHERE plane = ? AND run_id = ? AND request_id = ?
-                  AND request_digest = ? AND state = 'pending'
-                """,
-                (
-                    outcome.value,
-                    finished_at.isoformat(),
-                    plane.value,
-                    run_id,
-                    request_id,
-                    request_digest,
-                ),
-            )
-            if cursor.rowcount != 1:
-                connection.rollback()
-                raise RuntimeError("durable egress hold was missing or not pending")
-            connection.commit()
-
-    def reconcile(
-        self,
-        *,
-        plane: EgressPlane,
-        run_id: str,
-        request_id: str,
-        request_digest: str,
-        disposition: ReconciliationDisposition,
-        reconciled_at: datetime,
-    ) -> bool:
-        with self._lock, self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            cursor = connection.execute(
-                """
-                UPDATE dispatch_hold SET state = ?, updated_at = ?
-                WHERE plane = ? AND run_id = ? AND request_id = ?
-                  AND request_digest = ? AND state = 'unknown_outcome'
-                """,
-                (
-                    disposition.value,
-                    reconciled_at.isoformat(),
-                    plane.value,
-                    run_id,
-                    request_id,
-                    request_digest,
-                ),
-            )
-            connection.commit()
-            return cursor.rowcount == 1
-
-    def dispatch_state(
-        self, *, plane: EgressPlane, run_id: str, request_id: str
-    ) -> str | None:
-        with self._lock, self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT state FROM dispatch_hold
-                WHERE plane = ? AND run_id = ? AND request_id = ?
-                """,
-                (plane.value, run_id, request_id),
-            ).fetchone()
-        return None if row is None else str(row[0])
-
-
 class TrustedAuthorityState:
     """Pinned trust material plus a signed grant and current signed scope epoch."""
 
@@ -878,6 +697,7 @@ class TrustedAuthorityState:
         *,
         trust_domain: str,
         trusted_key: Ed25519PublicKeyRecord,
+        trusted_reconciliation_key: Ed25519PublicKeyRecord,
         authority: SignedAuthorityGrant,
         scope_epoch: SignedScopeEpoch,
         state_store: SqliteEgressStateStore,
@@ -889,6 +709,12 @@ class TrustedAuthorityState:
             trusted_key.model_dump(mode="python")
         )
         load_public_key(self._trusted_key)
+        self._trusted_reconciliation_key = Ed25519PublicKeyRecord.model_validate(
+            trusted_reconciliation_key.model_dump(mode="python")
+        )
+        load_public_key(self._trusted_reconciliation_key)
+        if self._trusted_reconciliation_key.key_id == self._trusted_key.key_id:
+            raise ValueError("reconciliation requires a separate trusted signing key")
         self._authority = SignedAuthorityGrant.model_validate(
             authority.model_dump(mode="python")
         )
@@ -911,6 +737,18 @@ class TrustedAuthorityState:
     @property
     def state_store(self) -> SqliteEgressStateStore:
         return self._state_store
+
+    @property
+    def trust_domain(self) -> str:
+        return self._trust_domain
+
+    @property
+    def reconciliation_key_id(self) -> str:
+        return self._trusted_reconciliation_key.key_id
+
+    @property
+    def reconciliation_key_digest(self) -> str:
+        return sha256_digest(self._trusted_reconciliation_key)
 
     def verify(self, now: datetime) -> tuple[AuthorityGrant, ScopeEpoch]:
         with self._lock:
@@ -955,23 +793,79 @@ class TrustedAuthorityState:
     ) -> None:
         self._state_store.observe_authority(
             trust_domain=self._trust_domain,
+            trusted_key_digest=sha256_digest(self._trusted_key),
             key_id=self._trusted_key.key_id,
             grant_id=grant.grant_id,
             grant_version=grant.grant_version,
+            authority_digest=sha256_digest(self._authority),
             scope_epoch=epoch.epoch,
+            epoch_digest=sha256_digest(self._scope_epoch),
             revoked=revoked,
             observed_at=now,
         )
 
+    def verify_reconciliation(
+        self,
+        authorization: SignedReconciliationAuthorization,
+        *,
+        now: datetime,
+        plane: EgressPlane,
+        action_digest: str,
+        request_digest: str,
+    ) -> ReconciliationAuthorization:
+        candidate = SignedReconciliationAuthorization.model_validate(
+            authorization.model_dump(mode="python")
+        )
+        payload = candidate.payload
+        if candidate.key_id != self._trusted_reconciliation_key.key_id:
+            raise SignatureVerificationError("untrusted reconciliation key")
+        if candidate.payload_digest != sha256_digest(payload):
+            raise SignatureVerificationError("reconciliation payload digest mismatch")
+        if not payload.issued_at <= now < payload.expires_at:
+            raise SignatureVerificationError("reconciliation authorization is not current")
+        if (
+            payload.plane is not plane
+            or payload.action_digest != action_digest
+            or payload.request_digest != request_digest
+            or payload.authority_digest != self.authority_digest
+            or payload.scope_epoch != self.scope_epoch_number
+        ):
+            raise SignatureVerificationError("reconciliation authorization binding mismatch")
+        padding = "=" * (-len(candidate.signature) % 4)
+        try:
+            raw_signature = base64.b64decode(
+                candidate.signature + padding, altchars=b"-_", validate=True
+            )
+        except (TypeError, ValueError) as exc:
+            raise SignatureVerificationError("invalid reconciliation signature encoding") from exc
+        if base64.urlsafe_b64encode(raw_signature).rstrip(b"=").decode("ascii") != candidate.signature:
+            raise SignatureVerificationError("non-canonical reconciliation signature")
+        try:
+            load_public_key(self._trusted_reconciliation_key).verify(
+                raw_signature,
+                _reconciliation_signing_bytes(
+                    payload,
+                    key_id=candidate.key_id,
+                    payload_digest=candidate.payload_digest,
+                ),
+            )
+        except InvalidSignature as exc:
+            raise SignatureVerificationError("reconciliation signature verification failed") from exc
+        return payload
+
 
 def _validated_resolution(
-    resolver: DestinationResolver, origin: str
+    resolver: DestinationResolver, origin: str, *, expected_plane: EgressPlane
 ) -> DestinationResolution:
+    if getattr(resolver, "plane", None) is not expected_plane:
+        raise ValueError("destination resolver belongs to another egress plane")
     value = resolver.resolve(origin)
+    if getattr(resolver, "plane", None) is not expected_plane:
+        raise ValueError("destination resolver plane changed during resolution")
     if not isinstance(value, DestinationResolution):
         raise TypeError("destination resolver must return DestinationResolution")
     resolution = DestinationResolution.model_validate(value.model_dump(mode="python"))
-    if resolution.origin != origin:
+    if resolution.origin != origin or resolution.plane is not expected_plane:
         raise ValueError("destination resolution is bound to another origin")
     return resolution
 
@@ -988,6 +882,77 @@ def _validated_transport_result(value: object) -> EgressTransportResult:
     if not isinstance(value, EgressTransportResult):
         raise TypeError("egress transport must return EgressTransportResult")
     return EgressTransportResult.model_validate(value.model_dump(mode="python"))
+
+
+def _component_id(value: object, *, field: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", value
+    ) is None:
+        raise ValueError(f"{field} must be a stable identifier")
+    return value
+
+
+def _execution_component_digest(
+    plane: EgressPlane, resolver: DestinationResolver, transport: object
+) -> str:
+    return sha256_digest(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "plane": plane,
+            "resolver_id": _component_id(
+                getattr(resolver, "resolver_id", None), field="resolver_id"
+            ),
+            "transport_id": _component_id(
+                getattr(transport, "transport_id", None), field="transport_id"
+            ),
+        }
+    )
+
+
+def provider_action_digest(request: ProviderRequest) -> str:
+    return sha256_digest(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "plane": EgressPlane.MODEL_PROVIDER,
+            "authority_digest": request.authority_digest,
+            "scope_epoch": request.scope_epoch,
+            "endpoint_id": request.endpoint_id,
+            "provider_id": request.provider_id,
+            "model_snapshot": request.model_snapshot,
+            "data_policy_id": request.data_policy_id,
+            "credential_ref": request.credential_ref,
+            "payload_digest": request.payload_digest,
+            "payload_bytes": request.payload_bytes,
+            "tool_ids": request.tool_ids,
+            "live": request.live,
+        }
+    )
+
+
+def knowledge_action_digest(request: KnowledgeFetchIntent) -> str:
+    return sha256_digest(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "plane": EgressPlane.KNOWLEDGE,
+            "authority_digest": request.authority_digest,
+            "scope_epoch": request.scope_epoch,
+            "source_id": request.source_id,
+            "method": request.method,
+            "path": request.path,
+            "data_policy_id": request.data_policy_id,
+        }
+    )
+
+
+def _correlation_digest(plane: EgressPlane, *, run_id: str, request_id: str) -> str:
+    return sha256_digest(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "plane": plane,
+            "run_id": run_id,
+            "request_id": request_id,
+        }
+    )
 
 
 class ProviderProxy:
@@ -1011,6 +976,8 @@ class ProviderProxy:
             raise TypeError("provider proxy requires pinned signed authority state")
         if not callable(getattr(resolver, "resolve", None)):
             raise TypeError("provider proxy requires a destination resolver")
+        if getattr(resolver, "plane", None) is not EgressPlane.MODEL_PROVIDER:
+            raise ValueError("provider proxy requires a model-provider resolver")
         self._endpoints = _registry(endpoints, "endpoint_id")
         self._transport = transport
         self._resolver = resolver
@@ -1018,10 +985,14 @@ class ProviderProxy:
         self._state_store = authority_state.state_store
         self._live = live
         self._clock = clock
+        self._component_digest = _execution_component_digest(
+            EgressPlane.MODEL_PROVIDER, resolver, transport
+        )
 
     def dispatch(self, request: ProviderRequest) -> EgressReceipt:
         now = _trusted_now(self._clock)
         request_digest = sha256_digest(request)
+        action_digest = provider_action_digest(request)
         authority_digest = self._authority.authority_digest
         scope_epoch = self._authority.scope_epoch_number
         endpoint = self._endpoints.get(request.endpoint_id)
@@ -1083,7 +1054,7 @@ class ProviderProxy:
                 now=now,
         )
         assert isinstance(endpoint, ProviderEndpoint)
-        prior_state = self._prior_dispatch_state(request)
+        prior_state = self._prior_dispatch_state(action_digest)
         if prior_state is not None:
             return self._denied(
                 request=request,
@@ -1095,7 +1066,11 @@ class ProviderProxy:
                 now=now,
             )
         try:
-            resolution = _validated_resolution(self._resolver, endpoint.origin)
+            resolution = _validated_resolution(
+                self._resolver,
+                endpoint.origin,
+                expected_plane=EgressPlane.MODEL_PROVIDER,
+            )
             destination_denial = _destination_denial(endpoint.origin, resolution, grant)
         except (TypeError, ValueError, OSError):
             resolution = None
@@ -1129,9 +1104,13 @@ class ProviderProxy:
         )
         try:
             reservation = self._state_store.reserve_dispatch(
-                plane=EgressPlane.MODEL_PROVIDER,
-                run_id=request.run_id,
-                request_id=request.request_id,
+                plane=EgressPlane.MODEL_PROVIDER.value,
+                action_digest=action_digest,
+                correlation_digest=_correlation_digest(
+                    EgressPlane.MODEL_PROVIDER,
+                    run_id=request.run_id,
+                    request_id=request.request_id,
+                ),
                 request_digest=request_digest,
                 reserved_at=now,
             )
@@ -1145,7 +1124,7 @@ class ProviderProxy:
                 denial=DenialCode.STATE_STORE_UNAVAILABLE,
                 now=now,
             )
-        if reservation is not _ReservationResult.RESERVED:
+        if reservation != _ReservationResult.RESERVED.value:
             return self._denied(
                 request=request,
                 request_digest=request_digest,
@@ -1158,6 +1137,7 @@ class ProviderProxy:
         return self._dispatch_compiled(
             request=request,
             compiled=compiled,
+            action_digest=action_digest,
             request_digest=request_digest,
             authority_digest=authority_digest,
             scope_epoch=epoch.epoch,
@@ -1166,16 +1146,37 @@ class ProviderProxy:
         )
 
     def reconcile(
-        self, request: ProviderRequest, disposition: ReconciliationDisposition
+        self,
+        request: ProviderRequest,
+        authorization: SignedReconciliationAuthorization,
     ) -> bool:
-        return self._state_store.reconcile(
-            plane=EgressPlane.MODEL_PROVIDER,
-            run_id=request.run_id,
-            request_id=request.request_id,
-            request_digest=sha256_digest(request),
-            disposition=disposition,
-            reconciled_at=_trusted_now(self._clock),
-        )
+        if not isinstance(authorization, SignedReconciliationAuthorization):
+            return False
+        now = _trusted_now(self._clock)
+        request_digest = sha256_digest(request)
+        action_digest = provider_action_digest(request)
+        try:
+            payload = self._authority.verify_reconciliation(
+                authorization,
+                now=now,
+                plane=EgressPlane.MODEL_PROVIDER,
+                action_digest=action_digest,
+                request_digest=request_digest,
+            )
+            return self._state_store.reconcile(
+                trust_domain=self._authority.trust_domain,
+                trusted_key_digest=self._authority.reconciliation_key_digest,
+                key_id=self._authority.reconciliation_key_id,
+                capability_id=payload.capability_id,
+                sequence=payload.sequence,
+                plane=EgressPlane.MODEL_PROVIDER.value,
+                action_digest=action_digest,
+                request_digest=request_digest,
+                disposition=payload.disposition.value,
+                reconciled_at=now,
+            )
+        except (SignatureVerificationError, ValueError, sqlite3.Error, OSError, RuntimeError):
+            return False
 
     def _denied(
         self,
@@ -1202,12 +1203,11 @@ class ProviderProxy:
             evaluated_at=now,
         )
 
-    def _prior_dispatch_state(self, request: ProviderRequest) -> DenialCode | None:
+    def _prior_dispatch_state(self, action_digest: str) -> DenialCode | None:
         try:
             state = self._state_store.dispatch_state(
-                plane=EgressPlane.MODEL_PROVIDER,
-                run_id=request.run_id,
-                request_id=request.request_id,
+                plane=EgressPlane.MODEL_PROVIDER.value,
+                action_digest=action_digest,
             )
         except (sqlite3.Error, OSError, RuntimeError):
             return DenialCode.STATE_STORE_UNAVAILABLE
@@ -1268,6 +1268,7 @@ class ProviderProxy:
         *,
         request: ProviderRequest,
         compiled: CompiledProviderRequest,
+        action_digest: str,
         request_digest: str,
         authority_digest: str,
         scope_epoch: int,
@@ -1283,9 +1284,19 @@ class ProviderProxy:
             }
         )
         try:
-            result = _validated_transport_result(self._transport.dispatch(compiled))
-        except Exception:
-            self._finish_or_hold_unknown(request, request_digest, now)
+            current_component_digest = _execution_component_digest(
+                EgressPlane.MODEL_PROVIDER, self._resolver, self._transport
+            )
+        except ValueError:
+            current_component_digest = None
+        if current_component_digest != self._component_digest:
+            self._state_store.finish_dispatch(
+                plane=EgressPlane.MODEL_PROVIDER.value,
+                action_digest=action_digest,
+                request_digest=request_digest,
+                outcome=EgressOutcome.FAILED.value,
+                finished_at=now,
+            )
             return _receipt(
                 plane=EgressPlane.MODEL_PROVIDER,
                 request_id=request.request_id,
@@ -1294,6 +1305,27 @@ class ProviderProxy:
                 scope_epoch=scope_epoch,
                 policy_digest=policy_digest,
                 destination_digest=destination_digest,
+                execution_component_digest=self._component_digest,
+                outcome=EgressOutcome.FAILED,
+                denial_code=None,
+                result=None,
+                evaluated_at=now,
+            )
+        try:
+            result = _validated_transport_result(self._transport.dispatch(compiled))
+        except Exception:
+            self._finish_or_hold_unknown(
+                action_digest, request_digest, now, plane=EgressPlane.MODEL_PROVIDER
+            )
+            return _receipt(
+                plane=EgressPlane.MODEL_PROVIDER,
+                request_id=request.request_id,
+                request_digest=request_digest,
+                authority_digest=authority_digest,
+                scope_epoch=scope_epoch,
+                policy_digest=policy_digest,
+                destination_digest=destination_digest,
+                execution_component_digest=self._component_digest,
                 outcome=EgressOutcome.UNKNOWN_OUTCOME,
                 denial_code=None,
                 result=None,
@@ -1310,11 +1342,10 @@ class ProviderProxy:
             outcome = _transport_outcome(result)
         try:
             self._state_store.finish_dispatch(
-                plane=EgressPlane.MODEL_PROVIDER,
-                run_id=request.run_id,
-                request_id=request.request_id,
+                plane=EgressPlane.MODEL_PROVIDER.value,
+                action_digest=action_digest,
                 request_digest=request_digest,
-                outcome=outcome,
+                outcome=outcome.value,
                 finished_at=now,
             )
         except (sqlite3.Error, OSError, RuntimeError):
@@ -1327,6 +1358,7 @@ class ProviderProxy:
             scope_epoch=scope_epoch,
             policy_digest=policy_digest,
             destination_digest=destination_digest,
+            execution_component_digest=self._component_digest,
             outcome=outcome,
             denial_code=None,
             result=result,
@@ -1334,15 +1366,19 @@ class ProviderProxy:
         )
 
     def _finish_or_hold_unknown(
-        self, request: ProviderRequest, request_digest: str, now: datetime
+        self,
+        action_digest: str,
+        request_digest: str,
+        now: datetime,
+        *,
+        plane: EgressPlane,
     ) -> None:
         try:
             self._state_store.finish_dispatch(
-                plane=EgressPlane.MODEL_PROVIDER,
-                run_id=request.run_id,
-                request_id=request.request_id,
+                plane=plane.value,
+                action_digest=action_digest,
                 request_digest=request_digest,
-                outcome=EgressOutcome.UNKNOWN_OUTCOME,
+                outcome=EgressOutcome.UNKNOWN_OUTCOME.value,
                 finished_at=now,
             )
         except (sqlite3.Error, OSError, RuntimeError):
@@ -1368,16 +1404,22 @@ class KnowledgeFetcher:
             raise TypeError("knowledge fetcher requires pinned signed authority state")
         if not callable(getattr(resolver, "resolve", None)):
             raise TypeError("knowledge fetcher requires a destination resolver")
+        if getattr(resolver, "plane", None) is not EgressPlane.KNOWLEDGE:
+            raise ValueError("knowledge fetcher requires a knowledge resolver")
         self._sources = _registry(sources, "source_id")
         self._transport = transport
         self._resolver = resolver
         self._authority = authority_state
         self._state_store = authority_state.state_store
         self._clock = clock
+        self._component_digest = _execution_component_digest(
+            EgressPlane.KNOWLEDGE, resolver, transport
+        )
 
     def dispatch(self, request: KnowledgeFetchIntent) -> EgressReceipt:
         now = _trusted_now(self._clock)
         request_digest = sha256_digest(request)
+        action_digest = knowledge_action_digest(request)
         authority_digest = self._authority.authority_digest
         scope_epoch = self._authority.scope_epoch_number
         source = self._sources.get(request.source_id)
@@ -1436,7 +1478,7 @@ class KnowledgeFetcher:
                 now=now,
             )
         assert isinstance(source, KnowledgeSource)
-        prior_state = self._prior_dispatch_state(request)
+        prior_state = self._prior_dispatch_state(action_digest)
         if prior_state is not None:
             return self._denied(
                 request=request,
@@ -1448,7 +1490,11 @@ class KnowledgeFetcher:
                 now=now,
             )
         try:
-            resolution = _validated_resolution(self._resolver, source.origin)
+            resolution = _validated_resolution(
+                self._resolver,
+                source.origin,
+                expected_plane=EgressPlane.KNOWLEDGE,
+            )
             destination_denial = _destination_denial(source.origin, resolution, grant)
         except (TypeError, ValueError, OSError):
             resolution = None
@@ -1473,6 +1519,7 @@ class KnowledgeFetcher:
             data_policy_id=request.data_policy_id,
             resolved_addresses=_compiled_addresses(resolution),
             resolution_digest=sha256_digest(resolution),
+            maximum_request_bytes=grant.budget.max_request_bytes,
             maximum_response_bytes=min(
                 source.maximum_response_bytes, grant.budget.max_response_bytes
             ),
@@ -1488,9 +1535,13 @@ class KnowledgeFetcher:
         )
         try:
             reservation = self._state_store.reserve_dispatch(
-                plane=EgressPlane.KNOWLEDGE,
-                run_id=request.run_id,
-                request_id=request.request_id,
+                plane=EgressPlane.KNOWLEDGE.value,
+                action_digest=action_digest,
+                correlation_digest=_correlation_digest(
+                    EgressPlane.KNOWLEDGE,
+                    run_id=request.run_id,
+                    request_id=request.request_id,
+                ),
                 request_digest=request_digest,
                 reserved_at=now,
             )
@@ -1504,7 +1555,7 @@ class KnowledgeFetcher:
                 denial=DenialCode.STATE_STORE_UNAVAILABLE,
                 now=now,
             )
-        if reservation is not _ReservationResult.RESERVED:
+        if reservation != _ReservationResult.RESERVED.value:
             return self._denied(
                 request=request,
                 request_digest=request_digest,
@@ -1515,9 +1566,19 @@ class KnowledgeFetcher:
                 now=now,
             )
         try:
-            result = _validated_transport_result(self._transport.dispatch(compiled))
-        except Exception:
-            self._finish_or_hold_unknown(request, request_digest, now)
+            current_component_digest = _execution_component_digest(
+                EgressPlane.KNOWLEDGE, self._resolver, self._transport
+            )
+        except ValueError:
+            current_component_digest = None
+        if current_component_digest != self._component_digest:
+            self._state_store.finish_dispatch(
+                plane=EgressPlane.KNOWLEDGE.value,
+                action_digest=action_digest,
+                request_digest=request_digest,
+                outcome=EgressOutcome.FAILED.value,
+                finished_at=now,
+            )
             return _receipt(
                 plane=EgressPlane.KNOWLEDGE,
                 request_id=request.request_id,
@@ -1526,6 +1587,25 @@ class KnowledgeFetcher:
                 scope_epoch=epoch.epoch,
                 policy_digest=policy_digest,
                 destination_digest=destination_digest,
+                execution_component_digest=self._component_digest,
+                outcome=EgressOutcome.FAILED,
+                denial_code=None,
+                result=None,
+                evaluated_at=now,
+            )
+        try:
+            result = _validated_transport_result(self._transport.dispatch(compiled))
+        except Exception:
+            self._finish_or_hold_unknown(action_digest, request_digest, now)
+            return _receipt(
+                plane=EgressPlane.KNOWLEDGE,
+                request_id=request.request_id,
+                request_digest=request_digest,
+                authority_digest=authority_digest,
+                scope_epoch=epoch.epoch,
+                policy_digest=policy_digest,
+                destination_digest=destination_digest,
+                execution_component_digest=self._component_digest,
                 outcome=EgressOutcome.UNKNOWN_OUTCOME,
                 denial_code=None,
                 result=None,
@@ -1533,17 +1613,19 @@ class KnowledgeFetcher:
             )
         if result.plane is not EgressPlane.KNOWLEDGE:
             outcome = EgressOutcome.UNKNOWN_OUTCOME
-        elif result.bytes_received > compiled.maximum_response_bytes:
+        elif (
+            result.bytes_sent > compiled.maximum_request_bytes
+            or result.bytes_received > compiled.maximum_response_bytes
+        ):
             outcome = EgressOutcome.UNKNOWN_OUTCOME
         else:
             outcome = _transport_outcome(result)
         try:
             self._state_store.finish_dispatch(
-                plane=EgressPlane.KNOWLEDGE,
-                run_id=request.run_id,
-                request_id=request.request_id,
+                plane=EgressPlane.KNOWLEDGE.value,
+                action_digest=action_digest,
                 request_digest=request_digest,
-                outcome=outcome,
+                outcome=outcome.value,
                 finished_at=now,
             )
         except (sqlite3.Error, OSError, RuntimeError):
@@ -1556,6 +1638,7 @@ class KnowledgeFetcher:
             scope_epoch=epoch.epoch,
             policy_digest=policy_digest,
             destination_digest=destination_digest,
+            execution_component_digest=self._component_digest,
             outcome=outcome,
             denial_code=None,
             result=result,
@@ -1563,16 +1646,37 @@ class KnowledgeFetcher:
         )
 
     def reconcile(
-        self, request: KnowledgeFetchIntent, disposition: ReconciliationDisposition
+        self,
+        request: KnowledgeFetchIntent,
+        authorization: SignedReconciliationAuthorization,
     ) -> bool:
-        return self._state_store.reconcile(
-            plane=EgressPlane.KNOWLEDGE,
-            run_id=request.run_id,
-            request_id=request.request_id,
-            request_digest=sha256_digest(request),
-            disposition=disposition,
-            reconciled_at=_trusted_now(self._clock),
-        )
+        if not isinstance(authorization, SignedReconciliationAuthorization):
+            return False
+        now = _trusted_now(self._clock)
+        request_digest = sha256_digest(request)
+        action_digest = knowledge_action_digest(request)
+        try:
+            payload = self._authority.verify_reconciliation(
+                authorization,
+                now=now,
+                plane=EgressPlane.KNOWLEDGE,
+                action_digest=action_digest,
+                request_digest=request_digest,
+            )
+            return self._state_store.reconcile(
+                trust_domain=self._authority.trust_domain,
+                trusted_key_digest=self._authority.reconciliation_key_digest,
+                key_id=self._authority.reconciliation_key_id,
+                capability_id=payload.capability_id,
+                sequence=payload.sequence,
+                plane=EgressPlane.KNOWLEDGE.value,
+                action_digest=action_digest,
+                request_digest=request_digest,
+                disposition=payload.disposition.value,
+                reconciled_at=now,
+            )
+        except (SignatureVerificationError, ValueError, sqlite3.Error, OSError, RuntimeError):
+            return False
 
     def _denied(
         self,
@@ -1599,14 +1703,11 @@ class KnowledgeFetcher:
             evaluated_at=now,
         )
 
-    def _prior_dispatch_state(
-        self, request: KnowledgeFetchIntent
-    ) -> DenialCode | None:
+    def _prior_dispatch_state(self, action_digest: str) -> DenialCode | None:
         try:
             state = self._state_store.dispatch_state(
-                plane=EgressPlane.KNOWLEDGE,
-                run_id=request.run_id,
-                request_id=request.request_id,
+                plane=EgressPlane.KNOWLEDGE.value,
+                action_digest=action_digest,
             )
         except (sqlite3.Error, OSError, RuntimeError):
             return DenialCode.STATE_STORE_UNAVAILABLE
@@ -1615,15 +1716,14 @@ class KnowledgeFetcher:
         return DenialCode.REQUEST_REPLAY_DENIED
 
     def _finish_or_hold_unknown(
-        self, request: KnowledgeFetchIntent, request_digest: str, now: datetime
+        self, action_digest: str, request_digest: str, now: datetime
     ) -> None:
         try:
             self._state_store.finish_dispatch(
-                plane=EgressPlane.KNOWLEDGE,
-                run_id=request.run_id,
-                request_id=request.request_id,
+                plane=EgressPlane.KNOWLEDGE.value,
+                action_digest=action_digest,
                 request_digest=request_digest,
-                outcome=EgressOutcome.UNKNOWN_OUTCOME,
+                outcome=EgressOutcome.UNKNOWN_OUTCOME.value,
                 finished_at=now,
             )
         except (sqlite3.Error, OSError, RuntimeError):
