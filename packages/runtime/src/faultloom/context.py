@@ -501,16 +501,22 @@ class ContextCompiler:
         live: bool,
         verification_time: datetime,
     ) -> CompiledContext:
+        exact_verification_time = _require_aware_datetime(verification_time)
+        if type(live) is not bool:
+            raise ProviderMetadataError("live must be an exact boolean")
+        exact_live = live
         state = ContextState.model_validate(state.model_dump(mode="python"))
         provider = ProviderContextMetadata.model_validate(provider.model_dump(mode="python"))
-        _require_aware_datetime(verification_time)
-        scope_anchor = self._verify_scope(state, verification_time=verification_time)
+        scope_anchor = self._verify_scope(
+            state,
+            verification_time=exact_verification_time,
+        )
         self._verify_engagement_bindings(state)
-        if live:
+        if exact_live:
             provider.require_live_safe()
         context_window, prompt_overhead_tokens = self._effective_provider_limits(
             provider,
-            live=live,
+            live=exact_live,
         )
         allocation = ContextAllocation.for_window(context_window)
         try:
@@ -521,7 +527,7 @@ class ContextCompiler:
                     allocation,
                     scope_anchor=scope_anchor,
                     effective_prompt_overhead_tokens=prompt_overhead_tokens,
-                    live=live,
+                    live=exact_live,
                 )
             )
         except UnicodeEncodeError as exc:
@@ -1317,13 +1323,16 @@ def _view_binding_tag(key: bytes, view: RetrievedView) -> str:
     return _view_binding_tag_from_values(key, view.model_dump(mode="python"))
 
 
-def _require_aware_datetime(value: object) -> None:
+def _require_aware_datetime(value: object) -> datetime:
     if (
-        not isinstance(value, datetime)
+        type(value) is not datetime
         or value.tzinfo is None
         or value.utcoffset() is None
     ):
-        raise ContextScopeError("scope verification time must include a timezone")
+        raise ContextScopeError(
+            "scope verification time must be an exact datetime with a timezone"
+        )
+    return value
 
 
 def _require_identifier(value: object, label: str) -> str:

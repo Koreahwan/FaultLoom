@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import json
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
@@ -590,6 +590,82 @@ def test_scope_verification_time_must_be_explicitly_aware() -> None:
             live=True,
             verification_time=NOW.replace(tzinfo=None),
         )
+
+
+def test_scope_verification_time_rejects_datetime_alias_before_comparison() -> None:
+    class MasqueradingDatetime(datetime):
+        magic_calls = 0
+
+        @classmethod
+        def _unexpected(cls):
+            cls.magic_calls += 1
+            raise AssertionError("datetime subclass behavior executed")
+
+        def __add__(self, other: object):
+            return type(self)._unexpected()
+
+        def __lt__(self, other: object) -> bool:
+            return type(self)._unexpected()
+
+        def __le__(self, other: object) -> bool:
+            return type(self)._unexpected()
+
+        def __gt__(self, other: object) -> bool:
+            return type(self)._unexpected()
+
+        def __ge__(self, other: object) -> bool:
+            return type(self)._unexpected()
+
+        def utcoffset(self):
+            return type(self)._unexpected()
+
+    expired = NOW + timedelta(hours=3)
+    with pytest.raises(ContextScopeError, match="expired"):
+        compiler().compile(
+            context_state(),
+            provider(),
+            live=True,
+            verification_time=expired,
+        )
+
+    alias = MasqueradingDatetime(
+        expired.year,
+        expired.month,
+        expired.day,
+        expired.hour,
+        expired.minute,
+        expired.second,
+        expired.microsecond,
+        tzinfo=expired.tzinfo,
+        fold=expired.fold,
+    )
+    with pytest.raises(ContextScopeError, match="exact datetime"):
+        compiler().compile(
+            context_state(),
+            provider(),
+            live=True,
+            verification_time=alias,
+        )
+    assert MasqueradingDatetime.magic_calls == 0
+
+
+def test_compile_rejects_non_boolean_live_scalar_before_truth_testing() -> None:
+    class ExplodingTruth:
+        truth_calls = 0
+
+        def __bool__(self) -> bool:
+            type(self).truth_calls += 1
+            raise AssertionError("caller-controlled truth test executed")
+
+    live = ExplodingTruth()
+    with pytest.raises(ProviderMetadataError, match="exact boolean"):
+        compiler().compile(
+            context_state(),
+            provider(),
+            live=live,  # type: ignore[arg-type]
+            verification_time=VERIFY_AT,
+        )
+    assert ExplodingTruth.truth_calls == 0
 
 
 def test_line_ranges_reference_full_output_and_continue_without_loss() -> None:
