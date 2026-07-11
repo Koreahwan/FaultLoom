@@ -34,6 +34,10 @@ class ManifestConflictError(ManifestRegistryError):
     """An installed ID is reused for different immutable manifest bytes."""
 
 
+class DescriptorRoleConflictError(ManifestRegistryError):
+    """A descriptor identity is admitted for more than one semantic role."""
+
+
 class AuthorityBindingError(ManifestRegistryError):
     """A local extension request is not named by the supplied grant."""
 
@@ -65,6 +69,15 @@ class ManifestRegistry:
             "verifier_descriptors": frozenset(known_verifier_descriptors),
             "evaluation_descriptors": frozenset(known_evaluation_descriptors),
         }
+        descriptor_roles: dict[str, str] = {}
+        for role, descriptors in self._known_pack_descriptor_roles.items():
+            for descriptor in sorted(descriptors):
+                previous = descriptor_roles.setdefault(descriptor, role)
+                if previous != role:
+                    raise DescriptorRoleConflictError(
+                        f"descriptor {descriptor!r} is admitted for both "
+                        f"{previous!r} and {role!r}"
+                    )
         self._known_adapter_capabilities = frozenset(known_adapter_capabilities)
         self._available_gateway_features = frozenset(available_gateway_features)
         self._packs: dict[str, PackManifest] = {}

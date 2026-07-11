@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import NoReturn
 
 MAX_RPC_BYTES = 1_048_576
+MAX_SCHEMA_BYTES = 131_072
 SCHEMA_VERSION = "0.1.0"
 RPC_VERSION = "0.1.0"
 IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
@@ -51,6 +52,132 @@ def _aware_datetime(value: object) -> bool:
     except ValueError:
         return False
     return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
+def _json_equal(left: object, right: object) -> bool:
+    try:
+        return _canonical(left) == _canonical(right)
+    except (TypeError, ValueError):
+        return False
+
+
+def _json_type_matches(value: object, expected: str) -> bool:
+    return {
+        "array": isinstance(value, list),
+        "boolean": type(value) is bool,
+        "integer": type(value) is int,
+        "null": value is None,
+        "number": type(value) in {int, float},
+        "object": isinstance(value, dict),
+        "string": isinstance(value, str),
+    }.get(expected, False)
+
+
+def _schema_valid(value: object, schema: object, root: dict[str, object]) -> bool:
+    if not isinstance(schema, dict):
+        return False
+    reference = schema.get("$ref")
+    if reference is not None:
+        if not isinstance(reference, str) or not reference.startswith("#/$defs/"):
+            return False
+        name = reference.removeprefix("#/$defs/")
+        definitions = root.get("$defs")
+        if not isinstance(definitions, dict) or name not in definitions:
+            return False
+        if not _schema_valid(value, definitions[name], root):
+            return False
+    one_of = schema.get("oneOf")
+    if one_of is not None:
+        if not isinstance(one_of, list):
+            return False
+        if sum(_schema_valid(value, choice, root) for choice in one_of) != 1:
+            return False
+    any_of = schema.get("anyOf")
+    if any_of is not None:
+        if not isinstance(any_of, list):
+            return False
+        if not any(_schema_valid(value, choice, root) for choice in any_of):
+            return False
+    if "const" in schema and not _json_equal(value, schema["const"]):
+        return False
+    choices = schema.get("enum")
+    if choices is not None:
+        if not isinstance(choices, list) or not any(
+            _json_equal(value, choice) for choice in choices
+        ):
+            return False
+    expected_type = schema.get("type")
+    if expected_type is not None:
+        if not isinstance(expected_type, str) or not _json_type_matches(
+            value, expected_type
+        ):
+            return False
+    if isinstance(value, str):
+        minimum = schema.get("minLength")
+        maximum = schema.get("maxLength")
+        if minimum is not None and (type(minimum) is not int or len(value) < minimum):
+            return False
+        if maximum is not None and (type(maximum) is not int or len(value) > maximum):
+            return False
+        pattern = schema.get("pattern")
+        if pattern is not None:
+            if not isinstance(pattern, str):
+                return False
+            try:
+                if re.search(pattern, value) is None:
+                    return False
+            except re.error:
+                return False
+        format_name = schema.get("format")
+        if format_name is not None:
+            if format_name != "date-time" or not _aware_datetime(value):
+                return False
+    if type(value) is int:
+        minimum = schema.get("minimum")
+        maximum = schema.get("maximum")
+        if minimum is not None and (type(minimum) is not int or value < minimum):
+            return False
+        if maximum is not None and (type(maximum) is not int or value > maximum):
+            return False
+    if isinstance(value, list):
+        items = schema.get("items")
+        if items is not None and not all(
+            _schema_valid(item, items, root) for item in value
+        ):
+            return False
+    if isinstance(value, dict):
+        properties = schema.get("properties", {})
+        required = schema.get("required", [])
+        if not isinstance(properties, dict) or not isinstance(required, list):
+            return False
+        if not all(isinstance(name, str) and name in value for name in required):
+            return False
+        for name, child in value.items():
+            child_schema = properties.get(name)
+            if child_schema is not None:
+                if not _schema_valid(child, child_schema, root):
+                    return False
+            elif schema.get("additionalProperties") is False:
+                return False
+            elif isinstance(schema.get("additionalProperties"), dict):
+                if not _schema_valid(child, schema["additionalProperties"], root):
+                    return False
+    return True
+
+
+def _load_input_schema(raw: str) -> dict[str, object] | None:
+    encoded = raw.encode("utf-8")
+    if not encoded or len(encoded) > MAX_SCHEMA_BYTES:
+        return None
+    try:
+        schema = json.loads(encoded)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(schema, dict) or _canonical(schema) != encoded:
+        return None
+    if _digest(schema) != INPUT_SCHEMA_DIGEST:
+        return None
+    return schema
 
 
 def _exact_mapping(value: object, fields: set[str]) -> bool:
@@ -135,7 +262,6 @@ def _valid_intent(value: object) -> bool:
         and value["resource"]["target_id"] == value["target_id"]
         and _valid_state(value["state"])
         and isinstance(value["protocol"], str)
-        and 1 <= len(value["protocol"]) <= 256
         and (value["method"] is None or isinstance(value["method"], str))
         and (value["path"] is None or isinstance(value["path"], str))
         and (value["payload_digest"] is None or _valid_digest(value["payload_digest"]))
@@ -238,7 +364,12 @@ def _manifests(worker_digest: str) -> tuple[dict[str, object], dict[str, object]
     return pack, adapter
 
 
-def _handle(document: object, *, worker_digest: str) -> dict[str, object]:
+def _handle(
+    document: object,
+    *,
+    worker_digest: str,
+    input_schema: dict[str, object],
+) -> dict[str, object]:
     if not isinstance(document, dict):
         return _error(None, "rpc.invalid_request", "request must be one object")
     request_id = document.get("request_id")
@@ -250,6 +381,10 @@ def _handle(document: object, *, worker_digest: str) -> dict[str, object]:
     )
     if not common:
         return _error(request_id, "rpc.invalid_request", "invalid RPC envelope")
+    if method not in {"describe", "compile_action", "normalize_observation"}:
+        return _error(request_id, "rpc.unknown_method", "method is not admitted")
+    if not _schema_valid(document, input_schema, input_schema):
+        return _error(request_id, "rpc.invalid_request", "request violates RPC schema")
     if method == "describe":
         fields = {"schema_version", "rpc_version", "request_id", "method"}
         if set(document) != fields:
@@ -335,9 +470,12 @@ def _write(document: dict[str, object]) -> NoReturn:
 
 def main() -> NoReturn:
     sys.addaudithook(_deny_network)
-    if len(sys.argv) != 2 or not _valid_digest(sys.argv[1]):
+    if len(sys.argv) != 3 or not _valid_digest(sys.argv[1]):
         _write(_error(None, "rpc.invalid_worker_digest", "worker digest is not bound"))
     worker_digest = sys.argv[1]
+    input_schema = _load_input_schema(sys.argv[2])
+    if input_schema is None:
+        _write(_error(None, "rpc.invalid_schema", "input schema is not bound"))
     raw = sys.stdin.buffer.readline(MAX_RPC_BYTES + 1)
     if not raw or len(raw) > MAX_RPC_BYTES or not raw.endswith(b"\n"):
         _write(_error(None, "rpc.invalid_size", "request must be one bounded JSON line"))
@@ -347,7 +485,7 @@ def main() -> NoReturn:
         document = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError):
         _write(_error(None, "rpc.invalid_json", "request is not valid JSON"))
-    _write(_handle(document, worker_digest=worker_digest))
+    _write(_handle(document, worker_digest=worker_digest, input_schema=input_schema))
 
 
 if __name__ == "__main__":

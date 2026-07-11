@@ -727,13 +727,16 @@ class PackManifest(ProtocolModel):
     @model_validator(mode="after")
     def _supports_local_protocol(self) -> "PackManifest":
         require_protocol_compatible("0.1.0", self.protocol_range)
-        fields = (
+        descriptor_fields = (
             "capability_descriptors",
             "action_compilers",
             "observation_normalizers",
             "hypothesis_providers",
             "verifier_descriptors",
             "evaluation_descriptors",
+        )
+        fields = (
+            *descriptor_fields,
             "required_gateway_features",
             "required_adapter_capabilities",
         )
@@ -743,6 +746,15 @@ class PackManifest(ProtocolModel):
             values = getattr(self, field)
             if len(values) != len(set(values)):
                 raise ValueError(f"pack {field} must contain unique values")
+        descriptor_roles: dict[str, str] = {}
+        for field in descriptor_fields:
+            for descriptor in getattr(self, field):
+                previous = descriptor_roles.setdefault(descriptor, field)
+                if previous != field:
+                    raise ValueError(
+                        f"pack descriptor {descriptor!r} cannot be reused across "
+                        f"roles {previous!r} and {field!r}"
+                    )
         return self
 
 

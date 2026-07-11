@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from itertools import combinations
+
 import pytest
 
 import faultloom_protocol.models as m
 from faultloom_sdk import (
     AuthorityBindingError,
+    DescriptorRoleConflictError,
     ManifestConflictError,
     ManifestRegistry,
     UnknownDescriptorError,
@@ -15,6 +18,32 @@ from faultloom_sdk import (
 from tests.protocol.factories import sample_models
 
 from .conftest import reference_grant, reference_intent
+
+
+DESCRIPTOR_ROLE_ARGUMENTS = (
+    "known_capability_descriptors",
+    "known_action_compilers",
+    "known_observation_normalizers",
+    "known_hypothesis_providers",
+    "known_verifier_descriptors",
+    "known_evaluation_descriptors",
+)
+
+
+def _role_specific_registry() -> ManifestRegistry:
+    return ManifestRegistry(
+        known_capability_descriptors={
+            "reference.local_transform",
+            "reference.alternate_capability",
+        },
+        known_action_compilers={"reference.digest"},
+        known_observation_normalizers={"reference.observation_digest"},
+        known_hypothesis_providers={"reference.hypothesis"},
+        known_verifier_descriptors={"reference.verifier"},
+        known_evaluation_descriptors={"reference.evaluation"},
+        known_adapter_capabilities={"reference.digest_normalizer"},
+        available_gateway_features={"dispatch.leases"},
+    )
 
 
 def test_installation_does_not_grant_pack_or_adapter_authority() -> None:
@@ -101,22 +130,42 @@ def test_required_adapter_must_be_installed_and_granted_for_action_class() -> No
 
 
 @pytest.mark.parametrize(
-    ("field", "misclassified"),
+    ("field", "misclassified", "original_role"),
     [
-        ("capability_descriptors", "reference.digest"),
-        ("action_compilers", "reference.local_transform"),
-        ("observation_normalizers", "reference.hypothesis"),
-        ("hypothesis_providers", "reference.verifier"),
-        ("verifier_descriptors", "reference.evaluation"),
-        ("evaluation_descriptors", "reference.observation_digest"),
+        ("capability_descriptors", "reference.digest", "action_compilers"),
+        ("action_compilers", "reference.local_transform", "capability_descriptors"),
+        ("observation_normalizers", "reference.hypothesis", "hypothesis_providers"),
+        ("hypothesis_providers", "reference.verifier", "verifier_descriptors"),
+        ("verifier_descriptors", "reference.evaluation", "evaluation_descriptors"),
+        (
+            "evaluation_descriptors",
+            "reference.observation_digest",
+            "observation_normalizers",
+        ),
     ],
 )
 def test_pack_descriptor_roles_cannot_be_reclassified(
-    field: str, misclassified: str
+    field: str, misclassified: str, original_role: str
 ) -> None:
     source = reference_pack_manifest().model_dump(mode="python")
     source[field] = (misclassified,)
+    source[original_role] = (
+        ("reference.alternate_capability",)
+        if original_role == "capability_descriptors"
+        else ()
+    )
     manifest = m.PackManifest.model_validate(source)
 
     with pytest.raises(UnknownDescriptorError, match=field):
-        reference_registry().install_pack(manifest)
+        _role_specific_registry().install_pack(manifest)
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    tuple(combinations(DESCRIPTOR_ROLE_ARGUMENTS, 2)),
+)
+def test_descriptor_admission_catalogs_must_not_overlap(
+    left: str, right: str
+) -> None:
+    with pytest.raises(DescriptorRoleConflictError, match="reference.shared"):
+        ManifestRegistry(**{left: {"reference.shared"}, right: {"reference.shared"}})

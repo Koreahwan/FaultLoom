@@ -55,6 +55,11 @@ def test_pack_namespace_is_versioned_and_descriptor_lists_are_unique() -> None:
     with pytest.raises(ValidationError, match="unique"):
         m.PackManifest.model_validate(source)
 
+    source = reference_pack_manifest().model_dump(mode="python")
+    source["action_compilers"] = source["capability_descriptors"]
+    with pytest.raises(ValidationError, match="cannot be reused across roles"):
+        m.PackManifest.model_validate(source)
+
 
 def test_adapter_rejects_mutable_or_unidentified_upstream() -> None:
     source = reference_adapter_manifest().model_dump(mode="python")
@@ -148,6 +153,19 @@ def test_adapter_schema_digests_bind_complete_typed_rpc_contracts() -> None:
     assert compiled_action["properties"]["required_network_mode"]["const"] == (
         "gateway_only"
     )
+
+    intent_properties = input_schema["$defs"]["ActionIntent"]["properties"]
+    for field, maximum in (("method", 256), ("path", 4096)):
+        string_schema = next(
+            option
+            for option in intent_properties[field]["anyOf"]
+            if option.get("type") == "string"
+        )
+        assert string_schema["minLength"] == 1
+        assert string_schema["maxLength"] == maximum
+    media_type = input_schema["$defs"]["ObservationRef"]["properties"]["media_type"]
+    assert media_type["minLength"] == 1
+    assert media_type["maxLength"] == 256
 
 
 def test_rpc_schema_constraint_drift_changes_advertised_digests() -> None:

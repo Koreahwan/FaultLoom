@@ -6,13 +6,50 @@ import sys
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 import faultloom_sdk
 import faultloom_sdk.reference as reference
-from faultloom_sdk import ReferenceProcessClient, ReferenceProcessError, reference_registry
+from faultloom_protocol import canonical_json
+from faultloom_sdk import (
+    CompileActionRequest,
+    NormalizeObservationRequest,
+    ReferenceProcessClient,
+    ReferenceProcessError,
+    reference_registry,
+    rpc_input_schema,
+)
 from tests.protocol.factories import sample_models
 
 from .conftest import reference_grant, reference_intent
+
+
+def _run_worker(
+    document: dict[str, object], *, schema_text: str | None = None
+) -> dict[str, object]:
+    worker = Path(faultloom_sdk.__file__).resolve().parent / "reference_worker.py"
+    worker_digest = reference.reference_adapter_manifest().image_digest
+    assert worker_digest is not None
+    completed = subprocess.run(
+        (
+            str(Path(sys.executable).resolve()),
+            "-I",
+            "-S",
+            "-E",
+            str(worker),
+            worker_digest,
+            canonical_json(rpc_input_schema()) if schema_text is None else schema_text,
+        ),
+        input=(json.dumps(document) + "\n").encode(),
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+    assert completed.returncode == 0
+    assert completed.stderr == b""
+    response = json.loads(completed.stdout)
+    assert isinstance(response, dict)
+    return response
 
 
 def test_fixed_reference_process_describes_network_guarded_manifests() -> None:
@@ -57,34 +94,129 @@ def test_reference_process_normalizes_only_a_digest_reference() -> None:
 
 
 def test_worker_rejects_unknown_rpc_method_without_loading_plugin_code() -> None:
-    worker = Path(faultloom_sdk.__file__).resolve().parent / "reference_worker.py"
-    worker_digest = reference.reference_adapter_manifest().image_digest
-    assert worker_digest is not None
     request = {
         "schema_version": "0.1.0",
         "rpc_version": "0.1.0",
         "request_id": "rpc.unknown.1",
         "method": "open_target_socket",
     }
-    completed = subprocess.run(
-        (
-            str(Path(sys.executable).resolve()),
-            "-I",
-            "-S",
-            "-E",
-            str(worker),
-            worker_digest,
-        ),
-        input=(json.dumps(request) + "\n").encode(),
-        capture_output=True,
-        check=False,
-        timeout=5,
-    )
-    response = json.loads(completed.stdout)
-    assert completed.returncode == 0
-    assert completed.stderr == b""
+    response = _run_worker(request)
     assert response["status"] == "error"
     assert response["error_code"] == "rpc.unknown_method"
+
+
+@pytest.mark.parametrize("tamper", ["noncanonical", "constraint"])
+def test_worker_rejects_unbound_input_schema(tamper: str) -> None:
+    schema = rpc_input_schema()
+    if tamper == "noncanonical":
+        schema_text = json.dumps(schema, indent=2, sort_keys=True)
+    else:
+        method_schema = schema["$defs"]["ActionIntent"]["properties"]["method"]
+        string_schema = next(
+            option for option in method_schema["anyOf"] if option.get("type") == "string"
+        )
+        string_schema["maxLength"] = 257
+        schema_text = canonical_json(schema)
+
+    response = _run_worker(
+        {
+            "schema_version": "0.1.0",
+            "rpc_version": "0.1.0",
+            "request_id": f"rpc.schema.{tamper}",
+            "method": "describe",
+        },
+        schema_text=schema_text,
+    )
+    assert response["status"] == "error"
+    assert response["error_code"] == "rpc.invalid_schema"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("method", ""),
+        ("method", "m" * 257),
+        ("path", ""),
+        ("path", "p" * 4097),
+    ],
+)
+def test_worker_matches_action_intent_string_schema_rejections(
+    field: str, value: str
+) -> None:
+    registry = reference_registry()
+    request = registry.prepare_compile(
+        request_id=f"rpc.invalid.{field}.{len(value)}",
+        grant=reference_grant(),
+        intent=reference_intent(),
+    ).model_dump(mode="json")
+    request["action_intent"][field] = value
+
+    with pytest.raises(ValidationError):
+        CompileActionRequest.model_validate_json(json.dumps(request))
+    response = _run_worker(request)
+    assert response["status"] == "error"
+    assert response["error_code"] == "rpc.invalid_request"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("method", "m"),
+        ("method", "m" * 256),
+        ("path", "p"),
+        ("path", "p" * 4096),
+    ],
+)
+def test_worker_matches_action_intent_string_schema_boundaries(
+    field: str, value: str
+) -> None:
+    registry = reference_registry()
+    request = registry.prepare_compile(
+        request_id=f"rpc.valid.{field}.{len(value)}",
+        grant=reference_grant(),
+        intent=reference_intent(),
+    ).model_dump(mode="json")
+    request["action_intent"][field] = value
+
+    CompileActionRequest.model_validate_json(json.dumps(request))
+    response = _run_worker(request)
+    assert response["status"] == "ok"
+
+
+@pytest.mark.parametrize("value", ["", "m" * 257])
+def test_worker_matches_media_type_schema_rejections(value: str) -> None:
+    registry = reference_registry()
+    request = registry.prepare_normalize(
+        request_id=f"rpc.invalid.media-type.{len(value)}",
+        grant=reference_grant(),
+        adapter_id="adapter.reference",
+        capability="reference.digest_normalizer",
+        observation=sample_models()["ObservationRef"],
+    ).model_dump(mode="json")
+    request["observation"]["media_type"] = value
+
+    with pytest.raises(ValidationError):
+        NormalizeObservationRequest.model_validate_json(json.dumps(request))
+    response = _run_worker(request)
+    assert response["status"] == "error"
+    assert response["error_code"] == "rpc.invalid_request"
+
+
+@pytest.mark.parametrize("value", ["m", "m" * 256])
+def test_worker_matches_media_type_schema_boundaries(value: str) -> None:
+    registry = reference_registry()
+    request = registry.prepare_normalize(
+        request_id=f"rpc.valid.media-type.{len(value)}",
+        grant=reference_grant(),
+        adapter_id="adapter.reference",
+        capability="reference.digest_normalizer",
+        observation=sample_models()["ObservationRef"],
+    ).model_dump(mode="json")
+    request["observation"]["media_type"] = value
+
+    NormalizeObservationRequest.model_validate_json(json.dumps(request))
+    response = _run_worker(request)
+    assert response["status"] == "ok"
 
 
 def test_worker_swap_is_rejected_before_subprocess_execution(

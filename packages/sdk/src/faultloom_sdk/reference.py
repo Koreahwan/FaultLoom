@@ -19,6 +19,7 @@ from faultloom_protocol import (
     LicenseClass,
     PackManifest,
     TelemetryPolicy,
+    canonical_json,
     sha256_digest,
 )
 
@@ -246,6 +247,10 @@ class ReferenceProcessClient:
         source, worker_digest = _read_worker_source(
             expected_digest=self._expected_adapter_manifest.image_digest
         )
+        input_schema = canonical_json(rpc_input_schema())
+        input_schema_digest = "sha256:" + hashlib.sha256(input_schema.encode()).hexdigest()
+        if input_schema_digest != REFERENCE_INPUT_SCHEMA_DIGEST:
+            raise ReferenceProcessError("reference input schema differs from admission")
         command = (
             str(Path(sys.executable).resolve()),
             "-I",
@@ -254,6 +259,7 @@ class ReferenceProcessClient:
             "-c",
             source,
             worker_digest,
+            input_schema,
         )
         environment = {
             "PYTHONDONTWRITEBYTECODE": "1",

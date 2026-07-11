@@ -9,6 +9,7 @@ from .reference import (
 )
 from .registry import (
     AuthorityBindingError,
+    DescriptorRoleConflictError,
     ManifestConflictError,
     ManifestRegistry,
     ManifestRegistryError,
@@ -39,6 +40,7 @@ __all__ = [
     "CompiledAction",
     "DescribeRequest",
     "DescribeResponse",
+    "DescriptorRoleConflictError",
     "ManifestConflictError",
     "ManifestRegistry",
     "ManifestRegistryError",
