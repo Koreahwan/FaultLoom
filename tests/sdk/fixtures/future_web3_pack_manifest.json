@@ -1,0 +1,32 @@
+{
+  "action_compilers": [
+    "web3.simulate"
+  ],
+  "capability_descriptors": [
+    "web3.read_only_analysis"
+  ],
+  "evaluation_descriptors": [
+    "web3.invariant_fixture"
+  ],
+  "hypothesis_providers": [
+    "web3.invariant_hypothesis"
+  ],
+  "observation_normalizers": [
+    "web3.simulation_receipt"
+  ],
+  "pack_id": "pack.web3.future-fixture",
+  "pack_version": "0.3.0",
+  "process_isolation": "required",
+  "protocol_range": ">=0.1.0,<0.2.0",
+  "required_adapter_capabilities": [
+    "web3.read_only_rpc"
+  ],
+  "required_gateway_features": [
+    "web3.simulation"
+  ],
+  "schema_namespace": "faultloom.web3.v1",
+  "schema_version": "0.1.0",
+  "verifier_descriptors": [
+    "web3.deterministic_replay"
+  ]
+}
