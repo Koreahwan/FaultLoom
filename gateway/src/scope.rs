@@ -639,21 +639,25 @@ where
         Ok(())
     }
 
-    pub fn finish_resource(&self, resource_id: &str) -> bool {
+    pub fn finish_resource(&self, resource_id: &str) -> Result<bool, DenialCode> {
         self.state
             .lock()
-            .is_ok_and(|mut state| state.resources.remove(resource_id).is_some())
+            .map(|mut state| state.resources.remove(resource_id).is_some())
+            .map_err(|_| DenialCode::ScopeDenied)
     }
 
-    pub fn take_cancellations(&self) -> Vec<CancellationRecord> {
-        self.state.lock().map_or_else(
-            |_| Vec::new(),
-            |mut state| std::mem::take(&mut state.cancellation_log),
-        )
+    pub fn take_cancellations(&self) -> Result<Vec<CancellationRecord>, DenialCode> {
+        self.state
+            .lock()
+            .map(|mut state| std::mem::take(&mut state.cancellation_log))
+            .map_err(|_| DenialCode::ScopeDenied)
     }
 
-    pub fn active_resource_count(&self) -> usize {
-        self.state.lock().map_or(0, |state| state.resources.len())
+    pub fn active_resource_count(&self) -> Result<usize, DenialCode> {
+        self.state
+            .lock()
+            .map(|state| state.resources.len())
+            .map_err(|_| DenialCode::ScopeDenied)
     }
 }
 
@@ -1397,20 +1401,20 @@ mod tests {
                 })
                 .unwrap();
         }
-        assert_eq!(kernel.active_resource_count(), 6);
+        assert_eq!(kernel.active_resource_count().unwrap(), 6);
 
         let transition = kernel.admit_epoch(&revoked).unwrap();
         assert!(transition.revoked);
         assert_eq!(transition.cancellations.len(), 6);
-        assert_eq!(kernel.active_resource_count(), 0);
+        assert_eq!(kernel.active_resource_count().unwrap(), 0);
         assert!(
             transition
                 .cancellations
                 .iter()
                 .all(|item| item.cause == CancellationCause::ScopeRevoked)
         );
-        assert_eq!(kernel.take_cancellations().len(), 6);
-        assert!(kernel.take_cancellations().is_empty());
+        assert_eq!(kernel.take_cancellations().unwrap().len(), 6);
+        assert!(kernel.take_cancellations().unwrap().is_empty());
 
         let mut after_revoke = request();
         after_revoke.scope_epoch = 8;
@@ -1492,8 +1496,8 @@ mod tests {
             kernel.issue_scope_proof(&outside_window),
             Err(DenialCode::ScopeEpochExpired)
         );
-        assert_eq!(kernel.active_resource_count(), 0);
-        let cancellations = kernel.take_cancellations();
+        assert_eq!(kernel.active_resource_count().unwrap(), 0);
+        let cancellations = kernel.take_cancellations().unwrap();
         assert_eq!(cancellations.len(), 1);
         assert_eq!(cancellations[0].cause, CancellationCause::EpochExpired);
     }
@@ -1507,6 +1511,40 @@ mod tests {
         assert_eq!(
             kernel.admit_epoch(&envelope),
             Err(EpochAdmissionError::VerifierUnavailable)
+        );
+    }
+
+    #[test]
+    fn poisoned_scope_state_never_reports_an_empty_or_successful_state() {
+        let clock = FixedClock::new(1_000);
+        let (signed, verifier) = envelope(7, false);
+        let kernel = make_kernel(verifier, clock);
+        kernel.admit_epoch(&signed).unwrap();
+        let mut root = request();
+        authorize(&kernel, &mut root).unwrap();
+        kernel
+            .register_resource(ScopedResource {
+                resource_id: "resource:open".to_owned(),
+                owner_action_id: root.action_id.clone(),
+                kind: ResourceKind::OpenConnection,
+                scope_epoch: 7,
+            })
+            .unwrap();
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = kernel.state.lock().unwrap();
+            panic!("poison fixture scope state");
+        }));
+
+        assert_eq!(
+            kernel.issue_scope_proof(&request()),
+            Err(DenialCode::ScopeDenied)
+        );
+        assert_eq!(kernel.active_resource_count(), Err(DenialCode::ScopeDenied));
+        assert_eq!(kernel.take_cancellations(), Err(DenialCode::ScopeDenied));
+        assert_eq!(
+            kernel.finish_resource("resource:open"),
+            Err(DenialCode::ScopeDenied)
         );
     }
 }
