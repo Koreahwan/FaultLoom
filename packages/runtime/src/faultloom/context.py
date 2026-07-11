@@ -484,10 +484,13 @@ class ContextCompiler:
 
         binding_keys: dict[str, bytes] = {}
         for engagement_id, key in (retrieval_binding_keys or {}).items():
-            _require_identifier(engagement_id, "retrieval key engagement_id")
-            if not isinstance(key, bytes) or len(key) < 32:
+            exact_engagement_id = _require_identifier(
+                engagement_id,
+                "retrieval key engagement_id",
+            )
+            if type(key) is not bytes or len(key) < 32:
                 raise ValueError("retrieval binding keys must contain at least 32 bytes")
-            binding_keys[engagement_id] = bytes(key)
+            binding_keys[exact_engagement_id] = key
         self._retrieval_binding_keys = binding_keys
 
     def compile(
@@ -628,6 +631,17 @@ class _RetrievedContentSnapshot:
     watermark: int
 
 
+@dataclass(frozen=True, slots=True)
+class _RetrievalCursorSnapshot:
+    engagement_digest: str
+    run_id: str
+    content_id: str
+    unit: RetrievalUnit
+    start: int
+    count: int
+    watermark: int
+
+
 class RetrievalBackend(Protocol):
     def load(self, *, engagement_id: str, content_id: str) -> RetrievedContent | None:
         """Return content only when it belongs to ``engagement_id``."""
@@ -644,7 +658,7 @@ class BoundedRetriever:
         max_page_bytes: int = 65_536,
         max_page_lines: int = 500,
     ) -> None:
-        if not isinstance(cursor_key, bytes) or len(cursor_key) < 32:
+        if type(cursor_key) is not bytes or len(cursor_key) < 32:
             raise ValueError("cursor_key must contain at least 32 bytes")
         if (
             type(max_page_bytes) is not int
@@ -661,7 +675,7 @@ class BoundedRetriever:
                 f"max_page_lines must be between 1 and {MAX_RETRIEVAL_PAGE_LINES}"
             )
         self._backend = backend
-        self._cursor_key = bytes(cursor_key)
+        self._cursor_key = cursor_key
         self._max_page_bytes = max_page_bytes
         self._max_page_lines = max_page_lines
 
@@ -674,41 +688,59 @@ class BoundedRetriever:
         start: int,
         count: int,
     ) -> RetrievedView:
-        _require_identifier(engagement_id, "engagement_id")
-        _require_digest(content_id, "content_id")
-        if not isinstance(unit, RetrievalUnit):
+        exact_engagement_id = _require_identifier(engagement_id, "engagement_id")
+        exact_content_id = _require_digest(content_id, "content_id")
+        if type(unit) is not RetrievalUnit:
             raise RetrievalRangeError("unit must be a RetrievalUnit")
-        _validate_range(start, count)
-        maximum = self._max_page_bytes if unit is RetrievalUnit.BYTES else self._max_page_lines
-        if count > maximum:
+        exact_start, exact_count = _validate_range(start, count)
+        exact_unit = unit
+        maximum = (
+            self._max_page_bytes
+            if exact_unit is RetrievalUnit.BYTES
+            else self._max_page_lines
+        )
+        if exact_count > maximum:
             raise RetrievalRangeError(f"requested {unit.value} count exceeds the configured bound")
-        content = self._load(engagement_id=engagement_id, content_id=content_id)
-        return self._view(content, unit=unit, start=start, count=count)
+        content = self._load(
+            engagement_id=exact_engagement_id,
+            content_id=exact_content_id,
+        )
+        return self._view(
+            content,
+            unit=exact_unit,
+            start=exact_start,
+            count=exact_count,
+        )
 
     def continue_range(self, *, engagement_id: str, cursor: str) -> RetrievedView:
-        _require_identifier(engagement_id, "engagement_id")
-        cursor_payload = self._decode_cursor(cursor)
-        expected_engagement = _engagement_digest(engagement_id)
-        if not hmac.compare_digest(cursor_payload["engagement_digest"], expected_engagement):
+        exact_engagement_id = _require_identifier(engagement_id, "engagement_id")
+        cursor_snapshot = self._decode_cursor(cursor)
+        expected_engagement = _engagement_digest(exact_engagement_id)
+        if not hmac.compare_digest(
+            cursor_snapshot.engagement_digest,
+            expected_engagement,
+        ):
             raise RetrievalAccessError("retrieval unavailable for engagement")
-        unit = RetrievalUnit(cursor_payload["unit"])
-        count = cursor_payload["count"]
-        maximum = self._max_page_bytes if unit is RetrievalUnit.BYTES else self._max_page_lines
-        if count > maximum:
+        maximum = (
+            self._max_page_bytes
+            if cursor_snapshot.unit is RetrievalUnit.BYTES
+            else self._max_page_lines
+        )
+        if cursor_snapshot.count > maximum:
             raise RetrievalCursorError("cursor range exceeds the configured bound")
         content = self._load(
-            engagement_id=engagement_id,
-            content_id=cursor_payload["content_id"],
+            engagement_id=exact_engagement_id,
+            content_id=cursor_snapshot.content_id,
         )
-        if content.run_id != cursor_payload["run_id"]:
+        if content.run_id != cursor_snapshot.run_id:
             raise RetrievalCursorError("cursor no longer identifies the stored run")
-        if content.watermark != cursor_payload["watermark"]:
+        if content.watermark != cursor_snapshot.watermark:
             raise RetrievalCursorError("cursor watermark no longer identifies the stored output")
         return self._view(
             content,
-            unit=unit,
-            start=cursor_payload["start"],
-            count=count,
+            unit=cursor_snapshot.unit,
+            start=cursor_snapshot.start,
+            count=cursor_snapshot.count,
         )
 
     def _load(self, *, engagement_id: str, content_id: str) -> _RetrievedContentSnapshot:
@@ -742,11 +774,20 @@ class BoundedRetriever:
         if type(stored_watermark) is not int or stored_watermark <= 0:
             raise RetrievalError("stored watermark is invalid")
 
-        body = bytes(stored_body)
+        exact_stored_engagement_id = _require_identifier(
+            stored_engagement_id,
+            "stored engagement_id",
+        )
+        exact_stored_run_id = _require_identifier(stored_run_id, "stored run_id")
+        exact_stored_content_id = _require_digest(
+            stored_content_id,
+            "stored content_id",
+        )
+        body = stored_body
         content = _RetrievedContentSnapshot(
-            engagement_id=stored_engagement_id,
-            run_id=stored_run_id,
-            content_id=stored_content_id,
+            engagement_id=exact_stored_engagement_id,
+            run_id=exact_stored_run_id,
+            content_id=exact_stored_content_id,
             media_type=stored_media_type,
             body=body,
             full_byte_length=len(body),
@@ -759,7 +800,6 @@ class BoundedRetriever:
         )
         if not valid_identity:
             raise RetrievalAccessError("retrieval unavailable for engagement")
-        _require_identifier(content.run_id, "stored run_id")
         if (
             not content.media_type
             or content.media_type != content.media_type.strip()
@@ -890,8 +930,8 @@ class BoundedRetriever:
         )
         return f"{_b64url(payload)}.{_b64url(signature)}"
 
-    def _decode_cursor(self, cursor: str) -> dict[str, object]:
-        if not isinstance(cursor, str) or len(cursor) > 4096 or cursor.count(".") != 1:
+    def _decode_cursor(self, cursor: str) -> _RetrievalCursorSnapshot:
+        if type(cursor) is not str or len(cursor) > 4096 or cursor.count(".") != 1:
             raise RetrievalCursorError("cursor is malformed")
         encoded_payload, encoded_signature = cursor.split(".", 1)
         try:
@@ -910,7 +950,7 @@ class BoundedRetriever:
             document = json.loads(payload, object_pairs_hook=_unique_json_object)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             raise RetrievalCursorError("cursor payload is invalid") from exc
-        if not isinstance(document, dict) or canonical_json_bytes(document) != payload:
+        if type(document) is not dict or canonical_json_bytes(document) != payload:
             raise RetrievalCursorError("cursor payload is not canonical")
         expected_keys = {
             "version",
@@ -922,25 +962,43 @@ class BoundedRetriever:
             "count",
             "watermark",
         }
-        if set(document) != expected_keys or document.get("version") != _CURSOR_VERSION:
+        if set(document) != expected_keys:
             raise RetrievalCursorError("cursor schema is unsupported")
         try:
-            _require_digest(document["engagement_digest"], "cursor engagement digest")
-            _require_identifier(document["run_id"], "cursor run_id")
-            _require_digest(document["content_id"], "cursor content ID")
-            RetrievalUnit(document["unit"])
-            _validate_range(document["start"], document["count"])
-            if type(document["watermark"]) is not int or document["watermark"] <= 0:
+            version = document["version"]
+            if type(version) is not int or version != _CURSOR_VERSION:
+                raise ValueError("invalid version")
+            engagement_digest = _require_digest(
+                document["engagement_digest"],
+                "cursor engagement digest",
+            )
+            run_id = _require_identifier(document["run_id"], "cursor run_id")
+            content_id = _require_digest(document["content_id"], "cursor content ID")
+            unit_value = document["unit"]
+            if type(unit_value) is not str:
+                raise ValueError("invalid unit")
+            unit = RetrievalUnit(unit_value)
+            start, count = _validate_range(document["start"], document["count"])
+            watermark = document["watermark"]
+            if type(watermark) is not int or watermark <= 0:
                 raise ValueError("invalid watermark")
         except (TypeError, ValueError) as exc:
             raise RetrievalCursorError("cursor fields are invalid") from exc
-        return document
+        return _RetrievalCursorSnapshot(
+            engagement_digest=engagement_digest,
+            run_id=run_id,
+            content_id=content_id,
+            unit=unit,
+            start=start,
+            count=count,
+            watermark=watermark,
+        )
 
 
 def content_id_for(body: bytes) -> str:
     """Return the stable identifier for a complete immutable output."""
 
-    if not isinstance(body, bytes):
+    if type(body) is not bytes:
         raise TypeError("body must be bytes")
     return _raw_digest(body)
 
@@ -953,13 +1011,16 @@ def checkpoint_binding_tag_for(
 ) -> str:
     """Bind every checkpoint field to one engagement outside model-controlled state."""
 
-    _require_identifier(engagement_id, "checkpoint engagement_id")
-    if not isinstance(binding_key, bytes) or len(binding_key) < 32:
+    exact_engagement_id = _require_identifier(
+        engagement_id,
+        "checkpoint engagement_id",
+    )
+    if type(binding_key) is not bytes or len(binding_key) < 32:
         raise ValueError("checkpoint binding key must contain at least 32 bytes")
     checkpoint = ContextCheckpoint.model_validate(checkpoint.model_dump(mode="python"))
     document = canonical_json_bytes(
         {
-            "engagement_digest": _engagement_digest(engagement_id),
+            "engagement_digest": _engagement_digest(exact_engagement_id),
             "checkpoint": checkpoint,
         }
     )
@@ -1265,28 +1326,31 @@ def _require_aware_datetime(value: object) -> None:
         raise ContextScopeError("scope verification time must include a timezone")
 
 
-def _require_identifier(value: object, label: str) -> None:
-    if not isinstance(value, str) or _IDENTIFIER_RE.fullmatch(value) is None:
+def _require_identifier(value: object, label: str) -> str:
+    if type(value) is not str or _IDENTIFIER_RE.fullmatch(value) is None:
         raise RetrievalError(f"{label} is invalid")
+    return value
 
 
-def _require_digest(value: object, label: str) -> None:
+def _require_digest(value: object, label: str) -> str:
     if (
-        not isinstance(value, str)
+        type(value) is not str
         or len(value) != 71
         or not value.startswith("sha256:")
         or any(character not in "0123456789abcdef" for character in value[7:])
     ):
         raise RetrievalError(f"{label} is invalid")
+    return value
 
 
-def _validate_range(start: object, count: object) -> None:
+def _validate_range(start: object, count: object) -> tuple[int, int]:
     if type(start) is not int or start < 0 or start > MAX_INT64:
         raise RetrievalRangeError("range start must be a non-negative integer")
     if type(count) is not int or count <= 0 or count > MAX_INT64:
         raise RetrievalRangeError("range count must be a positive integer")
     if start + count > MAX_INT64:
         raise RetrievalRangeError("range end exceeds the supported integer bound")
+    return start, count
 
 
 def _utf8_lines(body: bytes) -> tuple[bytes, ...]:

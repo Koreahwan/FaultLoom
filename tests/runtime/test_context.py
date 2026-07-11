@@ -990,6 +990,392 @@ def test_backend_rejects_bytes_subclass_before_oversize_conversion() -> None:
     assert not OversizeOnConversion.conversion_attempted
 
 
+def test_public_retrieval_boundaries_reject_string_aliases_before_lookup() -> None:
+    class MasqueradingStr(str):
+        def __new__(cls, visible: str, target: str):
+            instance = super().__new__(cls, visible)
+            instance.target = target
+            instance.magic_calls = 0
+            return instance
+
+        def __hash__(self) -> int:
+            self.magic_calls += 1
+            return hash(self.target)
+
+        def __eq__(self, other: object) -> bool:
+            self.magic_calls += 1
+            return type(other) is str and other == self.target
+
+        def __len__(self) -> int:
+            self.magic_calls += 1
+            return len(self.target)
+
+        def __iter__(self):
+            self.magic_calls += 1
+            return iter(self.target)
+
+        def startswith(self, prefix: object, *args: object) -> bool:
+            self.magic_calls += 1
+            return self.target.startswith(prefix, *args)
+
+        def encode(self, encoding: str = "utf-8", errors: str = "strict") -> bytes:
+            self.magic_calls += 1
+            return self.target.encode(encoding, errors)
+
+    class MasqueradingCursor(str):
+        def __new__(cls, visible: str, target: str):
+            instance = super().__new__(cls, visible)
+            instance.target = target
+            instance.magic_calls = 0
+            return instance
+
+        def __len__(self) -> int:
+            self.magic_calls += 1
+            return len(self.target)
+
+        def count(self, value: str, *args: object) -> int:
+            self.magic_calls += 1
+            return self.target.count(value, *args)
+
+        def split(self, separator: str | None = None, maxsplit: int = -1):
+            self.magic_calls += 1
+            return self.target.split(separator, maxsplit)
+
+    class CountingBackend(MemoryBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.load_calls = 0
+
+        def load(
+            self, *, engagement_id: str, content_id: str
+        ) -> RetrievedContent | None:
+            self.load_calls += 1
+            return super().load(
+                engagement_id=engagement_id,
+                content_id=content_id,
+            )
+
+    victim_engagement = "engagement.victim"
+    attacker_engagement = "engagement.attacker"
+    backend = CountingBackend()
+    victim = backend.add(
+        b"victim-page-one\nvictim-page-two\n",
+        engagement_id=victim_engagement,
+    )
+    retriever = BoundedRetriever(
+        backend,
+        cursor_key=b"public-boundary-key" + b"x" * 32,
+        max_page_lines=1,
+    )
+    first = retriever.read_range(
+        engagement_id=victim_engagement,
+        content_id=victim.content_id,
+        unit=RetrievalUnit.LINES,
+        start=0,
+        count=1,
+    )
+    assert first.next_cursor is not None
+    assert backend.load_calls == 1
+
+    attacker_content_id = content_id_for(b"attacker-placeholder")
+    hostile_engagement_only = MasqueradingStr(
+        attacker_engagement,
+        victim_engagement,
+    )
+    hostile_content_only = MasqueradingStr(
+        attacker_content_id,
+        victim.content_id,
+    )
+    hostile_engagement_pair = MasqueradingStr(
+        attacker_engagement,
+        victim_engagement,
+    )
+    hostile_content_pair = MasqueradingStr(
+        attacker_content_id,
+        victim.content_id,
+    )
+    hostile_values = (
+        (
+            hostile_engagement_only,
+            victim.content_id,
+            (hostile_engagement_only,),
+        ),
+        (
+            victim_engagement,
+            hostile_content_only,
+            (hostile_content_only,),
+        ),
+        (
+            hostile_engagement_pair,
+            hostile_content_pair,
+            (hostile_engagement_pair, hostile_content_pair),
+        ),
+    )
+    for engagement_id, content_id, aliases in hostile_values:
+        with pytest.raises(RetrievalError):
+            retriever.read_range(
+                engagement_id=engagement_id,
+                content_id=content_id,
+                unit=RetrievalUnit.LINES,
+                start=0,
+                count=1,
+            )
+        assert all(alias.magic_calls == 0 for alias in aliases)
+        assert backend.load_calls == 1
+
+    hostile_engagement = MasqueradingStr(
+        attacker_engagement,
+        victim_engagement,
+    )
+    unconsumed_cursor = MasqueradingCursor("attacker.cursor", first.next_cursor)
+    with pytest.raises(RetrievalError):
+        retriever.continue_range(
+            engagement_id=hostile_engagement,
+            cursor=unconsumed_cursor,
+        )
+    assert hostile_engagement.magic_calls == 0
+    assert unconsumed_cursor.magic_calls == 0
+    assert backend.load_calls == 1
+
+    hostile_cursor = MasqueradingCursor("attacker.cursor", first.next_cursor)
+    with pytest.raises(RetrievalCursorError):
+        retriever.continue_range(
+            engagement_id=victim_engagement,
+            cursor=hostile_cursor,
+        )
+    assert hostile_cursor.magic_calls == 0
+    assert backend.load_calls == 1
+
+
+def test_public_scalar_boundaries_reject_subclasses_without_conversion() -> None:
+    class ExplodingStr(str):
+        magic_calls = 0
+
+        def __hash__(self) -> int:
+            type(self).magic_calls += 1
+            return str.__hash__(self)
+
+        def __len__(self) -> int:
+            type(self).magic_calls += 1
+            raise AssertionError("string subclass length executed")
+
+        def __iter__(self):
+            type(self).magic_calls += 1
+            raise AssertionError("string subclass iteration executed")
+
+        def encode(self, *args: object, **kwargs: object) -> bytes:
+            type(self).magic_calls += 1
+            raise AssertionError("string subclass encoding executed")
+
+    class ExplodingBytes(bytes):
+        magic_calls = 0
+
+        def __len__(self) -> int:
+            type(self).magic_calls += 1
+            raise AssertionError("bytes subclass length executed")
+
+        def __bytes__(self) -> bytes:
+            type(self).magic_calls += 1
+            raise AssertionError("bytes subclass conversion executed")
+
+        def __hash__(self) -> int:
+            type(self).magic_calls += 1
+            raise AssertionError("bytes subclass hash executed")
+
+    class ExplodingInt(int):
+        magic_calls = 0
+
+        def __lt__(self, other: object) -> bool:
+            type(self).magic_calls += 1
+            raise AssertionError("int subclass comparison executed")
+
+        def __gt__(self, other: object) -> bool:
+            type(self).magic_calls += 1
+            raise AssertionError("int subclass comparison executed")
+
+        def __add__(self, other: object):
+            type(self).magic_calls += 1
+            raise AssertionError("int subclass addition executed")
+
+    backend = MemoryBackend()
+    record = backend.add(b"bounded")
+    explosive_key = ExplodingBytes(b"k" * 32)
+    with pytest.raises(ValueError, match="cursor_key"):
+        BoundedRetriever(backend, cursor_key=explosive_key)
+    assert ExplodingBytes.magic_calls == 0
+
+    for key in (bytearray(b"k" * 32), memoryview(b"k" * 32)):
+        with pytest.raises(ValueError, match="cursor_key"):
+            BoundedRetriever(backend, cursor_key=key)  # type: ignore[arg-type]
+
+    retriever = BoundedRetriever(backend, cursor_key=b"k" * 32)
+    for start, count in ((ExplodingInt(0), 1), (0, ExplodingInt(1))):
+        with pytest.raises(RetrievalRangeError):
+            retriever.read_range(
+                engagement_id="engagement.1",
+                content_id=record.content_id,
+                unit=RetrievalUnit.BYTES,
+                start=start,
+                count=count,
+            )
+    assert ExplodingInt.magic_calls == 0
+
+    for option in ("max_page_bytes", "max_page_lines"):
+        with pytest.raises(ValueError, match=option):
+            BoundedRetriever(
+                backend,
+                cursor_key=b"k" * 32,
+                **{option: ExplodingInt(1)},
+            )
+    assert ExplodingInt.magic_calls == 0
+
+    with pytest.raises(ProviderMetadataError, match="context window"):
+        ContextAllocation.for_window(ExplodingInt(4096))
+    assert ExplodingInt.magic_calls == 0
+
+    ExplodingBytes.magic_calls = 0
+    with pytest.raises(TypeError, match="body must be bytes"):
+        content_id_for(ExplodingBytes(b"body"))
+    assert ExplodingBytes.magic_calls == 0
+    for body in (bytearray(b"body"), memoryview(b"body")):
+        with pytest.raises(TypeError, match="body must be bytes"):
+            content_id_for(body)  # type: ignore[arg-type]
+
+    ExplodingBytes.magic_calls = 0
+    with pytest.raises(ValueError, match="binding key"):
+        checkpoint_binding_tag_for(
+            context_state().checkpoint,
+            engagement_id="engagement.1",
+            binding_key=ExplodingBytes(b"b" * 32),
+        )
+    assert ExplodingBytes.magic_calls == 0
+
+    hostile_engagement = ExplodingStr("engagement.1")
+    with pytest.raises(RetrievalError, match="engagement_id"):
+        checkpoint_binding_tag_for(
+            context_state().checkpoint,
+            engagement_id=hostile_engagement,
+            binding_key=b"b" * 32,
+        )
+    assert ExplodingStr.magic_calls == 0
+
+    ExplodingBytes.magic_calls = 0
+    with pytest.raises(ValueError, match="retrieval binding keys"):
+        compiler(
+            retrieval_keys={"engagement.1": ExplodingBytes(b"b" * 32)}
+        )
+    assert ExplodingBytes.magic_calls == 0
+
+    hostile_retrieval_key = ExplodingStr("engagement.1")
+    hostile_mapping = {hostile_retrieval_key: b"b" * 32}
+    ExplodingStr.magic_calls = 0
+    with pytest.raises(RetrievalError, match="retrieval key engagement_id"):
+        compiler(retrieval_keys=hostile_mapping)
+    assert ExplodingStr.magic_calls == 0
+
+
+def test_backend_rejects_scalar_subclasses_before_magic_methods() -> None:
+    class StoredStr(str):
+        magic_calls = 0
+
+        def __eq__(self, other: object) -> bool:
+            type(self).magic_calls += 1
+            raise AssertionError("stored string equality executed")
+
+        def __hash__(self) -> int:
+            type(self).magic_calls += 1
+            raise AssertionError("stored string hash executed")
+
+        def encode(self, *args: object, **kwargs: object) -> bytes:
+            type(self).magic_calls += 1
+            raise AssertionError("stored string encoding executed")
+
+    class StoredInt(int):
+        magic_calls = 0
+
+        def __le__(self, other: object) -> bool:
+            type(self).magic_calls += 1
+            raise AssertionError("stored integer comparison executed")
+
+    original = b"stored-scalars"
+    records = (
+        RetrievedContent(
+            engagement_id=StoredStr("engagement.1"),
+            run_id="run.1",
+            content_id=content_id_for(original),
+            media_type="application/octet-stream",
+            body=original,
+            watermark=1,
+        ),
+        RetrievedContent(
+            engagement_id="engagement.1",
+            run_id="run.1",
+            content_id=content_id_for(original),
+            media_type="application/octet-stream",
+            body=original,
+            watermark=StoredInt(1),
+        ),
+    )
+
+    class Backend:
+        def __init__(self, record: RetrievedContent) -> None:
+            self.record = record
+
+        def load(
+            self, *, engagement_id: str, content_id: str
+        ) -> RetrievedContent | None:
+            return self.record
+
+    for record in records:
+        with pytest.raises(RetrievalError):
+            BoundedRetriever(Backend(record), cursor_key=b"z" * 32).read_range(
+                engagement_id="engagement.1",
+                content_id=content_id_for(original),
+                unit=RetrievalUnit.BYTES,
+                start=0,
+                count=1,
+            )
+    assert StoredStr.magic_calls == 0
+    assert StoredInt.magic_calls == 0
+
+
+def test_cursor_replay_is_read_only_and_watermark_change_expires_it() -> None:
+    backend = MemoryBackend()
+    record = backend.add(b"page-one\npage-two\n", watermark=14)
+    retriever = BoundedRetriever(
+        backend,
+        cursor_key=b"replay-expiry-key" + b"r" * 32,
+        max_page_lines=1,
+    )
+    first = retriever.read_range(
+        engagement_id="engagement.1",
+        content_id=record.content_id,
+        unit=RetrievalUnit.LINES,
+        start=0,
+        count=1,
+    )
+    assert first.next_cursor is not None
+    replayed_once = retriever.continue_range(
+        engagement_id="engagement.1",
+        cursor=first.next_cursor,
+    )
+    replayed_twice = retriever.continue_range(
+        engagement_id="engagement.1",
+        cursor=first.next_cursor,
+    )
+    assert replayed_once == replayed_twice
+
+    backend.records[("engagement.1", record.content_id)] = replace(
+        record,
+        watermark=15,
+    )
+    with pytest.raises(RetrievalCursorError, match="watermark"):
+        retriever.continue_range(
+            engagement_id="engagement.1",
+            cursor=first.next_cursor,
+        )
+
+
 def test_backend_rejects_control_characters_in_media_type() -> None:
     backend = MemoryBackend()
     record = backend.add(b"data", media_type="text/plain\nforged")
