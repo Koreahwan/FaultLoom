@@ -15,6 +15,10 @@ SCHEMA_VERSION = "0.1.0"
 RPC_VERSION = "0.1.0"
 IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
 DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+WIRE_DATETIME = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?"
+    r"(?:[Zz]|[+-](?P<offset_hour>\d{2}):(?P<offset_minute>\d{2}))$"
+)
 
 INPUT_SCHEMA_DIGEST = "sha256:6a084ecbce279e360616dbc5a945e42ea8c88163a84bc40551877a96975db02a"
 OUTPUT_SCHEMA_DIGEST = "sha256:c9397046a37dc06721f0f2010a88c0761636a05e5a98dccbad33b5ad8d75a64d"
@@ -44,14 +48,36 @@ def _identifier(value: object) -> bool:
     return isinstance(value, str) and IDENTIFIER.fullmatch(value) is not None
 
 
-def _aware_datetime(value: object) -> bool:
+def _canonical_wire_string(
+    value: object, *, format_name: object = None
+) -> str | None:
     if not isinstance(value, str):
-        return False
+        return None
+    if format_name is None:
+        return value if value.strip() else None
+    if format_name != "date-time":
+        return None
+    match = WIRE_DATETIME.fullmatch(value)
+    if match is None:
+        return None
+    offset_hour = match.group("offset_hour")
+    offset_minute = match.group("offset_minute")
+    if offset_hour is not None and (
+        int(offset_hour) > 23 or int(offset_minute) > 59
+    ):
+        return None
+    normalized = value[:-1] + "+00:00" if value[-1] in "Zz" else value
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(normalized)
     except ValueError:
-        return False
-    return parsed.tzinfo is not None and parsed.utcoffset() is not None
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return value
+
+
+def _aware_datetime(value: object) -> bool:
+    return _canonical_wire_string(value, format_name="date-time") is not None
 
 
 def _json_equal(left: object, right: object) -> bool:
@@ -113,24 +139,27 @@ def _schema_valid(value: object, schema: object, root: dict[str, object]) -> boo
         ):
             return False
     if isinstance(value, str):
+        wire_value = _canonical_wire_string(value, format_name=schema.get("format"))
+        if wire_value is None:
+            return False
         minimum = schema.get("minLength")
         maximum = schema.get("maxLength")
-        if minimum is not None and (type(minimum) is not int or len(value) < minimum):
+        if minimum is not None and (
+            type(minimum) is not int or len(wire_value) < minimum
+        ):
             return False
-        if maximum is not None and (type(maximum) is not int or len(value) > maximum):
+        if maximum is not None and (
+            type(maximum) is not int or len(wire_value) > maximum
+        ):
             return False
         pattern = schema.get("pattern")
         if pattern is not None:
             if not isinstance(pattern, str):
                 return False
             try:
-                if re.search(pattern, value) is None:
+                if re.search(pattern, wire_value) is None:
                     return False
             except re.error:
-                return False
-        format_name = schema.get("format")
-        if format_name is not None:
-            if format_name != "date-time" or not _aware_datetime(value):
                 return False
     if type(value) is int:
         minimum = schema.get("minimum")

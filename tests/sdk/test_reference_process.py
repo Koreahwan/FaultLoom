@@ -219,6 +219,153 @@ def test_worker_matches_media_type_schema_boundaries(value: str) -> None:
     assert response["status"] == "ok"
 
 
+@pytest.mark.parametrize("field", ["protocol", "method", "path"])
+def test_worker_matches_whitespace_only_action_string_rejections(field: str) -> None:
+    registry = reference_registry()
+    request = registry.prepare_compile(
+        request_id=f"rpc.invalid.whitespace.{field}",
+        grant=reference_grant(),
+        intent=reference_intent(),
+    ).model_dump(mode="json")
+    request["action_intent"][field] = " "
+
+    with pytest.raises(ValidationError):
+        CompileActionRequest.model_validate_json(json.dumps(request))
+    response = _run_worker(request)
+    assert response["status"] == "error"
+    assert response["error_code"] == "rpc.invalid_request"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "normalized"),
+    [
+        ("protocol", " http ", "http"),
+        ("method", " GET ", "GET"),
+        ("path", " /v1/items ", "/v1/items"),
+    ],
+)
+def test_worker_accepts_nonempty_action_strings_with_nearby_whitespace(
+    field: str, value: str, normalized: str
+) -> None:
+    registry = reference_registry()
+    request = registry.prepare_compile(
+        request_id=f"rpc.valid.whitespace.{field}",
+        grant=reference_grant(),
+        intent=reference_intent(),
+    ).model_dump(mode="json")
+    request["action_intent"][field] = value
+
+    parsed = CompileActionRequest.model_validate_json(json.dumps(request))
+    assert getattr(parsed.action_intent, field) == normalized
+    response = _run_worker(request)
+    assert response["status"] == "ok"
+
+
+def test_worker_matches_whitespace_only_media_type_rejection() -> None:
+    registry = reference_registry()
+    request = registry.prepare_normalize(
+        request_id="rpc.invalid.whitespace.media-type",
+        grant=reference_grant(),
+        adapter_id="adapter.reference",
+        capability="reference.digest_normalizer",
+        observation=sample_models()["ObservationRef"],
+    ).model_dump(mode="json")
+    request["observation"]["media_type"] = " "
+
+    with pytest.raises(ValidationError):
+        NormalizeObservationRequest.model_validate_json(json.dumps(request))
+    response = _run_worker(request)
+    assert response["status"] == "error"
+    assert response["error_code"] == "rpc.invalid_request"
+
+
+def test_worker_accepts_nonempty_media_type_with_nearby_whitespace() -> None:
+    registry = reference_registry()
+    request = registry.prepare_normalize(
+        request_id="rpc.valid.whitespace.media-type",
+        grant=reference_grant(),
+        adapter_id="adapter.reference",
+        capability="reference.digest_normalizer",
+        observation=sample_models()["ObservationRef"],
+    ).model_dump(mode="json")
+    request["observation"]["media_type"] = " application/json "
+
+    parsed = NormalizeObservationRequest.model_validate_json(json.dumps(request))
+    assert parsed.observation.media_type == "application/json"
+    response = _run_worker(request)
+    assert response["status"] == "ok"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "20300102T030405+0000",
+        "2030-W01-2T03:04:05+00:00",
+        "2030-01-02T03:04:05+00",
+    ],
+)
+def test_worker_matches_core_datetime_rejections(value: str) -> None:
+    registry = reference_registry()
+    compile_request = registry.prepare_compile(
+        request_id="rpc.invalid.datetime.compile",
+        grant=reference_grant(),
+        intent=reference_intent(),
+    ).model_dump(mode="json")
+    compile_request["action_intent"]["requested_at"] = value
+    normalize_request = registry.prepare_normalize(
+        request_id="rpc.invalid.datetime.normalize",
+        grant=reference_grant(),
+        adapter_id="adapter.reference",
+        capability="reference.digest_normalizer",
+        observation=sample_models()["ObservationRef"],
+    ).model_dump(mode="json")
+    normalize_request["observation"]["created_at"] = value
+
+    for model, request in (
+        (CompileActionRequest, compile_request),
+        (NormalizeObservationRequest, normalize_request),
+    ):
+        with pytest.raises(ValidationError):
+            model.model_validate_json(json.dumps(request))
+        response = _run_worker(request)
+        assert response["status"] == "error"
+        assert response["error_code"] == "rpc.invalid_request"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "2030-01-02T03:04:05Z",
+        "2030-01-02 03:04:05+00:00",
+        "2030-01-02t03:04:05.1+09:30",
+    ],
+)
+def test_worker_accepts_nearby_core_datetime_forms(value: str) -> None:
+    registry = reference_registry()
+    compile_request = registry.prepare_compile(
+        request_id="rpc.valid.datetime.compile",
+        grant=reference_grant(),
+        intent=reference_intent(),
+    ).model_dump(mode="json")
+    compile_request["action_intent"]["requested_at"] = value
+    normalize_request = registry.prepare_normalize(
+        request_id="rpc.valid.datetime.normalize",
+        grant=reference_grant(),
+        adapter_id="adapter.reference",
+        capability="reference.digest_normalizer",
+        observation=sample_models()["ObservationRef"],
+    ).model_dump(mode="json")
+    normalize_request["observation"]["created_at"] = value
+
+    for model, request in (
+        (CompileActionRequest, compile_request),
+        (NormalizeObservationRequest, normalize_request),
+    ):
+        model.model_validate_json(json.dumps(request))
+        response = _run_worker(request)
+        assert response["status"] == "ok"
+
+
 def test_worker_swap_is_rejected_before_subprocess_execution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
