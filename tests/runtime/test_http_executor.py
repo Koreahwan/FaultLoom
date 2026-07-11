@@ -34,7 +34,7 @@ def test_only_injected_gateway_receives_an_approved_semantic_request() -> None:
 
 
 def test_expired_or_future_lease_is_rejected_before_gateway_call() -> None:
-    expired = command(lease_issued_at=NOW - timedelta(minutes=2), lease_expires_at=NOW)
+    expired = command()
     future = command(
         action_id="action.future",
         lease_id="lease.future",
@@ -42,12 +42,13 @@ def test_expired_or_future_lease_is_rejected_before_gateway_call() -> None:
         lease_expires_at=NOW + timedelta(minutes=1),
     )
     gateway = RecordingGateway(completed_result)
-    executor = SemanticHttpExecutor(gateway, now=lambda: NOW)
+    expired_executor = SemanticHttpExecutor(gateway, now=lambda: NOW + timedelta(minutes=2))
+    future_executor = SemanticHttpExecutor(gateway, now=lambda: NOW)
 
     with pytest.raises(ExecutionContractError, match="not currently valid"):
-        executor.execute(expired)
+        expired_executor.execute(expired)
     with pytest.raises(ExecutionContractError, match="not currently valid"):
-        executor.execute(future)
+        future_executor.execute(future)
     assert gateway.calls == []
 
 
@@ -122,6 +123,25 @@ def test_forged_receipt_is_unknown_and_cannot_be_replayed() -> None:
     assert executor.state_for(approved.intent.action_id) is LocalDispatchState.UNKNOWN
     with pytest.raises(DispatchReplayError):
         executor.execute(approved)
+
+
+def test_receipt_dispatched_outside_lease_window_is_rejected() -> None:
+    approved = command()
+    valid = completed_result(approved)
+    receipt_values = valid.receipt.model_dump(mode="python")
+    receipt_values["dispatched_at"] = approved.lease.expires_at
+    receipt_values["completed_at"] = approved.lease.expires_at + timedelta(seconds=1)
+    forged = GatewayDispatchResult(
+        schema_version=SCHEMA_VERSION,
+        receipt=m.DispatchReceipt.model_validate(receipt_values),
+        observation=valid.observation,
+    )
+    gateway = RecordingGateway(lambda _: forged)
+    executor = SemanticHttpExecutor(gateway, now=lambda: NOW)
+
+    with pytest.raises(ExecutionContractError, match="outside the lease window"):
+        executor.execute(approved)
+    assert executor.state_for(approved.intent.action_id) is LocalDispatchState.UNKNOWN
 
 
 def test_unknown_outcome_requires_reconciliation_and_never_retries() -> None:

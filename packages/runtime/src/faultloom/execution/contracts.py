@@ -303,6 +303,12 @@ class GatewayDispatchCommand(ExecutionModel):
         lease_scope = (self.lease.grant_id, self.lease.grant_version, self.lease.scope_epoch)
         if decision_scope != lease_scope:
             raise ValueError("decision and lease scope bindings differ")
+        if not (
+            self.intent.requested_at
+            <= self.decision.evaluated_at
+            <= self.lease.issued_at
+        ):
+            raise ValueError("intent, decision, and lease timestamps are not causally ordered")
         return self
 
     @property

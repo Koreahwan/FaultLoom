@@ -179,6 +179,8 @@ class SemanticHttpExecutor:
             raise ExecutionContractError("Gateway exceeded reserved request bytes")
         if receipt.bytes_received > command.lease.reservation.response_bytes:
             raise ExecutionContractError("Gateway exceeded reserved response bytes")
+        if not command.lease.issued_at <= receipt.dispatched_at < command.lease.expires_at:
+            raise ExecutionContractError("Gateway dispatch occurred outside the lease window")
         if receipt.response_status is not None and not 100 <= receipt.response_status <= 599:
             raise ExecutionContractError("Gateway returned an invalid HTTP status")
         if receipt.outcome is DispatchOutcome.COMPLETED and receipt.response_status is None:
@@ -205,6 +207,10 @@ class SemanticHttpExecutor:
                     raise ExecutionContractError("browser child belongs to another parent action")
                 if child.browser_context_id != command.identity.context_id:
                     raise ExecutionContractError("browser child escaped its identity context")
+            if observation.child_candidates and receipt.outcome is not DispatchOutcome.COMPLETED:
+                raise ExecutionContractError(
+                    "browser children require a completed parent response"
+                )
 
         if receipt.outcome is DispatchOutcome.COMPLETED:
             return LocalDispatchState.COMPLETED
