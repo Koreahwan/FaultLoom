@@ -259,8 +259,15 @@ class EventLedger:
             self._parent_binding.close()
             raise
         os.close(descriptor)
-        _validate_ledger_directory(self._parent_fd, path.name)
         self.path = path
+        self._sidecar_descriptors: dict[str, int] = {}
+        try:
+            _validate_ledger_directory(self._parent_fd, path.name)
+            self._validate_sidecars()
+        except Exception:
+            self._close_sidecar_descriptors()
+            self._parent_binding.close()
+            raise
         stable_path = f"/proc/self/fd/{self._parent_fd}/{path.name}"
         try:
             self._connection = sqlite3.connect(
@@ -270,11 +277,13 @@ class EventLedger:
                 timeout=5.0,
             )
         except sqlite3.Error as exc:
+            self._close_sidecar_descriptors()
             self._parent_binding.close()
             raise StorageError("cannot connect to event ledger") from exc
         after = os.stat(path.name, dir_fd=self._parent_fd, follow_symlinks=False)
         if (opened.st_dev, opened.st_ino) != (after.st_dev, after.st_ino):
             self._connection.close()
+            self._close_sidecar_descriptors()
             self._parent_binding.close()
             raise StorageError("ledger file changed while opening")
         self._database_identity = inode_identity(after)
@@ -289,6 +298,7 @@ class EventLedger:
             self._connection.execute("PRAGMA trusted_schema=OFF")
             self._connection.execute("PRAGMA busy_timeout=5000")
             _validate_ledger_directory(self._parent_fd, path.name)
+            self._validate_sidecars()
             if created:
                 self._connection.executescript(SCHEMA)
                 self._connection.execute(f"PRAGMA application_id={APPLICATION_ID}")
@@ -299,14 +309,15 @@ class EventLedger:
             self.verify_chain(check_fts=not rebuild_fts)
             if rebuild_fts:
                 self.rebuild_fts()
-        except (sqlite3.Error, StorageError) as exc:
+            self._validate_paths()
+        except Exception as exc:
             self._connection.close()
+            self._close_sidecar_descriptors()
             self._parent_binding.close()
-            if isinstance(exc, StorageError):
-                raise
-            raise StorageError(f"cannot initialize event ledger: {exc}") from exc
+            if isinstance(exc, sqlite3.Error):
+                raise StorageError(f"cannot initialize event ledger: {exc}") from exc
+            raise
         self._closed = False
-        self._validate_paths()
 
     def __enter__(self) -> EventLedger:
         return self
@@ -331,11 +342,12 @@ class EventLedger:
             if failure is None:
                 failure = exc
         try:
-            self._validate_paths()
+            self._validate_paths(allow_removed_sidecars=True)
         except Exception as exc:
             if failure is None:
                 failure = exc
         finally:
+            self._close_sidecar_descriptors()
             self._parent_binding.close()
             self._closed = True
         if failure is not None:
@@ -346,7 +358,103 @@ class EventLedger:
             raise StorageError("event ledger is closed")
         self._validate_paths()
 
-    def _validate_paths(self) -> None:
+    def _close_sidecar_descriptors(self) -> None:
+        for descriptor in self._sidecar_descriptors.values():
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        self._sidecar_descriptors.clear()
+
+    def _validate_sidecars(self, *, allow_removed: bool = False) -> None:
+        for suffix in ("-wal", "-shm"):
+            filename = f"{self.path.name}{suffix}"
+            descriptor = self._sidecar_descriptors.get(filename)
+            if descriptor is None:
+                try:
+                    candidate = os.open(
+                        filename,
+                        os.O_RDONLY | NOFOLLOW,
+                        dir_fd=self._parent_fd,
+                    )
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    raise StorageError(
+                        f"event ledger sidecar {filename!r} cannot be safely bound"
+                    ) from exc
+                try:
+                    retained = os.fstat(candidate)
+                    visible = os.stat(
+                        filename,
+                        dir_fd=self._parent_fd,
+                        follow_symlinks=False,
+                    )
+                    require_private_file(
+                        retained, context=f"event ledger sidecar {filename!r} descriptor"
+                    )
+                    require_private_file(
+                        visible, context=f"event ledger sidecar {filename!r} path"
+                    )
+                    if inode_identity(retained) != inode_identity(visible):
+                        raise StorageError(
+                            f"event ledger sidecar {filename!r} changed while binding"
+                        )
+                except (OSError, StorageError) as exc:
+                    os.close(candidate)
+                    if isinstance(exc, StorageError):
+                        raise
+                    raise StorageError(
+                        f"event ledger sidecar {filename!r} cannot be safely bound"
+                    ) from exc
+                self._sidecar_descriptors[filename] = candidate
+                continue
+
+            try:
+                retained = os.fstat(descriptor)
+            except OSError as exc:
+                raise StorageError(
+                    f"event ledger sidecar {filename!r} descriptor is unavailable"
+                ) from exc
+            try:
+                visible = os.stat(
+                    filename,
+                    dir_fd=self._parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError as exc:
+                if not allow_removed:
+                    raise StorageError(
+                        f"event ledger sidecar {filename!r} path disappeared"
+                    ) from exc
+                try:
+                    require_private_file(
+                        retained,
+                        context=f"event ledger sidecar {filename!r} removed descriptor",
+                        allowed_links=(0,),
+                    )
+                except StorageError as retained_error:
+                    raise StorageError(
+                        f"event ledger sidecar {filename!r} path changed instead of "
+                        "being removed"
+                    ) from retained_error
+                continue
+            except OSError as exc:
+                raise StorageError(
+                    f"event ledger sidecar {filename!r} path is unavailable"
+                ) from exc
+            require_private_file(
+                retained, context=f"event ledger sidecar {filename!r} descriptor"
+            )
+            require_private_file(
+                visible, context=f"event ledger sidecar {filename!r} path"
+            )
+            if inode_identity(retained) != inode_identity(visible):
+                raise StorageError(
+                    f"event ledger sidecar {filename!r} path identity changed"
+                )
+
+    def _validate_paths(self, *, allow_removed_sidecars: bool = False) -> None:
         self._parent_binding.revalidate()
         try:
             database = os.stat(
@@ -359,6 +467,7 @@ class EventLedger:
             raise StorageError("event ledger path is no longer safely bound") from exc
         if inode_identity(database) != self._database_identity:
             raise StorageError("event ledger file path identity changed")
+        self._validate_sidecars(allow_removed=allow_removed_sidecars)
         if self._path_validator is not None:
             self._path_validator()
 

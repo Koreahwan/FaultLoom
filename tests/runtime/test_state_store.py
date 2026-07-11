@@ -90,6 +90,28 @@ def replace_private_directory(path: Path, displaced: Path) -> None:
         assert after.st_uid == getuid()
 
 
+def replace_private_file_with_identical_copy(path: Path, displaced_root: Path) -> None:
+    """Displace a live private file and install an identical private new inode."""
+
+    displaced_root.mkdir(mode=0o700)
+    displaced = displaced_root / path.name
+    before_bytes = path.read_bytes()
+    before = path.stat()
+    assert stat.S_IMODE(before.st_mode) == 0o600
+    assert before.st_nlink == 1
+    path.rename(displaced)
+    shutil.copyfile(displaced, path)
+    path.chmod(0o600)
+    after = path.stat()
+    assert path.read_bytes() == before_bytes == displaced.read_bytes()
+    assert (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+    assert stat.S_IMODE(after.st_mode) == 0o600
+    assert after.st_nlink == 1
+    getuid = getattr(os, "geteuid", None)
+    if getuid is not None:
+        assert after.st_uid == getuid()
+
+
 def assert_reopened_observation(
     root: Path, engagement_id: str, expected_raw: bytes
 ) -> None:
@@ -498,6 +520,121 @@ os._exit(0)
         assert reopened.ledger.events()[0].seq == 1
         report = reopened.recover()
         assert len(report.verified_artifacts) == 2
+
+
+@pytest.mark.parametrize("sidecar_suffix", ["-wal", "-shm"])
+def test_append_rejects_identical_sqlite_sidecar_replacement_before_return(
+    tmp_path: Path, sidecar_suffix: str
+) -> None:
+    path = tmp_path / "ledger" / "state.sqlite3"
+    path.parent.mkdir(mode=0o700)
+    state = {"armed": False, "replaced": False}
+
+    def replace_after_commit() -> None:
+        if state["armed"] and not state["replaced"]:
+            replace_private_file_with_identical_copy(
+                Path(f"{path}{sidecar_suffix}"),
+                tmp_path / "append-displaced",
+            )
+            state["replaced"] = True
+
+    ledger = EventLedger(path, "eng.sidecar-append", commit_callback=replace_after_commit)
+    ledger.append(actor_stream="researcher", event_type="baseline", payload={"value": 1})
+    state["armed"] = True
+    with pytest.raises(StorageError, match="event ledger sidecar"):
+        ledger.append(actor_stream="researcher", event_type="delta", payload={"value": 2})
+    assert state["replaced"]
+    with pytest.raises(StorageError, match="event ledger sidecar"):
+        ledger.close()
+    assert ledger._closed
+    assert ledger._sidecar_descriptors == {}
+
+
+@pytest.mark.parametrize("sidecar_suffix", ["-wal", "-shm"])
+def test_checkpoint_rejects_identical_sqlite_sidecar_replacement_before_return(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sidecar_suffix: str,
+) -> None:
+    path = tmp_path / "ledger" / "state.sqlite3"
+    path.parent.mkdir(mode=0o700)
+    ledger = EventLedger(path, "eng.sidecar-checkpoint")
+    ledger.append(actor_stream="researcher", event_type="delta", payload={"value": 1})
+    verify_chain = ledger.verify_chain
+
+    def verify_then_replace(*, check_fts: bool = True) -> str:
+        head = verify_chain(check_fts=check_fts)
+        replace_private_file_with_identical_copy(
+            Path(f"{path}{sidecar_suffix}"),
+            tmp_path / "checkpoint-displaced",
+        )
+        return head
+
+    monkeypatch.setattr(ledger, "verify_chain", verify_then_replace)
+    with pytest.raises(StorageError, match="event ledger sidecar"):
+        ledger.chain_checkpoint()
+    with pytest.raises(StorageError, match="event ledger sidecar"):
+        ledger.close()
+    assert ledger._closed
+    assert ledger._sidecar_descriptors == {}
+
+
+@pytest.mark.parametrize("sidecar_suffix", ["-wal", "-shm"])
+def test_close_rejects_identical_sqlite_sidecar_replacement_and_releases_resources(
+    tmp_path: Path, sidecar_suffix: str
+) -> None:
+    path = tmp_path / "ledger" / "state.sqlite3"
+    path.parent.mkdir(mode=0o700)
+    state = {"armed": False, "validations": 0}
+
+    def replace_after_final_preclose_validation() -> None:
+        if not state["armed"]:
+            return
+        state["validations"] += 1
+        if state["validations"] == 2:
+            replace_private_file_with_identical_copy(
+                Path(f"{path}{sidecar_suffix}"),
+                tmp_path / "close-displaced",
+            )
+
+    ledger = EventLedger(
+        path,
+        "eng.sidecar-close",
+        path_validator=replace_after_final_preclose_validation,
+    )
+    ledger.append(actor_stream="researcher", event_type="delta", payload={"value": 1})
+    state["armed"] = True
+    with pytest.raises(StorageError, match="event ledger sidecar"):
+        ledger.close()
+    assert state["validations"] == 2
+    assert ledger._closed
+    assert ledger._sidecar_descriptors == {}
+
+
+def test_sqlite_sidecar_create_remove_and_reopen_lifecycle_is_allowed(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "ledger" / "state.sqlite3"
+    path.parent.mkdir(mode=0o700)
+    sidecars = tuple(Path(f"{path}{suffix}") for suffix in ("-wal", "-shm"))
+    assert not any(sidecar.exists() for sidecar in sidecars)
+
+    for generation in (1, 2):
+        ledger = EventLedger(path, "eng.sidecar-lifecycle")
+        for sidecar in sidecars:
+            metadata = sidecar.stat()
+            assert stat.S_IMODE(metadata.st_mode) == 0o600
+            assert metadata.st_nlink == 1
+        ledger.append(
+            actor_stream="researcher",
+            event_type="delta",
+            payload={"generation": generation},
+        )
+        assert ledger.chain_checkpoint()[0] == generation
+        ledger.close()
+        assert ledger._closed
+        assert ledger._sidecar_descriptors == {}
+        assert not any(sidecar.exists() for sidecar in sidecars)
 
 
 def test_terminal_symlink_roots_are_rejected(tmp_path: Path) -> None:
