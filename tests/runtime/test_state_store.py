@@ -27,6 +27,7 @@ from faultloom.state import (
     StorageError,
 )
 import faultloom.state.cas as cas_module
+import faultloom.state.ledger as ledger_module
 
 
 KEY_BYTES = bytes(range(32))
@@ -110,6 +111,37 @@ def replace_private_file_with_identical_copy(path: Path, displaced_root: Path) -
     getuid = getattr(os, "geteuid", None)
     if getuid is not None:
         assert after.st_uid == getuid()
+
+
+def install_stale_sidecar_stat_swap(
+    monkeypatch: pytest.MonkeyPatch,
+    ledger: EventLedger,
+    path: Path,
+    sidecar_suffix: str,
+    displaced_root: Path,
+    state: dict[str, bool],
+) -> None:
+    """Replace a sidecar after its old name metadata has been returned."""
+
+    real_stat = ledger_module.os.stat
+    target_name = f"{path.name}{sidecar_suffix}"
+
+    def stat_then_replace(name, *args, **kwargs):
+        metadata = real_stat(name, *args, **kwargs)
+        if (
+            state["armed"]
+            and not state["replaced"]
+            and name == target_name
+            and kwargs.get("dir_fd") == ledger._parent_fd
+            and kwargs.get("follow_symlinks") is False
+        ):
+            state["replaced"] = True
+            replace_private_file_with_identical_copy(
+                Path(f"{path}{sidecar_suffix}"), displaced_root
+            )
+        return metadata
+
+    monkeypatch.setattr(ledger_module.os, "stat", stat_then_replace)
 
 
 def assert_reopened_observation(
@@ -551,6 +583,44 @@ def test_append_rejects_identical_sqlite_sidecar_replacement_before_return(
 
 
 @pytest.mark.parametrize("sidecar_suffix", ["-wal", "-shm"])
+def test_append_rejects_sidecar_swap_after_stale_stat_before_return(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sidecar_suffix: str,
+) -> None:
+    path = tmp_path / "ledger" / "state.sqlite3"
+    path.parent.mkdir(mode=0o700)
+    state = {"armed": False, "replaced": False}
+
+    def arm_after_commit() -> None:
+        state["armed"] = True
+
+    ledger = EventLedger(
+        path,
+        "eng.sidecar-stale-stat-append",
+        commit_callback=arm_after_commit,
+    )
+    ledger.append(actor_stream="researcher", event_type="baseline", payload={"value": 1})
+    state["armed"] = False
+    install_stale_sidecar_stat_swap(
+        monkeypatch,
+        ledger,
+        path,
+        sidecar_suffix,
+        tmp_path / "stale-stat-append-displaced",
+        state,
+    )
+
+    with pytest.raises(StorageError, match="event ledger sidecar"):
+        ledger.append(actor_stream="researcher", event_type="delta", payload={"value": 2})
+    assert state["replaced"]
+    with pytest.raises(StorageError, match="event ledger sidecar"):
+        ledger.close()
+    assert ledger._closed
+    assert ledger._sidecar_descriptors == {}
+
+
+@pytest.mark.parametrize("sidecar_suffix", ["-wal", "-shm"])
 def test_checkpoint_rejects_identical_sqlite_sidecar_replacement_before_return(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -573,6 +643,42 @@ def test_checkpoint_rejects_identical_sqlite_sidecar_replacement_before_return(
     monkeypatch.setattr(ledger, "verify_chain", verify_then_replace)
     with pytest.raises(StorageError, match="event ledger sidecar"):
         ledger.chain_checkpoint()
+    with pytest.raises(StorageError, match="event ledger sidecar"):
+        ledger.close()
+    assert ledger._closed
+    assert ledger._sidecar_descriptors == {}
+
+
+@pytest.mark.parametrize("sidecar_suffix", ["-wal", "-shm"])
+def test_checkpoint_rejects_sidecar_swap_after_stale_stat_before_return(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sidecar_suffix: str,
+) -> None:
+    path = tmp_path / "ledger" / "state.sqlite3"
+    path.parent.mkdir(mode=0o700)
+    state = {"armed": False, "replaced": False}
+    ledger = EventLedger(path, "eng.sidecar-stale-stat-checkpoint")
+    ledger.append(actor_stream="researcher", event_type="delta", payload={"value": 1})
+    install_stale_sidecar_stat_swap(
+        monkeypatch,
+        ledger,
+        path,
+        sidecar_suffix,
+        tmp_path / "stale-stat-checkpoint-displaced",
+        state,
+    )
+    verify_chain = ledger.verify_chain
+
+    def verify_then_arm(*, check_fts: bool = True) -> str:
+        head = verify_chain(check_fts=check_fts)
+        state["armed"] = True
+        return head
+
+    monkeypatch.setattr(ledger, "verify_chain", verify_then_arm)
+    with pytest.raises(StorageError, match="event ledger sidecar"):
+        ledger.chain_checkpoint()
+    assert state["replaced"]
     with pytest.raises(StorageError, match="event ledger sidecar"):
         ledger.close()
     assert ledger._closed

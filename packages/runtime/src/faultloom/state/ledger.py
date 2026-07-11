@@ -366,6 +366,26 @@ class EventLedger:
                 pass
         self._sidecar_descriptors.clear()
 
+    def _current_sidecar_identity(self, filename: str) -> tuple[int, int]:
+        try:
+            descriptor = os.open(
+                filename,
+                os.O_RDONLY | NOFOLLOW,
+                dir_fd=self._parent_fd,
+            )
+        except OSError as exc:
+            raise StorageError(
+                f"event ledger sidecar {filename!r} cannot be reopened safely"
+            ) from exc
+        try:
+            metadata = os.fstat(descriptor)
+            require_private_file(
+                metadata, context=f"event ledger sidecar {filename!r} current path"
+            )
+            return inode_identity(metadata)
+        finally:
+            os.close(descriptor)
+
     def _validate_sidecars(self, *, allow_removed: bool = False) -> None:
         for suffix in ("-wal", "-shm"):
             filename = f"{self.path.name}{suffix}"
@@ -396,7 +416,11 @@ class EventLedger:
                     require_private_file(
                         visible, context=f"event ledger sidecar {filename!r} path"
                     )
-                    if inode_identity(retained) != inode_identity(visible):
+                    retained_identity = inode_identity(retained)
+                    if (
+                        retained_identity != inode_identity(visible)
+                        or self._current_sidecar_identity(filename) != retained_identity
+                    ):
                         raise StorageError(
                             f"event ledger sidecar {filename!r} changed while binding"
                         )
@@ -449,7 +473,11 @@ class EventLedger:
             require_private_file(
                 visible, context=f"event ledger sidecar {filename!r} path"
             )
-            if inode_identity(retained) != inode_identity(visible):
+            retained_identity = inode_identity(retained)
+            if (
+                retained_identity != inode_identity(visible)
+                or self._current_sidecar_identity(filename) != retained_identity
+            ):
                 raise StorageError(
                     f"event ledger sidecar {filename!r} path identity changed"
                 )
