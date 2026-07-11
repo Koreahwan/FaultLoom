@@ -4,25 +4,23 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
 from typing import Mapping, Sequence
 
-from pydantic import BaseModel
-
-from .base import assert_no_raw_secret_fields
+from .base import (
+    _normalize_protocol_datetime,
+    _snapshot_protocol_value,
+    assert_no_raw_secret_fields,
+)
 
 
 def _normalize(value: object) -> object:
-    if isinstance(value, BaseModel):
-        return _normalize(value.model_dump(mode="python", exclude_none=False))
-    if isinstance(value, datetime):
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("cannot canonicalize a naive datetime")
-        utc_value = value.astimezone(timezone.utc)
+    if type(value) is datetime:
+        utc_value = _normalize_protocol_datetime(value, label="canonical datetime")
         return utc_value.isoformat(timespec="microseconds").replace("+00:00", "Z")
     if isinstance(value, Enum):
-        return _normalize(value.value)
+        return _normalize(object.__getattribute__(value, "_value_"))
     if isinstance(value, Mapping):
         if not all(isinstance(key, str) for key in value):
             raise TypeError("canonical JSON object keys must be strings")
@@ -43,8 +41,9 @@ def _normalize(value: object) -> object:
 def canonical_json_bytes(value: object) -> bytes:
     """Return the unique UTF-8 JSON representation used for hashes/signatures."""
 
-    assert_no_raw_secret_fields(value)
-    normalized = _normalize(value)
+    snapshot = _snapshot_protocol_value(value)
+    assert_no_raw_secret_fields(snapshot)
+    normalized = _normalize(snapshot)
     return json.dumps(
         normalized,
         allow_nan=False,

@@ -12,14 +12,19 @@ import re
 import struct
 from datetime import datetime, timezone
 
-from .base import PROTOCOL_VERSION, SCHEMA_VERSION
+from .base import (
+    MAX_INT64,
+    PROTOCOL_VERSION,
+    SCHEMA_VERSION,
+    _normalize_protocol_datetime,
+)
 from .canonical import canonical_json_bytes
 from .models import (
     Ed25519PublicKeyRecord,
     SignaturePurpose,
     SignedScopeEpoch,
 )
-from .signing import AuthorityRevokedError, verify_scope_epoch
+from .signing import _verify_scope_epoch_status
 
 _RECEIPT_MAGIC = b"FLER"
 _RECEIPT_VERSION = 1
@@ -28,19 +33,19 @@ _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
 
 
 def _valid_boot_secret(value: bytes) -> bool:
-    return isinstance(value, bytes) and len(value) == 32 and len(set(value)) >= 8
+    return type(value) is bytes and len(value) == 32 and len(set(value)) >= 8
 
 
 def _identifier(value: str, *, label: str) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{label} must be an exact string")
     if _IDENTIFIER.fullmatch(value) is None:
         raise ValueError(f"{label} must be a canonical protocol identifier")
     return value
 
 
 def _millis(value: datetime, *, label: str) -> int:
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError(f"{label} must include a timezone")
-    utc_value = value.astimezone(timezone.utc)
+    utc_value = _normalize_protocol_datetime(value, label=label)
     if utc_value.microsecond % 1_000:
         raise ValueError(f"{label} must be aligned to a millisecond")
     milliseconds = _floor_millis(utc_value)
@@ -50,6 +55,7 @@ def _millis(value: datetime, *, label: str) -> int:
 
 
 def _canonical_time(value: datetime) -> str:
+    value = _normalize_protocol_datetime(value, label="receipt time")
     return (
         value.astimezone(timezone.utc)
         .isoformat(timespec="microseconds")
@@ -58,7 +64,7 @@ def _canonical_time(value: datetime) -> str:
 
 
 def _floor_millis(value: datetime) -> int:
-    utc_value = value.astimezone(timezone.utc)
+    utc_value = _normalize_protocol_datetime(value, label="receipt time")
     epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
     delta = utc_value - epoch
     return (
@@ -69,6 +75,8 @@ def _floor_millis(value: datetime) -> int:
 
 
 def _text(value: str, *, maximum: int = 256) -> bytes:
+    if type(value) is not str:
+        raise ValueError("receipt text must be an exact string")
     encoded = value.encode("utf-8")
     if not encoded or len(encoded) > maximum:
         raise ValueError("receipt string is outside its bounded channel representation")
@@ -76,6 +84,8 @@ def _text(value: str, *, maximum: int = 256) -> bytes:
 
 
 def _optional_text(value: str | None) -> bytes:
+    if value is not None and type(value) is not str:
+        raise ValueError("optional receipt text must be an exact string")
     return b"\x00" if value is None else b"\x01" + _text(value, maximum=16_384)
 
 
@@ -121,36 +131,46 @@ class GatewayEpochReceiptIssuer:
     ) -> bytes:
         """Verify a signed epoch with T13 before authenticating it for one boot."""
 
-        envelope = SignedScopeEpoch.model_validate(envelope.model_dump(mode="python"))
-        try:
-            epoch = verify_scope_epoch(
-                envelope,
-                authority_public_key,
-                now=verified_at,
-                minimum_epoch=minimum_epoch,
-                expected_grant_id=expected_grant_id,
-            )
-        except AuthorityRevokedError:
-            # verify_scope_epoch raises this only after purpose, key, sequence,
-            # time, digest, Ed25519, expiry, and grant binding all pass.
-            if not envelope.payload.revoked:
-                raise
-            epoch = envelope.payload
-
+        if type(minimum_epoch) is not int or not 1 <= minimum_epoch <= MAX_INT64:
+            raise ValueError("minimum_epoch must be an exact positive signed int64")
+        expected_grant_id = _identifier(
+            expected_grant_id,
+            label="expected_grant_id",
+        )
+        verified_at = _normalize_protocol_datetime(
+            verified_at,
+            label="verified_at",
+        )
+        receipt_expires_at = _normalize_protocol_datetime(
+            receipt_expires_at,
+            label="receipt_expires_at",
+        )
+        if type(nonce) is not bytes:
+            raise ValueError("nonce must be an exact bytes value")
+        if len(nonce) != 16 or len(set(nonce)) < 4:
+            raise ValueError("nonce must be a fresh high-entropy 16-byte value")
         verified_at_millis = _millis(verified_at, label="verified_at")
         receipt_expires_at_millis = _millis(
             receipt_expires_at, label="receipt_expires_at"
         )
-        epoch_expires_at_millis = _floor_millis(epoch.expires_at)
         if (
             receipt_expires_at_millis <= verified_at_millis
             or receipt_expires_at_millis - verified_at_millis
             > _MAX_RECEIPT_TTL_MILLIS
-            or receipt_expires_at_millis > epoch_expires_at_millis
         ):
-            raise ValueError("receipt TTL must be positive, at most five seconds, and within epoch")
-        if not isinstance(nonce, bytes) or len(nonce) != 16 or len(set(nonce)) < 4:
-            raise ValueError("nonce must be a fresh high-entropy 16-byte value")
+            raise ValueError("receipt TTL must be positive and at most five seconds")
+
+        status = _verify_scope_epoch_status(
+            envelope,
+            authority_public_key,
+            now=verified_at,
+            minimum_epoch=minimum_epoch,
+            expected_grant_id=expected_grant_id,
+        )
+        envelope, epoch = status._proved()
+        epoch_expires_at_millis = _floor_millis(epoch.expires_at)
+        if receipt_expires_at_millis > epoch_expires_at_millis:
+            raise ValueError("receipt expiry must not exceed scope epoch expiry")
 
         canonical_envelope = canonical_json_bytes(envelope)
         canonical_payload = canonical_json_bytes(epoch)

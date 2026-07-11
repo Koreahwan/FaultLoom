@@ -20,21 +20,24 @@ signed older artifact is valid cryptographically but is rejected below that
 trusted monotonic watermark.
 
 Verifier controls are validated before operator dispatch. `now` is either
-`None` or an exact base `datetime` whose `tzinfo` is the built-in
-`timezone.utc` singleton; custom and non-UTC timezone objects are rejected
-without invoking their hooks. `maximum_clock_skew` is an exact non-negative
-`timedelta`; monotonic watermarks are exact positive `int` values; and expected
-binding values are exact `str` values. Subclasses are rejected so they cannot
-override truthiness, arithmetic, comparisons, or timezone behavior.
+`None` or an exact base `datetime` whose `tzinfo` is an exact built-in
+`datetime.timezone` or Pydantic-core `TzInfo`; trusted offsets are normalized
+to UTC before comparison. Custom timezone objects are rejected without
+invoking their hooks. `maximum_clock_skew` is an exact non-negative `timedelta`;
+monotonic watermarks are exact positive `int` values; and expected binding
+values are exact `str` values. Subclasses are rejected so they cannot override
+truthiness, arithmetic, comparisons, or timezone behavior.
 
 `GatewayEpochReceiptIssuer` is a host-side T13 capability, not a wire model.
-It first calls the ordinary Ed25519 `verify_scope_epoch` path with an explicit
-pinned public key, expected grant, and monotonic epoch, then authenticates the
-exact canonical envelope for one Gateway boot. Its 32-byte boot key must be
-injected out of band, rotated on every Gateway start, and never exposed to a
-model, pack, adapter, or dispatch RPC. Receipts expire within five seconds and
-are consumed once by the Gateway kernel. The cross-language envelope and
-receipt fixtures under `tests/fixtures` are normative for this local channel.
+It requires the same complete Ed25519 scope-verification proof with an explicit
+pinned public key, expected grant, and monotonic epoch before authenticating the
+exact canonical envelope for one Gateway boot. A valid signed revocation can
+therefore reach the Gateway cancellation path, but an invalid revocation cannot
+produce a receipt. Its 32-byte boot key must be injected out of band, rotated on
+every Gateway start, and never exposed to a model, pack, adapter, or dispatch
+RPC. Receipts expire within five seconds and are consumed once by the Gateway
+kernel. The cross-language envelope and receipt fixtures under `tests/fixtures`
+are normative for this local channel.
 
 An `EngagementBundle` embeds the complete `SignedAuthorityGrant`; verification
 checks both signatures, current grant validity, and target, pack, identity, and
