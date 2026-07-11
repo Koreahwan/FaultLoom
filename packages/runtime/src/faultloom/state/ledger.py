@@ -9,8 +9,8 @@ import json
 import os
 import sqlite3
 import threading
-from collections.abc import Iterable, Mapping
-from contextlib import AbstractContextManager, nullcontext
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -538,9 +538,8 @@ class EventLedger:
         if self._schema_manifest(self._connection) != manifest:
             raise ChainIntegrityError("event ledger schema manifest is not exact")
 
-    def _initialize_metadata(self, *, allow_create: bool) -> None:
-        rows = dict(self._connection.execute("SELECT key, value FROM ledger_metadata"))
-        expected = {
+    def _expected_metadata(self) -> dict[str, str]:
+        return {
             "engagement_id": self.engagement_id,
             "schema_version": str(SCHEMA_VERSION),
             "event_auth_key_commitment": hmac.digest(
@@ -550,24 +549,37 @@ class EventLedger:
                 "sha256",
             ).hex(),
         }
+
+    def _verify_metadata(self) -> None:
+        rows = dict(self._connection.execute("SELECT key, value FROM ledger_metadata"))
+        expected = self._expected_metadata()
+        if rows.get("engagement_id") != self.engagement_id:
+            if "engagement_id" in rows:
+                raise CrossEngagementError(
+                    "ledger metadata does not match this engagement"
+                )
+            raise ChainIntegrityError("existing event ledger metadata is missing")
+        if rows != expected:
+            raise ChainIntegrityError(
+                "ledger metadata authentication key or schema does not match"
+            )
+
+    def _initialize_metadata(self, *, allow_create: bool) -> None:
+        rows = dict(self._connection.execute("SELECT key, value FROM ledger_metadata"))
         if not rows:
             if not allow_create:
                 raise ChainIntegrityError("existing event ledger metadata is missing")
             self._connection.execute("BEGIN IMMEDIATE")
             try:
                 self._connection.executemany(
-                    "INSERT INTO ledger_metadata(key, value) VALUES (?, ?)", expected.items()
+                    "INSERT INTO ledger_metadata(key, value) VALUES (?, ?)",
+                    self._expected_metadata().items(),
                 )
                 self._connection.execute("COMMIT")
             except Exception:
                 self._connection.execute("ROLLBACK")
                 raise
-        elif rows.get("engagement_id") != self.engagement_id:
-            raise CrossEngagementError("ledger metadata does not match this engagement")
-        elif rows != expected:
-            raise ChainIntegrityError(
-                "ledger metadata authentication key or schema does not match"
-            )
+        self._verify_metadata()
 
     @staticmethod
     def _event_digest(
@@ -650,6 +662,7 @@ class EventLedger:
             with self._lock:
                 try:
                     self._connection.execute("BEGIN IMMEDIATE")
+                    previous_checkpoint = self._verify_snapshot(check_fts=True)
                     last = self._connection.execute(
                         """SELECT seq, event_hash, event_auth_tag
                            FROM events ORDER BY seq DESC LIMIT 1"""
@@ -659,6 +672,10 @@ class EventLedger:
                     prev_auth_tag = (
                         ZERO_HASH if last is None else str(last["event_auth_tag"])
                     )
+                    if previous_checkpoint != (seq - 1, prev_hash):
+                        raise ChainIntegrityError(
+                            "event ledger changed inside the append transaction"
+                        )
                     event_hash = self._event_digest(
                         seq=seq,
                         engagement_id=self.engagement_id,
@@ -719,6 +736,10 @@ class EventLedger:
                             )
                     if _side_effect is not None:
                         _side_effect(self._connection, seq)
+                    if self._verify_snapshot(check_fts=True) != (seq, event_hash):
+                        raise ChainIntegrityError(
+                            "appended event does not match the verified transaction head"
+                        )
                     self._connection.execute("COMMIT")
                     if self._commit_callback is not None:
                         self._commit_callback()
@@ -781,29 +802,56 @@ class EventLedger:
         self._validate_paths()
         return records
 
-    def verify_chain(self, *, check_fts: bool = True) -> str:
+    def _verify_snapshot(self, *, check_fts: bool) -> tuple[int, str]:
+        if not self._connection.in_transaction:
+            raise StorageError("ledger verification requires an active transaction")
+        self._verify_header()
+        self._verify_schema()
+        self._verify_metadata()
+        _validate_ledger_directory(self._parent_fd, self.path.name)
+        integrity = self._connection.execute("PRAGMA quick_check").fetchone()[0]
+        if integrity != "ok":
+            raise ChainIntegrityError(f"SQLite integrity check failed: {integrity}")
+        foreign_keys = self._connection.execute("PRAGMA foreign_key_check").fetchall()
+        if foreign_keys:
+            raise ChainIntegrityError("SQLite foreign-key integrity check failed")
+        if check_fts:
+            try:
+                self._connection.execute(
+                    "INSERT INTO search_fts(search_fts, rank) VALUES('integrity-check', 1)"
+                )
+            except sqlite3.Error as exc:
+                raise ChainIntegrityError("FTS projection integrity check failed") from exc
+        rows = self._connection.execute("SELECT * FROM events ORDER BY seq").fetchall()
+        return len(rows), self._verify_rows(rows)
+
+    @contextmanager
+    def verified_checkpoint(
+        self, *, check_fts: bool = True
+    ) -> Iterator[tuple[int, str]]:
+        """Hold a verified SQLite writer snapshot across an anchor decision."""
+
         self._require_open() if hasattr(self, "_closed") else None
-        with self._lock:
-            self._verify_header()
-            self._verify_schema()
-            _validate_ledger_directory(self._parent_fd, self.path.name)
-            integrity = self._connection.execute("PRAGMA quick_check").fetchone()[0]
-            if integrity != "ok":
-                raise ChainIntegrityError(f"SQLite integrity check failed: {integrity}")
-            foreign_keys = self._connection.execute("PRAGMA foreign_key_check").fetchall()
-            if foreign_keys:
-                raise ChainIntegrityError("SQLite foreign-key integrity check failed")
-            if check_fts:
+        with self._transaction_lock:
+            with self._lock:
                 try:
-                    self._connection.execute(
-                        "INSERT INTO search_fts(search_fts, rank) VALUES('integrity-check', 1)"
-                    )
-                except sqlite3.Error as exc:
-                    raise ChainIntegrityError("FTS projection integrity check failed") from exc
-            rows = self._connection.execute("SELECT * FROM events ORDER BY seq").fetchall()
-            head = self._verify_rows(rows)
+                    self._connection.execute("BEGIN IMMEDIATE")
+                    checkpoint = self._verify_snapshot(check_fts=check_fts)
+                    yield checkpoint
+                    self._connection.execute("COMMIT")
+                except Exception as exc:
+                    if self._connection.in_transaction:
+                        self._connection.execute("ROLLBACK")
+                    if isinstance(exc, sqlite3.Error):
+                        raise StorageError(
+                            f"cannot verify event ledger transaction: {exc}"
+                        ) from exc
+                    raise
         self._validate_paths()
-        return head
+
+    def verify_chain(self, *, check_fts: bool = True) -> str:
+        with self.verified_checkpoint(check_fts=check_fts) as (_, head):
+            return head
 
     def _verify_rows(self, rows: list[sqlite3.Row]) -> str:
         previous = ZERO_HASH
@@ -851,35 +899,23 @@ class EventLedger:
     def rebuild_fts(self) -> None:
         """Explicitly rebuild the derived FTS index after primary-state verification."""
 
-        self.verify_chain(check_fts=False)
-        with self._transaction_lock:
-            with self._lock:
-                try:
-                    self._connection.execute(
-                        "INSERT INTO search_fts(search_fts) VALUES('rebuild')"
-                    )
-                except sqlite3.Error as exc:
-                    raise StorageError(
-                        "cannot deterministically rebuild FTS projection"
-                    ) from exc
+        with self.verified_checkpoint(check_fts=False):
+            try:
+                self._connection.execute(
+                    "INSERT INTO search_fts(search_fts) VALUES('rebuild')"
+                )
+                self._verify_snapshot(check_fts=True)
+            except sqlite3.Error as exc:
+                raise StorageError(
+                    "cannot deterministically rebuild FTS projection"
+                ) from exc
         self.verify_chain(check_fts=True)
 
     def chain_checkpoint(self) -> tuple[int, str]:
         """Return the verified current sequence and head hash."""
 
-        head = self.verify_chain()
-        with self._lock:
-            row = self._connection.execute(
-                "SELECT seq, event_hash FROM events ORDER BY seq DESC LIMIT 1"
-            ).fetchone()
-        if row is None:
-            self._validate_paths()
-            return 0, ZERO_HASH
-        if str(row["event_hash"]) != head:
-            raise ChainIntegrityError("event ledger changed while reading its checkpoint")
-        checkpoint = int(row["seq"]), head
-        self._validate_paths()
-        return checkpoint
+        with self.verified_checkpoint() as checkpoint:
+            return checkpoint
 
     def event_hash_at(self, seq: int) -> str:
         self._require_open()

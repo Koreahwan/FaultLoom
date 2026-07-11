@@ -66,6 +66,32 @@ def database_path(root: Path, engagement_id: str) -> Path:
     return state_root(root) / "engagements" / namespace / "state.sqlite3"
 
 
+def tamper_live_ledger(path: Path, mutation: str) -> None:
+    with sqlite3.connect(path, timeout=5.0) as connection:
+        if mutation == "metadata":
+            trigger = connection.execute(
+                "SELECT sql FROM sqlite_schema WHERE type='trigger' "
+                "AND name='ledger_metadata_no_update'"
+            ).fetchone()[0]
+            connection.execute("DROP TRIGGER ledger_metadata_no_update")
+            connection.execute(
+                "UPDATE ledger_metadata SET value=? "
+                "WHERE key='event_auth_key_commitment'",
+                ("0" * 64,),
+            )
+            connection.execute(trigger)
+        elif mutation == "schema":
+            connection.execute("DROP TRIGGER events_no_update")
+            connection.execute(
+                "CREATE TRIGGER events_no_update BEFORE UPDATE ON events "
+                "BEGIN SELECT 1; END"
+            )
+        elif mutation == "header":
+            connection.execute("PRAGMA user_version=99")
+        else:  # pragma: no cover - test helper contract
+            raise AssertionError(f"unknown ledger mutation: {mutation}")
+
+
 def blob_path(root: Path, reference: ArtifactRef) -> Path:
     namespace = hashlib.sha256(reference.engagement_id.encode()).hexdigest()
     return (
@@ -702,6 +728,166 @@ connection.close()
     assert anchor_path.read_bytes() == anchor_before
 
 
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("metadata", "metadata authentication key or schema"),
+        ("schema", "schema manifest"),
+        ("header", "schema version"),
+    ),
+)
+def test_live_ledger_integrity_is_rechecked_before_verify_checkpoint_and_append(
+    tmp_path: Path, mutation: str, message: str
+) -> None:
+    path = tmp_path / "ledger" / "state.sqlite3"
+    path.parent.mkdir(mode=0o700)
+    ledger = EventLedger(path, f"eng.live-{mutation}", key())
+    first = ledger.append(
+        actor_stream="researcher", event_type="baseline", payload={"value": 1}
+    )
+    tamper_live_ledger(path, mutation)
+
+    with pytest.raises(StorageError, match=message):
+        ledger.verify_chain()
+    with pytest.raises(StorageError, match=message):
+        ledger.chain_checkpoint()
+    with pytest.raises(StorageError, match=message):
+        ledger.append(
+            actor_stream="researcher", event_type="forbidden", payload={"value": 2}
+        )
+
+    with sqlite3.connect(path) as connection:
+        rows = connection.execute(
+            "SELECT seq, event_hash FROM events ORDER BY seq"
+        ).fetchall()
+    assert rows == [(1, first.event_hash)]
+    ledger.close()
+    with pytest.raises(StorageError, match=message):
+        EventLedger(path, f"eng.live-{mutation}", key())
+
+
+def test_live_metadata_tamper_blocks_state_surfaces_without_advancing_anchor(
+    tmp_path: Path,
+) -> None:
+    engagement_id = "eng.live-metadata-surfaces"
+    store = state_store(tmp_path, engagement_id)
+    first = store.ledger.append(
+        actor_stream="researcher", event_type="baseline", payload={"value": 1}
+    )
+    assert store.checkpoint().seq == first.seq
+    orphan = store.cas.put(b"must-not-be-quarantined-after-integrity-failure")
+    anchor_path = (
+        anchor_root(tmp_path)
+        / "anchors"
+        / f"{hashlib.sha256(engagement_id.encode()).hexdigest()}.anchor"
+    )
+    anchor_before = anchor_path.read_bytes()
+    path = database_path(tmp_path, engagement_id)
+    tamper_live_ledger(path, "metadata")
+
+    with pytest.raises(ChainIntegrityError, match="metadata authentication key"):
+        store.checkpoint()
+    assert anchor_path.read_bytes() == anchor_before
+    with pytest.raises(ChainIntegrityError, match="metadata authentication key"):
+        store.ledger.append(
+            actor_stream="researcher", event_type="forbidden", payload={"value": 2}
+        )
+    assert anchor_path.read_bytes() == anchor_before
+    with pytest.raises(ChainIntegrityError, match="metadata authentication key"):
+        store.recover()
+    assert orphan.sha256 in store.cas.blob_digests()
+    assert anchor_path.read_bytes() == anchor_before
+    with pytest.raises(ChainIntegrityError, match="metadata authentication key"):
+        store.close()
+    assert store._closed
+    assert anchor_path.read_bytes() == anchor_before
+
+    with sqlite3.connect(path) as connection:
+        rows = connection.execute(
+            "SELECT seq, event_hash FROM events ORDER BY seq"
+        ).fetchall()
+    assert rows == [(1, first.event_hash)]
+    with pytest.raises(ChainIntegrityError, match="metadata authentication key"):
+        state_store(tmp_path, engagement_id)
+
+
+def test_anchor_decision_holds_sqlite_writer_lock_until_persisted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engagement_id = "eng.anchor-transaction"
+    store = state_store(tmp_path, engagement_id)
+    first = store.ledger.append(
+        actor_stream="researcher", event_type="baseline", payload={"value": 1}
+    )
+    assert store.checkpoint().seq == first.seq
+
+    callback = store.ledger._commit_callback
+    store.ledger._commit_callback = None
+    try:
+        tail = store.ledger.append(
+            actor_stream="researcher", event_type="crash.tail", payload={"value": 2}
+        )
+    finally:
+        store.ledger._commit_callback = callback
+    assert store.anchor.load_optional().seq == first.seq
+
+    path = database_path(tmp_path, engagement_id)
+    with sqlite3.connect(path) as connection:
+        trigger = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' "
+            "AND name='ledger_metadata_no_update'"
+        ).fetchone()[0]
+    started = threading.Event()
+    finished = threading.Event()
+    failures: list[BaseException] = []
+
+    def tamper_while_anchor_is_written() -> None:
+        try:
+            with sqlite3.connect(path, timeout=5.0) as connection:
+                started.set()
+                connection.execute("DROP TRIGGER ledger_metadata_no_update")
+                connection.execute(
+                    "UPDATE ledger_metadata SET value=? "
+                    "WHERE key='event_auth_key_commitment'",
+                    ("0" * 64,),
+                )
+                connection.execute(trigger)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            failures.append(exc)
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=tamper_while_anchor_is_written)
+    original_write = store.anchor.write
+
+    def write_while_tamper_waits(checkpoint: AnchorCheckpoint) -> None:
+        worker.start()
+        assert started.wait(timeout=2.0)
+        assert not finished.wait(timeout=0.25)
+        original_write(checkpoint)
+
+    monkeypatch.setattr(store.anchor, "write", write_while_tamper_waits)
+    checkpoint = store.checkpoint()
+    worker.join(timeout=5.0)
+    assert not worker.is_alive()
+    assert failures == []
+    assert checkpoint.seq == tail.seq
+    anchor_path = (
+        anchor_root(tmp_path)
+        / "anchors"
+        / f"{hashlib.sha256(engagement_id.encode()).hexdigest()}.anchor"
+    )
+    anchor_after = anchor_path.read_bytes()
+
+    with pytest.raises(ChainIntegrityError, match="metadata authentication key"):
+        store.checkpoint()
+    assert anchor_path.read_bytes() == anchor_after
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT count(*) FROM events").fetchone()[0] == 2
+    with pytest.raises(ChainIntegrityError, match="metadata authentication key"):
+        store.close()
+
+
 @pytest.mark.parametrize("sidecar_suffix", ["-wal", "-shm"])
 def test_append_rejects_identical_sqlite_sidecar_replacement_before_return(
     tmp_path: Path, sidecar_suffix: str
@@ -781,17 +967,17 @@ def test_checkpoint_rejects_identical_sqlite_sidecar_replacement_before_return(
     path.parent.mkdir(mode=0o700)
     ledger = EventLedger(path, "eng.sidecar-checkpoint", key())
     ledger.append(actor_stream="researcher", event_type="delta", payload={"value": 1})
-    verify_chain = ledger.verify_chain
+    verify_snapshot = ledger._verify_snapshot
 
-    def verify_then_replace(*, check_fts: bool = True) -> str:
-        head = verify_chain(check_fts=check_fts)
+    def verify_then_replace(*, check_fts: bool) -> tuple[int, str]:
+        checkpoint = verify_snapshot(check_fts=check_fts)
         replace_private_file_with_identical_copy(
             Path(f"{path}{sidecar_suffix}"),
             tmp_path / "checkpoint-displaced",
         )
-        return head
+        return checkpoint
 
-    monkeypatch.setattr(ledger, "verify_chain", verify_then_replace)
+    monkeypatch.setattr(ledger, "_verify_snapshot", verify_then_replace)
     with pytest.raises(StorageError, match="event ledger sidecar"):
         ledger.chain_checkpoint()
     with pytest.raises(StorageError, match="event ledger sidecar"):
@@ -819,14 +1005,14 @@ def test_checkpoint_rejects_sidecar_swap_after_stale_stat_before_return(
         tmp_path / "stale-stat-checkpoint-displaced",
         state,
     )
-    verify_chain = ledger.verify_chain
+    verify_snapshot = ledger._verify_snapshot
 
-    def verify_then_arm(*, check_fts: bool = True) -> str:
-        head = verify_chain(check_fts=check_fts)
+    def verify_then_arm(*, check_fts: bool) -> tuple[int, str]:
+        checkpoint = verify_snapshot(check_fts=check_fts)
         state["armed"] = True
-        return head
+        return checkpoint
 
-    monkeypatch.setattr(ledger, "verify_chain", verify_then_arm)
+    monkeypatch.setattr(ledger, "_verify_snapshot", verify_then_arm)
     with pytest.raises(StorageError, match="event ledger sidecar"):
         ledger.chain_checkpoint()
     assert state["replaced"]

@@ -274,32 +274,40 @@ class StateStore:
 
     def _synchronize_anchor(self) -> AnchorCheckpoint:
         ledger, _, anchor_store = self._components()
-        checkpoint = anchor_store.load_optional()
-        if checkpoint is None:
-            raise ChainIntegrityError("authenticated anchor disappeared")
-        seq, head = ledger.chain_checkpoint()
-        if checkpoint.seq > seq:
-            raise ChainIntegrityError("event ledger is behind its authenticated anchor")
-        if checkpoint.seq == seq:
-            if checkpoint.head != head:
-                raise ChainIntegrityError("event ledger head differs from its authenticated anchor")
-        else:
-            if checkpoint.seq == 0:
-                if checkpoint.head != ZERO_HASH:
-                    raise ChainIntegrityError("empty authenticated anchor is invalid")
-            elif ledger.event_hash_at(checkpoint.seq) != checkpoint.head:
-                raise ChainIntegrityError("event ledger diverged before its authenticated anchor")
-            checkpoint = AnchorCheckpoint(
-                engagement_id=self.engagement_id,
-                seq=seq,
-                head=head,
-            )
-            anchor_store.write(checkpoint)
-            persisted = anchor_store.load_optional()
-            if persisted != checkpoint:
-                raise ChainIntegrityError("authenticated anchor update was not durable")
-        self._validate_minimum(checkpoint, ledger=ledger)
-        return checkpoint
+        with ledger.verified_checkpoint() as (seq, head):
+            checkpoint = anchor_store.load_optional()
+            if checkpoint is None:
+                raise ChainIntegrityError("authenticated anchor disappeared")
+            if checkpoint.seq > seq:
+                raise ChainIntegrityError("event ledger is behind its authenticated anchor")
+            if checkpoint.seq == seq:
+                if checkpoint.head != head:
+                    raise ChainIntegrityError(
+                        "event ledger head differs from its authenticated anchor"
+                    )
+            else:
+                if checkpoint.seq == 0:
+                    if checkpoint.head != ZERO_HASH:
+                        raise ChainIntegrityError("empty authenticated anchor is invalid")
+                elif ledger.event_hash_at(checkpoint.seq) != checkpoint.head:
+                    raise ChainIntegrityError(
+                        "event ledger diverged before its authenticated anchor"
+                    )
+                candidate = AnchorCheckpoint(
+                    engagement_id=self.engagement_id,
+                    seq=seq,
+                    head=head,
+                )
+                self._validate_minimum(candidate, ledger=ledger)
+                anchor_store.write(candidate)
+                persisted = anchor_store.load_optional()
+                if persisted != candidate:
+                    raise ChainIntegrityError(
+                        "authenticated anchor update was not durable"
+                    )
+                checkpoint = candidate
+            self._validate_minimum(checkpoint, ledger=ledger)
+            return checkpoint
 
     def checkpoint(self) -> AnchorCheckpoint:
         with self._lock:
