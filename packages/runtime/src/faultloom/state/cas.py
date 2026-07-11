@@ -8,6 +8,8 @@ import hmac
 import json
 import os
 import secrets
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -17,11 +19,11 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .canonical import canonical_json
 from .filesystem import (
+    DirectoryBinding,
     NOFOLLOW,
     PRIVATE_FILE_MODE,
     inode_identity,
     open_private_directory,
-    open_root_directory,
     require_private_file,
 )
 from .types import (
@@ -153,6 +155,7 @@ class EncryptedCAS:
         key: EngagementKey,
         *,
         max_artifact_bytes: int = DEFAULT_MAX_ARTIFACT_BYTES,
+        path_validator: Callable[[], None] | None = None,
     ) -> None:
         self.engagement_id = require_identifier(engagement_id, field="engagement_id")
         if not isinstance(max_artifact_bytes, int) or not 1 <= max_artifact_bytes <= 2**31:
@@ -172,19 +175,59 @@ class EncryptedCAS:
             b"faultloom-cas-cursor-v1\0" + engagement_context,
             "sha256",
         )
-        self._root_fd = open_root_directory(Path(root), create=True)
-        namespace = hashlib.sha256(self.engagement_id.encode("utf-8")).hexdigest()
-        self._namespace_fd = _open_directory(self._root_fd, namespace, create=True)
-        self._nonces_fd = _open_directory(self._namespace_fd, "nonces", create=True)
+        self._path_validator = path_validator
+        self._root_binding = DirectoryBinding(
+            Path(root), create=True, context="encrypted CAS root"
+        )
+        self._root_fd = self._root_binding.descriptor
+        self._namespace = hashlib.sha256(
+            self.engagement_id.encode("utf-8")
+        ).hexdigest()
+        namespace_fd: int | None = None
+        nonces_fd: int | None = None
+        try:
+            namespace_fd = _open_directory(
+                self._root_fd, self._namespace, create=True
+            )
+            self._namespace_fd = namespace_fd
+            self._namespace_identity = inode_identity(os.fstat(self._namespace_fd))
+            nonces_fd = _open_directory(
+                self._namespace_fd, "nonces", create=True
+            )
+            self._nonces_fd = nonces_fd
+            self._nonces_identity = inode_identity(os.fstat(self._nonces_fd))
+        except Exception:
+            if nonces_fd is not None:
+                os.close(nonces_fd)
+            if namespace_fd is not None:
+                os.close(namespace_fd)
+            self._root_binding.close()
+            raise
         self._closed = False
+        try:
+            self._validate_paths()
+        except Exception:
+            os.close(self._nonces_fd)
+            os.close(self._namespace_fd)
+            self._root_binding.close()
+            self._closed = True
+            raise
 
     def close(self) -> None:
         if self._closed:
             return
-        os.close(self._nonces_fd)
-        os.close(self._namespace_fd)
-        os.close(self._root_fd)
-        self._closed = True
+        failure: Exception | None = None
+        try:
+            self._validate_paths()
+        except Exception as exc:
+            failure = exc
+        finally:
+            os.close(self._nonces_fd)
+            os.close(self._namespace_fd)
+            self._root_binding.close()
+            self._closed = True
+        if failure is not None:
+            raise failure
 
     def __enter__(self) -> EncryptedCAS:
         return self
@@ -195,6 +238,26 @@ class EncryptedCAS:
     def _require_open(self) -> None:
         if self._closed:
             raise StorageError("CAS is closed")
+        self._validate_paths()
+
+    def _validate_paths(self) -> None:
+        self._root_binding.revalidate()
+        namespace_fd = _open_directory(
+            self._root_fd, self._namespace, create=False
+        )
+        try:
+            if inode_identity(os.fstat(namespace_fd)) != self._namespace_identity:
+                raise StorageError("encrypted CAS namespace path identity changed")
+            nonces_fd = _open_directory(namespace_fd, "nonces", create=False)
+            try:
+                if inode_identity(os.fstat(nonces_fd)) != self._nonces_identity:
+                    raise StorageError("CAS nonce registry path identity changed")
+            finally:
+                os.close(nonces_fd)
+        finally:
+            os.close(namespace_fd)
+        if self._path_validator is not None:
+            self._path_validator()
 
     def _validate_ref(self, reference: ArtifactRef) -> None:
         if reference.engagement_id != self.engagement_id:
@@ -223,7 +286,8 @@ class EncryptedCAS:
     def _filename(digest: str) -> str:
         return f"{digest}.flcas"
 
-    def _read_envelope(self, reference: ArtifactRef) -> bytes:
+    @contextmanager
+    def _opened_envelope(self, reference: ArtifactRef) -> Iterator[bytes]:
         self._validate_ref(reference)
         shard_fd = self._open_shard(reference.sha256, create=False)
         try:
@@ -239,12 +303,71 @@ class EncryptedCAS:
                     require_private_file(opened, context="encrypted artifact")
                 except StorageError as exc:
                     raise ChainIntegrityError(str(exc)) from exc
+                filename = self._filename(reference.sha256)
+                try:
+                    named = os.stat(
+                        filename, dir_fd=shard_fd, follow_symlinks=False
+                    )
+                except OSError as exc:
+                    raise ChainIntegrityError(
+                        "encrypted artifact name changed while opening"
+                    ) from exc
+                if inode_identity(named) != inode_identity(opened):
+                    raise ChainIntegrityError(
+                        "encrypted artifact name changed while opening"
+                    )
                 maximum = self.max_artifact_bytes + len(MAGIC) + NONCE_BYTES + 16
-                return _read_all(descriptor, maximum=maximum)
+                envelope = _read_all(descriptor, maximum=maximum)
+                yield envelope
+                self._validate_paths()
+                visible_shard = self._open_shard(reference.sha256, create=False)
+                try:
+                    if inode_identity(os.fstat(visible_shard)) != inode_identity(
+                        os.fstat(shard_fd)
+                    ):
+                        raise ChainIntegrityError(
+                            "encrypted artifact shard path identity changed"
+                        )
+                    after = os.fstat(descriptor)
+                    try:
+                        named_after = os.stat(
+                            filename,
+                            dir_fd=visible_shard,
+                            follow_symlinks=False,
+                        )
+                    except OSError as exc:
+                        raise ChainIntegrityError(
+                            "encrypted artifact final name changed during validation"
+                        ) from exc
+                    if (
+                        inode_identity(after) != inode_identity(opened)
+                        or inode_identity(named_after) != inode_identity(opened)
+                        or after.st_nlink != opened.st_nlink
+                        or after.st_size != opened.st_size
+                        or after.st_mtime_ns != opened.st_mtime_ns
+                        or after.st_ctime_ns != opened.st_ctime_ns
+                    ):
+                        raise ChainIntegrityError(
+                            "encrypted artifact final name changed during validation"
+                        )
+                    try:
+                        require_private_file(after, context="encrypted artifact")
+                        require_private_file(
+                            named_after, context="encrypted artifact path"
+                        )
+                    except StorageError as exc:
+                        raise ChainIntegrityError(str(exc)) from exc
+                finally:
+                    os.close(visible_shard)
+                self._validate_paths()
             finally:
                 os.close(descriptor)
         finally:
             os.close(shard_fd)
+
+    def _read_envelope(self, reference: ArtifactRef) -> bytes:
+        with self._opened_envelope(reference) as envelope:
+            return envelope
 
     def _decrypt(self, reference: ArtifactRef, envelope: bytes) -> bytes:
         if len(envelope) < len(MAGIC) + NONCE_BYTES + 16 or not envelope.startswith(MAGIC):
@@ -295,7 +418,7 @@ class EncryptedCAS:
             return nonce
         raise StorageError("encryption nonce generator repeated a reserved nonce")
 
-    def _existing(self, reference: ArtifactRef) -> bool:
+    def _object_path_exists(self, reference: ArtifactRef) -> bool:
         try:
             os.stat(reference.sha256[:2], dir_fd=self._namespace_fd, follow_symlinks=False)
         except FileNotFoundError:
@@ -312,8 +435,6 @@ class EncryptedCAS:
                 os.close(shard_fd)
         except FileNotFoundError:
             return False
-        envelope = self._read_envelope(reference)
-        self._decrypt(reference, envelope)
         return True
 
     def put(self, data: bytes, *, media_type: str = "application/octet-stream") -> ArtifactRef:
@@ -328,8 +449,11 @@ class EncryptedCAS:
             byte_length=len(data),
             media_type=media_type,
         )
-        if self._existing(reference):
-            return reference
+        if self._object_path_exists(reference):
+            with self._opened_envelope(reference) as existing:
+                self._decrypt(reference, existing)
+                self._validate_paths()
+                return reference
         nonce = self._reserve_nonce()
         envelope = MAGIC + nonce + self._cipher.encrypt(nonce, data, self._aad(reference))
         shard_fd = self._open_shard(reference.sha256, create=True)
@@ -358,8 +482,7 @@ class EncryptedCAS:
                     follow_symlinks=False,
                 )
             except FileExistsError:
-                if not self._existing(reference):
-                    raise ChainIntegrityError("existing content address is invalid")
+                pass
             os.fsync(shard_fd)
             os.unlink(temporary, dir_fd=shard_fd)
             temporary = ""
@@ -371,11 +494,17 @@ class EncryptedCAS:
                 except FileNotFoundError:
                     pass
             os.close(shard_fd)
-        return reference
+        with self._opened_envelope(reference) as persisted:
+            self._decrypt(reference, persisted)
+            self._validate_paths()
+            return reference
 
     def get(self, reference: ArtifactRef) -> bytes:
         self._require_open()
-        return self._decrypt(reference, self._read_envelope(reference))
+        with self._opened_envelope(reference) as envelope:
+            plaintext = self._decrypt(reference, envelope)
+            self._validate_paths()
+            return plaintext
 
     @staticmethod
     def _b64encode(value: bytes) -> str:
@@ -451,12 +580,14 @@ class EncryptedCAS:
         plaintext = self.get(reference)
         end = min(len(plaintext), offset + max_bytes)
         next_cursor = self._cursor(reference, end) if end < len(plaintext) else None
-        return RetrievalPage(
+        page = RetrievalPage(
             data=plaintext[offset:end],
             offset=offset,
             total_bytes=len(plaintext),
             next_cursor=next_cursor,
         )
+        self._validate_paths()
+        return page
 
     def blob_digests(self) -> tuple[str, ...]:
         """Return only live CAS object IDs; orphan quarantine is excluded."""
@@ -472,7 +603,9 @@ class EncryptedCAS:
                     result.append(digest)
             finally:
                 os.close(shard_fd)
-        return tuple(sorted(result))
+        digests = tuple(sorted(result))
+        self._validate_paths()
+        return digests
 
     def temporary_entries(self) -> tuple[tuple[str, str], ...]:
         """Return interrupted pre-publication writes for crash reconciliation."""
@@ -487,7 +620,9 @@ class EncryptedCAS:
                     result.append((shard, filename))
             finally:
                 os.close(shard_fd)
-        return tuple(sorted(result))
+        entries = tuple(sorted(result))
+        self._validate_paths()
+        return entries
 
     @staticmethod
     def _is_lower_hex(value: str, length: int) -> bool:
@@ -722,6 +857,7 @@ class EncryptedCAS:
                         raise ChainIntegrityError(
                             "interrupted publication changed during reconciliation"
                         )
+                    self._validate_paths()
                     return "published"
             finally:
                 os.close(descriptor)
@@ -739,6 +875,7 @@ class EncryptedCAS:
             finally:
                 os.close(recovery_fd)
                 os.close(orphan_fd)
+            self._validate_paths()
             return "quarantined"
         finally:
             os.close(source_fd)
@@ -764,3 +901,4 @@ class EncryptedCAS:
                 os.close(orphan_fd)
         finally:
             os.close(source_fd)
+        self._validate_paths()

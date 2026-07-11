@@ -6,6 +6,7 @@ import os
 import pickle
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -75,6 +76,31 @@ def blob_path(root: Path, reference: ArtifactRef) -> Path:
     )
 
 
+def replace_private_directory(path: Path, displaced: Path) -> None:
+    """Replace a live private root with an executable same-owner 0700 copy."""
+
+    before = path.stat()
+    path.rename(displaced)
+    shutil.copytree(displaced, path)
+    after = path.stat()
+    assert (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+    assert stat.S_IMODE(after.st_mode) == 0o700
+    getuid = getattr(os, "geteuid", None)
+    if getuid is not None:
+        assert after.st_uid == getuid()
+
+
+def assert_reopened_observation(
+    root: Path, engagement_id: str, expected_raw: bytes
+) -> None:
+    with state_store(root, engagement_id) as reopened:
+        events = reopened.ledger.events()
+        assert len(events) == 1
+        assert reopened.checkpoint().seq == 1
+        reference = ArtifactRef.from_dict(events[0].payload["artifact_ref"])
+        assert reopened.cas.get(reference) == expected_raw
+
+
 def test_full_raw_output_is_encrypted_and_retrievable_without_truncation(tmp_path: Path) -> None:
     raw = (b"line with a unique raw marker\n" * 1200) + b"tail"
     with state_store(tmp_path, "eng.alpha") as store:
@@ -141,6 +167,49 @@ def test_same_content_can_have_multiple_descriptive_media_types(tmp_path: Path) 
         assert text.sha256 == binary.sha256
         assert cas.get(text) == cas.get(binary) == b"same"
         assert len(cas.blob_digests()) == 1
+
+
+@pytest.mark.parametrize("operation", ["get", "put"])
+def test_cas_final_name_swap_after_descriptor_read_fails_closed_before_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    cas_root = tmp_path / "cas"
+    engagement_id = f"eng.final-swap-{operation}"
+    raw = b"descriptor-bound evidence"
+    cas = EncryptedCAS(cas_root, engagement_id, key())
+    reference = cas.put(raw)
+    namespace = hashlib.sha256(engagement_id.encode()).hexdigest()
+    final = (
+        cas_root
+        / namespace
+        / reference.sha256[:2]
+        / f"{reference.sha256}.flcas"
+    )
+    replacement = final.with_name(".executable-final-swap")
+    replacement.write_bytes(final.read_bytes())
+    replacement.chmod(0o600)
+    original_decrypt = cas._decrypt
+    swapped = False
+
+    def decrypt_then_swap(candidate: ArtifactRef, envelope: bytes) -> bytes:
+        nonlocal swapped
+        plaintext = original_decrypt(candidate, envelope)
+        if not swapped:
+            os.replace(replacement, final)
+            swapped = True
+        return plaintext
+
+    monkeypatch.setattr(cas, "_decrypt", decrypt_then_swap)
+    with pytest.raises(ChainIntegrityError, match="final name changed"):
+        if operation == "get":
+            cas.get(reference)
+        else:
+            cas.put(raw)
+    assert swapped
+    cas.close()
+
+    with EncryptedCAS(cas_root, engagement_id, key()) as reopened:
+        assert reopened.get(reference) == raw
 
 
 def test_content_id_is_deterministic_but_initial_encryption_is_randomized(
@@ -442,6 +511,101 @@ def test_terminal_symlink_roots_are_rejected(tmp_path: Path) -> None:
     ledger_link.symlink_to(real / "state.sqlite3")
     with pytest.raises(StorageError, match="symlink"):
         EventLedger(ledger_link, "eng.link")
+
+
+@pytest.mark.parametrize("root_kind", ["state", "anchor"])
+def test_append_rejects_live_private_root_replacement_at_transaction_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, root_kind: str
+) -> None:
+    engagement_id = f"eng.append-root-{root_kind}"
+    raw = b"committed before root replacement detection"
+    store = state_store(tmp_path, engagement_id)
+    visible = state_root(tmp_path) if root_kind == "state" else anchor_root(tmp_path)
+    displaced = tmp_path / f"{root_kind}-append-displaced"
+    synchronize = store._synchronize_anchor
+    calls = 0
+
+    def synchronize_then_replace() -> AnchorCheckpoint:
+        nonlocal calls
+        checkpoint = synchronize()
+        calls += 1
+        if calls == 2:
+            replace_private_directory(visible, displaced)
+        return checkpoint
+
+    monkeypatch.setattr(store, "_synchronize_anchor", synchronize_then_replace)
+    with pytest.raises(StorageError, match="visible path identity changed"):
+        store.append_observation(
+            actor_stream="researcher",
+            event_type="observation",
+            raw_output=raw,
+            metadata={},
+        )
+    assert calls == 2
+    with pytest.raises(StorageError, match="visible path identity changed"):
+        store.close()
+    assert store._closed
+    assert_reopened_observation(tmp_path, engagement_id, raw)
+
+
+@pytest.mark.parametrize("root_kind", ["state", "anchor"])
+def test_checkpoint_rejects_live_private_root_replacement_before_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, root_kind: str
+) -> None:
+    engagement_id = f"eng.checkpoint-root-{root_kind}"
+    raw = b"checkpoint root binding"
+    store = state_store(tmp_path, engagement_id)
+    store.append_observation(
+        actor_stream="researcher",
+        event_type="observation",
+        raw_output=raw,
+        metadata={},
+    )
+    visible = state_root(tmp_path) if root_kind == "state" else anchor_root(tmp_path)
+    displaced = tmp_path / f"{root_kind}-checkpoint-displaced"
+    synchronize = store._synchronize_anchor
+
+    def synchronize_then_replace() -> AnchorCheckpoint:
+        checkpoint = synchronize()
+        replace_private_directory(visible, displaced)
+        return checkpoint
+
+    monkeypatch.setattr(store, "_synchronize_anchor", synchronize_then_replace)
+    with pytest.raises(StorageError, match="visible path identity changed"):
+        store.checkpoint()
+    with pytest.raises(StorageError, match="visible path identity changed"):
+        store.close()
+    assert store._closed
+    assert_reopened_observation(tmp_path, engagement_id, raw)
+
+
+@pytest.mark.parametrize("root_kind", ["state", "anchor"])
+def test_close_rejects_live_private_root_replacement_and_releases_resources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, root_kind: str
+) -> None:
+    engagement_id = f"eng.close-root-{root_kind}"
+    raw = b"close root binding"
+    store = state_store(tmp_path, engagement_id)
+    store.append_observation(
+        actor_stream="researcher",
+        event_type="observation",
+        raw_output=raw,
+        metadata={},
+    )
+    visible = state_root(tmp_path) if root_kind == "state" else anchor_root(tmp_path)
+    displaced = tmp_path / f"{root_kind}-close-displaced"
+    synchronize = store._synchronize_anchor
+
+    def synchronize_then_replace() -> AnchorCheckpoint:
+        checkpoint = synchronize()
+        replace_private_directory(visible, displaced)
+        return checkpoint
+
+    monkeypatch.setattr(store, "_synchronize_anchor", synchronize_then_replace)
+    with pytest.raises(StorageError, match="visible path identity changed"):
+        store.close()
+    assert store._closed
+    assert_reopened_observation(tmp_path, engagement_id, raw)
 
 
 def test_artifact_reference_schema_is_strict() -> None:

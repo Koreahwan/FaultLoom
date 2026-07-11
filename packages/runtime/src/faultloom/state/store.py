@@ -14,7 +14,7 @@ from typing import Any
 from .anchor import AnchorCheckpoint, AuthenticatedAnchor, EngagementLock, ZERO_HASH
 from .canonical import canonical_json
 from .cas import ArtifactRef, EncryptedCAS, EngagementKey
-from .filesystem import open_private_directory, open_root_directory
+from .filesystem import DirectoryBinding, open_private_directory
 from .ledger import EventLedger, EventRecord
 from .types import ChainIntegrityError, CrossEngagementError, StorageError, require_identifier
 
@@ -100,21 +100,43 @@ class StateStore:
         if minimum_anchor is not None and minimum_anchor.engagement_id != self.engagement_id:
             raise CrossEngagementError("minimum anchor belongs to another engagement")
         self._minimum_anchor = minimum_anchor
-        self._lock = EngagementLock(self.anchor_root, self.engagement_id)
         self.anchor: AuthenticatedAnchor | None = None
         self.cas: EncryptedCAS | None = None
         self.ledger: EventLedger | None = None
         self._closed = False
+        self._state_binding = DirectoryBinding(
+            self.root, create=True, context="configured state root"
+        )
+        try:
+            self._anchor_binding = DirectoryBinding(
+                self.anchor_root, create=True, context="external anchor root"
+            )
+        except Exception:
+            self._state_binding.close()
+            self._closed = True
+            raise
+        try:
+            self._lock = EngagementLock(
+                self.anchor_root,
+                self.engagement_id,
+                path_validator=self._revalidate_roots,
+            )
+        except Exception:
+            self._anchor_binding.close()
+            self._state_binding.close()
+            self._closed = True
+            raise
         namespace = hashlib.sha256(self.engagement_id.encode("utf-8")).hexdigest()
         try:
             with self._lock:
-                state_root_fd = open_root_directory(self.root, create=True)
-                try:
-                    existing_state = _engagement_state_exists(state_root_fd, namespace)
-                finally:
-                    os.close(state_root_fd)
+                self._revalidate_roots()
+                state_root_fd = self._state_binding.descriptor
+                existing_state = _engagement_state_exists(state_root_fd, namespace)
                 self.anchor = AuthenticatedAnchor(
-                    self.anchor_root, self.engagement_id, key
+                    self.anchor_root,
+                    self.engagement_id,
+                    key,
+                    path_validator=self._revalidate_roots,
                 )
                 checkpoint = self.anchor.load_optional()
                 if checkpoint is None:
@@ -129,45 +151,55 @@ class StateStore:
                     )
                     self.anchor.write(checkpoint)
                 self._validate_minimum(checkpoint, ledger=None)
-                state_root_fd = open_root_directory(self.root, create=False)
-                try:
-                    engagements_fd = open_private_directory(
-                        state_root_fd, "engagements", create=True
-                    )
-                    try:
-                        engagement_fd = open_private_directory(
-                            engagements_fd, namespace, create=True
-                        )
-                        os.close(engagement_fd)
-                    finally:
-                        os.close(engagements_fd)
-                    cas_fd = open_private_directory(state_root_fd, "cas", create=True)
-                    os.close(cas_fd)
-                finally:
-                    os.close(state_root_fd)
-                self.cas = EncryptedCAS(
-                    self.root / "cas", self.engagement_id, key
+                engagements_fd = open_private_directory(
+                    state_root_fd, "engagements", create=True
                 )
                 try:
-                    self.ledger = EventLedger(
-                        self.root / "engagements" / namespace / "state.sqlite3",
-                        self.engagement_id,
-                        transaction_lock=self._lock,
-                        commit_callback=self._synchronize_anchor,
+                    engagement_fd = open_private_directory(
+                        engagements_fd, namespace, create=True
                     )
-                except Exception:
-                    self.cas.close()
-                    self.cas = None
-                    raise
+                    os.close(engagement_fd)
+                finally:
+                    os.close(engagements_fd)
+                cas_fd = open_private_directory(state_root_fd, "cas", create=True)
+                os.close(cas_fd)
+                self.cas = EncryptedCAS(
+                    self.root / "cas",
+                    self.engagement_id,
+                    key,
+                    path_validator=self._revalidate_roots,
+                )
+                self.ledger = EventLedger(
+                    self.root / "engagements" / namespace / "state.sqlite3",
+                    self.engagement_id,
+                    transaction_lock=self._lock,
+                    commit_callback=self._synchronize_anchor,
+                    path_validator=self._revalidate_roots,
+                )
                 self._synchronize_anchor()
         except Exception:
             if self.ledger is not None:
-                self.ledger.close()
+                try:
+                    self.ledger.close()
+                except Exception:
+                    pass
             if self.cas is not None:
-                self.cas.close()
+                try:
+                    self.cas.close()
+                except Exception:
+                    pass
             if self.anchor is not None:
-                self.anchor.close()
-            self._lock.close()
+                try:
+                    self.anchor.close()
+                except Exception:
+                    pass
+            try:
+                self._lock.close()
+            except Exception:
+                pass
+            self._anchor_binding.close()
+            self._state_binding.close()
+            self._closed = True
             raise
 
     def __enter__(self) -> StateStore:
@@ -181,17 +213,42 @@ class StateStore:
             raise StorageError("state store is closed")
         return self.ledger, self.cas, self.anchor
 
+    def _revalidate_roots(self) -> None:
+        self._state_binding.revalidate()
+        self._anchor_binding.revalidate()
+
     def close(self) -> None:
         if self._closed:
             return
         ledger, cas, anchor = self._components()
-        with self._lock:
-            self._synchronize_anchor()
-            ledger.close()
-        cas.close()
-        anchor.close()
-        self._lock.close()
-        self._closed = True
+        failure: Exception | None = None
+
+        def remember(exc: Exception) -> None:
+            nonlocal failure
+            if failure is None:
+                failure = exc
+
+        try:
+            with self._lock:
+                self._synchronize_anchor()
+                ledger.close()
+        except Exception as exc:
+            remember(exc)
+        for component in (ledger, cas, anchor, self._lock):
+            try:
+                component.close()
+            except Exception as exc:
+                remember(exc)
+        try:
+            self._revalidate_roots()
+        except Exception as exc:
+            remember(exc)
+        finally:
+            self._anchor_binding.close()
+            self._state_binding.close()
+            self._closed = True
+        if failure is not None:
+            raise failure
 
     def _validate_minimum(
         self, checkpoint: AnchorCheckpoint, *, ledger: EventLedger | None

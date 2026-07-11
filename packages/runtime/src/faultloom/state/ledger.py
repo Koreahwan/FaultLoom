@@ -18,9 +18,10 @@ from typing import Any, Callable
 from .canonical import canonical_json
 from .cas import ArtifactRef
 from .filesystem import (
+    DirectoryBinding,
     NOFOLLOW,
     PRIVATE_FILE_MODE,
-    open_root_directory,
+    inode_identity,
     require_private_file,
 )
 from .types import (
@@ -214,14 +215,19 @@ class EventLedger:
         rebuild_fts: bool = False,
         transaction_lock: AbstractContextManager[Any] | None = None,
         commit_callback: Callable[[], None] | None = None,
+        path_validator: Callable[[], None] | None = None,
     ) -> None:
         self.engagement_id = require_identifier(engagement_id, field="engagement_id")
         self._transaction_lock = transaction_lock or nullcontext()
         self._commit_callback = commit_callback
+        self._path_validator = path_validator
         path = Path(path)
         if not path.is_absolute() or path.name in {"", ".", ".."} or "/" in path.name:
             raise StorageError("ledger path must be an absolute private file path")
-        self._parent_fd = open_root_directory(path.parent, create=True)
+        self._parent_binding = DirectoryBinding(
+            path.parent, create=True, context="event ledger directory"
+        )
+        self._parent_fd = self._parent_binding.descriptor
         created = False
         try:
             descriptor = os.open(
@@ -239,7 +245,7 @@ class EventLedger:
                     dir_fd=self._parent_fd,
                 )
             except OSError as exc:
-                os.close(self._parent_fd)
+                self._parent_binding.close()
                 raise StorageError(
                     "cannot safely open event ledger; symlinks are forbidden"
                 ) from exc
@@ -250,7 +256,7 @@ class EventLedger:
                 raise StorageError("existing event ledger is empty")
         except Exception:
             os.close(descriptor)
-            os.close(self._parent_fd)
+            self._parent_binding.close()
             raise
         os.close(descriptor)
         _validate_ledger_directory(self._parent_fd, path.name)
@@ -264,13 +270,14 @@ class EventLedger:
                 timeout=5.0,
             )
         except sqlite3.Error as exc:
-            os.close(self._parent_fd)
+            self._parent_binding.close()
             raise StorageError("cannot connect to event ledger") from exc
         after = os.stat(path.name, dir_fd=self._parent_fd, follow_symlinks=False)
         if (opened.st_dev, opened.st_ino) != (after.st_dev, after.st_ino):
             self._connection.close()
-            os.close(self._parent_fd)
+            self._parent_binding.close()
             raise StorageError("ledger file changed while opening")
+        self._database_identity = inode_identity(after)
         self._connection.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         try:
@@ -294,11 +301,12 @@ class EventLedger:
                 self.rebuild_fts()
         except (sqlite3.Error, StorageError) as exc:
             self._connection.close()
-            os.close(self._parent_fd)
+            self._parent_binding.close()
             if isinstance(exc, StorageError):
                 raise
             raise StorageError(f"cannot initialize event ledger: {exc}") from exc
         self._closed = False
+        self._validate_paths()
 
     def __enter__(self) -> EventLedger:
         return self
@@ -309,15 +317,50 @@ class EventLedger:
     def close(self) -> None:
         if self._closed:
             return
-        with self._lock:
-            self._connection.execute("PRAGMA wal_checkpoint(FULL)")
+        failure: Exception | None = None
+        try:
+            with self._lock:
+                self._validate_paths()
+                self._connection.execute("PRAGMA wal_checkpoint(FULL)")
+                self._validate_paths()
+        except Exception as exc:
+            failure = exc
+        try:
             self._connection.close()
-            os.close(self._parent_fd)
+        except Exception as exc:
+            if failure is None:
+                failure = exc
+        try:
+            self._validate_paths()
+        except Exception as exc:
+            if failure is None:
+                failure = exc
+        finally:
+            self._parent_binding.close()
             self._closed = True
+        if failure is not None:
+            raise failure
 
     def _require_open(self) -> None:
         if self._closed:
             raise StorageError("event ledger is closed")
+        self._validate_paths()
+
+    def _validate_paths(self) -> None:
+        self._parent_binding.revalidate()
+        try:
+            database = os.stat(
+                self.path.name,
+                dir_fd=self._parent_fd,
+                follow_symlinks=False,
+            )
+            require_private_file(database, context="event ledger path")
+        except (OSError, StorageError) as exc:
+            raise StorageError("event ledger path is no longer safely bound") from exc
+        if inode_identity(database) != self._database_identity:
+            raise StorageError("event ledger file path identity changed")
+        if self._path_validator is not None:
+            self._path_validator()
 
     def _verify_header(self) -> None:
         application_id = self._connection.execute("PRAGMA application_id").fetchone()[0]
@@ -501,7 +544,7 @@ class EventLedger:
                     if isinstance(exc, StorageError):
                         raise
                     raise StorageError(f"cannot append event: {exc}") from exc
-        return EventRecord(
+        record = EventRecord(
             seq=seq,
             engagement_id=self.engagement_id,
             actor_stream=actor_stream,
@@ -512,6 +555,8 @@ class EventLedger:
             event_hash=event_hash,
             created_at=timestamp,
         )
+        self._validate_paths()
+        return record
 
     @staticmethod
     def _record(row: sqlite3.Row) -> EventRecord:
@@ -544,7 +589,9 @@ class EventLedger:
             rows = self._connection.execute(
                 "SELECT * FROM events WHERE seq > ? ORDER BY seq LIMIT ?", (after_seq, limit)
             ).fetchall()
-        return tuple(self._record(row) for row in rows)
+        records = tuple(self._record(row) for row in rows)
+        self._validate_paths()
+        return records
 
     def verify_chain(self, *, check_fts: bool = True) -> str:
         self._require_open() if hasattr(self, "_closed") else None
@@ -566,7 +613,9 @@ class EventLedger:
                 except sqlite3.Error as exc:
                     raise ChainIntegrityError("FTS projection integrity check failed") from exc
             rows = self._connection.execute("SELECT * FROM events ORDER BY seq").fetchall()
-            return self._verify_rows(rows)
+            head = self._verify_rows(rows)
+        self._validate_paths()
+        return head
 
     def _verify_rows(self, rows: list[sqlite3.Row]) -> str:
         previous = ZERO_HASH
@@ -622,12 +671,16 @@ class EventLedger:
                 "SELECT seq, event_hash FROM events ORDER BY seq DESC LIMIT 1"
             ).fetchone()
         if row is None:
+            self._validate_paths()
             return 0, ZERO_HASH
         if str(row["event_hash"]) != head:
             raise ChainIntegrityError("event ledger changed while reading its checkpoint")
-        return int(row["seq"]), head
+        checkpoint = int(row["seq"]), head
+        self._validate_paths()
+        return checkpoint
 
     def event_hash_at(self, seq: int) -> str:
+        self._require_open()
         if not isinstance(seq, int) or isinstance(seq, bool) or seq <= 0:
             raise StorageError("event sequence is invalid")
         with self._lock:
@@ -636,7 +689,9 @@ class EventLedger:
             ).fetchone()
         if row is None:
             raise ChainIntegrityError("anchored event sequence is missing")
-        return str(row["event_hash"])
+        event_hash = str(row["event_hash"])
+        self._validate_paths()
+        return event_hash
 
     def _verify_auxiliary_state(self, events: dict[int, EventRecord]) -> None:
         with self._lock:
@@ -763,7 +818,7 @@ class EventLedger:
             rows = self._connection.execute(
                 "SELECT sha256, byte_length, media_type FROM artifacts ORDER BY sha256"
             ).fetchall()
-        return tuple(
+        references = tuple(
             ArtifactRef(
                 engagement_id=self.engagement_id,
                 sha256=str(row["sha256"]),
@@ -772,6 +827,8 @@ class EventLedger:
             )
             for row in rows
         )
+        self._validate_paths()
+        return references
 
     def add_search_document(
         self,
@@ -844,7 +901,9 @@ class EventLedger:
                 ).fetchall()
             except sqlite3.Error as exc:
                 raise StorageError(f"search query failed closed: {exc}") from exc
-        return tuple(dict(row) for row in rows)
+        results = tuple(dict(row) for row in rows)
+        self._validate_paths()
+        return results
 
     def add_graph_node(
         self,
@@ -958,7 +1017,7 @@ class EventLedger:
                 """,
                 (node_id, node_id, limit),
             ).fetchall()
-        return tuple(
+        results = tuple(
             {
                 "edge_id": row["edge_id"],
                 "source_node_id": row["source_node_id"],
@@ -970,3 +1029,5 @@ class EventLedger:
             }
             for row in rows
         )
+        self._validate_paths()
+        return results

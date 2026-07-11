@@ -9,6 +9,7 @@ import json
 import os
 import secrets
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,11 +17,11 @@ from typing import Any
 from .canonical import canonical_json
 from .cas import EngagementKey
 from .filesystem import (
+    DirectoryBinding,
     NOFOLLOW,
     PRIVATE_FILE_MODE,
     inode_identity,
     open_private_directory,
-    open_root_directory,
     require_private_file,
 )
 from .types import ChainIntegrityError, CrossEngagementError, StorageError, require_identifier
@@ -56,10 +57,27 @@ class AnchorCheckpoint:
 class EngagementLock:
     """A private stable-inode advisory lock shared by all StateStore processes."""
 
-    def __init__(self, anchor_root: Path, engagement_id: str) -> None:
+    def __init__(
+        self,
+        anchor_root: Path,
+        engagement_id: str,
+        *,
+        path_validator: Callable[[], None] | None = None,
+    ) -> None:
         self.engagement_id = require_identifier(engagement_id, field="engagement_id")
-        self._root_fd = open_root_directory(Path(anchor_root), create=True)
-        self._locks_fd = open_private_directory(self._root_fd, "locks", create=True)
+        self._path_validator = path_validator
+        self._root_binding = DirectoryBinding(
+            Path(anchor_root), create=True, context="external anchor root"
+        )
+        self._root_fd = self._root_binding.descriptor
+        try:
+            self._locks_fd = open_private_directory(
+                self._root_fd, "locks", create=True
+            )
+        except Exception:
+            self._root_binding.close()
+            raise
+        self._locks_identity = inode_identity(os.fstat(self._locks_fd))
         namespace = hashlib.sha256(self.engagement_id.encode("utf-8")).hexdigest()
         self._name = f"{namespace}.lock"
         descriptor: int | None = None
@@ -101,12 +119,26 @@ class EngagementLock:
         self._thread_lock = threading.RLock()
         self._depth = 0
         self._closed = False
+        try:
+            self._revalidate()
+        except Exception:
+            os.close(self._descriptor)
+            self._close_directories()
+            self._closed = True
+            raise
 
     def _close_directories(self) -> None:
         os.close(self._locks_fd)
-        os.close(self._root_fd)
+        self._root_binding.close()
 
     def _revalidate(self) -> None:
+        self._root_binding.revalidate()
+        locks_fd = open_private_directory(self._root_fd, "locks", create=False)
+        try:
+            if inode_identity(os.fstat(locks_fd)) != self._locks_identity:
+                raise StorageError("engagement lock directory path identity changed")
+        finally:
+            os.close(locks_fd)
         try:
             metadata = os.stat(self._name, dir_fd=self._locks_fd, follow_symlinks=False)
         except OSError as exc:
@@ -114,44 +146,73 @@ class EngagementLock:
         require_private_file(metadata, context="engagement lock path")
         if inode_identity(metadata) != self._identity:
             raise StorageError("engagement lock inode changed")
+        if self._path_validator is not None:
+            self._path_validator()
 
     def __enter__(self) -> EngagementLock:
         if self._closed:
             raise StorageError("engagement lock is closed")
         self._thread_lock.acquire()
+        flock_acquired = False
         try:
             if self._depth == 0:
                 self._revalidate()
                 fcntl.flock(self._descriptor, fcntl.LOCK_EX)
+                flock_acquired = True
                 self._revalidate()
             self._depth += 1
             return self
         except Exception:
+            if flock_acquired:
+                fcntl.flock(self._descriptor, fcntl.LOCK_UN)
             self._thread_lock.release()
             raise
 
     def __exit__(self, *_: object) -> None:
+        failure: Exception | None = None
         try:
             self._depth -= 1
             if self._depth == 0:
-                fcntl.flock(self._descriptor, fcntl.LOCK_UN)
+                try:
+                    self._revalidate()
+                except Exception as exc:
+                    failure = exc
         finally:
+            if self._depth == 0:
+                fcntl.flock(self._descriptor, fcntl.LOCK_UN)
             self._thread_lock.release()
+        if failure is not None:
+            raise failure
 
     def close(self) -> None:
         if self._closed:
             return
         if self._depth:
             raise StorageError("cannot close a held engagement lock")
-        os.close(self._descriptor)
-        self._close_directories()
-        self._closed = True
+        failure: Exception | None = None
+        try:
+            self._revalidate()
+        except Exception as exc:
+            failure = exc
+        finally:
+            os.close(self._descriptor)
+            self._close_directories()
+            self._closed = True
+        if failure is not None:
+            raise failure
 
 
 class AuthenticatedAnchor:
     """Key-authenticated chain checkpoint stored outside the mutable state root."""
 
-    def __init__(self, anchor_root: Path, engagement_id: str, key: EngagementKey) -> None:
+    def __init__(
+        self,
+        anchor_root: Path,
+        engagement_id: str,
+        key: EngagementKey,
+        *,
+        path_validator: Callable[[], None] | None = None,
+    ) -> None:
         self.engagement_id = require_identifier(engagement_id, field="engagement_id")
         material = key._copy_for_cipher()
         context = self.engagement_id.encode("utf-8")
@@ -161,18 +222,55 @@ class AuthenticatedAnchor:
         self._key_commitment = hmac.digest(
             material, b"faultloom-engagement-key-v1\0" + context, "sha256"
         ).hex()
-        self._root_fd = open_root_directory(Path(anchor_root), create=True)
-        self._anchors_fd = open_private_directory(self._root_fd, "anchors", create=True)
+        self._path_validator = path_validator
+        self._root_binding = DirectoryBinding(
+            Path(anchor_root), create=True, context="external anchor root"
+        )
+        self._root_fd = self._root_binding.descriptor
+        try:
+            self._anchors_fd = open_private_directory(
+                self._root_fd, "anchors", create=True
+            )
+        except Exception:
+            self._root_binding.close()
+            raise
+        self._anchors_identity = inode_identity(os.fstat(self._anchors_fd))
         namespace = hashlib.sha256(self.engagement_id.encode("utf-8")).hexdigest()
         self._name = f"{namespace}.anchor"
         self._closed = False
+        try:
+            self._validate_paths()
+        except Exception:
+            os.close(self._anchors_fd)
+            self._root_binding.close()
+            self._closed = True
+            raise
+
+    def _validate_paths(self) -> None:
+        self._root_binding.revalidate()
+        anchors_fd = open_private_directory(self._root_fd, "anchors", create=False)
+        try:
+            if inode_identity(os.fstat(anchors_fd)) != self._anchors_identity:
+                raise StorageError("authenticated anchor directory path identity changed")
+        finally:
+            os.close(anchors_fd)
+        if self._path_validator is not None:
+            self._path_validator()
 
     def close(self) -> None:
         if self._closed:
             return
-        os.close(self._anchors_fd)
-        os.close(self._root_fd)
-        self._closed = True
+        failure: Exception | None = None
+        try:
+            self._validate_paths()
+        except Exception as exc:
+            failure = exc
+        finally:
+            os.close(self._anchors_fd)
+            self._root_binding.close()
+            self._closed = True
+        if failure is not None:
+            raise failure
 
     def _body(self, checkpoint: AnchorCheckpoint) -> dict[str, Any]:
         return {
@@ -195,6 +293,7 @@ class AuthenticatedAnchor:
     def load_optional(self) -> AnchorCheckpoint | None:
         if self._closed:
             raise StorageError("authenticated anchor is closed")
+        self._validate_paths()
         try:
             descriptor = os.open(
                 self._name,
@@ -202,11 +301,13 @@ class AuthenticatedAnchor:
                 dir_fd=self._anchors_fd,
             )
         except FileNotFoundError:
+            self._validate_paths()
             return None
         except OSError as exc:
             raise StorageError("cannot safely open authenticated anchor") from exc
         try:
-            require_private_file(os.fstat(descriptor), context="authenticated anchor")
+            opened = os.fstat(descriptor)
+            require_private_file(opened, context="authenticated anchor")
             chunks: list[bytes] = []
             total = 0
             while True:
@@ -260,9 +361,16 @@ class AuthenticatedAnchor:
         )
         if self._encoded(checkpoint) != data:
             raise ChainIntegrityError("authenticated anchor encoding is not canonical")
+        named_after = os.stat(
+            self._name, dir_fd=self._anchors_fd, follow_symlinks=False
+        )
+        if inode_identity(named_after) != inode_identity(opened):
+            raise ChainIntegrityError("authenticated anchor name changed while reading")
+        self._validate_paths()
         return checkpoint
 
     def write(self, checkpoint: AnchorCheckpoint) -> None:
+        self._validate_paths()
         if checkpoint.engagement_id != self.engagement_id:
             raise CrossEngagementError("cannot write a foreign engagement anchor")
         encoded = self._encoded(checkpoint)
@@ -291,6 +399,7 @@ class AuthenticatedAnchor:
                 dst_dir_fd=self._anchors_fd,
             )
             os.fsync(self._anchors_fd)
+            self._validate_paths()
         finally:
             if descriptor is not None:
                 os.close(descriptor)

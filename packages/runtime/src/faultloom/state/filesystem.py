@@ -134,3 +134,39 @@ def open_private_file(
 
 def inode_identity(metadata: os.stat_result) -> tuple[int, int]:
     return metadata.st_dev, metadata.st_ino
+
+
+class DirectoryBinding:
+    """Bind a long-lived directory descriptor to its configured visible path."""
+
+    def __init__(self, path: Path, *, create: bool, context: str) -> None:
+        self.path = Path(path)
+        self.context = context
+        self.descriptor = open_root_directory(self.path, create=create)
+        self._identity = inode_identity(os.fstat(self.descriptor))
+        self._closed = False
+
+    def revalidate(self) -> None:
+        if self._closed:
+            raise StorageError(f"{self.context} binding is closed")
+        retained = os.fstat(self.descriptor)
+        require_private_directory(retained, context=self.context)
+        if inode_identity(retained) != self._identity:
+            raise StorageError(f"{self.context} descriptor identity changed")
+        try:
+            visible = open_root_directory(self.path, create=False)
+        except StorageError as exc:
+            raise StorageError(
+                f"{self.context} is no longer safely reachable at its configured path"
+            ) from exc
+        try:
+            if inode_identity(os.fstat(visible)) != self._identity:
+                raise StorageError(f"{self.context} visible path identity changed")
+        finally:
+            os.close(visible)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        os.close(self.descriptor)
+        self._closed = True
