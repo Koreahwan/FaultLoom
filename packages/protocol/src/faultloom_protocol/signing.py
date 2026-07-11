@@ -232,12 +232,13 @@ def _verification_controls(
 ) -> datetime:
     if now is None:
         verified_at = _utc_now()
-    elif type(now) is not datetime:
-        raise ValueError("verification time must be None or an exact datetime")
+    elif type(now) is not datetime or now.tzinfo is not timezone.utc:
+        raise ValueError(
+            "verification time must be None or an exact datetime with "
+            "tzinfo=timezone.utc"
+        )
     else:
         verified_at = now
-    if verified_at.tzinfo is None or verified_at.utcoffset() is None:
-        raise ValueError("verification time must include a timezone")
     if (
         type(maximum_clock_skew) is not timedelta
         or maximum_clock_skew < timedelta(0)
@@ -362,8 +363,10 @@ def _verify(
     now: datetime,
     maximum_clock_skew: timedelta,
 ) -> T:
-    if now.tzinfo is None or now.utcoffset() is None:
-        raise ValueError("verification time must include a timezone")
+    if type(now) is not datetime or now.tzinfo is not timezone.utc:
+        raise ValueError(
+            "verification time must be an exact datetime with tzinfo=timezone.utc"
+        )
     if type(minimum_sequence) is not int or not 1 <= minimum_sequence <= MAX_INT64:
         raise ValueError("minimum trusted sequence must be within signed int64")
     if block.purpose is not purpose:

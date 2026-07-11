@@ -20,10 +20,12 @@ signed older artifact is valid cryptographically but is rejected below that
 trusted monotonic watermark.
 
 Verifier controls are validated before operator dispatch. `now` is either
-`None` or an exact, timezone-aware base `datetime`; `maximum_clock_skew` is an
-exact non-negative `timedelta`; monotonic watermarks are exact positive `int`
-values; and expected binding values are exact `str` values. Subclasses are
-rejected so they cannot override truthiness, arithmetic, or comparisons.
+`None` or an exact base `datetime` whose `tzinfo` is the built-in
+`timezone.utc` singleton; custom and non-UTC timezone objects are rejected
+without invoking their hooks. `maximum_clock_skew` is an exact non-negative
+`timedelta`; monotonic watermarks are exact positive `int` values; and expected
+binding values are exact `str` values. Subclasses are rejected so they cannot
+override truthiness, arithmetic, comparisons, or timezone behavior.
 
 `GatewayEpochReceiptIssuer` is a host-side T13 capability, not a wire model.
 It first calls the ordinary Ed25519 `verify_scope_epoch` path with an explicit
