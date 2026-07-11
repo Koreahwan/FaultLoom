@@ -15,7 +15,7 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Literal, Protocol, Self
 
@@ -45,9 +45,9 @@ from faultloom_protocol.signing import SignatureVerificationError
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
 _CURSOR_COMPONENT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
-_CURSOR_VERSION = 1
+_CURSOR_VERSION = 2
 _CHECKPOINT_BINDING_DOMAIN = b"faultloom-context-checkpoint-v1\0"
-_CURSOR_AUTH_DOMAIN = b"faultloom-range-cursor-v1\0"
+_CURSOR_AUTH_DOMAIN = b"faultloom-range-cursor-v2\0"
 _VIEW_BINDING_DOMAIN = b"faultloom-retrieved-view-v1\0"
 MAX_RETRIEVAL_PAGE_BYTES = 1_048_576
 MAX_RETRIEVAL_PAGE_LINES = 50_000
@@ -642,6 +642,7 @@ class _RetrievalCursorSnapshot:
     engagement_digest: str
     run_id: str
     content_id: str
+    media_type: str
     unit: RetrievalUnit
     start: int
     count: int
@@ -740,6 +741,10 @@ class BoundedRetriever:
         )
         if content.run_id != cursor_snapshot.run_id:
             raise RetrievalCursorError("cursor no longer identifies the stored run")
+        if content.media_type != cursor_snapshot.media_type:
+            raise RetrievalCursorError(
+                "cursor media type no longer identifies the stored output"
+            )
         if content.watermark != cursor_snapshot.watermark:
             raise RetrievalCursorError("cursor watermark no longer identifies the stored output")
         return self._view(
@@ -850,6 +855,7 @@ class BoundedRetriever:
                 engagement_id=content.engagement_id,
                 run_id=content.run_id,
                 content_id=content.content_id,
+                media_type=content.media_type,
                 unit=unit,
                 start=end,
                 count=count,
@@ -912,6 +918,7 @@ class BoundedRetriever:
         engagement_id: str,
         run_id: str,
         content_id: str,
+        media_type: str,
         unit: RetrievalUnit,
         start: int,
         count: int,
@@ -923,6 +930,7 @@ class BoundedRetriever:
                 "engagement_digest": _engagement_digest(engagement_id),
                 "run_id": run_id,
                 "content_id": content_id,
+                "media_type": media_type,
                 "unit": unit.value,
                 "start": start,
                 "count": count,
@@ -963,6 +971,7 @@ class BoundedRetriever:
             "engagement_digest",
             "run_id",
             "content_id",
+            "media_type",
             "unit",
             "start",
             "count",
@@ -980,6 +989,10 @@ class BoundedRetriever:
             )
             run_id = _require_identifier(document["run_id"], "cursor run_id")
             content_id = _require_digest(document["content_id"], "cursor content ID")
+            media_type = _require_media_type(
+                document["media_type"],
+                "cursor media type",
+            )
             unit_value = document["unit"]
             if type(unit_value) is not str:
                 raise ValueError("invalid unit")
@@ -994,6 +1007,7 @@ class BoundedRetriever:
             engagement_digest=engagement_digest,
             run_id=run_id,
             content_id=content_id,
+            media_type=media_type,
             unit=unit,
             start=start,
             count=count,
@@ -1324,14 +1338,22 @@ def _view_binding_tag(key: bytes, view: RetrievedView) -> str:
 
 
 def _require_aware_datetime(value: object) -> datetime:
-    if (
-        type(value) is not datetime
-        or value.tzinfo is None
-        or value.utcoffset() is None
-    ):
+    if type(value) is not datetime or value.tzinfo is not timezone.utc:
         raise ContextScopeError(
-            "scope verification time must be an exact datetime with a timezone"
+            "scope verification time must be an exact datetime with timezone.utc"
         )
+    return value
+
+
+def _require_media_type(value: object, label: str) -> str:
+    if (
+        type(value) is not str
+        or not value
+        or value != value.strip()
+        or len(value) > 256
+        or any(not 32 <= ord(character) <= 126 for character in value)
+    ):
+        raise RetrievalError(f"{label} is invalid")
     return value
 
 

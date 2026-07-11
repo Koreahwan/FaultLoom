@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import json
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone, tzinfo
 
 import pytest
 from pydantic import ValidationError
@@ -649,6 +649,63 @@ def test_scope_verification_time_rejects_datetime_alias_before_comparison() -> N
     assert MasqueradingDatetime.magic_calls == 0
 
 
+def test_scope_verification_time_rejects_custom_tzinfo_without_hooks() -> None:
+    class CountingTimezone(tzinfo):
+        calls = 0
+
+        def utcoffset(self, value: datetime | None) -> timedelta:
+            type(self).calls += 1
+            return timedelta(0)
+
+        def dst(self, value: datetime | None) -> timedelta:
+            type(self).calls += 1
+            return timedelta(0)
+
+        def tzname(self, value: datetime | None) -> str:
+            type(self).calls += 1
+            return "UTC"
+
+    class ExplodingTimezone(tzinfo):
+        calls = 0
+
+        @classmethod
+        def _unexpected(cls):
+            cls.calls += 1
+            raise AssertionError("caller-controlled tzinfo hook executed")
+
+        def utcoffset(self, value: datetime | None):
+            return type(self)._unexpected()
+
+        def dst(self, value: datetime | None):
+            return type(self)._unexpected()
+
+        def tzname(self, value: datetime | None):
+            return type(self)._unexpected()
+
+    assert VERIFY_AT.tzinfo is timezone.utc
+    for hostile in (CountingTimezone(), ExplodingTimezone()):
+        supplied = datetime(
+            VERIFY_AT.year,
+            VERIFY_AT.month,
+            VERIFY_AT.day,
+            VERIFY_AT.hour,
+            VERIFY_AT.minute,
+            VERIFY_AT.second,
+            VERIFY_AT.microsecond,
+            tzinfo=hostile,
+            fold=VERIFY_AT.fold,
+        )
+        with pytest.raises(ContextScopeError, match=r"timezone\.utc"):
+            compiler().compile(
+                context_state(),
+                provider(),
+                live=True,
+                verification_time=supplied,
+            )
+    assert CountingTimezone.calls == 0
+    assert ExplodingTimezone.calls == 0
+
+
 def test_compile_rejects_non_boolean_live_scalar_before_truth_testing() -> None:
     class ExplodingTruth:
         truth_calls = 0
@@ -848,6 +905,53 @@ def test_cursor_is_bound_to_the_original_run() -> None:
         run_id="run.2",
     )
     with pytest.raises(RetrievalCursorError, match="stored run"):
+        retriever.continue_range(
+            engagement_id="engagement.1",
+            cursor=first.next_cursor,
+        )
+
+
+@pytest.mark.parametrize(
+    ("original_media_type", "replacement_media_type"),
+    (
+        ("text/plain", "text/html"),
+        ("application/octet-stream", "text/plain"),
+        ("text/plain", "application/octet-stream"),
+    ),
+)
+def test_cursor_is_bound_to_the_exact_media_type(
+    original_media_type: str,
+    replacement_media_type: str,
+) -> None:
+    backend = MemoryBackend()
+    record = backend.add(
+        b"one\ntwo\n",
+        media_type=original_media_type,
+    )
+    retriever = BoundedRetriever(
+        backend,
+        cursor_key=b"media-type-cursor-key" + b"m" * 32,
+        max_page_lines=1,
+    )
+    first = retriever.read_range(
+        engagement_id="engagement.1",
+        content_id=record.content_id,
+        unit=RetrievalUnit.LINES,
+        start=0,
+        count=1,
+    )
+    assert first.next_cursor is not None
+    unchanged = retriever.continue_range(
+        engagement_id="engagement.1",
+        cursor=first.next_cursor,
+    )
+    assert unchanged.media_type == original_media_type
+
+    backend.records[("engagement.1", record.content_id)] = replace(
+        record,
+        media_type=replacement_media_type,
+    )
+    with pytest.raises(RetrievalCursorError, match="media type"):
         retriever.continue_range(
             engagement_id="engagement.1",
             cursor=first.next_cursor,
