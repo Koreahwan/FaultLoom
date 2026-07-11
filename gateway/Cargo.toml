@@ -1,0 +1,21 @@
+[package]
+name = "faultloom-gateway"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96.1"
+description = "Fail-closed target egress kernel for FaultLoom"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "faultloom_gateway"
+path = "src/lib.rs"
+
+[[bin]]
+name = "faultloom-gateway"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
