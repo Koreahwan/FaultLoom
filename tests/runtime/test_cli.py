@@ -295,6 +295,158 @@ def test_key_replacement_after_authority_read_cannot_change_trust_anchor(
     assert replaced is True
 
 
+def test_authority_open_triggered_key_replacement_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, trusted_key = _authority_files(tmp_path / "trusted-a", signer_seed=0)
+    attacker_authority, attacker_key = _authority_files(
+        tmp_path / "attacker-b", signer_seed=37
+    )
+    active_key = tmp_path / "active-key.json"
+    active_key.write_bytes(trusted_key.read_bytes())
+    pending_key = tmp_path / "pending-attacker-key.json"
+    pending_key.write_bytes(attacker_key.read_bytes())
+    original_open = cli._open_bound_protocol_file
+    events: list[str] = []
+    replaced = False
+
+    def replace_when_authority_opens(
+        candidate: object,
+    ) -> cli._BoundProtocolFile:
+        nonlocal replaced
+        path = getattr(candidate, "path", candidate)
+        bound = original_open(candidate)  # type: ignore[arg-type]
+        events.append(f"open:{Path(path).name}")
+        if path == attacker_authority and not replaced:
+            os.replace(pending_key, active_key)
+            events.append("swap:key-after-authority-open")
+            replaced = True
+        return bound
+
+    monkeypatch.setattr(cli, "_open_bound_protocol_file", replace_when_authority_opens)
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+
+    assert cli.main(_run_arguments(attacker_authority, active_key)) == cli.EXIT_AUTHORITY
+    assert replaced is True
+    assert events == [
+        "open:active-key.json",
+        "open:authority.json",
+        "swap:key-after-authority-open",
+    ]
+
+
+def test_both_paths_are_snapshotted_and_bound_before_either_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority_path, key_path = _authority_files(tmp_path)
+    original_snapshot = cli._snapshot_protocol_file_path
+    original_open = cli._open_bound_protocol_file
+    original_read = cli._read_bound_protocol_file
+    original_reconcile = cli._reconcile_bound_protocol_file
+    events: list[str] = []
+
+    def record_snapshot(path: Path) -> cli._ProtocolFilePathSnapshot:
+        snapshot = original_snapshot(path)
+        events.append(f"snapshot:{path.name}")
+        return snapshot
+
+    def record_open(
+        snapshot: cli._ProtocolFilePathSnapshot,
+    ) -> cli._BoundProtocolFile:
+        bound = original_open(snapshot)
+        events.append(f"open:{snapshot.path.name}")
+        return bound
+
+    def record_read(bound: cli._BoundProtocolFile) -> bytes:
+        content = original_read(bound)
+        events.append(f"read:{bound.path.name}")
+        return content
+
+    def record_reconcile(bound: cli._BoundProtocolFile) -> None:
+        original_reconcile(bound)
+        events.append(f"reconcile:{bound.path.name}")
+
+    monkeypatch.setattr(cli, "_snapshot_protocol_file_path", record_snapshot)
+    monkeypatch.setattr(cli, "_open_bound_protocol_file", record_open)
+    monkeypatch.setattr(cli, "_read_bound_protocol_file", record_read)
+    monkeypatch.setattr(cli, "_reconcile_bound_protocol_file", record_reconcile)
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+
+    assert cli.main(_run_arguments(authority_path, key_path)) == cli.EXIT_OK
+    assert events == [
+        "snapshot:authority-public-key.json",
+        "snapshot:authority.json",
+        "open:authority-public-key.json",
+        "open:authority.json",
+        "read:authority.json",
+        "read:authority-public-key.json",
+        "reconcile:authority.json",
+        "reconcile:authority-public-key.json",
+    ]
+
+
+@pytest.mark.parametrize("swap_target", ("trusted_key", "authority"))
+def test_leaf_replacement_after_pre_snapshot_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    swap_target: str,
+) -> None:
+    authority_path, key_path = _authority_files(tmp_path / "active")
+    selected = key_path if swap_target == "trusted_key" else authority_path
+    replacement = tmp_path / f"pending-{swap_target}.json"
+    replacement.write_bytes(selected.read_bytes())
+    original_snapshot = cli._snapshot_protocol_file_path
+    replaced = False
+
+    def replace_after_snapshot(path: Path) -> cli._ProtocolFilePathSnapshot:
+        nonlocal replaced
+        snapshot = original_snapshot(path)
+        if path == selected and not replaced:
+            os.replace(replacement, selected)
+            replaced = True
+        return snapshot
+
+    monkeypatch.setattr(cli, "_snapshot_protocol_file_path", replace_after_snapshot)
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+
+    assert cli.main(_run_arguments(authority_path, key_path)) == cli.EXIT_AUTHORITY
+    assert replaced is True
+
+
+def test_component_replacement_after_both_pre_snapshots_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active = tmp_path / "active"
+    authority_path, key_path = _authority_files(active)
+    replacement = tmp_path / "replacement"
+    _authority_files(replacement)
+    parked = tmp_path / "parked"
+    original_snapshot = cli._snapshot_protocol_file_path
+    snapshots = 0
+
+    def replace_component_after_snapshots(
+        path: Path,
+    ) -> cli._ProtocolFilePathSnapshot:
+        nonlocal snapshots
+        snapshot = original_snapshot(path)
+        snapshots += 1
+        if snapshots == 2:
+            active.rename(parked)
+            replacement.rename(active)
+        return snapshot
+
+    monkeypatch.setattr(
+        cli, "_snapshot_protocol_file_path", replace_component_after_snapshots
+    )
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+
+    assert cli.main(_run_arguments(authority_path, key_path)) == cli.EXIT_AUTHORITY
+    assert snapshots == 2
+
+
 @pytest.mark.parametrize("mutation", ("rename", "in_place_restore"))
 def test_authority_mutation_after_capture_starts_fails_closed(
     tmp_path: Path,
@@ -449,6 +601,94 @@ def test_loopback_hostname_uses_canonical_ascii_grammar(
     expected: bool,
 ) -> None:
     assert cli._hostname_is_loopback(hostname) is expected
+
+
+@pytest.mark.parametrize(
+    ("cidr", "expected"),
+    (
+        ("127.0.0.0/8", True),
+        ("127.0.0.1/32", True),
+        ("127.255.255.255/32", True),
+        ("::1/128", True),
+        ("127.0.0.1", False),
+        ("127.0.0.1/8", False),
+        ("127.1.2.3/8", False),
+        ("127.0.0.1/08", False),
+        ("127.0.0.1/255.0.0.0", False),
+        ("2130706433/32", False),
+        ("0:0:0:0:0:0:0:1/128", False),
+        ("0:0:0:0:0:0:0:A/128", False),
+        ("::1%lo/128", False),
+        ("::1%25lo/128", False),
+        ("::1%eth0/128", False),
+        ("::1/0128", False),
+        ("::1/128 ", False),
+        (" ::1/128", False),
+        ("::ffff:127.0.0.1/128", False),
+        ("127.0.0.0/7", False),
+    ),
+)
+def test_loopback_cidr_uses_canonical_ascii_grammar(
+    cidr: str,
+    expected: bool,
+) -> None:
+    assert cli._network_is_loopback(cidr) is expected
+
+
+@pytest.mark.parametrize(
+    "cidr",
+    (
+        "127.0.0.1",
+        "127.0.0.1/8",
+        "127.1.2.3/8",
+        "127.0.0.1/08",
+        "127.0.0.1/255.0.0.0",
+        "2130706433/32",
+        "0:0:0:0:0:0:0:1/128",
+        "0:0:0:0:0:0:0:A/128",
+        "::1%lo/128",
+        "::1%25lo/128",
+        "::1%eth0/128",
+        "::1/0128",
+        "::1/128 ",
+        " ::1/128",
+        "::ffff:127.0.0.1/128",
+        "127.0.0.0/7",
+    ),
+)
+def test_signed_noncanonical_or_non_loopback_cidrs_are_denied(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cidr: str,
+) -> None:
+    authority_path, key_path = _authority_files(
+        tmp_path,
+        hostnames=(),
+        cidrs=(cidr,),
+    )
+    if cidr != cidr.strip():
+        raw = json.loads(authority_path.read_text(encoding="utf-8"))
+        raw["payload"]["targets"][0]["cidrs"] = [cidr]
+        authority_path.write_text(json.dumps(raw), encoding="utf-8")
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+
+    assert cli.main(_run_arguments(authority_path, key_path)) == cli.EXIT_AUTHORITY
+
+
+@pytest.mark.parametrize("cidr", ("127.0.0.0/8", "127.0.0.1/32", "::1/128"))
+def test_signed_canonical_loopback_cidrs_are_accepted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cidr: str,
+) -> None:
+    authority_path, key_path = _authority_files(
+        tmp_path,
+        hostnames=(),
+        cidrs=(cidr,),
+    )
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+
+    assert cli.main(_run_arguments(authority_path, key_path)) == cli.EXIT_OK
 
 
 @pytest.mark.parametrize(

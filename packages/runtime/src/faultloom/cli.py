@@ -69,6 +69,16 @@ class _BoundProtocolFile:
     initial_stat: os.stat_result
 
 
+@dataclass(frozen=True)
+class _ProtocolFilePathSnapshot:
+    path: Path
+    root: str
+    directory_names: tuple[str, ...]
+    directory_stats: tuple[os.stat_result, ...]
+    leaf_name: str
+    leaf_stat: os.stat_result
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -147,14 +157,56 @@ def _require_regular_single_link(
         raise _protocol_file_error(path, "input must have exactly one hard link")
 
 
-def _open_bound_protocol_file(path: Path) -> _BoundProtocolFile:
+def _snapshot_protocol_file_path(path: Path) -> _ProtocolFilePathSnapshot:
+    root, parts = _path_parts(path)
+    directory_names: list[str] = []
+    directory_stats: list[os.stat_result] = []
+    current_path = Path(root)
+
+    try:
+        root_stat = os.stat(root, follow_symlinks=False)
+        if not stat.S_ISDIR(root_stat.st_mode):
+            raise _protocol_file_error(path, "path root is not a real directory")
+        directory_stats.append(root_stat)
+
+        for component in parts[:-1]:
+            current_path /= component
+            component_stat = os.stat(current_path, follow_symlinks=False)
+            if not stat.S_ISDIR(component_stat.st_mode):
+                raise _protocol_file_error(path, "path component is not a real directory")
+            directory_names.append(component)
+            directory_stats.append(component_stat)
+
+        leaf_name = parts[-1]
+        leaf_stat = os.stat(current_path / leaf_name, follow_symlinks=False)
+        _require_regular_single_link(path, leaf_stat)
+        if leaf_stat.st_size > MAX_PROTOCOL_FILE_BYTES:
+            raise _protocol_file_error(
+                path,
+                f"input exceeds {MAX_PROTOCOL_FILE_BYTES} bytes",
+            )
+        return _ProtocolFilePathSnapshot(
+            path=path,
+            root=root,
+            directory_names=tuple(directory_names),
+            directory_stats=tuple(directory_stats),
+            leaf_name=leaf_name,
+            leaf_stat=leaf_stat,
+        )
+    except CliError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise _protocol_file_error(path, str(exc)) from exc
+
+
+def _open_bound_protocol_file(
+    snapshot: _ProtocolFilePathSnapshot,
+) -> _BoundProtocolFile:
+    path = snapshot.path
     if not _secure_open_flags_available():
         raise _protocol_file_error(path, "secure descriptor flags are unavailable")
 
-    root, parts = _path_parts(path)
     directory_descriptors: list[int] = []
-    directory_names: list[str] = []
-    directory_stats: list[os.stat_result] = []
     file_descriptor: int | None = None
     directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
     file_flags = (
@@ -166,11 +218,17 @@ def _open_bound_protocol_file(path: Path) -> _BoundProtocolFile:
     )
 
     try:
-        root_descriptor = os.open(root, directory_flags)
+        root_descriptor = os.open(snapshot.root, directory_flags)
         directory_descriptors.append(root_descriptor)
-        directory_stats.append(os.fstat(root_descriptor))
+        root_stat = os.fstat(root_descriptor)
+        if not stat.S_ISDIR(root_stat.st_mode) or not _stat_matches(
+            snapshot.directory_stats[0],
+            root_stat,
+            _DIRECTORY_STAT_FIELDS,
+        ):
+            raise _protocol_file_error(path, "path root changed before opening")
 
-        for component in parts[:-1]:
+        for index, component in enumerate(snapshot.directory_names, start=1):
             parent_descriptor = directory_descriptors[-1]
             before = os.stat(
                 component,
@@ -179,31 +237,37 @@ def _open_bound_protocol_file(path: Path) -> _BoundProtocolFile:
             )
             if not stat.S_ISDIR(before.st_mode):
                 raise _protocol_file_error(path, "path component is not a real directory")
+            expected = snapshot.directory_stats[index]
+            if not _stat_matches(expected, before, _DIRECTORY_STAT_FIELDS):
+                raise _protocol_file_error(path, "path component changed before opening")
             child_descriptor = os.open(component, directory_flags, dir_fd=parent_descriptor)
             try:
                 child_stat = os.fstat(child_descriptor)
             except OSError:
                 os.close(child_descriptor)
                 raise
-            if not _stat_matches(before, child_stat, _DIRECTORY_STAT_FIELDS):
+            if not _stat_matches(expected, child_stat, _DIRECTORY_STAT_FIELDS):
                 os.close(child_descriptor)
                 raise _protocol_file_error(path, "path component changed while opening")
-            directory_names.append(component)
             directory_descriptors.append(child_descriptor)
-            directory_stats.append(child_stat)
 
-        leaf_name = parts[-1]
         parent_descriptor = directory_descriptors[-1]
         before = os.stat(
-            leaf_name,
+            snapshot.leaf_name,
             dir_fd=parent_descriptor,
             follow_symlinks=False,
         )
         _require_regular_single_link(path, before)
-        file_descriptor = os.open(leaf_name, file_flags, dir_fd=parent_descriptor)
+        if not _stat_matches(snapshot.leaf_stat, before, _FILE_STAT_FIELDS):
+            raise _protocol_file_error(path, "input changed before opening")
+        file_descriptor = os.open(
+            snapshot.leaf_name,
+            file_flags,
+            dir_fd=parent_descriptor,
+        )
         opened = os.fstat(file_descriptor)
         _require_regular_single_link(path, opened)
-        if not _stat_matches(before, opened, _FILE_STAT_FIELDS):
+        if not _stat_matches(snapshot.leaf_stat, opened, _FILE_STAT_FIELDS):
             raise _protocol_file_error(path, "input changed while opening")
         if opened.st_size > MAX_PROTOCOL_FILE_BYTES:
             raise _protocol_file_error(
@@ -214,10 +278,10 @@ def _open_bound_protocol_file(path: Path) -> _BoundProtocolFile:
             path=path,
             descriptor=file_descriptor,
             directory_descriptors=tuple(directory_descriptors),
-            directory_names=tuple(directory_names),
-            directory_stats=tuple(directory_stats),
-            leaf_name=leaf_name,
-            initial_stat=opened,
+            directory_names=snapshot.directory_names,
+            directory_stats=snapshot.directory_stats,
+            leaf_name=snapshot.leaf_name,
+            initial_stat=snapshot.leaf_stat,
         )
     except CliError:
         if file_descriptor is not None:
@@ -308,9 +372,11 @@ def _capture_protocol_file_pair(
     authority_path: Path,
     key_path: Path,
 ) -> tuple[bytes, bytes]:
-    authority = _open_bound_protocol_file(authority_path)
+    key_snapshot = _snapshot_protocol_file_path(key_path)
+    authority_snapshot = _snapshot_protocol_file_path(authority_path)
+    key = _open_bound_protocol_file(key_snapshot)
     try:
-        key = _open_bound_protocol_file(key_path)
+        authority = _open_bound_protocol_file(authority_snapshot)
         try:
             authority_content = _read_bound_protocol_file(authority)
             key_content = _read_bound_protocol_file(key)
@@ -318,9 +384,9 @@ def _capture_protocol_file_pair(
             _reconcile_bound_protocol_file(key)
             return authority_content, key_content
         finally:
-            _close_bound_protocol_file(key)
+            _close_bound_protocol_file(authority)
     finally:
-        _close_bound_protocol_file(authority)
+        _close_bound_protocol_file(key)
 
 
 def _validate_json_depth(text: str) -> None:
@@ -356,7 +422,9 @@ def _parse_protocol_file(
     try:
         text = content.decode("utf-8")
         _validate_json_depth(text)
-        json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+        raw_value = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+        if model_type is SignedAuthorityGrant:
+            _validate_signed_authority_cidr_wire_values(raw_value)
         return model_type.model_validate_json(text)
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
         raise CliError(
@@ -375,12 +443,53 @@ def _trusted_key_path(arguments: argparse.Namespace) -> Path:
     return Path(value)
 
 
-def _network_is_loopback(value: str) -> bool:
+def _canonical_network(
+    value: object,
+) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
+    if (
+        not isinstance(value, str)
+        or not value
+        or not value.isascii()
+        or "%" in value
+        or any(ord(character) < 33 or ord(character) > 126 for character in value)
+    ):
+        return None
     try:
-        network = ipaddress.ip_network(value, strict=False)
+        network = ipaddress.ip_network(value, strict=True)
     except ValueError:
-        return False
-    return network.network_address.is_loopback and network.broadcast_address.is_loopback
+        return None
+    return network if str(network) == value else None
+
+
+def _validate_signed_authority_cidr_wire_values(value: object) -> None:
+    if not isinstance(value, dict):
+        return
+    payload = value.get("payload")
+    if not isinstance(payload, dict):
+        return
+    targets = payload.get("targets")
+    if not isinstance(targets, list):
+        return
+    for target in targets:
+        if not isinstance(target, dict):
+            continue
+        cidrs = target.get("cidrs")
+        if not isinstance(cidrs, list):
+            continue
+        for cidr in cidrs:
+            if isinstance(cidr, str) and _canonical_network(cidr) is None:
+                raise ValueError(
+                    "CIDR must use canonical ASCII network-prefix notation"
+                )
+
+
+def _network_is_loopback(value: str) -> bool:
+    network = _canonical_network(value)
+    return bool(
+        network is not None
+        and network.network_address.is_loopback
+        and network.broadcast_address.is_loopback
+    )
 
 
 def _hostname_is_loopback(value: str) -> bool:
