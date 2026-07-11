@@ -379,7 +379,7 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
         adapter_id="adapter.http",
         adapter_version="0.1.0",
         upstream_version="0.28.1",
-        upstream_commit="0123456789abcdef",
+        upstream_commit="0123456789abcdef0123456789abcdef01234567",
         license_class=m.LicenseClass.BUNDLED_OPEN_SOURCE,
         capabilities=("semantic_http",),
         action_classes=(m.ActionClass.OBSERVE, m.ActionClass.SAFE_PROBE),
@@ -390,7 +390,7 @@ def sample_models() -> dict[str, m.ProtocolModel]:  # type: ignore[name-defined]
             m.AdapterBudget,
             rate_per_minute=10, timeout_seconds=30, max_bytes=65536, max_concurrency=2
         ),
-        telemetry_policy="telemetry.disabled",
+        telemetry_policy=m.TelemetryPolicy.DISABLED,
         evidence_capability=m.EvidenceCapability.EVIDENCE_CAPABLE,
     )
     pack_manifest = _model(

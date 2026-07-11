@@ -10,7 +10,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Annotated, Literal
 
-from pydantic import BeforeValidator, Field, model_validator
+from pydantic import AfterValidator, BeforeValidator, Field, model_validator
 
 from .base import (
     AwareDatetime,
@@ -24,12 +24,29 @@ from .base import (
     ShortStr,
 )
 from .canonical import sha256_digest
-from .compatibility import require_protocol_compatible
+from .compatibility import SemVer, require_protocol_compatible
 
 Port = Annotated[int, Field(ge=1, le=65535)]
 PositiveInt = Annotated[int, Field(ge=1, le=MAX_INT64)]
 NonNegativeInt = Annotated[int, Field(ge=0, le=MAX_INT64)]
 ConfidenceBps = Annotated[int, Field(ge=0, le=10_000)]
+
+
+def _require_stable_semver(value: str) -> str:
+    SemVer.parse(value)
+    return value
+
+
+StableSemVer = Annotated[str, AfterValidator(_require_stable_semver)]
+SchemaNamespace = Annotated[
+    str,
+    Field(
+        min_length=5,
+        max_length=256,
+        pattern=r"^[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)+\.v[1-9][0-9]*$",
+    ),
+]
+UpstreamCommit = Annotated[str, Field(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")]
 
 
 def _reject_base64url_surrounding_whitespace(value: object) -> object:
@@ -639,6 +656,12 @@ class EvidenceCapability(str, Enum):
     EVIDENCE_CAPABLE = "evidence_capable"
 
 
+class TelemetryPolicy(str, Enum):
+    DISABLED = "disabled"
+    LOCAL_RECEIPTS_ONLY = "local_receipts_only"
+    EXTERNAL_USER_MANAGED = "external_user_managed"
+
+
 class AdapterBudget(ProtocolModel):
     rate_per_minute: PositiveInt
     timeout_seconds: PositiveInt
@@ -648,9 +671,9 @@ class AdapterBudget(ProtocolModel):
 
 class AdapterManifest(ProtocolModel):
     adapter_id: Identifier
-    adapter_version: ShortStr
+    adapter_version: StableSemVer
     upstream_version: ShortStr
-    upstream_commit: ShortStr | None = None
+    upstream_commit: UpstreamCommit | None = None
     image_digest: Sha256Digest | None = None
     license_class: LicenseClass
     capabilities: tuple[Identifier, ...]
@@ -659,16 +682,38 @@ class AdapterManifest(ProtocolModel):
     input_schema_digest: Sha256Digest
     output_schema_digest: Sha256Digest
     budget: AdapterBudget
-    telemetry_policy: Identifier
+    telemetry_policy: TelemetryPolicy
     update_policy: Literal["pinned_no_runtime_updates"] = "pinned_no_runtime_updates"
     evidence_capability: EvidenceCapability
+
+    @model_validator(mode="after")
+    def _immutable_v01_contract(self) -> "AdapterManifest":
+        if self.upstream_version.casefold() == "latest" or any(
+            marker in self.upstream_version for marker in ("*", "@", ">", "<", "=")
+        ):
+            raise ValueError("upstream_version must identify one pinned release")
+        if self.upstream_commit is None and self.image_digest is None:
+            raise ValueError("adapter requires an immutable upstream commit or image digest")
+        if not self.capabilities or not self.action_classes:
+            raise ValueError("adapter requires capabilities and action classes")
+        if len(self.capabilities) != len(set(self.capabilities)):
+            raise ValueError("adapter capabilities must be unique")
+        if len(self.action_classes) != len(set(self.action_classes)):
+            raise ValueError("adapter action classes must be unique")
+        unsupported = {ActionClass.HIGH_LOAD, ActionClass.DESTRUCTIVE}.intersection(
+            self.action_classes
+        )
+        if unsupported:
+            names = ", ".join(sorted(item.value for item in unsupported))
+            raise ValueError(f"unsupported v0.1 adapter action classes: {names}")
+        return self
 
 
 class PackManifest(ProtocolModel):
     pack_id: Identifier
-    pack_version: ShortStr
+    pack_version: StableSemVer
     protocol_range: ShortStr
-    schema_namespace: Identifier
+    schema_namespace: SchemaNamespace
     capability_descriptors: tuple[Identifier, ...]
     action_compilers: tuple[Identifier, ...]
     observation_normalizers: tuple[Identifier, ...]
@@ -682,6 +727,22 @@ class PackManifest(ProtocolModel):
     @model_validator(mode="after")
     def _supports_local_protocol(self) -> "PackManifest":
         require_protocol_compatible("0.1.0", self.protocol_range)
+        fields = (
+            "capability_descriptors",
+            "action_compilers",
+            "observation_normalizers",
+            "hypothesis_providers",
+            "verifier_descriptors",
+            "evaluation_descriptors",
+            "required_gateway_features",
+            "required_adapter_capabilities",
+        )
+        if not self.capability_descriptors:
+            raise ValueError("pack requires at least one capability descriptor")
+        for field in fields:
+            values = getattr(self, field)
+            if len(values) != len(set(values)):
+                raise ValueError(f"pack {field} must contain unique values")
         return self
 
 
