@@ -519,6 +519,10 @@ class KnowledgeTransport(Protocol):
 Clock = Callable[[], datetime]
 
 
+class _UntrustedClockError(RuntimeError):
+    """Raised before an untrusted clock value can execute caller-defined hooks."""
+
+
 @dataclass(frozen=True, slots=True)
 class _AuthorityGeneration:
     authority_digest: str
@@ -531,17 +535,24 @@ def _system_clock() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _trusted_datetime(value: object, *, source: str) -> datetime:
+    if type(value) is not datetime or value.tzinfo is not timezone.utc:
+        raise _UntrustedClockError(f"{source} must be an exact UTC datetime")
+    return value
+
+
 def _trusted_now(clock: Clock) -> datetime:
-    now = clock()
-    if now.tzinfo is None or now.utcoffset() is None:
-        raise RuntimeError("egress clock must return a timezone-aware datetime")
-    return now
+    return _trusted_datetime(clock(), source="egress clock")
 
 
 def _authority_is_current(grant: AuthorityGrant, now: datetime) -> bool:
+    trusted_now = _trusted_datetime(now, source="authority evaluation time")
     return (
-        grant.not_before <= now < grant.expires_at
-        and any(window.starts_at <= now < window.ends_at for window in grant.execution_windows)
+        grant.not_before <= trusted_now < grant.expires_at
+        and any(
+            window.starts_at <= trusted_now < window.ends_at
+            for window in grant.execution_windows
+        )
     )
 
 
@@ -783,8 +794,9 @@ class TrustedAuthorityState:
         return sha256_digest(self._trusted_reconciliation_key)
 
     def verify(self, now: datetime) -> tuple[AuthorityGrant, ScopeEpoch]:
+        trusted_now = _trusted_datetime(now, source="authority verification time")
         with self._lock:
-            grant, epoch, _ = self._verify_generation_locked(now)
+            grant, epoch, _ = self._verify_generation_locked(trusted_now)
             return grant, epoch
 
     def snapshot_generation(self) -> _AuthorityGeneration:
@@ -797,8 +809,9 @@ class TrustedAuthorityState:
         *,
         expected: _AuthorityGeneration | None = None,
     ) -> tuple[AuthorityGrant, ScopeEpoch, _AuthorityGeneration]:
+        trusted_now = _trusted_datetime(now, source="authority verification time")
         with self._lock:
-            grant, epoch, generation = self._verify_generation_locked(now)
+            grant, epoch, generation = self._verify_generation_locked(trusted_now)
             if expected is not None and generation != expected:
                 raise ValueError("authority generation changed during dispatch")
             return grant, epoch, generation
@@ -851,10 +864,11 @@ class TrustedAuthorityState:
     def _verify_generation_locked(
         self, now: datetime
     ) -> tuple[AuthorityGrant, ScopeEpoch, _AuthorityGeneration]:
+        trusted_now = _trusted_datetime(now, source="authority verification time")
         grant = verify_authority_grant(
             self._authority,
             self._trusted_key,
-            now=now,
+            now=trusted_now,
             minimum_version=1,
             expected_grant_id=self._authority.payload.grant_id,
         )
@@ -862,17 +876,18 @@ class TrustedAuthorityState:
             epoch = verify_scope_epoch(
                 self._scope_epoch,
                 self._trusted_key,
-                now=now,
+                now=trusted_now,
                 minimum_epoch=1,
                 expected_grant_id=grant.grant_id,
             )
         except AuthorityRevokedError:
-            self._observe(grant, self._scope_epoch.payload, now, revoked=True)
+            self._observe(grant, self._scope_epoch.payload, trusted_now, revoked=True)
             raise
-        self._observe(grant, epoch, now, revoked=False)
+        self._observe(grant, epoch, trusted_now, revoked=False)
         return grant, epoch, self._generation_locked()
 
     def install_scope_epoch(self, scope_epoch: SignedScopeEpoch, *, now: datetime) -> None:
+        trusted_now = _trusted_datetime(now, source="scope epoch installation time")
         if getattr(self._dispatch_local, "depth", 0):
             raise RuntimeError("scope epoch mutation during dispatch is forbidden")
         candidate = SignedScopeEpoch.model_validate(scope_epoch.model_dump(mode="python"))
@@ -882,7 +897,7 @@ class TrustedAuthorityState:
                 raise ValueError("scope epoch update must advance monotonically")
             self._scope_epoch = candidate
             try:
-                self._verify_generation_locked(now)
+                self._verify_generation_locked(trusted_now)
             except AuthorityRevokedError:
                 raise
             except (SignatureVerificationError, ValueError, sqlite3.Error, OSError, RuntimeError):
@@ -914,6 +929,7 @@ class TrustedAuthorityState:
         action_digest: str,
         request_digest: str,
     ) -> ReconciliationAuthorization:
+        trusted_now = _trusted_datetime(now, source="reconciliation verification time")
         candidate = SignedReconciliationAuthorization.model_validate(
             authorization.model_dump(mode="python")
         )
@@ -922,7 +938,7 @@ class TrustedAuthorityState:
             raise SignatureVerificationError("untrusted reconciliation key")
         if candidate.payload_digest != sha256_digest(payload):
             raise SignatureVerificationError("reconciliation payload digest mismatch")
-        if not payload.issued_at <= now < payload.expires_at:
+        if not payload.issued_at <= trusted_now < payload.expires_at:
             raise SignatureVerificationError("reconciliation authorization is not current")
         if (
             payload.plane is not plane
@@ -1119,7 +1135,6 @@ class ProviderProxy:
         )
 
     def dispatch(self, request: ProviderRequest) -> EgressReceipt:
-        now = _trusted_now(self._clock)
         request_digest = sha256_digest(request)
         action_digest = provider_action_digest(request)
         snapshot = self._authority.snapshot_generation()
@@ -1136,6 +1151,18 @@ class ProviderProxy:
                 "live": self._live,
             }
         )
+        try:
+            now = _trusted_now(self._clock)
+        except _UntrustedClockError:
+            return self._denied(
+                request=request,
+                request_digest=request_digest,
+                authority_digest=authority_digest,
+                scope_epoch=scope_epoch,
+                policy_digest=unverified_policy_digest,
+                denial=DenialCode.AUTHORITY_VERIFICATION_FAILED,
+                now=_system_clock(),
+            )
         try:
             grant, epoch, generation = self._authority.verify_generation(now)
         except (AuthorityRevokedError, SignatureExpiredError, SignatureNotYetValidError):
@@ -1216,7 +1243,18 @@ class ProviderProxy:
                 denial=destination_denial or DenialCode.DESTINATION_RESOLUTION_DENIED,
                 now=now,
             )
-        admitted_at = _trusted_now(self._clock)
+        try:
+            admitted_at = _trusted_now(self._clock)
+        except _UntrustedClockError:
+            return self._denied(
+                request=request,
+                request_digest=request_digest,
+                authority_digest=authority_digest,
+                scope_epoch=epoch.epoch,
+                policy_digest=policy_digest,
+                denial=DenialCode.AUTHORITY_VERIFICATION_FAILED,
+                now=now,
+            )
         try:
             self._authority.verify_generation(admitted_at, expected=generation)
         except (AuthorityRevokedError, SignatureExpiredError, SignatureNotYetValidError):
@@ -1343,10 +1381,10 @@ class ProviderProxy:
     ) -> bool:
         if not isinstance(authorization, SignedReconciliationAuthorization):
             return False
-        now = _trusted_now(self._clock)
         request_digest = sha256_digest(request)
         action_digest = provider_action_digest(request)
         try:
+            now = _trusted_now(self._clock)
             payload = self._authority.verify_reconciliation(
                 authorization,
                 now=now,
@@ -1523,7 +1561,7 @@ class ProviderProxy:
                 scope_epoch=scope_epoch,
                 policy_digest=policy_digest,
                 denial=DenialCode.AUTHORITY_NOT_CURRENT,
-                now=_trusted_now(self._clock),
+                now=dispatch_now,
             )
         except (SignatureVerificationError, ValueError, sqlite3.Error, OSError, RuntimeError):
             return self._finish_reserved_without_send(
@@ -1535,7 +1573,7 @@ class ProviderProxy:
                 scope_epoch=scope_epoch,
                 policy_digest=policy_digest,
                 denial=DenialCode.AUTHORITY_VERIFICATION_FAILED,
-                now=_trusted_now(self._clock),
+                now=dispatch_now,
             )
         if not binding_matches:
             return self._finish_reserved_without_send(
@@ -1702,7 +1740,6 @@ class KnowledgeFetcher:
         )
 
     def dispatch(self, request: KnowledgeFetchIntent) -> EgressReceipt:
-        now = _trusted_now(self._clock)
         request_digest = sha256_digest(request)
         action_digest = knowledge_action_digest(request)
         snapshot = self._authority.snapshot_generation()
@@ -1718,6 +1755,18 @@ class KnowledgeFetcher:
                 "source": source,
             }
         )
+        try:
+            now = _trusted_now(self._clock)
+        except _UntrustedClockError:
+            return self._denied(
+                request=request,
+                request_digest=request_digest,
+                authority_digest=authority_digest,
+                scope_epoch=scope_epoch,
+                policy_digest=unverified_policy_digest,
+                denial=DenialCode.AUTHORITY_VERIFICATION_FAILED,
+                now=_system_clock(),
+            )
         try:
             grant, epoch, generation = self._authority.verify_generation(now)
         except (AuthorityRevokedError, SignatureExpiredError, SignatureNotYetValidError):
@@ -1796,7 +1845,18 @@ class KnowledgeFetcher:
                 denial=destination_denial or DenialCode.DESTINATION_RESOLUTION_DENIED,
                 now=now,
             )
-        admitted_at = _trusted_now(self._clock)
+        try:
+            admitted_at = _trusted_now(self._clock)
+        except _UntrustedClockError:
+            return self._denied(
+                request=request,
+                request_digest=request_digest,
+                authority_digest=authority_digest,
+                scope_epoch=epoch.epoch,
+                policy_digest=policy_digest,
+                denial=DenialCode.AUTHORITY_VERIFICATION_FAILED,
+                now=now,
+            )
         try:
             self._authority.verify_generation(admitted_at, expected=generation)
         except (AuthorityRevokedError, SignatureExpiredError, SignatureNotYetValidError):
@@ -1952,7 +2012,7 @@ class KnowledgeFetcher:
                 scope_epoch=epoch.epoch,
                 policy_digest=policy_digest,
                 denial=DenialCode.AUTHORITY_NOT_CURRENT,
-                now=_trusted_now(self._clock),
+                now=dispatch_now,
             )
         except (SignatureVerificationError, ValueError, sqlite3.Error, OSError, RuntimeError):
             return self._finish_reserved_without_send(
@@ -1964,7 +2024,7 @@ class KnowledgeFetcher:
                 scope_epoch=epoch.epoch,
                 policy_digest=policy_digest,
                 denial=DenialCode.AUTHORITY_VERIFICATION_FAILED,
-                now=_trusted_now(self._clock),
+                now=dispatch_now,
             )
         if not binding_matches:
             return self._finish_reserved_without_send(
@@ -2043,10 +2103,10 @@ class KnowledgeFetcher:
     ) -> bool:
         if not isinstance(authorization, SignedReconciliationAuthorization):
             return False
-        now = _trusted_now(self._clock)
         request_digest = sha256_digest(request)
         action_digest = knowledge_action_digest(request)
         try:
+            now = _trusted_now(self._clock)
             payload = self._authority.verify_reconciliation(
                 authorization,
                 now=now,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 import shutil
 import sqlite3
@@ -12,6 +12,7 @@ from threading import Event, Thread
 import pytest
 from pydantic import ValidationError
 
+import faultloom.egress as egress_module
 from faultloom.egress import (
     CompiledKnowledgeRequest,
     CompiledProviderRequest,
@@ -49,6 +50,7 @@ from faultloom_protocol import (
     SecretRef,
     SignedAuthorityGrant,
     SignedScopeEpoch,
+    SignatureExpiredError,
     sha256_digest,
     sign_authority_grant,
     sign_scope_epoch,
@@ -350,6 +352,100 @@ class MemoryKnowledgeTransport:
 
 def clock() -> datetime:
     return DISPATCH_TIME
+
+
+def hostile_expiry(
+    expiry: datetime, kind: str
+) -> tuple[datetime, dict[str, int]]:
+    calls = {
+        "comparison": 0,
+        "arithmetic": 0,
+        "utcoffset": 0,
+        "dst": 0,
+        "tzname": 0,
+        "fromutc": 0,
+    }
+
+    if kind == "subclass":
+
+        class HostileDatetime(datetime):
+            def _fail(self, hook: str) -> None:
+                calls[hook] += 1
+                raise AssertionError(f"hostile datetime {hook} hook executed")
+
+            def utcoffset(self):  # type: ignore[no-untyped-def]
+                self._fail("utcoffset")
+
+            def __lt__(self, other):  # type: ignore[no-untyped-def]
+                self._fail("comparison")
+
+            def __le__(self, other):  # type: ignore[no-untyped-def]
+                self._fail("comparison")
+
+            def __gt__(self, other):  # type: ignore[no-untyped-def]
+                self._fail("comparison")
+
+            def __ge__(self, other):  # type: ignore[no-untyped-def]
+                self._fail("comparison")
+
+            def __add__(self, other):  # type: ignore[no-untyped-def]
+                self._fail("arithmetic")
+
+            def __radd__(self, other):  # type: ignore[no-untyped-def]
+                self._fail("arithmetic")
+
+            def __sub__(self, other):  # type: ignore[no-untyped-def]
+                self._fail("arithmetic")
+
+            def __rsub__(self, other):  # type: ignore[no-untyped-def]
+                self._fail("arithmetic")
+
+        value = HostileDatetime(
+            expiry.year,
+            expiry.month,
+            expiry.day,
+            expiry.hour,
+            expiry.minute,
+            expiry.second,
+            expiry.microsecond,
+            tzinfo=timezone.utc,
+            fold=expiry.fold,
+        )
+        return value, calls
+
+    if kind == "tzinfo":
+
+        class HostileTimezone(tzinfo):
+            def _fail(self, hook: str) -> None:
+                calls[hook] += 1
+                raise AssertionError(f"hostile timezone {hook} hook executed")
+
+            def utcoffset(self, value):  # type: ignore[no-untyped-def]
+                self._fail("utcoffset")
+
+            def dst(self, value):  # type: ignore[no-untyped-def]
+                self._fail("dst")
+
+            def tzname(self, value):  # type: ignore[no-untyped-def]
+                self._fail("tzname")
+
+            def fromutc(self, value):  # type: ignore[no-untyped-def]
+                self._fail("fromutc")
+
+        value = datetime(
+            expiry.year,
+            expiry.month,
+            expiry.day,
+            expiry.hour,
+            expiry.minute,
+            expiry.second,
+            expiry.microsecond,
+            tzinfo=HostileTimezone(),
+            fold=expiry.fold,
+        )
+        return value, calls
+
+    raise AssertionError(f"unknown hostile expiry kind: {kind}")
 
 
 def test_provider_proxy_compiles_only_configured_destination_and_secret_reference(
@@ -685,6 +781,147 @@ def test_expired_authority_is_checked_against_trusted_clock(tmp_path: Path) -> N
     receipt = fetcher.dispatch(knowledge_request(authority))
     assert receipt.denial_code is DenialCode.AUTHORITY_NOT_CURRENT
     assert transport.requests == []
+
+
+@pytest.mark.parametrize("kind", ["subclass", "tzinfo"])
+def test_authority_state_rejects_untrusted_exact_expiry_before_protocol_hooks(
+    kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    authority = grant()
+    state = authority_state(authority, tmp_path / "state.sqlite3")
+    untrusted_expiry, hook_calls = hostile_expiry(authority.expires_at, kind)
+    protocol_calls = {"grant": 0, "epoch": 0}
+    original_grant = egress_module.verify_authority_grant
+    original_epoch = egress_module.verify_scope_epoch
+
+    def verify_grant(*args: object, **kwargs: object):
+        protocol_calls["grant"] += 1
+        return original_grant(*args, **kwargs)
+
+    def verify_epoch(*args: object, **kwargs: object):
+        protocol_calls["epoch"] += 1
+        return original_epoch(*args, **kwargs)
+
+    monkeypatch.setattr(egress_module, "verify_authority_grant", verify_grant)
+    monkeypatch.setattr(egress_module, "verify_scope_epoch", verify_epoch)
+
+    with pytest.raises(RuntimeError, match="exact UTC datetime"):
+        state.verify_generation(untrusted_expiry)
+
+    assert protocol_calls == {"grant": 0, "epoch": 0}
+    assert all(count == 0 for count in hook_calls.values())
+
+
+def test_authority_state_retains_exact_utc_expiry_boundary(tmp_path: Path) -> None:
+    authority = grant()
+    state = authority_state(authority, tmp_path / "state.sqlite3")
+    before_expiry = authority.expires_at - timedelta(microseconds=1)
+
+    assert type(before_expiry) is datetime
+    assert before_expiry.tzinfo is timezone.utc
+    state.verify_generation(before_expiry)
+    with pytest.raises(SignatureExpiredError):
+        state.verify_generation(authority.expires_at)
+
+
+@pytest.mark.parametrize("plane", ["provider", "knowledge"])
+@pytest.mark.parametrize("kind", ["subclass", "tzinfo"])
+@pytest.mark.parametrize("hostile_call", [1, 2, 3, 4])
+def test_egress_rejects_untrusted_exact_expiry_at_every_clock_boundary(
+    plane: str,
+    kind: str,
+    hostile_call: int,
+    tmp_path: Path,
+) -> None:
+    authority = grant()
+    untrusted_expiry, hook_calls = hostile_expiry(authority.expires_at, kind)
+
+    class BoundaryClock:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self) -> datetime:
+            self.calls += 1
+            if self.calls == hostile_call:
+                return untrusted_expiry
+            return DISPATCH_TIME
+
+    boundary_clock = BoundaryClock()
+    if plane == "provider":
+        transport = MemoryProviderTransport()
+        receipt = provider_proxy(
+            authority,
+            tmp_path / "state.sqlite3",
+            transport=transport,
+            proxy_clock=boundary_clock,
+        ).dispatch(provider_request(authority))
+    else:
+        transport = MemoryKnowledgeTransport()
+        receipt = knowledge_fetcher(
+            authority,
+            tmp_path / "state.sqlite3",
+            transport=transport,
+            fetch_clock=boundary_clock,
+        ).dispatch(knowledge_request(authority))
+
+    assert boundary_clock.calls == hostile_call
+    assert receipt.outcome is EgressOutcome.DENIED
+    assert receipt.denial_code is DenialCode.AUTHORITY_VERIFICATION_FAILED
+    assert transport.requests == []
+    assert type(receipt.evaluated_at) is datetime
+    assert receipt.evaluated_at.tzinfo is timezone.utc
+    assert all(count == 0 for count in hook_calls.values())
+
+
+@pytest.mark.parametrize("plane", ["provider", "knowledge"])
+@pytest.mark.parametrize(
+    ("evaluation_time", "expected_outcome", "expected_denial", "transport_calls"),
+    [
+        (
+            grant().expires_at - timedelta(microseconds=1),
+            EgressOutcome.COMPLETED,
+            None,
+            1,
+        ),
+        (
+            grant().expires_at,
+            EgressOutcome.DENIED,
+            DenialCode.AUTHORITY_NOT_CURRENT,
+            0,
+        ),
+    ],
+)
+def test_egress_retains_exact_utc_expiry_controls(
+    plane: str,
+    evaluation_time: datetime,
+    expected_outcome: EgressOutcome,
+    expected_denial: DenialCode | None,
+    transport_calls: int,
+    tmp_path: Path,
+) -> None:
+    authority = grant()
+    assert type(evaluation_time) is datetime
+    assert evaluation_time.tzinfo is timezone.utc
+    if plane == "provider":
+        transport = MemoryProviderTransport()
+        receipt = provider_proxy(
+            authority,
+            tmp_path / "state.sqlite3",
+            transport=transport,
+            proxy_clock=lambda: evaluation_time,
+        ).dispatch(provider_request(authority))
+    else:
+        transport = MemoryKnowledgeTransport()
+        receipt = knowledge_fetcher(
+            authority,
+            tmp_path / "state.sqlite3",
+            transport=transport,
+            fetch_clock=lambda: evaluation_time,
+        ).dispatch(knowledge_request(authority))
+
+    assert receipt.outcome is expected_outcome
+    assert receipt.denial_code is expected_denial
+    assert len(transport.requests) == transport_calls
 
 
 @pytest.mark.parametrize(
