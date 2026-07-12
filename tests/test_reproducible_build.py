@@ -1167,9 +1167,35 @@ dependencies = []
                 metadata = wheel.read(metadata_name).decode("utf-8")
             self.assertIn("Description-Content-Type: text/x-rst\n", metadata)
 
-    def test_unsupported_entry_points_and_conflicting_license_fail_closed(self) -> None:
+    def test_console_scripts_are_deterministic_and_other_entry_points_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            make_repository(root)
+            project = root / "packages/demo/pyproject.toml"
+            write(
+                project,
+                project.read_text(encoding="utf-8")
+                + '\n[project.scripts]\nfaultloom-demo = "faultloom_demo:main"\n',
+            )
+            write(
+                root / "packages/demo/src/faultloom_demo/__init__.py",
+                "def main() -> int:\n    return 0\n",
+            )
+            commit_all(root, "Declare a deterministic console script")
+            output = root / "output"
+            build_once(root, output, EPOCH)
+            with zipfile.ZipFile(next(output.glob("*.whl"))) as wheel:
+                entry_points_name = next(
+                    name
+                    for name in wheel.namelist()
+                    if name.endswith(".dist-info/entry_points.txt")
+                )
+                self.assertEqual(
+                    wheel.read(entry_points_name),
+                    b"[console_scripts]\nfaultloom-demo = faultloom_demo:main\n",
+                )
+
         additions = (
-            ('\n[project.scripts]\nfaultloom-demo = "faultloom_demo:main"\n', "unsupported"),
             (
                 '\n[project.entry-points."faultloom.plugins"]\n'
                 'demo = "faultloom_demo:plugin"\n',
@@ -1186,6 +1212,69 @@ dependencies = []
                     commit_all(root, "Declare unsupported entry-point metadata")
                     with self.assertRaisesRegex(BuildPolicyError, error):
                         discover_projects(root, load_policy(root))
+
+        malformed_scripts = (
+            ('"bad script" = "faultloom_demo:main"', "invalid project script name"),
+            ('faultloom-demo = "faultloom_demo:main()"', "invalid project script target"),
+            ('faultloom-demo = ["faultloom_demo:main"]', "invalid project script target"),
+        )
+        for declaration, error in malformed_scripts:
+            with self.subTest(declaration=declaration):
+                with tempfile.TemporaryDirectory() as raw:
+                    root = Path(raw)
+                    make_repository(root)
+                    project = root / "packages/demo/pyproject.toml"
+                    write(
+                        project,
+                        project.read_text(encoding="utf-8")
+                        + f"\n[project.scripts]\n{declaration}\n",
+                    )
+                    commit_all(root, "Declare an invalid console script")
+                    with self.assertRaisesRegex(BuildPolicyError, error):
+                        discover_projects(root, load_policy(root))
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            make_repository(root)
+            project = root / "packages/demo/pyproject.toml"
+            write(
+                project,
+                project.read_text(encoding="utf-8")
+                + '\n[project.scripts]\nfaultloom-demo = "os:system"\n',
+            )
+            commit_all(root, "Target a module outside the wheel")
+            with self.assertRaisesRegex(BuildPolicyError, "outside its wheel"):
+                build_once(root, root / "output", EPOCH)
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            make_repository(root)
+            demo_project = root / "packages/demo/pyproject.toml"
+            write(
+                demo_project,
+                demo_project.read_text(encoding="utf-8")
+                + '\n[project.scripts]\nFaultLoom-Demo = "faultloom_demo:main"\n',
+            )
+            second_project = root / "packages/second/pyproject.toml"
+            write(
+                second_project,
+                demo_project.read_text(encoding="utf-8").replace(
+                    'name = "faultloom-demo"', 'name = "faultloom-second"'
+                ).replace(
+                    'FaultLoom-Demo = "faultloom_demo:main"',
+                    'faultloom-demo = "faultloom_second:main"',
+                ),
+            )
+            write(root / "packages/second/README.md", "# Second\n")
+            write(root / "packages/second/LICENSE", "project license\n")
+            write(root / "packages/second/NOTICE", "project notice\n")
+            write(
+                root / "packages/second/src/faultloom_second/__init__.py",
+                "def main() -> int:\n    return 0\n",
+            )
+            commit_all(root, "Collide console script names across projects")
+            with self.assertRaisesRegex(BuildPolicyError, "unique across projects"):
+                discover_projects(root, load_policy(root))
 
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

@@ -41,7 +41,7 @@ from tools.rust_toolchain import (
 )
 
 
-BUILDER_ID = "faultloom-core-builder/0.2"
+BUILDER_ID = "faultloom-core-builder/0.3"
 MINIMUM_ZIP_EPOCH = 315532800  # 1980-01-01T00:00:00Z
 PINNED_ACTION_REFERENCE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*"
@@ -99,6 +99,13 @@ EXACT_PROJECT_DEPENDENCY = re.compile(
 SAFE_VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+){1,3}$")
 SAFE_PROJECT_NAME = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$"
+)
+SAFE_SCRIPT_NAME = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$"
+)
+SAFE_SCRIPT_TARGET = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*:"
+    r"[A-Za-z_][A-Za-z0-9_]*$"
 )
 SAFE_REQUIRES_PYTHON = re.compile(
     r"^(?:(?:~=|==|!=|<=|>=|<|>)[0-9]+\.[0-9]+(?:\.[0-9]+)?)"
@@ -219,6 +226,7 @@ class Project:
     readme: Path | None
     readme_content_type: str | None
     license_files: tuple[Path, ...]
+    scripts: tuple[tuple[str, str], ...]
 
 
 @dataclass(frozen=True)
@@ -1064,6 +1072,7 @@ def discover_projects(
                 "optional-dependencies",
                 "readme",
                 "requires-python",
+                "scripts",
                 "version",
             }
             unsupported_fields = sorted(set(project) - supported_project_fields)
@@ -1096,6 +1105,7 @@ def discover_projects(
                     f"requires-python uses an unsupported specifier in {manifest.path}"
                 )
             dependencies = project.get("dependencies", [])
+            raw_scripts = project.get("scripts", {})
             optional_dependencies = project.get("optional-dependencies", {})
             dynamic = project.get("dynamic", [])
             build_requirements = build.get("requires", [])
@@ -1105,6 +1115,36 @@ def discover_projects(
                 raise BuildPolicyError(
                     f"project dependencies must be a string list in {manifest.path}"
                 )
+            if not isinstance(raw_scripts, dict):
+                raise BuildPolicyError(
+                    f"project scripts must be a string table in {manifest.path}"
+                )
+            scripts: list[tuple[str, str]] = []
+            normalized_script_names: set[str] = set()
+            for script_name, script_target in sorted(raw_scripts.items()):
+                if (
+                    not isinstance(script_name, str)
+                    or SAFE_SCRIPT_NAME.fullmatch(script_name) is None
+                ):
+                    raise BuildPolicyError(
+                        f"invalid project script name in {manifest.path}: {script_name!r}"
+                    )
+                normalized_script_name = script_name.casefold()
+                if normalized_script_name in normalized_script_names:
+                    raise BuildPolicyError(
+                        f"duplicate normalized project script name in {manifest.path}: "
+                        f"{script_name!r}"
+                    )
+                if (
+                    not isinstance(script_target, str)
+                    or SAFE_SCRIPT_TARGET.fullmatch(script_target) is None
+                ):
+                    raise BuildPolicyError(
+                        f"invalid project script target in {manifest.path}: "
+                        f"{script_target!r}"
+                    )
+                normalized_script_names.add(normalized_script_name)
+                scripts.append((script_name, script_target))
             if optional_dependencies not in ({}, None):
                 raise BuildPolicyError(
                     f"optional project dependencies are unsupported in {manifest.path}"
@@ -1219,11 +1259,22 @@ def discover_projects(
                     readme=readme,
                     readme_content_type=readme_content_type,
                     license_files=tuple(license_files),
+                    scripts=tuple(scripts),
                 )
             )
     names = [_normalized_name(project.name) for project in projects]
     if len(names) != len(set(names)):
         raise BuildPolicyError("discovered package names must be unique")
+    script_owners: dict[str, str] = {}
+    for project in projects:
+        for script_name, _ in project.scripts:
+            normalized_script_name = script_name.casefold()
+            previous = script_owners.setdefault(normalized_script_name, project.name)
+            if previous != project.name:
+                raise BuildPolicyError(
+                    "console script names must be unique across projects: "
+                    f"{script_name!r} is declared by {previous!r} and {project.name!r}"
+                )
     return tuple(projects)
 
 
@@ -1468,6 +1519,17 @@ def build_wheel(
     revision: str = "HEAD",
 ) -> tuple[str, bytes]:
     files = _wheel_files(root, project, revision=revision)
+    for script_name, script_target in project.scripts:
+        module_name, _ = script_target.split(":", 1)
+        module_path = module_name.replace(".", "/")
+        if (
+            f"{module_path}.py" not in files
+            and f"{module_path}/__init__.py" not in files
+        ):
+            raise BuildPolicyError(
+                f"console script {script_name!r} targets a module outside its wheel: "
+                f"{module_name!r}"
+            )
     distribution = _wheel_name(project.name)
     version = _wheel_version(project.version)
     dist_info = f"{distribution}-{version}.dist-info"
@@ -1545,6 +1607,15 @@ def build_wheel(
         "Root-Is-Purelib: true\n"
         "Tag: py3-none-any\n"
     ).encode()
+    if project.scripts:
+        entry_points = ["[console_scripts]"]
+        entry_points.extend(
+            f"{script_name} = {script_target}"
+            for script_name, script_target in project.scripts
+        )
+        files[f"{dist_info}/entry_points.txt"] = (
+            "\n".join(entry_points) + "\n"
+        ).encode()
     for license_path, metadata_path in zip(
         wheel_license_files, license_metadata_paths, strict=True
     ):
