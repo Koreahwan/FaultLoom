@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TypeVar
@@ -75,6 +76,13 @@ class _TrustedPublicKey:
     public_key: Ed25519PublicKey
 
 
+@dataclass(frozen=True, slots=True)
+class _TrustedSignerMaterial:
+    key_id: str
+    private_key: Ed25519PrivateKey  # gitleaks:allow -- type name, not key material
+    public_key: Ed25519PublicKey
+
+
 _SCOPE_VERIFICATION_PROOF = object()
 
 
@@ -105,8 +113,17 @@ def _b64_decode(value: str) -> bytes:
     return decoded
 
 
+_backend_private_key_probe = Ed25519PrivateKey.from_private_bytes(bytes(32))
+_TRUSTED_PRIVATE_KEY_TYPE = type(_backend_private_key_probe)
+_TRUSTED_PUBLIC_KEY_TYPE = type(_backend_private_key_probe.public_key())
+del _backend_private_key_probe
+
+
 def _public_key_bytes(public_key: Ed25519PublicKey) -> bytes:
-    return public_key.public_bytes(
+    if type(public_key) is not _TRUSTED_PUBLIC_KEY_TYPE:
+        raise TypeError("public key must use the trusted Ed25519 backend")
+    return _TRUSTED_PUBLIC_KEY_TYPE.public_bytes(
+        public_key,
         encoding=serialization.Encoding.Raw,
         format=serialization.PublicFormat.Raw,
     )
@@ -115,6 +132,42 @@ def _public_key_bytes(public_key: Ed25519PublicKey) -> bytes:
 def _key_id(public_key: Ed25519PublicKey) -> str:
     digest = hashlib.sha256(_public_key_bytes(public_key)).hexdigest()
     return f"ed25519:sha256:{digest}"
+
+
+def _snapshot_private_key_material(private_key: object) -> _TrustedSignerMaterial:
+    if type(private_key) is not _TRUSTED_PRIVATE_KEY_TYPE:
+        raise TypeError("private_key must use the trusted concrete Ed25519 backend")
+    try:
+        private_bytes = _TRUSTED_PRIVATE_KEY_TYPE.private_bytes(
+            private_key,
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PrivateFormat.Raw,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Ed25519 private key could not be snapshotted") from exc
+    if type(private_bytes) is not bytes or len(private_bytes) != 32:
+        raise ValueError("Ed25519 private key snapshot must contain exactly 32 bytes")
+
+    reconstructed = Ed25519PrivateKey.from_private_bytes(private_bytes)
+    if type(reconstructed) is not _TRUSTED_PRIVATE_KEY_TYPE:
+        raise RuntimeError("Ed25519 backend returned an untrusted private key type")
+    source_public_key = _TRUSTED_PRIVATE_KEY_TYPE.public_key(private_key)
+    reconstructed_public_key = _TRUSTED_PRIVATE_KEY_TYPE.public_key(reconstructed)
+    if (
+        type(source_public_key) is not _TRUSTED_PUBLIC_KEY_TYPE
+        or type(reconstructed_public_key) is not _TRUSTED_PUBLIC_KEY_TYPE
+        or not hmac.compare_digest(
+            _public_key_bytes(source_public_key),
+            _public_key_bytes(reconstructed_public_key),
+        )
+    ):
+        raise ValueError("Ed25519 private key snapshot changes its public key")
+    return _TrustedSignerMaterial(
+        key_id=_key_id(reconstructed_public_key),
+        private_key=reconstructed,
+        public_key=reconstructed_public_key,
+    )
 
 
 class AuthoritySigner:
@@ -128,10 +181,9 @@ class AuthoritySigner:
     __slots__ = ("__private_key", "key_id")
 
     def __init__(self, private_key: Ed25519PrivateKey) -> None:
-        if not isinstance(private_key, Ed25519PrivateKey):
-            raise TypeError("private_key must be an Ed25519PrivateKey")
-        self.__private_key = private_key
-        self.key_id = _key_id(private_key.public_key())
+        trusted = _snapshot_private_key_material(private_key)
+        self.__private_key = trusted.private_key
+        self.key_id = trusted.key_id
 
     @classmethod
     def generate(cls) -> "AuthoritySigner":
@@ -139,21 +191,28 @@ class AuthoritySigner:
 
     @classmethod
     def from_private_bytes(cls, private_key: bytes) -> "AuthoritySigner":
+        if type(private_key) is not bytes:
+            raise TypeError("Ed25519 private key seed must be exact bytes")
         if len(private_key) != 32:
             raise ValueError("Ed25519 private key seed must contain exactly 32 bytes")
         return cls(Ed25519PrivateKey.from_private_bytes(private_key))
 
     @property
     def public_key_record(self) -> Ed25519PublicKeyRecord:
-        public_key = self.__private_key.public_key()
+        trusted = _snapshot_authority_signer(self)
         return Ed25519PublicKeyRecord(
             schema_version=SCHEMA_VERSION,
-            key_id=self.key_id,
-            public_key=_b64_encode(_public_key_bytes(public_key)),
+            key_id=trusted.key_id,
+            public_key=_b64_encode(_public_key_bytes(trusted.public_key)),
         )
 
     def sign(self, document: bytes) -> str:
-        return _b64_encode(self.__private_key.sign(document))
+        if type(document) is not bytes:
+            raise TypeError("signed document must be exact bytes")
+        trusted = _snapshot_authority_signer(self)
+        return _b64_encode(
+            _TRUSTED_PRIVATE_KEY_TYPE.sign(trusted.private_key, document)
+        )
 
     def __repr__(self) -> str:
         return f"AuthoritySigner(key_id={self.key_id!r}, private_key=<redacted>)"
@@ -170,15 +229,21 @@ def _snapshot_trusted_public_key(
         )
     except (TypeError, ValueError) as exc:
         raise UnknownKeyError("trusted public key record is malformed") from exc
-    raw_key = _b64_decode(record.public_key)
-    if len(raw_key) != 32:
-        raise UnknownKeyError("Ed25519 public key must contain exactly 32 bytes")
     try:
+        raw_key = _b64_decode(record.public_key)
+        if len(raw_key) != 32:
+            raise UnknownKeyError("Ed25519 public key must contain exactly 32 bytes")
         public_key = Ed25519PublicKey.from_public_bytes(raw_key)
-    except ValueError as exc:
-        raise UnknownKeyError("invalid Ed25519 public key") from exc
-    if _key_id(public_key) != record.key_id:
-        raise UnknownKeyError("public key bytes do not match key_id")
+        if type(public_key) is not _TRUSTED_PUBLIC_KEY_TYPE:
+            raise UnknownKeyError("invalid Ed25519 public key")
+        if _key_id(public_key) != record.key_id:
+            raise UnknownKeyError("public key bytes do not match key_id")
+    except UnknownKeyError:
+        raise
+    except SignatureTamperError as exc:
+        raise UnknownKeyError(f"trusted public key record is malformed: {exc}") from exc
+    except (TypeError, ValueError) as exc:
+        raise UnknownKeyError("trusted public key record is malformed") from exc
     return _TrustedPublicKey(key_id=record.key_id, public_key=public_key)
 
 
@@ -186,15 +251,55 @@ def load_public_key(record: Ed25519PublicKeyRecord) -> Ed25519PublicKey:
     return _snapshot_trusted_public_key(record).public_key
 
 
-def _signer_key_id(signer: AuthoritySigner) -> str:
+def _snapshot_authority_signer(signer: AuthoritySigner) -> _TrustedSignerMaterial:
     if type(signer) is not AuthoritySigner:
         raise TypeError("signer must be an exact AuthoritySigner")
     private_key = object.__getattribute__(signer, "_AuthoritySigner__private_key")
-    derived_key_id = _key_id(private_key.public_key())
+    trusted = _snapshot_private_key_material(private_key)
     stored_key_id = object.__getattribute__(signer, "key_id")
-    if type(stored_key_id) is not str or stored_key_id != derived_key_id:
+    if (
+        type(stored_key_id) is not str
+        or not hmac.compare_digest(stored_key_id, trusted.key_id)
+    ):
         raise ValueError("signer key_id does not match its private key")
-    return derived_key_id
+    return trusted
+
+
+_MISSING_SIGNATURE_FIELD = object()
+
+
+def _validate_signed_sequence(
+    value: object,
+    model_type: type[ProtocolModel],
+    *,
+    label: str,
+) -> None:
+    if type(value) is not model_type:
+        return
+    envelope_storage = object.__getattribute__(value, "__dict__")
+    if type(envelope_storage) is not dict:
+        return
+    signature = dict.get(
+        envelope_storage,
+        "signature",
+        _MISSING_SIGNATURE_FIELD,
+    )
+    if type(signature) is not SignatureBlock:
+        return
+    signature_storage = object.__getattribute__(signature, "__dict__")
+    if type(signature_storage) is not dict:
+        return
+    sequence = dict.get(
+        signature_storage,
+        "sequence",
+        _MISSING_SIGNATURE_FIELD,
+    )
+    if sequence is _MISSING_SIGNATURE_FIELD:
+        return
+    if type(sequence) is not int or not 1 <= sequence <= MAX_INT64:
+        raise SignatureRollbackError(
+            f"{label}.signature.sequence must be an exact integer within signed int64"
+        )
 
 
 def _snapshot_payload(payload: T, *, label: str) -> T:
@@ -210,6 +315,7 @@ def _snapshot_signed_model(
     *,
     label: str,
 ) -> T:
+    _validate_signed_sequence(value, model_type, label=label)
     try:
         return _snapshot_protocol_model(value, model_type, label=label)
     except _ProtocolSnapshotError as exc:
@@ -278,7 +384,8 @@ def _sign(
     signed_at: datetime,
     expires_at: datetime | None,
 ) -> SignatureBlock:
-    key_id = _signer_key_id(signer)
+    trusted_signer = _snapshot_authority_signer(signer)
+    key_id = trusted_signer.key_id
     payload_digest = sha256_digest(payload)
     unsigned = _signature_document(
         payload,
@@ -289,7 +396,12 @@ def _sign(
         expires_at=expires_at,
         payload_digest=payload_digest,
     )
-    signature = AuthoritySigner.sign(signer, canonical_json_bytes(unsigned))
+    signature = _b64_encode(
+        _TRUSTED_PRIVATE_KEY_TYPE.sign(
+            trusted_signer.private_key,
+            canonical_json_bytes(unsigned),
+        )
+    )
     return SignatureBlock(
         schema_version=SCHEMA_VERSION,
         purpose=purpose,

@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Callable, ClassVar
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 import faultloom_protocol.signing as signing_module
 from faultloom_protocol import (
@@ -28,6 +29,7 @@ from faultloom_protocol import (
     SignedScopeEpoch,
     UnknownKeyError,
     canonical_json_bytes,
+    load_public_key,
     sign_authority_grant,
     sign_engagement_bundle,
     sign_run_result_bundle,
@@ -208,6 +210,40 @@ class HostileEnumValue(str):
 
     def __hash__(self) -> int:
         self._hook()
+
+
+class SplitPrivateKey(Ed25519PrivateKey):
+    """Advertise one trusted key while attempting to sign with another."""
+
+    def __init__(
+        self,
+        advertised: Ed25519PrivateKey,
+        signing: Ed25519PrivateKey,
+    ) -> None:
+        self.advertised = advertised
+        self.signing = signing
+        self.calls = {
+            "public_key": 0,
+            "sign": 0,
+            "private_bytes": 0,
+            "private_bytes_raw": 0,
+        }
+
+    def public_key(self):  # type: ignore[no-untyped-def]
+        self.calls["public_key"] += 1
+        return self.advertised.public_key()
+
+    def sign(self, data: bytes) -> bytes:
+        self.calls["sign"] += 1
+        return self.signing.sign(data)
+
+    def private_bytes(self, encoding, format, encryption_algorithm):  # type: ignore[no-untyped-def]
+        self.calls["private_bytes"] += 1
+        return self.signing.private_bytes(encoding, format, encryption_algorithm)
+
+    def private_bytes_raw(self) -> bytes:
+        self.calls["private_bytes_raw"] += 1
+        return self.signing.private_bytes_raw()
 
 
 class HookedAuthorityEnvelope(SignedAuthorityGrant):
@@ -1106,3 +1142,190 @@ def test_each_trusted_key_is_snapshotted_once_per_public_verifier(
         assert len(calls) == len(expected_records)
         for record in expected_records:
             assert calls.count(id(record)) == 1
+
+
+def test_untrusted_private_key_backend_is_rejected_without_hooks_across_signers() -> None:
+    models = sample_models()
+    victim = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+    attacker = Ed25519PrivateKey.from_private_bytes(bytes([9]) * 32)
+    split = SplitPrivateKey(victim, attacker)
+
+    with pytest.raises(TypeError, match="trusted concrete Ed25519 backend"):
+        AuthoritySigner(split)
+    assert set(split.calls.values()) == {0}
+
+    signer = AuthoritySigner.from_private_bytes(bytes(range(32)))
+    object.__setattr__(signer, "_AuthoritySigner__private_key", split)
+    calls = (
+        lambda: sign_authority_grant(
+            models["AuthorityGrant"], signer, signed_at=NOW
+        ),
+        lambda: sign_scope_epoch(models["ScopeEpoch"], signer, signed_at=NOW),
+        lambda: sign_engagement_bundle(
+            models["EngagementBundle"], signer, signed_at=NOW
+        ),
+        lambda: sign_run_result_bundle(
+            models["RunResultBundle"], signer, signed_at=NOW
+        ),
+    )
+    for call in calls:
+        with pytest.raises(TypeError, match="trusted concrete Ed25519 backend"):
+            call()
+    assert set(split.calls.values()) == {0}
+
+
+def test_exact_private_backend_is_reconstructed_and_key_id_bound_across_signers() -> None:
+    models = sample_models()
+    source = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+    signer = AuthoritySigner(source)
+    stored = object.__getattribute__(signer, "_AuthoritySigner__private_key")
+    assert type(stored) is type(source)
+    assert stored is not source
+    assert signer.public_key_record.key_id == signer.key_id
+
+    envelopes = (
+        sign_authority_grant(models["AuthorityGrant"], signer, signed_at=NOW),
+        sign_scope_epoch(models["ScopeEpoch"], signer, signed_at=NOW),
+        sign_engagement_bundle(models["EngagementBundle"], signer, signed_at=NOW),
+        sign_run_result_bundle(models["RunResultBundle"], signer, signed_at=NOW),
+    )
+    assert all(envelope.signature.key_id == signer.key_id for envelope in envelopes)
+
+    object.__setattr__(signer, "key_id", "ed25519:sha256:" + "00" * 32)
+    calls = (
+        lambda: sign_authority_grant(
+            models["AuthorityGrant"], signer, signed_at=NOW
+        ),
+        lambda: sign_scope_epoch(models["ScopeEpoch"], signer, signed_at=NOW),
+        lambda: sign_engagement_bundle(
+            models["EngagementBundle"], signer, signed_at=NOW
+        ),
+        lambda: sign_run_result_bundle(
+            models["RunResultBundle"], signer, signed_at=NOW
+        ),
+    )
+    for call in calls:
+        with pytest.raises(ValueError, match="key_id does not match"):
+            call()
+
+
+def test_malformed_exact_public_key_maps_to_unknown_key_for_all_entrypoints() -> None:
+    authority, scope, engagement, result = _signed_state()
+    state = _state()
+    authority_signer = state["authority_signer"]
+    outer_signer = state["outer_signer"]
+    result_signer = state["result_signer"]
+    result_payload = state["result"]
+    assert isinstance(authority_signer, AuthoritySigner)
+    assert isinstance(outer_signer, AuthoritySigner)
+    assert isinstance(result_signer, AuthoritySigner)
+    assert isinstance(result_payload, RunResultBundle)
+
+    def malformed(key_id: str) -> Ed25519PublicKeyRecord:
+        return Ed25519PublicKeyRecord(
+            schema_version="0.1.0",
+            key_id=key_id,
+            public_key="A",
+        )
+
+    calls = (
+        lambda: load_public_key(malformed(authority_signer.key_id)),
+        lambda: verify_authority_grant(
+            authority,
+            malformed(authority_signer.key_id),
+            now=NOW,
+        ),
+        lambda: verify_scope_epoch(
+            scope,
+            malformed(authority_signer.key_id),
+            now=NOW,
+        ),
+        lambda: verify_engagement_bundle(
+            engagement,
+            malformed(outer_signer.key_id),
+            authority_public_key=authority_signer.public_key_record,
+            now=NOW,
+        ),
+        lambda: verify_run_result_bundle(
+            result,
+            malformed(result_signer.key_id),
+            now=NOW,
+            expected_run_id=result_payload.run_id,
+            expected_run_manifest_digest=result_payload.run_manifest_digest,
+            expected_authority_digest=result_payload.authority_digest,
+        ),
+    )
+    for call in calls:
+        with pytest.raises(UnknownKeyError, match="trusted public key"):
+            call()
+
+
+@pytest.mark.parametrize(
+    "sequence",
+    (0, -1, 2**63, True, "1", RollbackBypassInt(1)),
+)
+def test_invalid_exact_signature_sequence_maps_to_rollback_before_hooks(
+    sequence: object,
+) -> None:
+    authority, scope, engagement, result = _signed_state()
+
+    def corrupt(envelope: object) -> object:
+        signature = object.__getattribute__(envelope, "signature")
+        block = SignatureBlock.model_construct(
+            **{
+                **object.__getattribute__(signature, "__dict__"),
+                "sequence": sequence,
+            }
+        )
+        return type(envelope).model_construct(
+            **{
+                **object.__getattribute__(envelope, "__dict__"),
+                "signature": block,
+            }
+        )
+
+    RollbackBypassInt.hook_calls = 0
+    calls = _verification_calls(
+        authority=corrupt(authority),
+        scope=corrupt(scope),
+        engagement=corrupt(engagement),
+        result=corrupt(result),
+        now=NOW,
+    )
+    for call in calls:
+        with pytest.raises(SignatureRollbackError, match=r"signature\.sequence"):
+            call()
+    assert RollbackBypassInt.hook_calls == 0
+
+
+def test_registered_enum_value_is_bound_to_immutable_backing_without_hooks() -> None:
+    _, scope, _, _ = _signed_state()
+    signer = AuthoritySigner.from_private_bytes(bytes(range(32)))
+    member = SignaturePurpose.SCOPE_EPOCH
+    original_value = object.__getattribute__(member, "_value_")
+
+    for replacement in (
+        "scope_epoch_corrupt",
+        HostileEnumValue("scope_epoch_corrupt"),
+    ):
+        try:
+            object.__setattr__(member, "_value_", replacement)
+            HostileEnumValue.hook_calls = 0
+            with pytest.raises(ValueError, match="immutable expected value"):
+                canonical_json_bytes({"purpose": member})
+            with pytest.raises(ValueError, match="immutable expected value"):
+                signing_bytes(scope.payload, scope.signature)
+            with pytest.raises(SignatureTamperError, match="immutable expected value"):
+                verify_scope_epoch(scope, signer.public_key_record, now=NOW)
+            assert HostileEnumValue.hook_calls == 0
+        finally:
+            object.__setattr__(member, "_value_", original_value)
+
+    expected_value = str.__str__(member)
+    value_map = type.__getattribute__(type(member), "_value2member_map_")
+    registered = dict.pop(value_map, expected_value)
+    try:
+        with pytest.raises(ValueError, match="immutable expected value"):
+            canonical_json_bytes({"purpose": member})
+    finally:
+        dict.__setitem__(value_map, expected_value, registered)

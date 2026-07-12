@@ -41,7 +41,7 @@ def _normalize(value: object) -> object:
 def canonical_json_bytes(value: object) -> bytes:
     """Return the unique UTF-8 JSON representation used for hashes/signatures."""
 
-    snapshot = _snapshot_protocol_value(value)
+    snapshot = _snapshot_protocol_value(value, _enum_values=True)
     assert_no_raw_secret_fields(snapshot)
     normalized = _normalize(snapshot)
     return json.dumps(

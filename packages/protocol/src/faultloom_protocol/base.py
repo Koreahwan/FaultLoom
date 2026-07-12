@@ -134,12 +134,57 @@ def _safe_type_name(value_type: type[object]) -> str:
     return type_name if type(type_name) is str else "<unknown>"
 
 
+def _snapshot_protocol_enum_value(value: Enum, *, path: str) -> str:
+    value_type = type(value)
+    if not _trusted_protocol_type(value_type):
+        raise _ProtocolSnapshotError(
+            path,
+            "enum",
+            f"{path} must contain an exact protocol enum",
+        )
+    member_name = object.__getattribute__(value, "_name_")
+    member_map = type.__getattribute__(value_type, "_member_map_")
+    if (
+        type(member_name) is not str
+        or type(member_map) is not dict
+        or dict.get(member_map, member_name) is not value
+    ):
+        raise _ProtocolSnapshotError(
+            path,
+            "enum",
+            f"{path} must contain a registered protocol enum member",
+        )
+    member_value = object.__getattribute__(value, "_value_")
+    if not issubclass(value_type, str):
+        raise _ProtocolSnapshotError(
+            path,
+            "enum",
+            f"{path} protocol enum must have an immutable string value",
+        )
+    expected_value = str.__str__(value)
+    value_map = type.__getattribute__(value_type, "_value2member_map_")
+    if (
+        type(member_value) is not str
+        or type(expected_value) is not str
+        or member_value != expected_value
+        or type(value_map) is not dict
+        or dict.get(value_map, expected_value) is not value
+    ):
+        raise _ProtocolSnapshotError(
+            path,
+            "enum",
+            f"{path} protocol enum member differs from its immutable expected value",
+        )
+    return expected_value
+
+
 def _snapshot_protocol_value(
     value: object,
     *,
     path: str = "$",
     _ancestor_ids: frozenset[int] | None = None,
     _depth: int = 0,
+    _enum_values: bool = False,
 ) -> object:
     """Copy protocol data from field storage without calling user methods."""
 
@@ -181,6 +226,7 @@ def _snapshot_protocol_value(
                 path=f"{path}[{index}]",
                 _ancestor_ids=descendant_ancestors,
                 _depth=_depth + 1,
+                _enum_values=_enum_values,
             )
             for index, child in enumerate(value)
         )
@@ -191,6 +237,7 @@ def _snapshot_protocol_value(
                 path=f"{path}[{index}]",
                 _ancestor_ids=descendant_ancestors,
                 _depth=_depth + 1,
+                _enum_values=_enum_values,
             )
             for index, child in enumerate(value)
         ]
@@ -207,34 +254,14 @@ def _snapshot_protocol_value(
                         path=f"{path}.{key}",
                         _ancestor_ids=descendant_ancestors,
                         _depth=_depth + 1,
+                        _enum_values=_enum_values,
                     ),
                 )
             )
         return dict(safe_items)
     if isinstance(value, Enum):
-        if not _trusted_protocol_type(value_type):
-            raise _ProtocolSnapshotError(
-                path,
-                "enum",
-                f"{path} must contain an exact protocol enum",
-            )
-        member_map = type.__getattribute__(value_type, "_member_map_")
-        if type(member_map) is not dict or not any(
-            value is member for member in dict.values(member_map)
-        ):
-            raise _ProtocolSnapshotError(
-                path,
-                "enum",
-                f"{path} must contain a registered protocol enum member",
-            )
-        member_value = object.__getattribute__(value, "_value_")
-        if type(member_value) not in (str, int, bool):
-            raise _ProtocolSnapshotError(
-                path,
-                "enum",
-                f"{path} protocol enum member has an invalid value",
-            )
-        return value
+        expected_value = _snapshot_protocol_enum_value(value, path=path)
+        return expected_value if _enum_values else value
     if is_protocol_model:
         if not _trusted_protocol_type(value_type):
             raise _ProtocolSnapshotError(
@@ -261,6 +288,7 @@ def _snapshot_protocol_value(
                 path=f"{path}.{name}",
                 _ancestor_ids=descendant_ancestors,
                 _depth=_depth + 1,
+                _enum_values=_enum_values,
             )
             for name in field_names
         }
