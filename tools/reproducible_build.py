@@ -2211,6 +2211,21 @@ def make_build_context(
     }
 
 
+def _set_and_verify_artifact_mode(path: Path, mode: int) -> None:
+    try:
+        path.chmod(mode)
+        actual_mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError as exc:
+        raise BuildPolicyError(
+            f"cannot enforce artifact mode for {path.name}: {exc}"
+        ) from exc
+    if actual_mode != mode:
+        raise BuildPolicyError(
+            f"artifact mode mismatch for {path.name}: "
+            f"expected {mode:04o}, found {actual_mode:04o}"
+        )
+
+
 def _run_metadata_hook(
     *,
     root: Path,
@@ -2252,6 +2267,7 @@ def _run_metadata_hook(
         raise BuildPolicyError(f"{kind} hook failed: {result.stderr.strip()}")
     if not output_path.is_file():
         raise BuildPolicyError(f"{kind} hook did not create its output")
+    _set_and_verify_artifact_mode(output_path, 0o644)
     try:
         value = json.loads(
             output_path.read_text(encoding="utf-8"),
@@ -2295,7 +2311,7 @@ def _write_artifact(path: Path, data: bytes, *, mode: int = 0o644) -> None:
         handle.write(data)
         handle.flush()
         os.fsync(handle.fileno())
-    path.chmod(mode)
+    _set_and_verify_artifact_mode(path, mode)
 
 
 def build_primary_artifacts(
@@ -2484,8 +2500,10 @@ def build_reproducibly(
         output.mkdir(parents=True, exist_ok=True)
         for path in sorted(first.iterdir()):
             if path.is_file():
-                shutil.copyfile(path, output / path.name)
-                (output / path.name).chmod(stat.S_IMODE(path.stat().st_mode))
+                target = output / path.name
+                expected_mode = stat.S_IMODE(path.stat().st_mode)
+                shutil.copyfile(path, target)
+                _set_and_verify_artifact_mode(target, expected_mode)
         return first_manifest
 
 
