@@ -13,8 +13,9 @@ from collections.abc import Iterable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
+from .anchor import AnchorCheckpoint
 from .canonical import canonical_json
 from .cas import ArtifactRef, EngagementKey
 from .filesystem import (
@@ -24,6 +25,22 @@ from .filesystem import (
     inode_identity,
     require_private_file,
 )
+from .provider_journal import (
+    PROVIDER_FINALIZED_EVENT,
+    PROVIDER_JOURNAL_ACTOR,
+    PROVIDER_RESERVED_EVENT,
+    PROVIDER_SCHEMA,
+    PROVIDER_SCHEMA_STATEMENTS,
+    ProviderJournalEntry,
+    ProviderJournalRecord,
+    _require_digest as _require_provider_digest,
+    _require_identifier as _require_provider_identifier,
+    insert_provider_entry,
+    provider_entry_from_row,
+    provider_row_by_digest,
+    provider_terminal_or_reservation,
+    verify_provider_projection,
+)
 from .types import (
     ChainIntegrityError,
     CrossEngagementError,
@@ -32,10 +49,22 @@ from .types import (
     require_sha256,
 )
 
-
 ZERO_HASH = "0" * 64
-SCHEMA_VERSION = 2
+EVENT_SCHEMA_VERSION = 2
+LEDGER_SCHEMA_VERSION = 3
+# Kept as an internal compatibility alias for callers that inspected user_version.
+SCHEMA_VERSION = LEDGER_SCHEMA_VERSION
 APPLICATION_ID = 0x464C4F4D
+
+
+class _ProviderStateStore(Protocol):
+    @property
+    def ledger(self) -> object: ...
+
+    @property
+    def minimum_anchor(self) -> AnchorCheckpoint | None: ...
+
+    def _synchronize_anchor(self) -> AnchorCheckpoint: ...
 
 
 def _now() -> str:
@@ -107,10 +136,10 @@ class EventRecord:
     prev_auth_tag: str
     event_auth_tag: str
     created_at: str
-    schema_version: int = SCHEMA_VERSION
+    schema_version: int = EVENT_SCHEMA_VERSION
 
 
-SCHEMA = """
+SCHEMA_V2 = """
 CREATE TABLE IF NOT EXISTS ledger_metadata (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -207,6 +236,8 @@ CREATE TRIGGER IF NOT EXISTS graph_edges_no_delete
 BEFORE DELETE ON graph_edges BEGIN SELECT RAISE(ABORT, 'append-only graph edges'); END;
 """
 
+SCHEMA = SCHEMA_V2 + PROVIDER_SCHEMA
+
 
 class EventLedger:
     """One append-only database per engagement."""
@@ -219,10 +250,20 @@ class EventLedger:
         *,
         rebuild_fts: bool = False,
         transaction_lock: AbstractContextManager[Any] | None = None,
-        commit_callback: Callable[[], None] | None = None,
+        commit_callback: Callable[[], AnchorCheckpoint | None] | None = None,
         path_validator: Callable[[], None] | None = None,
+        migration_anchor: AnchorCheckpoint | None = None,
+        migration_minimum_anchor: AnchorCheckpoint | None = None,
     ) -> None:
         self.engagement_id = require_identifier(engagement_id, field="engagement_id")
+        for checkpoint, field in (
+            (migration_anchor, "migration_anchor"),
+            (migration_minimum_anchor, "migration_minimum_anchor"),
+        ):
+            if checkpoint is not None and checkpoint.engagement_id != self.engagement_id:
+                raise CrossEngagementError(f"{field} belongs to another engagement")
+        self._migration_anchor = migration_anchor
+        self._migration_minimum_anchor = migration_minimum_anchor
         key_material = key._copy_for_cipher()
         self._event_auth_key = hmac.digest(
             key_material,
@@ -231,6 +272,7 @@ class EventLedger:
         )
         self._transaction_lock = transaction_lock or nullcontext()
         self._commit_callback = commit_callback
+        self._provider_store = getattr(commit_callback, "__self__", None)
         self._path_validator = path_validator
         path = Path(path)
         if not path.is_absolute() or path.name in {"", ".", ".."} or "/" in path.name:
@@ -301,9 +343,9 @@ class EventLedger:
         self._connection.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         try:
-            if not created:
-                self._verify_header()
-            self._connection.execute("PRAGMA journal_mode=WAL")
+            existing_version = None if created else self._supported_header_version()
+            if created:
+                self._connection.execute("PRAGMA journal_mode=WAL")
             self._connection.execute("PRAGMA synchronous=FULL")
             self._connection.execute("PRAGMA foreign_keys=ON")
             self._connection.execute("PRAGMA trusted_schema=OFF")
@@ -313,7 +355,11 @@ class EventLedger:
             if created:
                 self._connection.executescript(SCHEMA)
                 self._connection.execute(f"PRAGMA application_id={APPLICATION_ID}")
-                self._connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                self._connection.execute(
+                    f"PRAGMA user_version={LEDGER_SCHEMA_VERSION}"
+                )
+            elif existing_version == 2:
+                self._migrate_v2_to_v3()
             self._verify_header()
             self._verify_schema()
             self._initialize_metadata(allow_create=created)
@@ -545,11 +591,42 @@ class EventLedger:
         if self._path_validator is not None:
             self._path_validator()
 
-    def _verify_header(self) -> None:
+    def _supported_header_version(self) -> int:
         application_id = self._connection.execute("PRAGMA application_id").fetchone()[0]
         user_version = self._connection.execute("PRAGMA user_version").fetchone()[0]
-        if application_id != APPLICATION_ID or user_version != SCHEMA_VERSION:
+        if application_id != APPLICATION_ID or user_version not in {
+            2,
+            LEDGER_SCHEMA_VERSION,
+        }:
             raise StorageError("event ledger application or schema version is unsupported")
+        return int(user_version)
+
+    def _verify_header(self) -> None:
+        if self._supported_header_version() != LEDGER_SCHEMA_VERSION:
+            raise StorageError("event ledger application or schema version is unsupported")
+
+    def _verify_runtime_pragmas(self) -> None:
+        values = {
+            "foreign_keys": self._connection.execute(
+                "PRAGMA foreign_keys"
+            ).fetchone()[0],
+            "journal_mode": str(
+                self._connection.execute("PRAGMA journal_mode").fetchone()[0]
+            ).lower(),
+            "synchronous": self._connection.execute(
+                "PRAGMA synchronous"
+            ).fetchone()[0],
+            "trusted_schema": self._connection.execute(
+                "PRAGMA trusted_schema"
+            ).fetchone()[0],
+        }
+        if values != {
+            "foreign_keys": 1,
+            "journal_mode": "wal",
+            "synchronous": 2,
+            "trusted_schema": 0,
+        }:
+            raise StorageError("event ledger runtime safety pragmas changed")
 
     @staticmethod
     def _schema_manifest(connection: sqlite3.Connection) -> tuple[tuple[object, ...], ...]:
@@ -563,20 +640,23 @@ class EventLedger:
         ).fetchall()
         return tuple(tuple(row) for row in rows)
 
-    def _verify_schema(self) -> None:
+    def _verify_schema_for(self, schema: str) -> None:
         expected = sqlite3.connect(":memory:")
         try:
-            expected.executescript(SCHEMA)
+            expected.executescript(schema)
             manifest = self._schema_manifest(expected)
         finally:
             expected.close()
         if self._schema_manifest(self._connection) != manifest:
             raise ChainIntegrityError("event ledger schema manifest is not exact")
 
+    def _verify_schema(self) -> None:
+        self._verify_schema_for(SCHEMA)
+
     def _expected_metadata(self) -> dict[str, str]:
         return {
             "engagement_id": self.engagement_id,
-            "schema_version": str(SCHEMA_VERSION),
+            "schema_version": str(EVENT_SCHEMA_VERSION),
             "event_auth_key_commitment": hmac.digest(
                 self._event_auth_key,
                 b"faultloom-event-auth-key-commitment-v1\0"
@@ -616,6 +696,87 @@ class EventLedger:
                 raise
         self._verify_metadata()
 
+    def _verify_migration_floors(
+        self, rows: list[sqlite3.Row]
+    ) -> None:
+        events = {int(row["seq"]): str(row["event_hash"]) for row in rows}
+
+        def verify(checkpoint: AnchorCheckpoint, *, field: str) -> None:
+            if checkpoint.seq > len(rows):
+                raise ChainIntegrityError(f"event ledger is behind its {field}")
+            if checkpoint.seq == 0:
+                if checkpoint.head != ZERO_HASH:
+                    raise ChainIntegrityError(f"empty {field} is invalid")
+            elif events.get(checkpoint.seq) != checkpoint.head:
+                raise ChainIntegrityError(f"event ledger diverges from its {field}")
+
+        anchor = self._migration_anchor
+        floor = self._migration_minimum_anchor
+        if anchor is not None:
+            verify(anchor, field="authenticated migration anchor")
+        if floor is not None:
+            verify(floor, field="trusted migration floor")
+        if anchor is not None and floor is not None:
+            if anchor.seq < floor.seq:
+                raise ChainIntegrityError(
+                    "authenticated migration anchor is older than the trusted floor"
+                )
+            if anchor.seq == floor.seq and anchor.head != floor.head:
+                raise ChainIntegrityError(
+                    "authenticated migration anchor diverges from the trusted floor"
+                )
+
+    def _migrate_v2_to_v3(self) -> None:
+        """Transactionally add the provider projection without rehashing v2 events."""
+
+        with self._transaction_lock:
+            with self._lock:
+                try:
+                    self._connection.execute("BEGIN IMMEDIATE")
+                    if self._supported_header_version() != 2:
+                        raise StorageError("legacy event ledger version changed during migration")
+                    self._validate_paths()
+                    self._verify_runtime_pragmas()
+                    self._verify_schema_for(SCHEMA_V2)
+                    self._verify_metadata()
+                    integrity = self._connection.execute("PRAGMA quick_check").fetchone()[0]
+                    if integrity != "ok":
+                        raise ChainIntegrityError(
+                            f"SQLite integrity check failed before migration: {integrity}"
+                        )
+                    if self._connection.execute("PRAGMA foreign_key_check").fetchall():
+                        raise ChainIntegrityError(
+                            "SQLite foreign-key integrity check failed before migration"
+                        )
+                    try:
+                        self._connection.execute(
+                            "INSERT INTO search_fts(search_fts, rank) "
+                            "VALUES('integrity-check', 1)"
+                        )
+                    except sqlite3.Error as exc:
+                        raise ChainIntegrityError(
+                            "FTS projection integrity check failed before migration"
+                        ) from exc
+                    rows = self._connection.execute(
+                        "SELECT * FROM events ORDER BY seq"
+                    ).fetchall()
+                    self._verify_rows(rows, include_provider=False)
+                    self._verify_migration_floors(rows)
+                    for statement in PROVIDER_SCHEMA_STATEMENTS:
+                        self._connection.execute(statement.strip())
+                    self._connection.execute(
+                        f"PRAGMA user_version={LEDGER_SCHEMA_VERSION}"
+                    )
+                    self._verify_header()
+                    self._verify_schema()
+                    self._verify_rows(rows, include_provider=True)
+                    self._connection.execute("COMMIT")
+                except Exception:
+                    if self._connection.in_transaction:
+                        self._connection.execute("ROLLBACK")
+                    raise
+        self._validate_paths()
+
     @staticmethod
     def _event_digest(
         *,
@@ -634,7 +795,7 @@ class EventLedger:
             "event_type": event_type,
             "payload_sha256": payload_sha256,
             "prev_hash": prev_hash,
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": EVENT_SCHEMA_VERSION,
             "seq": seq,
         }
         return hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
@@ -654,17 +815,23 @@ class EventLedger:
             "sha256",
         ).hex()
 
-    def append(
+    def _prepare_event(
         self,
         *,
         actor_stream: str,
         event_type: str,
         payload: Mapping[str, Any],
-        artifacts: Iterable[ArtifactRef] = (),
-        created_at: str | None = None,
-        _side_effect: Callable[[sqlite3.Connection, int], None] | None = None,
-    ) -> EventRecord:
-        self._require_open()
+        artifacts: Iterable[ArtifactRef],
+        created_at: str | None,
+    ) -> tuple[
+        str,
+        str,
+        dict[str, Any],
+        str,
+        str,
+        str,
+        tuple[ArtifactRef, ...],
+    ]:
         actor_stream = require_identifier(actor_stream, field="actor_stream")
         event_type = require_identifier(event_type, field="event_type")
         if not isinstance(payload, Mapping):
@@ -682,8 +849,12 @@ class EventLedger:
             raise StorageError("created_at must be timezone-aware")
         artifact_values = tuple(artifacts)
         payload_artifacts = _payload_artifacts(payload_value)
-        registered = {canonical_json(reference.to_dict()) for reference in artifact_values}
-        discovered = {canonical_json(reference.to_dict()) for reference in payload_artifacts}
+        registered = {
+            canonical_json(reference.to_dict()) for reference in artifact_values
+        }
+        discovered = {
+            canonical_json(reference.to_dict()) for reference in payload_artifacts
+        }
         if len(registered) != len(artifact_values):
             raise StorageError("event contains duplicate registered artifacts")
         if registered != discovered:
@@ -693,98 +864,108 @@ class EventLedger:
         for reference in artifact_values:
             if reference.engagement_id != self.engagement_id:
                 raise CrossEngagementError("event artifact belongs to another engagement")
-        with self._transaction_lock:
-            with self._lock:
-                try:
-                    self._connection.execute("BEGIN IMMEDIATE")
-                    previous_checkpoint = self._verify_snapshot(check_fts=True)
-                    last = self._connection.execute(
-                        """SELECT seq, event_hash, event_auth_tag
-                           FROM events ORDER BY seq DESC LIMIT 1"""
-                    ).fetchone()
-                    seq = 1 if last is None else int(last["seq"]) + 1
-                    prev_hash = ZERO_HASH if last is None else str(last["event_hash"])
-                    prev_auth_tag = (
-                        ZERO_HASH if last is None else str(last["event_auth_tag"])
-                    )
-                    if previous_checkpoint != (seq - 1, prev_hash):
-                        raise ChainIntegrityError(
-                            "event ledger changed inside the append transaction"
-                        )
-                    event_hash = self._event_digest(
-                        seq=seq,
-                        engagement_id=self.engagement_id,
-                        actor_stream=actor_stream,
-                        event_type=event_type,
-                        payload_sha256=payload_sha256,
-                        prev_hash=prev_hash,
-                        created_at=timestamp,
-                    )
-                    event_auth_tag = self._event_auth_digest(
-                        prev_auth_tag=prev_auth_tag,
-                        event_hash=event_hash,
-                    )
-                    self._connection.execute(
-                        """
-                        INSERT INTO events(
-                            seq, schema_version, engagement_id, actor_stream, event_type,
-                            payload_json, payload_sha256, prev_hash, event_hash,
-                            prev_auth_tag, event_auth_tag, created_at
-                        ) VALUES (?, 2, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            seq,
-                            self.engagement_id,
-                            actor_stream,
-                            event_type,
-                            payload_json,
-                            payload_sha256,
-                            prev_hash,
-                            event_hash,
-                            prev_auth_tag,
-                            event_auth_tag,
-                            timestamp,
-                        ),
-                    )
-                    for reference in artifact_values:
-                        existing = self._connection.execute(
-                            "SELECT byte_length FROM artifacts WHERE sha256 = ?",
-                            (reference.sha256,),
-                        ).fetchone()
-                        if existing is None:
-                            self._connection.execute(
-                                """
-                                INSERT INTO artifacts(
-                                    sha256, byte_length, media_type, first_event_seq
-                                ) VALUES (?, ?, ?, ?)
-                                """,
-                                (
-                                    reference.sha256,
-                                    reference.byte_length,
-                                    reference.media_type,
-                                    seq,
-                                ),
-                            )
-                        elif int(existing["byte_length"]) != reference.byte_length:
-                            raise ChainIntegrityError(
-                                "artifact digest collision in ledger metadata"
-                            )
-                    if _side_effect is not None:
-                        _side_effect(self._connection, seq)
-                    if self._verify_snapshot(check_fts=True) != (seq, event_hash):
-                        raise ChainIntegrityError(
-                            "appended event does not match the verified transaction head"
-                        )
-                    self._connection.execute("COMMIT")
-                    if self._commit_callback is not None:
-                        self._commit_callback()
-                except Exception as exc:
-                    if self._connection.in_transaction:
-                        self._connection.execute("ROLLBACK")
-                    if isinstance(exc, StorageError):
-                        raise
-                    raise StorageError(f"cannot append event: {exc}") from exc
-        record = EventRecord(
+        return (
+            actor_stream,
+            event_type,
+            payload_value,
+            payload_json,
+            payload_sha256,
+            timestamp,
+            artifact_values,
+        )
+
+    def _append_prepared_in_transaction(
+        self,
+        *,
+        actor_stream: str,
+        event_type: str,
+        payload_value: dict[str, Any],
+        payload_json: str,
+        payload_sha256: str,
+        timestamp: str,
+        artifact_values: tuple[ArtifactRef, ...],
+        side_effect: Callable[[sqlite3.Connection, int], None] | None,
+        previous_checkpoint: tuple[int, str] | None = None,
+    ) -> EventRecord:
+        if not self._connection.in_transaction:
+            raise StorageError("event append requires an active transaction")
+        checkpoint = previous_checkpoint or self._verify_snapshot(check_fts=True)
+        last = self._connection.execute(
+            """SELECT seq, event_hash, event_auth_tag
+               FROM events ORDER BY seq DESC LIMIT 1"""
+        ).fetchone()
+        seq = 1 if last is None else int(last["seq"]) + 1
+        prev_hash = ZERO_HASH if last is None else str(last["event_hash"])
+        prev_auth_tag = ZERO_HASH if last is None else str(last["event_auth_tag"])
+        if checkpoint != (seq - 1, prev_hash):
+            raise ChainIntegrityError(
+                "event ledger changed inside the append transaction"
+            )
+        event_hash = self._event_digest(
+            seq=seq,
+            engagement_id=self.engagement_id,
+            actor_stream=actor_stream,
+            event_type=event_type,
+            payload_sha256=payload_sha256,
+            prev_hash=prev_hash,
+            created_at=timestamp,
+        )
+        event_auth_tag = self._event_auth_digest(
+            prev_auth_tag=prev_auth_tag,
+            event_hash=event_hash,
+        )
+        self._connection.execute(
+            """
+            INSERT INTO events(
+                seq, schema_version, engagement_id, actor_stream, event_type,
+                payload_json, payload_sha256, prev_hash, event_hash,
+                prev_auth_tag, event_auth_tag, created_at
+            ) VALUES (?, 2, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                seq,
+                self.engagement_id,
+                actor_stream,
+                event_type,
+                payload_json,
+                payload_sha256,
+                prev_hash,
+                event_hash,
+                prev_auth_tag,
+                event_auth_tag,
+                timestamp,
+            ),
+        )
+        for reference in artifact_values:
+            existing = self._connection.execute(
+                "SELECT byte_length FROM artifacts WHERE sha256 = ?",
+                (reference.sha256,),
+            ).fetchone()
+            if existing is None:
+                self._connection.execute(
+                    """
+                    INSERT INTO artifacts(
+                        sha256, byte_length, media_type, first_event_seq
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        reference.sha256,
+                        reference.byte_length,
+                        reference.media_type,
+                        seq,
+                    ),
+                )
+            elif int(existing["byte_length"]) != reference.byte_length:
+                raise ChainIntegrityError(
+                    "artifact digest collision in ledger metadata"
+                )
+        if side_effect is not None:
+            side_effect(self._connection, seq)
+        if self._verify_snapshot(check_fts=True) != (seq, event_hash):
+            raise ChainIntegrityError(
+                "appended event does not match the verified transaction head"
+            )
+        return EventRecord(
             seq=seq,
             engagement_id=self.engagement_id,
             actor_stream=actor_stream,
@@ -797,6 +978,50 @@ class EventLedger:
             event_auth_tag=event_auth_tag,
             created_at=timestamp,
         )
+
+    def append(
+        self,
+        *,
+        actor_stream: str,
+        event_type: str,
+        payload: Mapping[str, Any],
+        artifacts: Iterable[ArtifactRef] = (),
+        created_at: str | None = None,
+        _side_effect: Callable[[sqlite3.Connection, int], None] | None = None,
+    ) -> EventRecord:
+        self._require_open()
+        prepared = self._prepare_event(
+            actor_stream=actor_stream,
+            event_type=event_type,
+            payload=payload,
+            artifacts=artifacts,
+            created_at=created_at,
+        )
+        with self._transaction_lock:
+            with self._lock:
+                try:
+                    self._connection.execute("BEGIN IMMEDIATE")
+                    previous_checkpoint = self._verify_snapshot(check_fts=True)
+                    record = self._append_prepared_in_transaction(
+                        actor_stream=prepared[0],
+                        event_type=prepared[1],
+                        payload_value=prepared[2],
+                        payload_json=prepared[3],
+                        payload_sha256=prepared[4],
+                        timestamp=prepared[5],
+                        artifact_values=prepared[6],
+                        side_effect=_side_effect,
+                        previous_checkpoint=previous_checkpoint,
+                    )
+                    self._connection.execute("COMMIT")
+                    if self._commit_callback is not None:
+                        self._commit_callback()
+                except Exception as exc:
+                    if self._connection.in_transaction:
+                        self._connection.execute("ROLLBACK")
+                    if isinstance(exc, StorageError):
+                        raise
+                    raise StorageError(f"cannot append event: {exc}") from exc
         self._validate_paths()
         return record
 
@@ -848,6 +1073,7 @@ class EventLedger:
             raise StorageError("ledger verification requires an active transaction")
         self._validate_paths()
         self._verify_header()
+        self._verify_runtime_pragmas()
         self._verify_schema()
         self._verify_metadata()
         _validate_ledger_directory(self._parent_fd, self.path.name)
@@ -895,12 +1121,14 @@ class EventLedger:
         with self.verified_checkpoint(check_fts=check_fts) as (_, head):
             return head
 
-    def _verify_rows(self, rows: list[sqlite3.Row]) -> str:
+    def _verify_rows(
+        self, rows: list[sqlite3.Row], *, include_provider: bool = True
+    ) -> str:
         previous = ZERO_HASH
         previous_auth_tag = ZERO_HASH
         for expected_seq, row in enumerate(rows, 1):
             record = self._record(row)
-            if record.seq != expected_seq or record.schema_version != SCHEMA_VERSION:
+            if record.seq != expected_seq or record.schema_version != EVENT_SCHEMA_VERSION:
                 raise ChainIntegrityError("event sequence or schema version is invalid")
             if record.engagement_id != self.engagement_id:
                 raise CrossEngagementError("event row belongs to another engagement")
@@ -935,7 +1163,10 @@ class EventLedger:
                 )
             previous = record.event_hash
             previous_auth_tag = record.event_auth_tag
-        self._verify_auxiliary_state({record.seq: record for record in map(self._record, rows)})
+        self._verify_auxiliary_state(
+            {record.seq: record for record in map(self._record, rows)},
+            include_provider=include_provider,
+        )
         return previous
 
     def rebuild_fts(self) -> None:
@@ -977,7 +1208,12 @@ class EventLedger:
             event_hash = self._event_hash_at_in_transaction(seq)
         return event_hash
 
-    def _verify_auxiliary_state(self, events: dict[int, EventRecord]) -> None:
+    def _verify_auxiliary_state(
+        self,
+        events: dict[int, EventRecord],
+        *,
+        include_provider: bool = True,
+    ) -> None:
         with self._lock:
             artifacts = self._connection.execute(
                 "SELECT sha256, byte_length, media_type, first_event_seq FROM artifacts"
@@ -1000,6 +1236,19 @@ class EventLedger:
                        attributes_json, source_event_seq, anchor_event_seq FROM graph_edges
                 """
             ).fetchall()
+            provider_rows = (
+                self._connection.execute(
+                    """
+                    SELECT receipt_digest, phase, reservation_receipt_digest,
+                           call_id, attempt, attempt_id, binding_digest,
+                           dispatch_reservation_digest, proxy_request_digest,
+                           receipt_json, anchor_event_seq
+                    FROM provider_journal_entries
+                    """
+                ).fetchall()
+                if include_provider
+                else ()
+            )
         expected_artifacts: dict[str, tuple[int, str, int]] = {}
         expected_documents: dict[int, dict[str, Any]] = {}
         expected_nodes: dict[int, dict[str, Any]] = {}
@@ -1095,6 +1344,395 @@ class EventLedger:
             raise ChainIntegrityError(
                 "graph edge projection is incomplete or differs from the event chain"
             )
+
+        if include_provider:
+            verify_provider_projection(events, provider_rows)
+
+    def _require_anchored_provider_store(
+        self,
+        state_store: _ProviderStateStore,
+        minimum_anchor: AnchorCheckpoint | None,
+    ) -> None:
+        if state_store is not self._provider_store or state_store.ledger is not self:
+            raise StorageError(
+                "provider journal requires its exact owning StateStore"
+            )
+        if state_store.minimum_anchor != minimum_anchor:
+            raise StorageError("provider journal trusted anchor floor changed")
+        callback = self._commit_callback
+        if (
+            callback is None
+            or getattr(callback, "__self__", None) is not state_store
+            or getattr(callback, "__func__", None)
+            is not getattr(type(state_store), "_synchronize_anchor", None)
+        ):
+            raise StorageError(
+                "provider journal requires the StateStore authenticated anchor callback"
+            )
+
+    def _provider_transaction(
+        self,
+        *,
+        state_store: _ProviderStateStore,
+        minimum_anchor: AnchorCheckpoint | None,
+        operation: Callable[
+            [tuple[int, str]], tuple[ProviderJournalEntry, int, str]
+        ],
+    ) -> ProviderJournalRecord:
+        self._require_open()
+        self._require_anchored_provider_store(state_store, minimum_anchor)
+        with self._transaction_lock:
+            state_store._synchronize_anchor()
+            with self._lock:
+                try:
+                    self._connection.execute("BEGIN IMMEDIATE")
+                    initial = self._verify_snapshot(check_fts=True)
+                    entry, event_seq, event_hash = operation(initial)
+                    checkpoint = self._verify_snapshot(check_fts=True)
+                    if event_seq > checkpoint[0]:
+                        raise ChainIntegrityError(
+                            "provider journal entry is outside the verified chain"
+                        )
+                    if self._event_hash_at_in_transaction(event_seq) != event_hash:
+                        raise ChainIntegrityError(
+                            "provider journal entry event hash changed"
+                        )
+                    self._connection.execute("COMMIT")
+                    callback = self._commit_callback
+                    assert callback is not None
+                    anchor = callback()
+                    if not isinstance(anchor, AnchorCheckpoint):
+                        raise StorageError(
+                            "provider journal anchor callback gave no checkpoint"
+                        )
+                    if anchor.engagement_id != self.engagement_id:
+                        raise CrossEngagementError(
+                            "provider journal anchor belongs to another engagement"
+                        )
+                    if (anchor.seq, anchor.head) != checkpoint:
+                        raise ChainIntegrityError(
+                            "provider journal post-commit anchor does not match the ledger"
+                        )
+                except Exception as exc:
+                    if self._connection.in_transaction:
+                        self._connection.execute("ROLLBACK")
+                    if isinstance(exc, StorageError):
+                        raise
+                    raise StorageError(
+                        f"provider journal transaction failed closed: {exc}"
+                    ) from exc
+        self._validate_paths()
+        return ProviderJournalRecord(
+            entry=entry,
+            event_seq=event_seq,
+            event_hash=event_hash,
+            anchor=anchor,
+        )
+
+    def reserve_provider_receipt(
+        self,
+        entry: ProviderJournalEntry,
+        *,
+        state_store: _ProviderStateStore,
+        minimum_anchor: AnchorCheckpoint | None,
+    ) -> ProviderJournalRecord:
+        """Atomically claim a provider attempt and durably anchor its receipt."""
+
+        if type(entry) is not ProviderJournalEntry or entry.phase != "reserved":
+            raise StorageError("provider reservation entry is invalid")
+        prepared = self._prepare_event(
+            actor_stream=PROVIDER_JOURNAL_ACTOR,
+            event_type=PROVIDER_RESERVED_EVENT,
+            payload=entry.to_event_payload(),
+            artifacts=(),
+            created_at=None,
+        )
+
+        def reserve(initial: tuple[int, str]) -> tuple[ProviderJournalEntry, int, str]:
+            matches = self._connection.execute(
+                """
+                SELECT journal.*, event.event_hash
+                FROM provider_journal_entries AS journal
+                JOIN events AS event ON event.seq = journal.anchor_event_seq
+                WHERE journal.receipt_digest = ?
+                   OR (
+                       journal.phase = 'reserved' AND (
+                           (journal.call_id = ? AND journal.attempt = ?)
+                           OR journal.attempt_id = ?
+                           OR journal.dispatch_reservation_digest = ?
+                           OR journal.proxy_request_digest = ?
+                       )
+                   )
+                """,
+                (
+                    entry.receipt_digest,
+                    entry.call_id,
+                    entry.attempt,
+                    entry.attempt_id,
+                    entry.dispatch_reservation_digest,
+                    entry.proxy_request_digest,
+                ),
+            ).fetchall()
+            if matches:
+                raise StorageError(
+                    "provider reservation identity is already durably claimed"
+                )
+
+            def insert(connection: sqlite3.Connection, event_seq: int) -> None:
+                insert_provider_entry(connection, event_seq, entry)
+
+            event = self._append_prepared_in_transaction(
+                actor_stream=prepared[0],
+                event_type=prepared[1],
+                payload_value=prepared[2],
+                payload_json=prepared[3],
+                payload_sha256=prepared[4],
+                timestamp=prepared[5],
+                artifact_values=prepared[6],
+                side_effect=insert,
+                previous_checkpoint=initial,
+            )
+            return entry, event.seq, event.event_hash
+
+        return self._provider_transaction(
+            state_store=state_store,
+            minimum_anchor=minimum_anchor,
+            operation=reserve,
+        )
+
+    def finalize_provider_receipt(
+        self,
+        reservation_receipt_digest: str,
+        entry: ProviderJournalEntry,
+        *,
+        state_store: _ProviderStateStore,
+        minimum_anchor: AnchorCheckpoint | None,
+    ) -> ProviderJournalRecord:
+        """CAS one terminal receipt onto its exact durable reservation."""
+
+        _require_provider_digest(
+            reservation_receipt_digest,
+            field="reservation_receipt_digest",
+        )
+        if (
+            type(entry) is not ProviderJournalEntry
+            or entry.phase != "finalized"
+            or entry.reservation_receipt_digest != reservation_receipt_digest
+        ):
+            raise StorageError("provider finalization entry is invalid")
+        prepared = self._prepare_event(
+            actor_stream=PROVIDER_JOURNAL_ACTOR,
+            event_type=PROVIDER_FINALIZED_EVENT,
+            payload=entry.to_event_payload(),
+            artifacts=(),
+            created_at=None,
+        )
+        immutable_fields = (
+            "call_id",
+            "attempt",
+            "attempt_id",
+            "binding_digest",
+            "dispatch_reservation_digest",
+            "proxy_request_digest",
+        )
+
+        def finalize(initial: tuple[int, str]) -> tuple[ProviderJournalEntry, int, str]:
+            reservation_row = provider_row_by_digest(
+                self._connection, reservation_receipt_digest
+            )
+            if reservation_row is None:
+                raise StorageError("provider finalization reservation is missing")
+            reservation = provider_entry_from_row(reservation_row)
+            if reservation.phase != "reserved" or any(
+                getattr(entry, field) != getattr(reservation, field)
+                for field in immutable_fields
+            ):
+                raise StorageError(
+                    "provider finalization does not match its durable reservation"
+                )
+            existing_rows = self._connection.execute(
+                """
+                SELECT journal.*, event.event_hash
+                FROM provider_journal_entries AS journal
+                JOIN events AS event ON event.seq = journal.anchor_event_seq
+                WHERE journal.receipt_digest = ?
+                   OR (
+                       journal.phase = 'finalized'
+                       AND journal.reservation_receipt_digest = ?
+                   )
+                """,
+                (entry.receipt_digest, reservation_receipt_digest),
+            ).fetchall()
+            if existing_rows:
+                if len(existing_rows) == 1:
+                    existing = provider_entry_from_row(existing_rows[0])
+                    if existing == entry:
+                        return (
+                            existing,
+                            int(existing_rows[0]["anchor_event_seq"]),
+                            str(existing_rows[0]["event_hash"]),
+                        )
+                raise StorageError(
+                    "provider reservation already has a conflicting finalization"
+                )
+
+            def insert(connection: sqlite3.Connection, event_seq: int) -> None:
+                insert_provider_entry(connection, event_seq, entry)
+
+            event = self._append_prepared_in_transaction(
+                actor_stream=prepared[0],
+                event_type=prepared[1],
+                payload_value=prepared[2],
+                payload_json=prepared[3],
+                payload_sha256=prepared[4],
+                timestamp=prepared[5],
+                artifact_values=prepared[6],
+                side_effect=insert,
+                previous_checkpoint=initial,
+            )
+            return entry, event.seq, event.event_hash
+
+        return self._provider_transaction(
+            state_store=state_store,
+            minimum_anchor=minimum_anchor,
+            operation=finalize,
+        )
+
+    def _lookup_optional_provider_receipt(
+        self,
+        *,
+        state_store: _ProviderStateStore,
+        minimum_anchor: AnchorCheckpoint | None,
+        lookup: Callable[[], sqlite3.Row | None],
+        resolve_terminal: bool,
+    ) -> ProviderJournalRecord | None:
+        self._require_open()
+        self._require_anchored_provider_store(state_store, minimum_anchor)
+        record_values: tuple[ProviderJournalEntry, int, str] | None = None
+        with self._transaction_lock:
+            state_store._synchronize_anchor()
+            with self._lock:
+                try:
+                    self._connection.execute("BEGIN IMMEDIATE")
+                    checkpoint = self._verify_snapshot(check_fts=True)
+                    row = lookup()
+                    if resolve_terminal:
+                        row = provider_terminal_or_reservation(
+                            self._connection, row
+                        )
+                    if row is not None:
+                        record_values = (
+                            provider_entry_from_row(row),
+                            int(row["anchor_event_seq"]),
+                            str(row["event_hash"]),
+                        )
+                    self._connection.execute("COMMIT")
+                    callback = self._commit_callback
+                    assert callback is not None
+                    anchor = callback()
+                    if not isinstance(anchor, AnchorCheckpoint):
+                        raise StorageError(
+                            "provider journal anchor callback gave no checkpoint"
+                        )
+                    if (anchor.seq, anchor.head) != checkpoint:
+                        raise ChainIntegrityError(
+                            "provider journal post-read anchor does not match the ledger"
+                        )
+                except Exception as exc:
+                    if self._connection.in_transaction:
+                        self._connection.execute("ROLLBACK")
+                    if isinstance(exc, StorageError):
+                        raise
+                    raise StorageError(
+                        f"provider journal lookup failed closed: {exc}"
+                    ) from exc
+        self._validate_paths()
+        if record_values is None:
+            return None
+        entry, event_seq, event_hash = record_values
+        return ProviderJournalRecord(
+            entry=entry,
+            event_seq=event_seq,
+            event_hash=event_hash,
+            anchor=anchor,
+        )
+
+    def provider_receipt_by_digest(
+        self,
+        receipt_digest: str,
+        *,
+        state_store: _ProviderStateStore,
+        minimum_anchor: AnchorCheckpoint | None,
+    ) -> ProviderJournalRecord | None:
+        _require_provider_digest(receipt_digest, field="receipt_digest")
+        return self._lookup_optional_provider_receipt(
+            state_store=state_store,
+            minimum_anchor=minimum_anchor,
+            lookup=lambda: provider_row_by_digest(self._connection, receipt_digest),
+            resolve_terminal=False,
+        )
+
+    def provider_receipt_by_attempt(
+        self,
+        call_id: str,
+        attempt: int,
+        *,
+        state_store: _ProviderStateStore,
+        minimum_anchor: AnchorCheckpoint | None,
+    ) -> ProviderJournalRecord | None:
+        _require_provider_identifier(call_id, field="call_id")
+        if (
+            not isinstance(attempt, int)
+            or isinstance(attempt, bool)
+            or not 1 <= attempt <= 2**63 - 1
+        ):
+            raise StorageError("attempt must be a positive signed 64-bit integer")
+
+        def lookup() -> sqlite3.Row | None:
+            return self._connection.execute(
+                """
+                SELECT journal.*, event.event_hash
+                FROM provider_journal_entries AS journal
+                JOIN events AS event ON event.seq = journal.anchor_event_seq
+                WHERE journal.phase = 'reserved'
+                  AND journal.call_id = ? AND journal.attempt = ?
+                """,
+                (call_id, attempt),
+            ).fetchone()
+
+        return self._lookup_optional_provider_receipt(
+            state_store=state_store,
+            minimum_anchor=minimum_anchor,
+            lookup=lookup,
+            resolve_terminal=True,
+        )
+
+    def provider_receipt_by_attempt_id(
+        self,
+        attempt_id: str,
+        *,
+        state_store: _ProviderStateStore,
+        minimum_anchor: AnchorCheckpoint | None,
+    ) -> ProviderJournalRecord | None:
+        _require_provider_identifier(attempt_id, field="attempt_id")
+
+        def lookup() -> sqlite3.Row | None:
+            return self._connection.execute(
+                """
+                SELECT journal.*, event.event_hash
+                FROM provider_journal_entries AS journal
+                JOIN events AS event ON event.seq = journal.anchor_event_seq
+                WHERE journal.phase = 'reserved' AND journal.attempt_id = ?
+                """,
+                (attempt_id,),
+            ).fetchone()
+
+        return self._lookup_optional_provider_receipt(
+            state_store=state_store,
+            minimum_anchor=minimum_anchor,
+            lookup=lookup,
+            resolve_terminal=True,
+        )
 
     def _referenced_artifacts_in_transaction(self) -> tuple[ArtifactRef, ...]:
         if not self._connection.in_transaction:
