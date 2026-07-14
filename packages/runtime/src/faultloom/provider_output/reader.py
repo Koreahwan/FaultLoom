@@ -1,14 +1,22 @@
 from __future__ import annotations
 
-import base64
 import hmac
 import json
+from typing import NoReturn, final
 
 from faultloom.state import StateStore
 from faultloom_protocol import Ed25519PublicKeyRecord, canonical_json
 
+from ._cursor import (
+    MAX_CURSOR_BYTES,
+    b64decode,
+    b64encode,
+    cursor_document,
+    validated_invocation,
+)
 from ._events import event_artifacts, invocation_from_event
 from ._receipt import ProviderReceiptVerifier
+from ._reader_admission import ReaderAdmission, trusted_reader_admission
 from ._store import ProviderOutputStoreBinding
 from .contracts import (
     ProviderInvocationResult,
@@ -19,73 +27,14 @@ from .contracts import (
 )
 
 MAX_PAGE_BYTES = 1024 * 1024
-MAX_CURSOR_BYTES = 4096
 _CURSOR_KEY_COPY = ProviderOutputCursorKey._copy_for_hmac
-_INVOCATION_DUMP = ProviderInvocationResult.model_dump
-_INVOCATION_VALIDATE = ProviderInvocationResult.model_validate
 _VERIFY_RECEIPT = ProviderReceiptVerifier.validate
 
 
-def _b64encode(value: bytes) -> str:
-    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
-
-
-def _b64decode(value: str) -> bytes:
-    if type(value) is not str or not value or "=" in value:
-        raise ValueError("invalid cursor segment")
-    decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
-    if _b64encode(decoded) != value:
-        raise ValueError("noncanonical cursor segment")
-    return decoded
-
-
-def _validated_invocation(
-    invocation: ProviderInvocationResult,
-) -> ProviderInvocationResult:
-    if type(invocation) is not ProviderInvocationResult:
-        raise ProviderOutputIntegrityError(
-            "provider output reader requires an exact invocation result"
-        )
-    try:
-        validated = _INVOCATION_VALIDATE(
-            _INVOCATION_DUMP(invocation, mode="python")
-        )
-    except Exception as exc:
-        raise ProviderOutputIntegrityError(
-            "provider invocation result integrity failed"
-        ) from exc
-    return validated
-
-
-def _cursor_document(
-    invocation: ProviderInvocationResult,
-    *,
-    inner_cursor: str,
-) -> dict[str, object]:
-    output = invocation.output_ref
-    observation = output.observation
-    return {
-        "byte_length": observation.byte_length,
-        "cas_digest": observation.cas_digest,
-        "engagement_id": output.engagement_id,
-        "event_hash": output.event_hash,
-        "event_seq": output.event_seq,
-        "inner_cursor": inner_cursor,
-        "media_type": observation.media_type,
-        "observation_id": observation.observation_id,
-        "receipt_digest": output.receipt_digest,
-        "run_id": observation.run_id,
-        "version": 1,
-    }
-
-
+@final
 class ProviderOutputReader:
-    __slots__ = (
-        "_binding",
-        "_cursor_key",
-        "_maximum_page_bytes",
-        "_receipt_verifier",
-    )
+    __slots__ = ("__admission",)
+    __admission: ReaderAdmission
 
     def __init__(
         self,
@@ -113,16 +62,42 @@ class ProviderOutputReader:
             raise ValueError("provider output maximum page size is invalid")
         binding = ProviderOutputStoreBinding(state)
         material = _CURSOR_KEY_COPY(cursor_key)
-        self._cursor_key = hmac.digest(
+        if type(material) is not bytes or len(material) != 32:
+            raise ProviderOutputIntegrityError(
+                "provider output cursor key capability is invalid"
+            )
+        derived_key = hmac.digest(
             material,
             b"faultloom.provider-output.cursor.v1\0"
             + binding.engagement_id.encode("utf-8"),
             "sha256",
         )
-        self._binding = binding
-        self._maximum_page_bytes = maximum_page_bytes
-        self._receipt_verifier = ProviderReceiptVerifier(
-            trusted_proxy_attestation_key
+        self.__admission = ReaderAdmission(
+            binding,
+            derived_key,
+            maximum_page_bytes,
+            ProviderReceiptVerifier(trusted_proxy_attestation_key),
+        )
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "_ProviderOutputReader__admission":
+            try:
+                object.__getattribute__(self, name)
+            except AttributeError:
+                object.__setattr__(self, name, value)
+                return
+        raise AttributeError("ProviderOutputReader is immutable")
+
+    def __delattr__(self, name: str) -> NoReturn:
+        raise AttributeError("ProviderOutputReader is immutable")
+
+    def _trusted_admission(self) -> ReaderAdmission:
+        return trusted_reader_admission(
+            object.__getattribute__(
+                self,
+                "_ProviderOutputReader__admission",
+            ),
+            maximum_page_bytes=MAX_PAGE_BYTES,
         )
 
     def read_page(
@@ -134,12 +109,13 @@ class ProviderOutputReader:
         cursor: str | None = None,
         max_bytes: int = 64 * 1024,
     ) -> ProviderOutputPage:
-        validated = _validated_invocation(invocation)
+        admission = self._trusted_admission()
+        validated = validated_invocation(invocation)
         output = validated.output_ref
         observation = output.observation
         if (
             type(expected_engagement_id) is not str
-            or expected_engagement_id != self._binding.engagement_id
+            or expected_engagement_id != admission.binding.engagement_id
             or output.engagement_id != expected_engagement_id
         ):
             raise ProviderOutputScopeError(
@@ -154,18 +130,13 @@ class ProviderOutputReader:
             )
         if (
             type(max_bytes) is not int
-            or not 1 <= max_bytes <= self._maximum_page_bytes
+            or not 1 <= max_bytes <= admission.maximum_page_bytes
         ):
             raise ProviderOutputIntegrityError(
                 "provider output page size is outside the bounded policy"
             )
-        verifier = self._receipt_verifier
-        if type(verifier) is not ProviderReceiptVerifier:
-            raise ProviderOutputIntegrityError(
-                "provider output receipt verifier capability changed"
-            )
-        _VERIFY_RECEIPT(verifier, validated.receipt)
-        binding = self._binding
+        _VERIFY_RECEIPT(admission.verifier, validated.receipt)
+        binding = admission.binding
         with binding.lock():
             binding.verify()
             event = binding.find(validated.receipt)
@@ -185,7 +156,13 @@ class ProviderOutputReader:
                 )
             reference, _ = event_artifacts(event)
             inner_cursor = (
-                None if cursor is None else self._decode_cursor(validated, cursor)
+                None
+                if cursor is None
+                else self._decode_cursor(
+                    validated,
+                    cursor,
+                    cursor_key=admission.cursor_key,
+                )
             )
             page = binding.read_page(
                 reference,
@@ -205,7 +182,11 @@ class ProviderOutputReader:
             next_cursor = (
                 None
                 if page.next_cursor is None
-                else self._encode_cursor(validated, page.next_cursor)
+                else self._encode_cursor(
+                    validated,
+                    page.next_cursor,
+                    cursor_key=admission.cursor_key,
+                )
             )
             return ProviderOutputPage(
                 page.data,
@@ -214,25 +195,29 @@ class ProviderOutputReader:
                 next_cursor=next_cursor,
             )
 
+    @staticmethod
     def _encode_cursor(
-        self,
         invocation: ProviderInvocationResult,
         inner_cursor: str,
+        *,
+        cursor_key: bytes,
     ) -> str:
         if type(inner_cursor) is not str or not inner_cursor:
             raise ProviderOutputIntegrityError(
                 "provider output storage cursor is invalid"
             )
         payload = canonical_json(
-            _cursor_document(invocation, inner_cursor=inner_cursor)
+            cursor_document(invocation, inner_cursor=inner_cursor)
         ).encode("utf-8")
-        signature = hmac.digest(self._cursor_key, payload, "sha256")
-        return f"{_b64encode(payload)}.{_b64encode(signature)}"
+        signature = hmac.digest(cursor_key, payload, "sha256")
+        return f"{b64encode(payload)}.{b64encode(signature)}"
 
+    @staticmethod
     def _decode_cursor(
-        self,
         invocation: ProviderInvocationResult,
         cursor: str,
+        *,
+        cursor_key: bytes,
     ) -> str:
         try:
             if type(cursor) is not str or not 1 <= len(cursor) <= MAX_CURSOR_BYTES:
@@ -240,19 +225,25 @@ class ProviderOutputReader:
             segments = cursor.split(".")
             if len(segments) != 2:
                 raise ValueError("invalid cursor shape")
-            payload = _b64decode(segments[0])
-            signature = _b64decode(segments[1])
-            expected_signature = hmac.digest(self._cursor_key, payload, "sha256")
+            payload = b64decode(segments[0])
+            signature = b64decode(segments[1])
+            expected_signature = hmac.digest(cursor_key, payload, "sha256")
             if not hmac.compare_digest(signature, expected_signature):
                 raise ValueError("invalid cursor signature")
             document = json.loads(payload)
-            if type(document) is not dict or type(document.get("inner_cursor")) is not str:
+            if (
+                type(document) is not dict
+                or type(document.get("inner_cursor")) is not str
+            ):
                 raise ValueError("invalid cursor document")
-            expected = _cursor_document(
+            expected = cursor_document(
                 invocation,
                 inner_cursor=document["inner_cursor"],
             )
-            if document != expected or canonical_json(document).encode("utf-8") != payload:
+            if (
+                document != expected
+                or canonical_json(document).encode("utf-8") != payload
+            ):
                 raise ValueError("invalid cursor binding")
             return document["inner_cursor"]
         except Exception:

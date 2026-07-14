@@ -23,7 +23,8 @@ METADATA_LIMIT = 4096
 
 
 class _StoreBinding(Protocol):
-    engagement_id: str
+    @property
+    def engagement_id(self) -> str: ...
 
     def verify(self) -> None: ...
 

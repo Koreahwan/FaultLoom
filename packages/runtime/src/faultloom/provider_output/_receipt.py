@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from typing import NamedTuple, NoReturn, final
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from faultloom.provider import (
@@ -64,8 +65,15 @@ def _attestation_bytes(result: ProviderProxyResult) -> bytes:
     )
 
 
+class _VerifierAdmission(NamedTuple):
+    key_id: str
+    public_key: Ed25519PublicKey
+
+
+@final
 class ProviderReceiptVerifier:
-    __slots__ = ("_key_id", "_public_key")
+    __slots__ = ("__admission",)
+    __admission: _VerifierAdmission
 
     def __init__(self, trusted_key: Ed25519PublicKeyRecord) -> None:
         if type(trusted_key) is not Ed25519PublicKeyRecord:
@@ -85,10 +93,38 @@ class ProviderReceiptVerifier:
             raise ProviderOutputIntegrityError(
                 "provider output proxy attestation key is invalid"
             )
-        self._key_id = validated.key_id
-        self._public_key = public_key
+        self.__admission = _VerifierAdmission(validated.key_id, public_key)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "_ProviderReceiptVerifier__admission":
+            try:
+                object.__getattribute__(self, name)
+            except AttributeError:
+                object.__setattr__(self, name, value)
+                return
+        raise AttributeError("ProviderReceiptVerifier is immutable")
+
+    def __delattr__(self, name: str) -> NoReturn:
+        raise AttributeError("ProviderReceiptVerifier is immutable")
+
+    def _trusted_admission(self) -> _VerifierAdmission:
+        admission = object.__getattribute__(
+            self,
+            "_ProviderReceiptVerifier__admission",
+        )
+        if (
+            type(admission) is not _VerifierAdmission
+            or type(admission.key_id) is not str
+            or not admission.key_id
+            or not isinstance(admission.public_key, Ed25519PublicKey)
+        ):
+            raise ProviderOutputIntegrityError(
+                "provider output receipt verifier capability changed"
+            )
+        return admission
 
     def validate(self, receipt: ProviderCallReceipt) -> ProviderCallReceipt:
+        admission = self._trusted_admission()
         if type(receipt) is not ProviderCallReceipt:
             raise ProviderOutputIntegrityError(
                 "provider output requires an exact provider receipt"
@@ -117,15 +153,15 @@ class ProviderReceiptVerifier:
                 "provider output receipt has a non-provider plane"
             )
         if (
-            validated.proxy_attestation_key_id != self._key_id
-            or result.attestation_key_id != self._key_id
+            validated.proxy_attestation_key_id != admission.key_id
+            or result.attestation_key_id != admission.key_id
         ):
             raise ProviderOutputIntegrityError(
                 "provider output proxy attestation identity is invalid"
             )
         signature = _decode_signature(result.attestation_signature)
         try:
-            self._public_key.verify(signature, _attestation_bytes(result))
+            admission.public_key.verify(signature, _attestation_bytes(result))
         except Exception as exc:
             raise ProviderOutputIntegrityError(
                 "provider output proxy attestation is invalid"

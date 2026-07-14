@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import re
-from typing import Annotated, Literal, NoReturn, Self, final
+from typing import Annotated, Literal, Self
 
 from faultloom.provider import (
     ProviderCallOutcome,
@@ -13,7 +14,14 @@ from faultloom.provider import (
 )
 from faultloom_protocol import ObservationRef, ProtocolModel
 from faultloom_protocol.base import Identifier, MAX_INT64, Sha256Digest
-from pydantic import Field, model_validator
+from pydantic import Field, ValidationInfo, field_validator, model_validator
+
+from ._errors import (
+    ProviderOutputError,
+    ProviderOutputIntegrityError,
+    ProviderOutputScopeError,
+)
+from ._immutable import ProviderOutputCursorKey, ProviderOutputPage
 
 SCHEMA_VERSION = "0.1.0"
 PositiveSigned64 = Annotated[int, Field(strict=True, ge=1, le=MAX_INT64)]
@@ -21,18 +29,6 @@ _DIGEST = re.compile(r"sha256:([0-9a-f]{64})")
 _MEDIA_TYPE = re.compile(
     r"[a-z0-9][a-z0-9!#$&^_.+-]{0,62}/[a-z0-9][a-z0-9!#$&^_.+-]{0,62}"
 )
-
-
-class ProviderOutputError(RuntimeError):
-    pass
-
-
-class ProviderOutputIntegrityError(ProviderOutputError):
-    pass
-
-
-class ProviderOutputScopeError(ProviderOutputError):
-    pass
 
 
 class _OutputModel(ProtocolModel):
@@ -71,12 +67,78 @@ def require_media_type(value: str) -> str:
     return value
 
 
+def _exact_raw_string(value: object, label: str) -> str:
+    if type(value) is not str or not value or value != value.strip():
+        raise ValueError(f"provider output {label} is not an exact canonical string")
+    return value
+
+
+def _strict_observation_input(value: object) -> object:
+    if type(value) is ObservationRef:
+        observation_values: dict[str, object] = {
+            "observation_id": value.observation_id,
+            "run_id": value.run_id,
+            "cas_digest": value.cas_digest,
+            "media_type": value.media_type,
+        }
+    elif type(value) is dict:
+        observation_values = value
+    else:
+        raise ValueError("provider output observation must be an exact mapping")
+    _exact_raw_string(observation_values.get("observation_id"), "observation ID")
+    _exact_raw_string(observation_values.get("run_id"), "run ID")
+    _digest_hex(_exact_raw_string(observation_values.get("cas_digest"), "CAS digest"))
+    require_media_type(
+        _exact_raw_string(observation_values.get("media_type"), "media type")
+    )
+    return value
+
+
 class ProviderOutputRef(_OutputModel):
     engagement_id: Identifier
     receipt_digest: Sha256Digest
     event_seq: PositiveSigned64
     event_hash: Sha256Digest
     observation: ObservationRef
+
+    @field_validator(
+        "engagement_id",
+        "receipt_digest",
+        "event_hash",
+        mode="before",
+    )
+    @classmethod
+    def _raw_identity_is_exact(
+        cls,
+        value: object,
+        info: ValidationInfo,
+    ) -> str:
+        field_name = info.field_name
+        if field_name is None:
+            raise ValueError("provider output identity field is unavailable")
+        label = {
+            "engagement_id": "engagement ID",
+            "receipt_digest": "receipt digest",
+            "event_hash": "event hash",
+        }.get(field_name, "identity")
+        exact = _exact_raw_string(value, label)
+        if field_name != "engagement_id":
+            _digest_hex(exact)
+        return exact
+
+    @field_validator("observation", mode="before")
+    @classmethod
+    def _raw_observation_is_exact(
+        cls,
+        value: object,
+        info: ValidationInfo,
+    ) -> object:
+        exact = _strict_observation_input(value)
+        if info.mode == "json" and type(exact) is dict:
+            return ObservationRef.model_validate_json(
+                json.dumps(exact, separators=(",", ":"))
+            )
+        return exact
 
     @model_validator(mode="after")
     def _canonical_identity(self) -> Self:
@@ -120,71 +182,6 @@ class ProviderInvocationResult(_OutputModel):
         ):
             raise ValueError("provider output is not bound to its receipt")
         return self
-
-
-@final
-class ProviderOutputCursorKey:
-    __slots__ = ("__material",)
-
-    def __init__(self, material: bytes) -> None:
-        if type(material) is not bytes or len(material) != 32:
-            raise ValueError("provider output cursor key must be exactly 32 bytes")
-        self.__material = material
-
-    def _copy_for_hmac(self) -> bytes:
-        return bytes(self.__material)
-
-    def __repr__(self) -> str:
-        return "ProviderOutputCursorKey(<redacted>)"
-
-    def __reduce__(self) -> NoReturn:
-        raise TypeError("ProviderOutputCursorKey cannot be serialized")
-
-
-@final
-class ProviderOutputPage:
-    __slots__ = ("__data", "offset", "total_bytes", "next_cursor")
-
-    def __init__(
-        self,
-        data: bytes,
-        *,
-        offset: int,
-        total_bytes: int,
-        next_cursor: str | None,
-    ) -> None:
-        if type(data) is not bytes:
-            raise TypeError("provider output page data must be exact bytes")
-        if (
-            type(offset) is not int
-            or type(total_bytes) is not int
-            or offset < 0
-            or total_bytes < 0
-            or offset + len(data) > total_bytes
-        ):
-            raise ValueError("provider output page bounds are invalid")
-        if next_cursor is not None and (
-            type(next_cursor) is not str or not next_cursor
-        ):
-            raise ValueError("provider output continuation cursor is invalid")
-        self.__data = data
-        self.offset = offset
-        self.total_bytes = total_bytes
-        self.next_cursor = next_cursor
-
-    @property
-    def data(self) -> bytes:
-        return bytes(self.__data)
-
-    def __repr__(self) -> str:
-        return (
-            "ProviderOutputPage(data=<redacted>, "
-            f"offset={self.offset}, total_bytes={self.total_bytes}, "
-            f"has_next={self.next_cursor is not None})"
-        )
-
-    def __reduce__(self) -> NoReturn:
-        raise TypeError("ProviderOutputPage cannot be serialized")
 
 
 __all__ = [

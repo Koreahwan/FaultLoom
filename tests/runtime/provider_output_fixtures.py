@@ -13,7 +13,7 @@ from faultloom.provider import (
 from faultloom.state import StateStore
 from faultloom_protocol import Ed25519PublicKeyRecord, sha256_digest
 
-from tests.runtime.test_provider import (
+from tests.runtime.provider_test_fixtures import (
     FakeProxy,
     PROXY_SIGNER,
     adapter,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from typing import NamedTuple, NoReturn, final
 
 from faultloom.provider import ProviderCallReceipt
 from faultloom.state import StateStore
@@ -20,13 +21,17 @@ MAX_OUTPUT_BYTES = 1024 * 1024
 _VERIFY_RECEIPT = ProviderReceiptVerifier.validate
 
 
+class _HandoffAdmission(NamedTuple):
+    binding: ProviderOutputStoreBinding
+    media_type: str
+    maximum_output_bytes: int
+    verifier: ProviderReceiptVerifier
+
+
+@final
 class ProviderOutputHandoff:
-    __slots__ = (
-        "_binding",
-        "_maximum_output_bytes",
-        "_media_type",
-        "_receipt_verifier",
-    )
+    __slots__ = ("__admission",)
+    __admission: _HandoffAdmission
 
     def __init__(
         self,
@@ -50,24 +55,69 @@ class ProviderOutputHandoff:
             )
         ):
             raise ValueError("provider output maximum byte count is invalid")
-        self._binding = binding
-        self._media_type = require_media_type(media_type)
-        self._maximum_output_bytes = maximum_output_bytes
-        self._receipt_verifier = ProviderReceiptVerifier(
-            trusted_proxy_attestation_key
+        self.__admission = _HandoffAdmission(
+            binding,
+            require_media_type(media_type),
+            maximum_output_bytes,
+            ProviderReceiptVerifier(trusted_proxy_attestation_key),
         )
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "_ProviderOutputHandoff__admission":
+            try:
+                object.__getattribute__(self, name)
+            except AttributeError:
+                object.__setattr__(self, name, value)
+                return
+        raise AttributeError("ProviderOutputHandoff is immutable")
+
+    def __delattr__(self, name: str) -> NoReturn:
+        raise AttributeError("ProviderOutputHandoff is immutable")
+
+    def _trusted_admission(self) -> _HandoffAdmission:
+        admission = object.__getattribute__(
+            self,
+            "_ProviderOutputHandoff__admission",
+        )
+        if (
+            type(admission) is not _HandoffAdmission
+            or type(admission.binding) is not ProviderOutputStoreBinding
+            or type(admission.verifier) is not ProviderReceiptVerifier
+            or type(admission.maximum_output_bytes) is not int
+            or not 1 <= admission.maximum_output_bytes <= MAX_OUTPUT_BYTES
+        ):
+            raise ProviderOutputIntegrityError(
+                "provider output handoff admission changed"
+            )
+        try:
+            media_type = require_media_type(admission.media_type)
+        except (TypeError, ValueError) as exc:
+            raise ProviderOutputIntegrityError(
+                "provider output handoff admission changed"
+            ) from exc
+        admission.binding.validate()
+        if (
+            media_type != admission.media_type
+            or admission.maximum_output_bytes
+            > admission.binding.max_artifact_bytes
+        ):
+            raise ProviderOutputIntegrityError(
+                "provider output handoff admission changed"
+            )
+        return admission
 
     def publish(
         self,
         receipt: ProviderCallReceipt,
         raw_output: bytes,
     ) -> ProviderInvocationResult:
-        validated = self._validated_receipt(receipt)
+        admission = self._trusted_admission()
+        validated = _VERIFY_RECEIPT(admission.verifier, receipt)
         if type(raw_output) is not bytes:
             raise ProviderOutputIntegrityError(
                 "provider output body must be exact bytes"
             )
-        if len(raw_output) > self._maximum_output_bytes:
+        if len(raw_output) > admission.maximum_output_bytes:
             raise ProviderOutputIntegrityError(
                 "provider output exceeds the configured maximum"
             )
@@ -79,7 +129,7 @@ class ProviderOutputHandoff:
             raise ProviderOutputIntegrityError(
                 "provider output digest or byte length does not match its receipt"
             )
-        binding = self._binding
+        binding = admission.binding
         with binding.lock():
             binding.verify()
             event = binding.find(validated)
@@ -87,7 +137,7 @@ class ProviderOutputHandoff:
                 binding.append(
                     validated,
                     raw_output,
-                    media_type=self._media_type,
+                    media_type=admission.media_type,
                 )
                 event = binding.find(validated)
             if event is None:
@@ -98,15 +148,16 @@ class ProviderOutputHandoff:
                 binding,
                 validated,
                 event,
-                media_type=self._media_type,
+                media_type=admission.media_type,
             )
 
     def recover(
         self,
         receipt: ProviderCallReceipt,
     ) -> ProviderInvocationResult | None:
-        validated = self._validated_receipt(receipt)
-        binding = self._binding
+        admission = self._trusted_admission()
+        validated = _VERIFY_RECEIPT(admission.verifier, receipt)
+        binding = admission.binding
         with binding.lock():
             binding.verify()
             event = binding.find(validated)
@@ -117,17 +168,6 @@ class ProviderOutputHandoff:
                     binding,
                     validated,
                     event,
-                    media_type=self._media_type,
+                    media_type=admission.media_type,
                 )
             )
-
-    def _validated_receipt(
-        self,
-        receipt: ProviderCallReceipt,
-    ) -> ProviderCallReceipt:
-        verifier = self._receipt_verifier
-        if type(verifier) is not ProviderReceiptVerifier:
-            raise ProviderOutputIntegrityError(
-                "provider output receipt verifier capability changed"
-            )
-        return _VERIFY_RECEIPT(verifier, receipt)
