@@ -3,20 +3,21 @@ from __future__ import annotations
 import pytest
 
 from faultloom.execution import (
-    BrowserChildCandidate,
     BrowserChildKind,
     BrowserContractError,
     BrowserExecutionCoordinator,
-    BrowserIdentityContext,
-    EndpointScheme,
-    SemanticEndpoint,
+    CancellationReason,
+    ExecutionFlowKind,
+    GatewayDispatchCommand,
+    GatewayResult,
     SemanticHttpExecutor,
     UnsupportedBrowserTransport,
 )
-from faultloom_protocol import SCHEMA_VERSION
+from faultloom_protocol import sha256_digest
 
+from .browser_execution_helpers import browser_context, http_candidate, websocket_candidate
 from .execution_helpers import (
-    D1,
+    CHANNEL_KEY,
     NOW,
     RecordingGateway,
     command,
@@ -26,76 +27,20 @@ from .execution_helpers import (
 )
 
 
-def browser_context(
-    *,
-    context_id: str = "browser.owner",
-    identity_id: str = "identity.owner",
-    tenant_id: str = "tenant.alpha",
-    session_uri: str = "secret://run/identity-owner",
-    partition_id: str = "partition.owner",
-) -> BrowserIdentityContext:
-    identity = execution_identity(
-        context_id=context_id,
-        identity_id=identity_id,
-        tenant_id=tenant_id,
-        session_uri=session_uri,
-    )
-    return BrowserIdentityContext(
-        schema_version=SCHEMA_VERSION,
-        browser_context_id=context_id,
-        storage_partition_id=partition_id,
-        identity=identity,
-    )
-
-
-def http_candidate(
-    kind: BrowserChildKind,
-    *,
-    suffix: str,
-    context_id: str = "browser.owner",
-) -> BrowserChildCandidate:
-    request = semantic_request(path=f"/{suffix}")
-    return BrowserChildCandidate(
-        schema_version=SCHEMA_VERSION,
-        candidate_id=f"child.{suffix}",
-        parent_action_id="action.nav",
-        browser_context_id=context_id,
-        kind=kind,
-        endpoint=request.endpoint,
-        request=request,
-        discovery_digest=D1,
-    )
-
-
-def websocket_candidate() -> BrowserChildCandidate:
-    endpoint = SemanticEndpoint(
-        schema_version=SCHEMA_VERSION,
-        scheme=EndpointScheme.WSS,
-        hostname="loopback.test",
-        port=443,
-        path="/events",
-    )
-    return BrowserChildCandidate(
-        schema_version=SCHEMA_VERSION,
-        candidate_id="child.websocket",
-        parent_action_id="action.nav",
-        browser_context_id="browser.owner",
-        kind=BrowserChildKind.WEBSOCKET,
-        endpoint=endpoint,
-        discovery_digest=D1,
-    )
-
-
 def test_identity_contexts_cannot_share_session_or_storage_partition() -> None:
     gateway = RecordingGateway(completed_result)
-    browser = BrowserExecutionCoordinator(SemanticHttpExecutor(gateway, now=lambda: NOW))
+    browser = BrowserExecutionCoordinator(
+        SemanticHttpExecutor._for_test(
+            gateway, channel_key=CHANNEL_KEY, now=lambda: NOW
+        )
+    )
     owner = browser_context()
     browser.register_context(owner)
 
     shared_session = browser_context(
         context_id="browser.member",
         identity_id="identity.member",
-        session_uri=owner.identity.session_ref.uri,
+        session_uri=owner.session_uri,
         partition_id="partition.member",
     )
     with pytest.raises(BrowserContractError, match="session handle"):
@@ -113,7 +58,11 @@ def test_identity_contexts_cannot_share_session_or_storage_partition() -> None:
 
 def test_navigation_rejects_cross_identity_session_before_gateway() -> None:
     gateway = RecordingGateway(completed_result)
-    browser = BrowserExecutionCoordinator(SemanticHttpExecutor(gateway, now=lambda: NOW))
+    browser = BrowserExecutionCoordinator(
+        SemanticHttpExecutor._for_test(
+            gateway, channel_key=CHANNEL_KEY, now=lambda: NOW
+        )
+    )
     browser.register_context(browser_context())
     member = execution_identity(
         context_id="browser.member",
@@ -138,13 +87,15 @@ def test_every_http_browser_child_requires_a_fresh_bound_gateway_action() -> Non
         websocket_candidate(),
     )
 
-    def handle(dispatch_command):
+    def handle(dispatch_command: GatewayDispatchCommand) -> GatewayResult:
         if dispatch_command.intent.action_id == "action.nav":
             return completed_result(dispatch_command, child_candidates=candidates)
         return completed_result(dispatch_command)
 
     gateway = RecordingGateway(handle)
-    http = SemanticHttpExecutor(gateway, now=lambda: NOW)
+    http = SemanticHttpExecutor._for_test(
+        gateway, channel_key=CHANNEL_KEY, now=lambda: NOW
+    )
     browser = BrowserExecutionCoordinator(http)
     context = browser_context()
     browser.register_context(context)
@@ -160,13 +111,30 @@ def test_every_http_browser_child_requires_a_fresh_bound_gateway_action() -> Non
         )
         browser.execute_child("browser.owner", candidate.candidate_id, child_command)
 
-    assert [call.intent.action_id for call in gateway.calls] == [
+    assert [frame.command.intent.action_id for frame in gateway.calls] == [
         "action.nav",
         "action.child.1",
         "action.child.2",
         "action.child.3",
         "action.child.4",
         "action.child.5",
+    ]
+    assert [frame.flow_kind for frame in gateway.calls] == [
+        ExecutionFlowKind.NAVIGATION,
+        ExecutionFlowKind.REDIRECT,
+        ExecutionFlowKind.IFRAME,
+        ExecutionFlowKind.SUBRESOURCE,
+        ExecutionFlowKind.SERVICE_WORKER,
+        ExecutionFlowKind.DOWNLOAD,
+    ]
+    assert [frame.context_generation for frame in gateway.calls] == [1] * 6
+    assert [frame.parent_action_id for frame in gateway.calls] == [
+        None,
+        "action.nav",
+        "action.nav",
+        "action.nav",
+        "action.nav",
+        "action.nav",
     ]
     assert browser.pending_candidate_ids("browser.owner") == ("child.websocket",)
 
@@ -191,7 +159,11 @@ def test_forged_or_mismatched_child_never_reaches_gateway() -> None:
             else (),
         )
     )
-    browser = BrowserExecutionCoordinator(SemanticHttpExecutor(gateway, now=lambda: NOW))
+    browser = BrowserExecutionCoordinator(
+        SemanticHttpExecutor._for_test(
+            gateway, channel_key=CHANNEL_KEY, now=lambda: NOW
+        )
+    )
     context = browser_context()
     browser.register_context(context)
     browser.navigate("browser.owner", command(identity=context.identity))
@@ -220,17 +192,51 @@ def test_forged_or_mismatched_child_never_reaches_gateway() -> None:
     assert len(gateway.calls) == 1
 
 
+def test_reused_child_candidate_is_poisoned_before_execution() -> None:
+    candidate = http_candidate(BrowserChildKind.REDIRECT, suffix="redirect")
+    second_candidate = candidate.model_copy(update={"parent_action_id": "action.nav.second"})
+
+    def handle(dispatch_command: GatewayDispatchCommand) -> GatewayResult:
+        if dispatch_command.intent.action_id == "action.nav":
+            return completed_result(dispatch_command, child_candidates=(candidate,))
+        return completed_result(dispatch_command, child_candidates=(second_candidate,))
+
+    gateway = RecordingGateway(handle)
+    browser = BrowserExecutionCoordinator(
+        SemanticHttpExecutor._for_test(
+            gateway, channel_key=CHANNEL_KEY, now=lambda: NOW
+        )
+    )
+    context = browser_context()
+    browser.register_context(context)
+    browser.navigate("browser.owner", command(identity=context.identity))
+    second_navigation = command(
+        action_id="action.nav.second",
+        lease_id="lease.nav.second",
+        identity=context.identity,
+    )
+
+    with pytest.raises(BrowserContractError, match="candidate ID was reused"):
+        browser.navigate("browser.owner", second_navigation)
+
+    assert browser.pending_candidate_ids("browser.owner") == ()
+
+
 def test_closing_context_cancels_pending_children_and_prevents_further_actions() -> None:
     candidate = http_candidate(BrowserChildKind.SUBRESOURCE, suffix="script")
     gateway = RecordingGateway(
         lambda dispatch_command: completed_result(dispatch_command, child_candidates=(candidate,))
     )
-    browser = BrowserExecutionCoordinator(SemanticHttpExecutor(gateway, now=lambda: NOW))
+    browser = BrowserExecutionCoordinator(
+        SemanticHttpExecutor._for_test(
+            gateway, channel_key=CHANNEL_KEY, now=lambda: NOW
+        )
+    )
     context = browser_context()
     browser.register_context(context)
     browser.navigate("browser.owner", command(identity=context.identity))
 
-    browser.close_context("browser.owner")
+    receipt = browser.close_context("browser.owner")
 
     child_command = command(
         action_id="action.child",
@@ -242,3 +248,5 @@ def test_closing_context_cancels_pending_children_and_prevents_further_actions()
     with pytest.raises(BrowserContractError, match="not active"):
         browser.execute_child("browser.owner", candidate.candidate_id, child_command)
     assert len(gateway.calls) == 1
+    assert receipt.request_digest == sha256_digest(gateway.cancel_calls[0])
+    assert gateway.cancel_calls[0].reason is CancellationReason.CONTEXT_CLOSED

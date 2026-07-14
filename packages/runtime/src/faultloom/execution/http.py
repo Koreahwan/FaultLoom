@@ -1,54 +1,48 @@
-"""Fail-closed semantic HTTP dispatch through an injected Gateway port."""
+"""Fail-closed semantic HTTP dispatch through an authenticated Gateway port."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime, timezone
-from enum import Enum
 from threading import Lock
-from typing import Protocol
+from typing import Protocol, Self, assert_never
 
-from faultloom_protocol import DispatchOutcome
+from faultloom_protocol import sha256_digest
 
 from .contracts import (
-    GatewayDeniedResult,
     GatewayDispatchCommand,
-    GatewayDispatchResult,
     GatewayResult,
 )
-
-
-class ExecutionContractError(ValueError):
-    """An approval, request, or Gateway response is not exactly bound."""
-
-
-class DispatchReplayError(ExecutionContractError):
-    """An action or single-use lease was already presented to this executor."""
-
-
-class DispatchUncertainError(ExecutionContractError):
-    """The local caller cannot prove whether a Gateway dispatch occurred."""
+from .gateway import (
+    GatewayCancellationReceipt,
+    GatewayCancellationRequest,
+    GatewayDispatchFrame,
+    GatewayResponseEnvelope,
+    gateway_cancellation_is_authentic,
+    gateway_dispatch_frame,
+)
+from .gateway_client import AuthenticatedGatewayClient
+from .http_validation import (
+    DispatchReplayError,
+    DispatchUncertainError,
+    ExecutionContractError,
+    LocalDispatchState,
+    ReconciliationStateError,
+    validate_gateway_envelope,
+)
 
 
 class GatewayPort(Protocol):
     """The sole target-egress dependency available to the runtime executor."""
 
-    def dispatch(self, command: GatewayDispatchCommand) -> GatewayResult:
-        """Ask the separate Gateway process to verify, compile, and dispatch once."""
+    def dispatch(self, frame: GatewayDispatchFrame) -> GatewayResponseEnvelope: ...
 
+    def cancel_context(
+        self,
+        request: GatewayCancellationRequest,
+    ) -> GatewayCancellationReceipt: ...
 
-class LocalDispatchState(str, Enum):
-    IN_FLIGHT = "in_flight"
-    DENIED = "denied"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    PENDING = "pending"
-    UNKNOWN = "unknown"
-
-
-_TERMINAL_OUTCOMES = frozenset(
-    {DispatchOutcome.COMPLETED, DispatchOutcome.FAILED, DispatchOutcome.CANCELLED}
-)
+    def reconcile(self, frame: GatewayDispatchFrame) -> GatewayResponseEnvelope | None: ...
 
 
 class SemanticHttpExecutor:
@@ -61,17 +55,56 @@ class SemanticHttpExecutor:
 
     def __init__(
         self,
-        gateway: GatewayPort,
+        gateway: AuthenticatedGatewayClient,
         *,
         now: Callable[[], datetime] | None = None,
     ) -> None:
+        if type(gateway) is not AuthenticatedGatewayClient:
+            raise ExecutionContractError(
+                "production execution requires the authenticated pipe Gateway client"
+            )
+        self._initialize(gateway, gateway.channel_key, now)
+
+    @classmethod
+    def _for_test(
+        cls,
+        gateway: GatewayPort,
+        *,
+        channel_key: bytes,
+        now: Callable[[], datetime] | None = None,
+    ) -> Self:
+        instance = cls.__new__(cls)
+        instance._initialize(gateway, channel_key, now)
+        return instance
+
+    def _initialize(
+        self,
+        gateway: GatewayPort,
+        channel_key: bytes,
+        now: Callable[[], datetime] | None,
+    ) -> None:
+        if len(channel_key) < 32:
+            raise ExecutionContractError("Gateway channel key must contain at least 256 bits")
         self._gateway = gateway
+        self._channel_key = bytes(channel_key)
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._lock = Lock()
         self._states: dict[str, LocalDispatchState] = {}
         self._leases: dict[str, str] = {}
+        self._frames: dict[str, GatewayDispatchFrame] = {}
 
-    def execute(self, command: GatewayDispatchCommand) -> GatewayResult:
+    def execute(
+        self,
+        dispatch: GatewayDispatchCommand | GatewayDispatchFrame,
+    ) -> GatewayResult:
+        match dispatch:
+            case GatewayDispatchCommand():
+                frame = gateway_dispatch_frame(dispatch)
+            case GatewayDispatchFrame():
+                frame = dispatch
+            case unreachable:
+                assert_never(unreachable)
+        command = frame.command
         now = self._validated_now()
         self._validate_before_dispatch(command, now)
         action_id = command.intent.action_id
@@ -86,27 +119,67 @@ class SemanticHttpExecutor:
                 )
             self._states[action_id] = LocalDispatchState.IN_FLIGHT
             self._leases[lease_id] = action_id
+            self._frames[action_id] = frame
+
+        envelope: GatewayResponseEnvelope | None = None
+        try:
+            envelope = self._gateway.dispatch(frame)
+        except Exception as exc:
+            raise DispatchUncertainError(
+                "Gateway call failed after local dispatch reservation; reconciliation is required"
+            ) from exc
+        finally:
+            if envelope is None:
+                self._set_state(action_id, LocalDispatchState.UNKNOWN)
+        if envelope is None:
+            raise DispatchUncertainError("Gateway returned no authenticated response")
 
         try:
-            result = self._gateway.dispatch(command)
-        except BaseException as exc:
-            self._set_state(action_id, LocalDispatchState.UNKNOWN)
-            if isinstance(exc, Exception):
-                raise DispatchUncertainError(
-                    "Gateway call failed after local dispatch reservation; "
-                    "reconciliation is required"
-                ) from exc
-            raise
-
-        try:
-            state = self._validate_gateway_result(command, result)
+            state = validate_gateway_envelope(frame, envelope, self._channel_key)
         except (TypeError, ValueError, ExecutionContractError) as exc:
             self._set_state(action_id, LocalDispatchState.UNKNOWN)
-            if isinstance(exc, ExecutionContractError):
-                raise
-            raise ExecutionContractError("Gateway returned an invalid typed response") from exc
+            match exc:
+                case ExecutionContractError():
+                    raise
+                case TypeError() | ValueError():
+                    raise ExecutionContractError(
+                        "Gateway returned an invalid typed response"
+                    ) from exc
+                case unreachable:
+                    assert_never(unreachable)
         self._set_state(action_id, state)
-        return result
+        return envelope.result
+
+    def reconcile(self, action_id: str) -> GatewayResult | None:
+        with self._lock:
+            if self._states.get(action_id) is not LocalDispatchState.UNKNOWN:
+                raise ReconciliationStateError(
+                    f"action is not awaiting reconciliation: {action_id}"
+                )
+            frame = self._frames[action_id]
+        try:
+            envelope = self._gateway.reconcile(frame)
+        except Exception as exc:
+            raise DispatchUncertainError("Gateway reconciliation channel failed") from exc
+        if envelope is None:
+            return None
+        state = validate_gateway_envelope(frame, envelope, self._channel_key)
+        self._set_state(action_id, state)
+        return envelope.result
+
+    def cancel_context(
+        self,
+        request: GatewayCancellationRequest,
+    ) -> GatewayCancellationReceipt:
+        try:
+            receipt = self._gateway.cancel_context(request)
+        except Exception as exc:
+            raise DispatchUncertainError("Gateway cancellation channel failed") from exc
+        if receipt.request_digest != sha256_digest(request):
+            raise ExecutionContractError("Gateway cancellation request binding mismatch")
+        if not gateway_cancellation_is_authentic(receipt, self._channel_key):
+            raise ExecutionContractError("Gateway cancellation authentication failed")
+        return receipt
 
     def state_for(self, action_id: str) -> LocalDispatchState | None:
         with self._lock:
@@ -154,70 +227,3 @@ class SemanticHttpExecutor:
         if command.request.body_ref is not None:
             if command.request.body_ref.byte_length > lease.reservation.request_bytes:
                 raise ExecutionContractError("request body exceeds its lease reservation")
-
-    @staticmethod
-    def _validate_gateway_result(
-        command: GatewayDispatchCommand,
-        result: object,
-    ) -> LocalDispatchState:
-        if isinstance(result, GatewayDeniedResult):
-            if result.action_id != command.intent.action_id:
-                raise ExecutionContractError("Gateway denial belongs to another action")
-            return LocalDispatchState.DENIED
-        if not isinstance(result, GatewayDispatchResult):
-            raise TypeError("Gateway result has an unknown type")
-
-        receipt = result.receipt
-        if (
-            receipt.lease_id != command.lease.lease_id
-            or receipt.intent_digest != command.intent_digest
-            or receipt.decision_digest != command.decision_digest
-            or receipt.scope_epoch != command.lease.scope_epoch
-        ):
-            raise ExecutionContractError("Gateway receipt binding mismatch")
-        if receipt.bytes_sent > command.lease.reservation.request_bytes:
-            raise ExecutionContractError("Gateway exceeded reserved request bytes")
-        if receipt.bytes_received > command.lease.reservation.response_bytes:
-            raise ExecutionContractError("Gateway exceeded reserved response bytes")
-        if not command.lease.issued_at <= receipt.dispatched_at < command.lease.expires_at:
-            raise ExecutionContractError("Gateway dispatch occurred outside the lease window")
-        if receipt.response_status is not None and not 100 <= receipt.response_status <= 599:
-            raise ExecutionContractError("Gateway returned an invalid HTTP status")
-        if receipt.outcome is DispatchOutcome.COMPLETED and receipt.response_status is None:
-            raise ExecutionContractError("completed semantic HTTP receipt requires a status")
-        if receipt.outcome in _TERMINAL_OUTCOMES and receipt.completed_at is None:
-            raise ExecutionContractError("terminal Gateway receipt requires completed_at")
-
-        observation = result.observation
-        if observation is None:
-            if receipt.response_digest is not None or receipt.bytes_received:
-                raise ExecutionContractError(
-                    "Gateway response bytes require an observation reference"
-                )
-        else:
-            response_ref = observation.response_ref
-            if receipt.response_digest != response_ref.cas_digest:
-                raise ExecutionContractError("response observation digest differs from the receipt")
-            if response_ref.run_id != command.intent.run_id:
-                raise ExecutionContractError("response observation belongs to another run")
-            if response_ref.byte_length != receipt.bytes_received:
-                raise ExecutionContractError("response observation length differs from the receipt")
-            for child in observation.child_candidates:
-                if child.parent_action_id != command.intent.action_id:
-                    raise ExecutionContractError("browser child belongs to another parent action")
-                if child.browser_context_id != command.identity.context_id:
-                    raise ExecutionContractError("browser child escaped its identity context")
-            if observation.child_candidates and receipt.outcome is not DispatchOutcome.COMPLETED:
-                raise ExecutionContractError(
-                    "browser children require a completed parent response"
-                )
-
-        if receipt.outcome is DispatchOutcome.COMPLETED:
-            return LocalDispatchState.COMPLETED
-        if receipt.outcome in {DispatchOutcome.FAILED, DispatchOutcome.CANCELLED}:
-            return LocalDispatchState.FAILED
-        if receipt.outcome is DispatchOutcome.DISPATCHED:
-            return LocalDispatchState.PENDING
-        if receipt.outcome is DispatchOutcome.UNKNOWN_OUTCOME:
-            return LocalDispatchState.UNKNOWN
-        raise ExecutionContractError("Gateway receipt has an unsupported outcome")

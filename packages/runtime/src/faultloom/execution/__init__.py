@@ -1,8 +1,8 @@
 """Gateway-only semantic HTTP and multi-identity browser execution."""
 
-from .browser import (
+from .browser import BrowserExecutionCoordinator
+from .browser_contracts import (
     BrowserContractError,
-    BrowserExecutionCoordinator,
     BrowserIdentityContext,
     UnsupportedBrowserTransport,
 )
@@ -25,14 +25,30 @@ from .contracts import (
     SemanticValue,
     semantic_payload_digest,
 )
-from .http import (
+from .http import GatewayPort, SemanticHttpExecutor
+from .http_validation import (
     DispatchReplayError,
     DispatchUncertainError,
     ExecutionContractError,
-    GatewayPort,
+    GatewayChannelError,
     LocalDispatchState,
-    SemanticHttpExecutor,
+    ReconciliationStateError,
 )
+from .gateway import (
+    CancellationReason,
+    ExecutionFlowKind,
+    GatewayCancellationReceipt,
+    GatewayCancellationRequest,
+    GatewayDispatchFrame,
+    GatewayResponseEnvelope,
+    bind_gateway_cancellation,
+    bind_gateway_response,
+    canonical_dispatch_receipt_id,
+    gateway_dispatch_frame,
+    gateway_frame_digest,
+)
+from .gateway_client import AuthenticatedGatewayClient
+from .gateway_pipe import GatewayPipeChannels, GatewayPipeFds
 
 __all__ = [
     "SEMANTIC_HTTP_ACTION_KIND",
@@ -41,17 +57,28 @@ __all__ = [
     "BrowserContractError",
     "BrowserExecutionCoordinator",
     "BrowserIdentityContext",
+    "AuthenticatedGatewayClient",
+    "CancellationReason",
     "DispatchReplayError",
     "DispatchUncertainError",
     "EndpointScheme",
+    "ExecutionFlowKind",
     "ExecutionContractError",
     "ExecutionIdentity",
     "GatewayDeniedResult",
+    "GatewayCancellationReceipt",
+    "GatewayCancellationRequest",
+    "GatewayChannelError",
     "GatewayDispatchCommand",
+    "GatewayDispatchFrame",
     "GatewayDispatchResult",
     "GatewayPort",
+    "GatewayPipeFds",
+    "GatewayPipeChannels",
+    "GatewayResponseEnvelope",
     "GatewayResult",
     "LocalDispatchState",
+    "ReconciliationStateError",
     "SemanticBodyRef",
     "SemanticEndpoint",
     "SemanticHeader",
@@ -61,5 +88,10 @@ __all__ = [
     "SemanticQueryParameter",
     "SemanticValue",
     "UnsupportedBrowserTransport",
+    "bind_gateway_cancellation",
+    "bind_gateway_response",
+    "canonical_dispatch_receipt_id",
+    "gateway_dispatch_frame",
+    "gateway_frame_digest",
     "semantic_payload_digest",
 ]
