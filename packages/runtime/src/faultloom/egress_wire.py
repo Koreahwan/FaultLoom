@@ -4,8 +4,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from types import ModuleType
-from typing import Literal, cast
+from typing import Literal
 
 import faultloom.egress_enum_integrity as enum_integrity
 from faultloom_protocol import ProtocolModel
@@ -61,10 +60,12 @@ class ExactEnumCatalog:
             )
             raw_member_map = enum_integrity.entry(class_entries, "_member_map_")
             raw_value_map = enum_integrity.entry(class_entries, "_value2member_map_")
-            if type(raw_member_map) is not dict or type(raw_value_map) is not dict:
+            if not enum_integrity.is_exact_dict(
+                raw_member_map
+            ) or not enum_integrity.is_exact_dict(raw_value_map):
                 raise EgressWireError("catalog_storage")
-            member_map = cast(dict[object, object], raw_member_map)
-            value_map = cast(dict[object, object], raw_value_map)
+            member_map = raw_member_map
+            value_map = raw_value_map
             member_entries = enum_integrity.exact_dict_entries(
                 member_map,
                 value_type=enum_type,
@@ -77,11 +78,15 @@ class ExactEnumCatalog:
             )
             members: list[enum_integrity.EnumMemberSnapshot] = []
             for name, raw_member in member_entries:
-                member = cast(Enum, raw_member)
+                if not enum_integrity.exact_string_member(
+                    raw_member, enum_type=enum_type
+                ):
+                    raise EgressWireError("catalog_member")
+                member = raw_member
                 member_name, member_value = enum_integrity.member_metadata(
                     member, error=EgressWireError("catalog_identity")
                 )
-                backing_value = str.__str__(cast(str, cast(object, member)))
+                backing_value = str.__str__(member)
                 if (
                     type(member_name) is not str
                     or type(member_value) is not str
@@ -99,8 +104,10 @@ class ExactEnumCatalog:
                     enum_integrity.EnumMemberSnapshot(name=name, member=member, value=backing_value)
                 )
             module_name = enum_integrity.entry(class_entries, "__module__")
-            class_name = cast(object, type.__getattribute__(enum_type, "__name__"))
-            if type(module_name) is not str or type(class_name) is not str:
+            class_name = enum_integrity.raw_class_name(enum_type)
+            if not enum_integrity.is_exact_string(
+                module_name
+            ) or not enum_integrity.is_exact_string(class_name):
                 raise EgressWireError("catalog_identity")
             module = enum_integrity.entry(
                 enum_integrity.exact_dict_entries(
@@ -110,9 +117,9 @@ class ExactEnumCatalog:
                 ),
                 module_name,
             )
-            if type(module) is not ModuleType:
+            if not enum_integrity.is_exact_module(module):
                 raise EgressWireError("catalog_identity")
-            exact_module = cast(ModuleType, module)
+            exact_module = module
             if enum_integrity.entry(
                 enum_integrity.module_entries(
                     exact_module, error=EgressWireError("catalog_identity")
@@ -128,11 +135,13 @@ class ExactEnumCatalog:
                     class_name=class_name,
                     class_entry_count=len(class_entries),
                     members=tuple(members),
-                    member_count=dict.__len__(member_map),
-                    value_count=dict.__len__(value_map),
+                    member_count=len(member_map),
+                    value_count=len(value_map),
                 )
             )
-        self._type_snapshots = tuple(type_snapshots)
+        self._type_snapshots: tuple[enum_integrity.EnumTypeSnapshot, ...] = tuple(
+            type_snapshots
+        )
 
     def normalize_input(
         self,
@@ -143,7 +152,7 @@ class ExactEnumCatalog:
     ) -> WireValue:
         snapshot = self._snapshot_for_type(enum_type)
         self._validate_snapshot(snapshot)
-        if type(value) is str and isinstance(value, str):
+        if type(value) is str:
             if value not in allowed_values:
                 raise EgressWireError("enum_value")
             return value
@@ -183,27 +192,27 @@ class ExactEnumCatalog:
         class_entries = enum_integrity.exact_class_entries(
             snapshot.enum_type, error=identity_error
         )
-        current_class_name = cast(
-            object, type.__getattribute__(snapshot.enum_type, "__name__")
-        )
+        current_class_name = enum_integrity.raw_class_name(snapshot.enum_type)
         current_module_name = enum_integrity.entry(class_entries, "__module__")
         if (
             len(class_entries) != snapshot.class_entry_count
-            or type(current_class_name) is not str
+            or not enum_integrity.is_exact_string(current_class_name)
             or current_class_name != snapshot.class_name
-            or type(current_module_name) is not str
+            or not enum_integrity.is_exact_string(current_module_name)
             or current_module_name != snapshot.module_name
         ):
             raise EgressWireError("enum_identity")
         raw_member_map = enum_integrity.entry(class_entries, "_member_map_")
         raw_value_map = enum_integrity.entry(class_entries, "_value2member_map_")
-        if type(raw_member_map) is not dict or type(raw_value_map) is not dict:
+        if not enum_integrity.is_exact_dict(
+            raw_member_map
+        ) or not enum_integrity.is_exact_dict(raw_value_map):
             raise EgressWireError("enum_identity")
-        member_map = cast(dict[object, object], raw_member_map)
-        value_map = cast(dict[object, object], raw_value_map)
+        member_map = raw_member_map
+        value_map = raw_value_map
         if (
-            dict.__len__(member_map) != snapshot.member_count
-            or dict.__len__(value_map) != snapshot.value_count
+            len(member_map) != snapshot.member_count
+            or len(value_map) != snapshot.value_count
         ):
             raise EgressWireError("enum_identity")
         member_entries = enum_integrity.exact_dict_entries(
@@ -216,21 +225,14 @@ class ExactEnumCatalog:
             value_type=snapshot.enum_type,
             error=EgressWireError("enum_identity"),
         )
-        module_entries = enum_integrity.module_entries(
-            snapshot.module, error=EgressWireError("enum_identity")
+        enum_integrity.validate_module_binding(
+            snapshot, error=EgressWireError("enum_identity")
         )
-        if (
-            enum_integrity.entry(module_entries, snapshot.class_name)
-            is not snapshot.enum_type
-        ):
-            raise EgressWireError("enum_identity")
         for member_snapshot in snapshot.members:
             member_name, member_value = enum_integrity.member_metadata(
                 member_snapshot.member, error=EgressWireError("enum_identity")
             )
-            backing_value = str.__str__(
-                cast(str, cast(object, member_snapshot.member))
-            )
+            backing_value = str.__str__(member_snapshot.member)
             if (
                 type(member_name) is not str
                 or member_name != member_snapshot.name
