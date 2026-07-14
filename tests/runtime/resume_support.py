@@ -4,13 +4,15 @@ from pathlib import Path
 
 from faultloom.context import ContextState, checkpoint_binding_tag_for
 from faultloom.resume import (
+    ActionReconciliation,
     CheckpointController,
     CheckpointReason,
     FailoverIntent,
     ResumePacket,
+    UnresolvedActionState,
 )
 from faultloom.state import AnchorCheckpoint, EngagementKey, StateStore
-from faultloom_protocol import ModelIdentity, RunManifest
+from faultloom_protocol import DispatchOutcome, ModelIdentity, RunManifest
 from tests.protocol.factories import NOW, sample_models
 from tests.runtime.test_context import DEFAULT_RETRIEVAL_KEY, context_state
 
@@ -88,6 +90,25 @@ def make_failover_intent() -> FailoverIntent:
         to_model=next_model,
         requested_at=NOW,
         reason="operator-approved failover boundary",
+    )
+
+
+def make_reconciliation(
+    context: ContextState,
+    *,
+    action_id: str = "action.unknown",
+    prior_state: UnresolvedActionState = UnresolvedActionState.UNKNOWN_OUTCOME,
+) -> ActionReconciliation:
+    checkpoint = context.checkpoint
+    return ActionReconciliation(
+        reconciliation_id=f"reconciliation.{action_id}",
+        action_id=action_id,
+        prior_state=prior_state,
+        outcome=DispatchOutcome.COMPLETED,
+        evidence_ref=checkpoint.recent_evidence_refs[0],
+        authority_digest=checkpoint.authority_digest,
+        scope_epoch=checkpoint.scope_epoch,
+        reconciled_at=NOW,
     )
 
 

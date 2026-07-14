@@ -7,7 +7,13 @@ from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from faultloom_protocol import ModelIdentity, RunManifest, sha256_digest
+from faultloom_protocol import (
+    DispatchOutcome,
+    EvidenceRef,
+    ModelIdentity,
+    RunManifest,
+    sha256_digest,
+)
 from faultloom_protocol.base import AwareDatetime, Identifier, Sha256Digest, ShortStr
 from faultloom_protocol.models import NonNegativeInt, PositiveInt
 
@@ -60,6 +66,11 @@ class CheckpointReason(StrEnum):
     TURN_END = "turn_end"
 
 
+class UnresolvedActionState(StrEnum):
+    PENDING = "pending"
+    UNKNOWN_OUTCOME = "unknown_outcome"
+
+
 class _ResumeModel(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
@@ -87,6 +98,35 @@ class FailoverIntent(_ResumeModel):
         return self
 
 
+class ActionReconciliation(_ResumeModel):
+    reconciliation_id: Identifier
+    action_id: Identifier
+    prior_state: UnresolvedActionState
+    outcome: DispatchOutcome
+    evidence_ref: EvidenceRef
+    authority_digest: Sha256Digest
+    scope_epoch: PositiveInt
+    reconciled_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def _has_terminal_evidence(self) -> Self:
+        if self.outcome not in {
+            DispatchOutcome.COMPLETED,
+            DispatchOutcome.FAILED,
+            DispatchOutcome.CANCELLED,
+        }:
+            raise ValueError("action reconciliation requires a terminal outcome")
+        if self.evidence_ref.created_at > self.reconciled_at:
+            raise ValueError("action reconciliation predates its evidence")
+        return self
+
+
+def _empty_action_reconciliations(
+    records: tuple[ActionReconciliation, ...],
+) -> bool:
+    return not records
+
+
 class CheckpointEnvelope(_ResumeModel):
     format_version: Literal[1] = 1
     kind: Literal["faultloom.resume_checkpoint"] = "faultloom.resume_checkpoint"
@@ -95,6 +135,10 @@ class CheckpointEnvelope(_ResumeModel):
     context_state: ContextState
     model_digest: Sha256Digest
     failover_intent: FailoverIntent | None = None
+    action_reconciliations: tuple[ActionReconciliation, ...] = Field(
+        default=(),
+        exclude_if=_empty_action_reconciliations,
+    )
 
     @model_validator(mode="after")
     def _is_consistent(self) -> Self:
@@ -126,6 +170,33 @@ class CheckpointEnvelope(_ResumeModel):
                 raise ValueError("failover intent source differs from the active model")
             if self.failover_intent.requested_at < checkpoint.created_at:
                 raise ValueError("failover intent predates its checkpoint")
+        reconciliation_ids = tuple(
+            record.reconciliation_id for record in self.action_reconciliations
+        )
+        action_ids = tuple(record.action_id for record in self.action_reconciliations)
+        if len(set(reconciliation_ids)) != len(reconciliation_ids):
+            raise ValueError("action reconciliation IDs must be unique")
+        if len(set(action_ids)) != len(action_ids):
+            raise ValueError("an action can be reconciled only once per checkpoint")
+        if self.action_reconciliations and (
+            self.reason is not CheckpointReason.BEFORE_STATE_CHANGE
+        ):
+            raise ValueError("action reconciliation requires a state-change checkpoint")
+        recent_evidence = set(checkpoint.recent_evidence_refs)
+        for record in self.action_reconciliations:
+            if record.evidence_ref.run_id != checkpoint.run_id:
+                raise ValueError("action reconciliation evidence belongs to another run")
+            if record.evidence_ref not in recent_evidence:
+                raise ValueError("action reconciliation evidence is not checkpoint-linked")
+            if not hmac.compare_digest(
+                record.authority_digest,
+                checkpoint.authority_digest,
+            ):
+                raise ValueError("action reconciliation authority differs from checkpoint")
+            if record.scope_epoch != checkpoint.scope_epoch:
+                raise ValueError("action reconciliation scope epoch differs from checkpoint")
+            if record.reconciled_at > checkpoint.created_at:
+                raise ValueError("action reconciliation postdates its checkpoint")
         return self
 
 
@@ -170,10 +241,13 @@ class ResumePacket:
     reason: CheckpointReason
     run_manifest: RunManifest
     context_state: ContextState
+    failover_intent: FailoverIntent | None
+    action_reconciliations: tuple[ActionReconciliation, ...]
     blocked_action_ids: tuple[str, ...]
     automatic_retry_action_ids: tuple[str, ...]
     dispatch_ready: bool
     requires_reconciliation: bool
+    failover_required: bool
 
 
 @dataclass(frozen=True, slots=True)

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from faultloom import cli
-from faultloom.resume import CheckpointController, trust_policy_for
+from faultloom.resume import CheckpointController, CheckpointReason, trust_policy_for
 from tests.protocol.factories import D1
 from tests.runtime.resume_support import (
     KEY_BYTES,
@@ -39,11 +39,13 @@ def _persist_resume_fixture(
     root: Path,
     *,
     unknown: tuple[str, ...] = (),
+    reason: CheckpointReason = CheckpointReason.TURN_END,
 ) -> None:
     with open_store(root) as active:
         packet = write_checkpoint(
             CheckpointController(active),
             make_context(unknown=unknown),
+            reason=reason,
         )
         policy = trust_policy_for(packet, minimum_anchor=active.checkpoint())
     (root / "resume-trust.json").write_text(
@@ -111,6 +113,27 @@ def test_inspect_cli_reports_unknown_outcome_without_dispatch(
     assert result["operation"] == "inspect"
     assert result["unknown_outcome_action_ids"] == ["action.unknown"]
     assert result["requires_reconciliation"] is True
+    assert result["dispatch_performed"] is False
+
+
+def test_inspect_cli_exposes_pending_failover_without_dispatch(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _persist_resume_fixture(
+        tmp_path,
+        reason=CheckpointReason.BEFORE_PROVIDER_FAILOVER,
+    )
+
+    exit_code = cli.main(_resume_arguments(tmp_path, command="inspect"))
+
+    assert exit_code == cli.EXIT_OK
+    result = json.loads(capsys.readouterr().out)
+    assert result["failover_required"] is True
+    assert result["dispatch_ready"] is False
+    assert result["failover_intent"]["to_model"]["actual_snapshot"] == (
+        "frontier-2030-02-01"
+    )
     assert result["dispatch_performed"] is False
 
 

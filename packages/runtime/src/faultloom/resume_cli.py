@@ -14,7 +14,9 @@ from typing import Literal, Protocol, assert_never
 from pydantic import BaseModel, ConfigDict
 
 from .resume import (
+    ActionReconciliation,
     CheckpointController,
+    FailoverIntent,
     ReconciliationRequiredError,
     ResumeError,
     ResumePacket,
@@ -80,7 +82,10 @@ class _ResumeReport(BaseModel):
     pending_action_ids: tuple[str, ...]
     unknown_outcome_action_ids: tuple[str, ...]
     automatic_retry_action_ids: tuple[str, ...]
+    failover_intent: FailoverIntent | None
+    action_reconciliations: tuple[ActionReconciliation, ...]
     requires_reconciliation: bool
+    failover_required: bool
     dispatch_ready: bool
 
 
@@ -228,7 +233,10 @@ def _report(operation: ResumeOperation, packet: ResumePacket) -> _ResumeReport:
         pending_action_ids=checkpoint.pending_action_ids,
         unknown_outcome_action_ids=checkpoint.unknown_outcome_action_ids,
         automatic_retry_action_ids=packet.automatic_retry_action_ids,
+        failover_intent=packet.failover_intent,
+        action_reconciliations=packet.action_reconciliations,
         requires_reconciliation=packet.requires_reconciliation,
+        failover_required=packet.failover_required,
         dispatch_ready=packet.dispatch_ready,
     )
 

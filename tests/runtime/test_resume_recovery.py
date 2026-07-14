@@ -7,17 +7,24 @@ from pathlib import Path
 import pytest
 
 from faultloom.resume import (
+    CheckpointConflictError,
     CheckpointController,
     CheckpointIntegrityError,
     CheckpointNotFoundError,
+    CheckpointReason,
     ReconciliationRequiredError,
     ResumeTrustError,
+    UnresolvedActionState,
     trust_policy_for,
 )
 from faultloom.state import ArtifactRef, ChainIntegrityError, EventRecord, StorageError
+from faultloom_protocol import DispatchOutcome
 from tests.protocol.factories import D1
 from tests.runtime.resume_support import (
     make_context,
+    make_failover_intent,
+    make_manifest,
+    make_reconciliation,
     open_store,
     state_root,
     write_checkpoint,
@@ -62,6 +69,265 @@ def test_unknown_outcome_is_inspectable_but_resume_requires_reconciliation(
             controller.resume(policy)
         assert active.ledger is not None
         assert len(active.ledger.events()) == 1
+
+
+def test_unknown_outcome_cannot_be_silently_dropped_by_a_successor(
+    tmp_path: Path,
+) -> None:
+    with open_store(tmp_path) as active:
+        controller = CheckpointController(active)
+        write_checkpoint(
+            controller,
+            make_context(unknown=("action.unknown",)),
+        )
+
+        with pytest.raises(CheckpointConflictError, match="reconciliation"):
+            write_checkpoint(
+                controller,
+                make_context(sequence=2, checkpoint_id="checkpoint.2"),
+            )
+
+        assert active.ledger is not None
+        assert len(active.ledger.events()) == 1
+
+
+def test_pending_action_cannot_be_silently_dropped_by_a_successor(
+    tmp_path: Path,
+) -> None:
+    with open_store(tmp_path) as active:
+        controller = CheckpointController(active)
+        write_checkpoint(
+            controller,
+            make_context(pending=("action.pending",)),
+        )
+
+        with pytest.raises(CheckpointConflictError, match="reconciliation"):
+            write_checkpoint(
+                controller,
+                make_context(sequence=2, checkpoint_id="checkpoint.2"),
+            )
+
+
+def test_pending_action_can_advance_to_unknown_but_stays_blocked(
+    tmp_path: Path,
+) -> None:
+    with open_store(tmp_path) as active:
+        controller = CheckpointController(active)
+        write_checkpoint(
+            controller,
+            make_context(pending=("action.pending",)),
+        )
+        packet = write_checkpoint(
+            controller,
+            make_context(
+                sequence=2,
+                checkpoint_id="checkpoint.2",
+                unknown=("action.pending",),
+            ),
+        )
+        policy = trust_policy_for(packet, minimum_anchor=active.checkpoint())
+
+        with pytest.raises(ReconciliationRequiredError, match="action.pending"):
+            controller.resume(policy)
+
+
+def test_evidence_linked_reconciliation_atomically_resolves_unknown_action(
+    tmp_path: Path,
+) -> None:
+    resolved_context = make_context(
+        sequence=2,
+        checkpoint_id="checkpoint.reconciled",
+    )
+    reconciliation = make_reconciliation(resolved_context)
+    with open_store(tmp_path) as active:
+        controller = CheckpointController(active)
+        write_checkpoint(
+            controller,
+            make_context(unknown=("action.unknown",)),
+        )
+        packet = controller.write(
+            reason=CheckpointReason.BEFORE_STATE_CHANGE,
+            run_manifest=make_manifest(),
+            context_state=resolved_context,
+            action_reconciliations=(reconciliation,),
+        )
+        floor = active.checkpoint()
+        policy = trust_policy_for(packet, minimum_anchor=floor)
+
+    with open_store(tmp_path, minimum_anchor=floor) as reopened:
+        restored = CheckpointController(reopened).resume(policy)
+
+    assert restored.action_reconciliations == (reconciliation,)
+    assert restored.blocked_action_ids == ()
+    assert restored.requires_reconciliation is False
+    assert restored.dispatch_ready is True
+
+
+def test_reconciliation_must_match_the_prior_unresolved_state(
+    tmp_path: Path,
+) -> None:
+    resolved_context = make_context(
+        sequence=2,
+        checkpoint_id="checkpoint.reconciled",
+    )
+    reconciliation = make_reconciliation(
+        resolved_context,
+        prior_state=UnresolvedActionState.PENDING,
+    )
+    with open_store(tmp_path) as active:
+        controller = CheckpointController(active)
+        write_checkpoint(
+            controller,
+            make_context(unknown=("action.unknown",)),
+        )
+
+        with pytest.raises(CheckpointConflictError, match="prior state"):
+            controller.write(
+                reason=CheckpointReason.BEFORE_STATE_CHANGE,
+                run_manifest=make_manifest(),
+                context_state=resolved_context,
+                action_reconciliations=(reconciliation,),
+            )
+
+
+def test_reconciliation_requires_checkpoint_linked_terminal_evidence(
+    tmp_path: Path,
+) -> None:
+    resolved_context = make_context(
+        sequence=2,
+        checkpoint_id="checkpoint.reconciled",
+    )
+    valid = make_reconciliation(resolved_context)
+    unlinked = valid.model_copy(
+        update={
+            "evidence_ref": valid.evidence_ref.model_copy(
+                update={"evidence_id": "evidence.unlinked"}
+            )
+        }
+    )
+    nonterminal = valid.model_copy(
+        update={"outcome": DispatchOutcome.UNKNOWN_OUTCOME}
+    )
+    with open_store(tmp_path) as active:
+        controller = CheckpointController(active)
+        write_checkpoint(
+            controller,
+            make_context(unknown=("action.unknown",)),
+        )
+
+        with pytest.raises(ValueError, match="checkpoint-linked"):
+            controller.write(
+                reason=CheckpointReason.BEFORE_STATE_CHANGE,
+                run_manifest=make_manifest(),
+                context_state=resolved_context,
+                action_reconciliations=(unlinked,),
+            )
+        with pytest.raises(ValueError, match="terminal outcome"):
+            controller.write(
+                reason=CheckpointReason.BEFORE_STATE_CHANGE,
+                run_manifest=make_manifest(),
+                context_state=resolved_context,
+                action_reconciliations=(nonterminal,),
+            )
+
+
+def test_reconciled_action_id_cannot_be_reintroduced_as_unresolved(
+    tmp_path: Path,
+) -> None:
+    resolved_context = make_context(
+        sequence=2,
+        checkpoint_id="checkpoint.reconciled",
+    )
+    with open_store(tmp_path) as active:
+        controller = CheckpointController(active)
+        write_checkpoint(
+            controller,
+            make_context(unknown=("action.unknown",)),
+        )
+        controller.write(
+            reason=CheckpointReason.BEFORE_STATE_CHANGE,
+            run_manifest=make_manifest(),
+            context_state=resolved_context,
+            action_reconciliations=(make_reconciliation(resolved_context),),
+        )
+
+        with pytest.raises(CheckpointConflictError, match="become unresolved"):
+            write_checkpoint(
+                controller,
+                make_context(
+                    sequence=3,
+                    checkpoint_id="checkpoint.reintroduced",
+                    pending=("action.unknown",),
+                ),
+            )
+
+
+def test_failover_intent_survives_resume_and_target_model_continues(
+    tmp_path: Path,
+) -> None:
+    with open_store(tmp_path) as active:
+        controller = CheckpointController(active)
+        intent = make_failover_intent()
+        first = controller.write(
+            reason=CheckpointReason.BEFORE_PROVIDER_FAILOVER,
+            run_manifest=make_manifest(),
+            context_state=make_context(),
+            failover_intent=intent,
+        )
+        policy = trust_policy_for(first, minimum_anchor=active.checkpoint())
+
+        restored = controller.resume(policy)
+        assert restored.failover_intent == intent
+        assert restored.failover_required is True
+        assert restored.dispatch_ready is False
+
+        target_manifest = make_manifest().model_copy(update={"model": intent.to_model})
+        drifted_target = target_manifest.model_copy(
+            update={"pack_ids": ("pack.unplanned",)}
+        )
+        with pytest.raises(CheckpointConflictError, match="exact target model"):
+            controller.write(
+                reason=CheckpointReason.TURN_END,
+                run_manifest=drifted_target,
+                context_state=make_context(
+                    sequence=2,
+                    checkpoint_id="checkpoint.drifted-failover",
+                ),
+            )
+        continuation = controller.write(
+            reason=CheckpointReason.TURN_END,
+            run_manifest=target_manifest,
+            context_state=make_context(
+                sequence=2,
+                checkpoint_id="checkpoint.failover-complete",
+            ),
+        )
+
+        assert continuation.run_manifest.model == intent.to_model
+        assert continuation.failover_intent is None
+        assert continuation.failover_required is False
+        assert continuation.dispatch_ready is True
+
+
+def test_unplanned_manifest_change_is_rejected_without_failover_intent(
+    tmp_path: Path,
+) -> None:
+    with open_store(tmp_path) as active:
+        controller = CheckpointController(active)
+        write_checkpoint(controller, make_context())
+        changed_manifest = make_manifest().model_copy(
+            update={"model": make_failover_intent().to_model}
+        )
+
+        with pytest.raises(CheckpointConflictError, match="manifest changed"):
+            controller.write(
+                reason=CheckpointReason.TURN_END,
+                run_manifest=changed_manifest,
+                context_state=make_context(
+                    sequence=2,
+                    checkpoint_id="checkpoint.unplanned-model-change",
+                ),
+            )
 
 
 def test_crash_before_ledger_commit_leaves_no_resumable_checkpoint(

@@ -75,5 +75,10 @@ have mode `0600`, and contain exactly one lowercase 64-character hex key with
 an optional final newline. Resume verifies the external anchor floor and every
 trusted digest before restoring state. It performs no network access or action
 dispatch. Pending or unknown-outcome actions require explicit reconciliation;
-they are never automatically retried. `inspect` reports that blocked state
-without dispatching it.
+they are never automatically retried and cannot disappear from a later
+checkpoint. Resolution is atomic with an `ActionReconciliation` that names the
+prior state, terminal outcome, exact authority and scope epoch, and a
+checkpoint-linked evidence reference. `inspect` reports that blocked state
+without dispatching it. A provider-failover checkpoint likewise remains
+non-dispatch-ready, exposes its exact `FailoverIntent`, and accepts only the
+immediate successor manifest whose model is the intent's exact target.

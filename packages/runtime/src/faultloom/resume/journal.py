@@ -16,6 +16,7 @@ from .models import (
     CheckpointReason,
     CheckpointRecord,
     ResumeTrustError,
+    UnresolvedActionState,
 )
 
 
@@ -67,6 +68,8 @@ class CheckpointJournal:
         records: list[CheckpointRecord] = []
         checkpoint_ids: set[str] = set()
         latest_by_run: dict[str, CheckpointRecord] = {}
+        resolved_actions_by_run: dict[str, set[str]] = {}
+        reconciliation_ids_by_run: dict[str, set[str]] = {}
         for event in events:
             if event.event_type != CHECKPOINT_EVENT_TYPE:
                 continue
@@ -75,9 +78,27 @@ class CheckpointJournal:
             if checkpoint.checkpoint_id in checkpoint_ids:
                 raise CheckpointIntegrityError("checkpoint ID appears more than once")
             checkpoint_ids.add(checkpoint.checkpoint_id)
+            resolved_action_ids = resolved_actions_by_run.setdefault(
+                checkpoint.run_id,
+                set(),
+            )
+            reconciliation_ids = reconciliation_ids_by_run.setdefault(
+                checkpoint.run_id,
+                set(),
+            )
+            _validate_action_history_state(
+                resolved_action_ids,
+                reconciliation_ids,
+                record.envelope,
+            )
             prior = latest_by_run.get(checkpoint.run_id)
-            if prior is not None:
+            if prior is None:
+                validate_initial(record.envelope)
+            else:
                 validate_successor(prior, record.envelope)
+            for reconciliation in record.envelope.action_reconciliations:
+                resolved_action_ids.add(reconciliation.action_id)
+                reconciliation_ids.add(reconciliation.reconciliation_id)
             latest_by_run[checkpoint.run_id] = record
             records.append(record)
         return tuple(records)
@@ -192,5 +213,134 @@ def validate_successor(
         raise CheckpointConflictError("stable-watermark checkpoint must advance")
     if checkpoint.goal_digest != previous.goal_digest:
         raise CheckpointConflictError("run goal digest changed between checkpoints")
-    if sha256_digest(envelope.run_manifest) != sha256_digest(prior.envelope.run_manifest):
-        raise CheckpointConflictError("run manifest changed between checkpoints")
+    _validate_action_continuity(prior, envelope)
+    _validate_manifest_continuity(prior, envelope)
+
+
+def validate_initial(envelope: CheckpointEnvelope) -> None:
+    if envelope.action_reconciliations:
+        raise CheckpointConflictError(
+            "action reconciliation requires a prior unresolved action"
+        )
+
+
+def validate_action_history(
+    records: tuple[CheckpointRecord, ...],
+    envelope: CheckpointEnvelope,
+) -> None:
+    run_id = envelope.context_state.checkpoint.run_id
+    resolved_action_ids: set[str] = set()
+    reconciliation_ids: set[str] = set()
+    for record in records:
+        checkpoint = record.envelope.context_state.checkpoint
+        if checkpoint.run_id != run_id:
+            continue
+        for reconciliation in record.envelope.action_reconciliations:
+            resolved_action_ids.add(reconciliation.action_id)
+            reconciliation_ids.add(reconciliation.reconciliation_id)
+
+    _validate_action_history_state(
+        resolved_action_ids,
+        reconciliation_ids,
+        envelope,
+    )
+
+
+def _validate_action_history_state(
+    resolved_action_ids: set[str],
+    reconciliation_ids: set[str],
+    envelope: CheckpointEnvelope,
+) -> None:
+    checkpoint = envelope.context_state.checkpoint
+    current_unresolved = set(checkpoint.pending_action_ids) | set(
+        checkpoint.unknown_outcome_action_ids
+    )
+    if resolved_action_ids & current_unresolved:
+        raise CheckpointConflictError(
+            "reconciled action cannot become unresolved again"
+        )
+    current_reconciliations = envelope.action_reconciliations
+    if resolved_action_ids & {
+        reconciliation.action_id for reconciliation in current_reconciliations
+    }:
+        raise CheckpointConflictError("action cannot be reconciled more than once")
+    if reconciliation_ids & {
+        reconciliation.reconciliation_id
+        for reconciliation in current_reconciliations
+    }:
+        raise CheckpointConflictError("action reconciliation ID is already durable")
+
+
+def _validate_action_continuity(
+    prior: CheckpointRecord,
+    envelope: CheckpointEnvelope,
+) -> None:
+    previous = prior.envelope.context_state.checkpoint
+    checkpoint = envelope.context_state.checkpoint
+    previous_pending = frozenset(previous.pending_action_ids)
+    previous_unknown = frozenset(previous.unknown_outcome_action_ids)
+    current_pending = frozenset(checkpoint.pending_action_ids)
+    current_unknown = frozenset(checkpoint.unknown_outcome_action_ids)
+
+    if previous_unknown & current_pending:
+        raise CheckpointConflictError(
+            "unknown-outcome action cannot regress to pending"
+        )
+
+    previous_unresolved = previous_pending | previous_unknown
+    current_unresolved = current_pending | current_unknown
+    removed = previous_unresolved - current_unresolved
+    reconciliations = {
+        record.action_id: record for record in envelope.action_reconciliations
+    }
+    reconciliation_ids = frozenset(reconciliations)
+    silently_removed = removed - reconciliation_ids
+    if silently_removed:
+        raise CheckpointConflictError(
+            "unresolved action removal requires durable reconciliation"
+        )
+    if reconciliation_ids - removed:
+        raise CheckpointConflictError(
+            "action reconciliation must resolve a prior unresolved action"
+        )
+
+    for action_id, record in reconciliations.items():
+        expected_state = (
+            UnresolvedActionState.PENDING
+            if action_id in previous_pending
+            else UnresolvedActionState.UNKNOWN_OUTCOME
+        )
+        if record.prior_state is not expected_state:
+            raise CheckpointConflictError(
+                "action reconciliation prior state differs from durable state"
+            )
+        if record.reconciled_at < previous.created_at:
+            raise CheckpointConflictError(
+                "action reconciliation predates the unresolved checkpoint"
+            )
+
+
+def _validate_manifest_continuity(
+    prior: CheckpointRecord,
+    envelope: CheckpointEnvelope,
+) -> None:
+    previous_envelope = prior.envelope
+    intent = previous_envelope.failover_intent
+    if intent is None:
+        if sha256_digest(envelope.run_manifest) != sha256_digest(
+            previous_envelope.run_manifest
+        ):
+            raise CheckpointConflictError("run manifest changed between checkpoints")
+        return
+
+    expected = previous_envelope.run_manifest.model_copy(
+        update={"model": intent.to_model}
+    )
+    if sha256_digest(envelope.run_manifest) != sha256_digest(expected):
+        raise CheckpointConflictError(
+            "provider failover successor must use the exact target model"
+        )
+    if envelope.context_state.checkpoint.created_at < intent.requested_at:
+        raise CheckpointConflictError(
+            "provider failover successor predates the failover intent"
+        )

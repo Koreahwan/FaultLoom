@@ -6,8 +6,15 @@ from faultloom_protocol import ModelIdentity, RunManifest, canonical_json_bytes,
 
 from ..context import ContextState
 from ..state import AnchorCheckpoint, StateStore
-from .journal import CheckpointJournal, latest_checkpoint, validate_successor
+from .journal import (
+    CheckpointJournal,
+    latest_checkpoint,
+    validate_action_history,
+    validate_initial,
+    validate_successor,
+)
 from .models import (
+    ActionReconciliation,
     CheckpointConflictError,
     CheckpointEnvelope,
     CheckpointNotFoundError,
@@ -39,6 +46,7 @@ class CheckpointController:
         run_manifest: RunManifest,
         context_state: ContextState,
         failover_intent: FailoverIntent | None = None,
+        action_reconciliations: tuple[ActionReconciliation, ...] = (),
     ) -> ResumePacket:
         if type(reason) is not CheckpointReason:
             raise ResumeError("checkpoint reason must be a typed CheckpointReason")
@@ -49,12 +57,17 @@ class CheckpointController:
             if failover_intent is None
             else FailoverIntent.model_validate(failover_intent.model_dump(mode="python"))
         )
+        reconciliations = tuple(
+            ActionReconciliation.model_validate(record.model_dump(mode="python"))
+            for record in action_reconciliations
+        )
         envelope = CheckpointEnvelope(
             reason=reason,
             run_manifest=manifest,
             context_state=context,
             model_digest=self.model_digest(manifest.model),
             failover_intent=failover,
+            action_reconciliations=reconciliations,
         )
         if envelope.context_state.engagement_id != self._store.engagement_id:
             raise ResumeTrustError("checkpoint belongs to another engagement")
@@ -77,7 +90,10 @@ class CheckpointController:
                 )
 
             prior = latest_checkpoint(records, checkpoint.run_id)
-            if prior is not None:
+            validate_action_history(records, envelope)
+            if prior is None:
+                validate_initial(envelope)
+            else:
                 validate_successor(prior, envelope)
             return self._packet(
                 self._journal.append(envelope, canonical, checkpoint_digest)
@@ -154,6 +170,7 @@ class CheckpointController:
     def _packet(record: CheckpointRecord) -> ResumePacket:
         checkpoint = record.envelope.context_state.checkpoint
         blocked = checkpoint.pending_action_ids + checkpoint.unknown_outcome_action_ids
+        failover = record.envelope.failover_intent
         return ResumePacket(
             checkpoint_digest=record.checkpoint_digest,
             event_sequence=record.event_sequence,
@@ -161,10 +178,13 @@ class CheckpointController:
             reason=record.envelope.reason,
             run_manifest=record.envelope.run_manifest,
             context_state=record.envelope.context_state,
+            failover_intent=failover,
+            action_reconciliations=record.envelope.action_reconciliations,
             blocked_action_ids=blocked,
             automatic_retry_action_ids=(),
-            dispatch_ready=not blocked,
+            dispatch_ready=not blocked and failover is None,
             requires_reconciliation=bool(blocked),
+            failover_required=failover is not None,
         )
 
 
