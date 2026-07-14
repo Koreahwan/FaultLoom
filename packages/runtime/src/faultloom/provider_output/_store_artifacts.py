@@ -1,26 +1,19 @@
 from __future__ import annotations
 
-from typing import Protocol
-
 from faultloom.state import ArtifactRef, EncryptedCAS, EventLedger, RetrievalPage
 
 from ._store_support import CAS_READ_PAGE, LEDGER_REFERENCES
 from .contracts import ProviderOutputIntegrityError
 
-class ArtifactStoreBinding(Protocol):
-    def ledger(self) -> EventLedger: ...
-
-    def cas(self) -> EncryptedCAS: ...
-
 
 def artifact_references(
-    binding: ArtifactStoreBinding,
+    ledger: EventLedger,
 ) -> tuple[ArtifactRef, ...]:
-    return LEDGER_REFERENCES(binding.ledger())
+    return LEDGER_REFERENCES(ledger)
 
 
 def read_artifact_page(
-    binding: ArtifactStoreBinding,
+    cas: EncryptedCAS,
     reference: ArtifactRef,
     *,
     cursor: str | None,
@@ -28,7 +21,7 @@ def read_artifact_page(
 ) -> RetrievalPage:
     try:
         page = CAS_READ_PAGE(
-            binding.cas(),
+            cas,
             reference,
             cursor=cursor,
             max_bytes=max_bytes,
@@ -45,10 +38,10 @@ def read_artifact_page(
 
 
 def verify_artifact_reference(
-    binding: ArtifactStoreBinding,
+    cas: EncryptedCAS,
     reference: ArtifactRef,
 ) -> None:
-    page = read_artifact_page(binding, reference, cursor=None, max_bytes=1)
+    page = read_artifact_page(cas, reference, cursor=None, max_bytes=1)
     expected_page_bytes = min(reference.byte_length, 1)
     if (
         page.offset != 0

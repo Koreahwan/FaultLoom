@@ -105,11 +105,14 @@ class ProviderOutputHandoff:
             raise ProviderOutputIntegrityError(
                 "provider output handoff admission changed"
             ) from exc
-        admission.binding.validate()
+        binding_admission = ProviderOutputStoreBinding._trusted_admission(
+            admission.binding
+        )
+        ProviderOutputStoreBinding.validate(admission.binding)
         if (
             media_type != admission.media_type
             or admission.maximum_output_bytes
-            > admission.binding.max_artifact_bytes
+            > binding_admission.max_artifact_bytes
         ):
             raise ProviderOutputIntegrityError(
                 "provider output handoff admission changed"
@@ -121,7 +124,7 @@ class ProviderOutputHandoff:
         receipt: ProviderCallReceipt,
         raw_output: bytes,
     ) -> ProviderInvocationResult:
-        admission = self._trusted_admission()
+        admission = ProviderOutputHandoff._trusted_admission(self)
         validated = _VERIFY_RECEIPT(admission.verifier, receipt)
         if type(raw_output) is not bytes:
             raise ProviderOutputIntegrityError(
@@ -140,16 +143,17 @@ class ProviderOutputHandoff:
                 "provider output digest or byte length does not match its receipt"
             )
         binding = admission.binding
-        with binding.lock():
-            binding.verify()
-            event = binding.find(validated)
+        with ProviderOutputStoreBinding.lock(binding):
+            ProviderOutputStoreBinding.verify(binding)
+            event = ProviderOutputStoreBinding.find(binding, validated)
             if event is None:
-                binding.append(
+                ProviderOutputStoreBinding.append(
+                    binding,
                     validated,
                     raw_output,
                     media_type=admission.media_type,
                 )
-                event = binding.find(validated)
+                event = ProviderOutputStoreBinding.find(binding, validated)
             if event is None:
                 raise ProviderOutputIntegrityError(
                     "provider output publication was not durable"
@@ -165,12 +169,12 @@ class ProviderOutputHandoff:
         self,
         receipt: ProviderCallReceipt,
     ) -> ProviderInvocationResult | None:
-        admission = self._trusted_admission()
+        admission = ProviderOutputHandoff._trusted_admission(self)
         validated = _VERIFY_RECEIPT(admission.verifier, receipt)
         binding = admission.binding
-        with binding.lock():
-            binding.verify()
-            event = binding.find(validated)
+        with ProviderOutputStoreBinding.lock(binding):
+            ProviderOutputStoreBinding.verify(binding)
+            event = ProviderOutputStoreBinding.find(binding, validated)
             return (
                 None
                 if event is None

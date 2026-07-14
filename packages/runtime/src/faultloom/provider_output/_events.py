@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import hmac
 import json
-from typing import Protocol
+from typing import TYPE_CHECKING
 
 from faultloom.provider import ProviderCallReceipt
 from faultloom.state import ArtifactRef, EventRecord, RetrievalPage
@@ -21,24 +21,8 @@ EVENT_TYPE = "provider-output-published"
 METADATA_MEDIA_TYPE = "application/vnd.faultloom.observation-metadata+json"
 METADATA_LIMIT = 4096
 
-
-class _StoreBinding(Protocol):
-    @property
-    def engagement_id(self) -> str: ...
-
-    def verify(self) -> None: ...
-
-    def references(self) -> tuple[ArtifactRef, ...]: ...
-
-    def read_page(
-        self,
-        reference: ArtifactRef,
-        *,
-        cursor: str | None,
-        max_bytes: int,
-    ) -> RetrievalPage: ...
-
-    def verify_artifact(self, reference: ArtifactRef) -> None: ...
+if TYPE_CHECKING:
+    from ._store import ProviderOutputStoreBinding
 
 
 def _mapping(value: object, *, label: str) -> dict[str, object]:
@@ -126,12 +110,19 @@ def event_artifacts(event: EventRecord) -> tuple[ArtifactRef, ArtifactRef]:
 
 
 def read_metadata(
-    binding: _StoreBinding,
+    binding: ProviderOutputStoreBinding,
     reference: ArtifactRef,
 ) -> dict[str, object]:
+    from ._store import ProviderOutputStoreBinding
+
     if reference.media_type != METADATA_MEDIA_TYPE:
         raise ProviderOutputIntegrityError("provider output metadata type is invalid")
-    page = binding.read_page(reference, cursor=None, max_bytes=METADATA_LIMIT)
+    page = ProviderOutputStoreBinding.read_page(
+        binding,
+        reference,
+        cursor=None,
+        max_bytes=METADATA_LIMIT,
+    )
     if (
         page.offset != 0
         or page.next_cursor is not None
@@ -164,30 +155,34 @@ def event_created_at(event: EventRecord) -> dt.datetime:
 
 
 def invocation_from_event(
-    binding: _StoreBinding,
+    binding: ProviderOutputStoreBinding,
     receipt: ProviderCallReceipt,
     event: EventRecord,
     *,
     media_type: str,
 ) -> ProviderInvocationResult:
-    binding.verify()
+    from ._store import ProviderOutputStoreBinding
+
+    admission = ProviderOutputStoreBinding._trusted_admission(binding)
+    ProviderOutputStoreBinding.verify(binding)
+    engagement_id = admission.engagement_id
     if (
         type(event) is not EventRecord
-        or event.engagement_id != binding.engagement_id
+        or event.engagement_id != engagement_id
         or event.event_type != EVENT_TYPE
         or event.actor_stream
         != provider_output_actor_stream(receipt.run_id, receipt.receipt_digest)
     ):
         raise ProviderOutputIntegrityError("provider output event identity is invalid")
     reference, metadata_reference = event_artifacts(event)
-    registered = binding.references()
+    registered = ProviderOutputStoreBinding.references(binding)
     if reference not in registered or metadata_reference not in registered:
         raise ProviderOutputIntegrityError(
             "provider output event artifacts are not registered"
         )
     expected = expected_metadata(
         receipt,
-        engagement_id=binding.engagement_id,
+        engagement_id=engagement_id,
         media_type=media_type,
     )
     if read_metadata(binding, metadata_reference) != expected:
@@ -197,7 +192,7 @@ def invocation_from_event(
     response_digest = receipt.response_digest
     if (
         type(response_digest) is not str
-        or reference.engagement_id != binding.engagement_id
+        or reference.engagement_id != engagement_id
         or reference.media_type != media_type
         or reference.byte_length != receipt.bytes_received
         or not hmac.compare_digest(
@@ -208,7 +203,7 @@ def invocation_from_event(
         raise ProviderOutputIntegrityError(
             "provider output artifact does not match its receipt"
         )
-    binding.verify_artifact(reference)
+    ProviderOutputStoreBinding.verify_artifact(binding, reference)
     observation = ObservationRef(
         schema_version="0.1.0",
         observation_id=provider_observation_id(receipt.receipt_digest),
@@ -220,7 +215,7 @@ def invocation_from_event(
         created_at=event_created_at(event),
     )
     output_ref = ProviderOutputRef(
-        engagement_id=binding.engagement_id,
+        engagement_id=engagement_id,
         receipt_digest=receipt.receipt_digest,
         event_seq=event.seq,
         event_hash=f"sha256:{event.event_hash}",

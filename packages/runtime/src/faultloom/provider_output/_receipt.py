@@ -134,7 +134,7 @@ class ProviderReceiptVerifier:
         return admission
 
     def validate(self, receipt: ProviderCallReceipt) -> ProviderCallReceipt:
-        admission = self._trusted_admission()
+        admission = ProviderReceiptVerifier._trusted_admission(self)
         if type(receipt) is not ProviderCallReceipt:
             raise ProviderOutputIntegrityError(
                 "provider output requires an exact provider receipt"

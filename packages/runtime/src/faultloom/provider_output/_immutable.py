@@ -130,25 +130,26 @@ class ProviderOutputPage:
 
     @property
     def data(self) -> bytes:
-        return bytes(self._trusted_value().data)
+        return bytes(ProviderOutputPage._trusted_value(self).data)
 
     @property
     def offset(self) -> int:
-        return self._trusted_value().offset
+        return ProviderOutputPage._trusted_value(self).offset
 
     @property
     def total_bytes(self) -> int:
-        return self._trusted_value().total_bytes
+        return ProviderOutputPage._trusted_value(self).total_bytes
 
     @property
     def next_cursor(self) -> str | None:
-        return self._trusted_value().next_cursor
+        return ProviderOutputPage._trusted_value(self).next_cursor
 
     def __repr__(self) -> str:
+        value = ProviderOutputPage._trusted_value(self)
         return (
             "ProviderOutputPage(data=<redacted>, "
-            f"offset={self.offset}, total_bytes={self.total_bytes}, "
-            f"has_next={self.next_cursor is not None})"
+            f"offset={value.offset}, total_bytes={value.total_bytes}, "
+            f"has_next={value.next_cursor is not None})"
         )
 
     def __reduce__(self) -> NoReturn:

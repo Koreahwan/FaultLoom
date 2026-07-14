@@ -79,7 +79,7 @@ class ProviderOutputStoreBinding:
             self,
             StoreAdmission(state, engagement_id, maximum),
         )
-        self.validate()
+        ProviderOutputStoreBinding.validate(self)
 
     def __setattr__(self, name: str, value: object) -> None:
         raise AttributeError("ProviderOutputStoreBinding is immutable")
@@ -92,14 +92,14 @@ class ProviderOutputStoreBinding:
 
     @property
     def engagement_id(self) -> str:
-        return self._trusted_admission().engagement_id
+        return ProviderOutputStoreBinding._trusted_admission(self).engagement_id
 
     @property
     def max_artifact_bytes(self) -> int:
-        return self._trusted_admission().max_artifact_bytes
+        return ProviderOutputStoreBinding._trusted_admission(self).max_artifact_bytes
 
     def validate(self) -> None:
-        admission = self._trusted_admission()
+        admission = ProviderOutputStoreBinding._trusted_admission(self)
         state = admission.state
         state_namespace = instance_values(state)
         state_engagement_id = state_namespace.get("engagement_id")
@@ -122,9 +122,9 @@ class ProviderOutputStoreBinding:
                 "provider output StateStore capability changed"
             )
         if (
-            type(self.engagement_id) is not str
+            type(admission.engagement_id) is not str
             or type(state_engagement_id) is not str
-            or state_engagement_id != self.engagement_id
+            or state_engagement_id != admission.engagement_id
         ):
             raise ProviderOutputIntegrityError(
                 "provider output StateStore identity changed"
@@ -132,16 +132,8 @@ class ProviderOutputStoreBinding:
         cas = state_namespace.get("cas")
         ledger = state_namespace.get("ledger")
         lock = state_namespace.get("_lock")
-        cas_values = (
-            instance_values(cas)
-            if type(cas) is EncryptedCAS
-            else {}
-        )
-        ledger_values = (
-            instance_values(ledger)
-            if type(ledger) is EventLedger
-            else {}
-        )
+        cas_values = instance_values(cas) if type(cas) is EncryptedCAS else {}
+        ledger_values = instance_values(ledger) if type(ledger) is EventLedger else {}
         cas_engagement_id = cas_values.get("engagement_id")
         cas_maximum = cas_values.get("max_artifact_bytes")
         ledger_engagement_id = ledger_values.get("engagement_id")
@@ -150,12 +142,12 @@ class ProviderOutputStoreBinding:
             or type(ledger) is not EventLedger
             or type(lock) is not EngagementLock
             or type(cas_engagement_id) is not str
-            or cas_engagement_id != self.engagement_id
-            or type(self.max_artifact_bytes) is not int
+            or cas_engagement_id != admission.engagement_id
+            or type(admission.max_artifact_bytes) is not int
             or type(cas_maximum) is not int
-            or cas_maximum != self.max_artifact_bytes
+            or cas_maximum != admission.max_artifact_bytes
             or type(ledger_engagement_id) is not str
-            or ledger_engagement_id != self.engagement_id
+            or ledger_engagement_id != admission.engagement_id
         ):
             raise ProviderOutputIntegrityError(
                 "provider output StateStore components are invalid"
@@ -169,28 +161,31 @@ class ProviderOutputStoreBinding:
             )
 
     def lock(self) -> EngagementLock:
-        self.validate()
-        lock = instance_values(self._trusted_admission().state).get("_lock")
+        ProviderOutputStoreBinding.validate(self)
+        admission = ProviderOutputStoreBinding._trusted_admission(self)
+        lock = instance_values(admission.state).get("_lock")
         if type(lock) is not EngagementLock:
             raise ProviderOutputIntegrityError("provider output lock is unavailable")
         return lock
 
     def verify(self) -> None:
-        self.validate()
-        ledger = self.ledger()
+        ProviderOutputStoreBinding.validate(self)
+        ledger = ProviderOutputStoreBinding.ledger(self)
         LEDGER_VERIFY(ledger)
-        STATE_CHECKPOINT(self._trusted_admission().state)
+        STATE_CHECKPOINT(ProviderOutputStoreBinding._trusted_admission(self).state)
 
     def ledger(self) -> EventLedger:
-        self.validate()
-        ledger = instance_values(self._trusted_admission().state).get("ledger")
+        ProviderOutputStoreBinding.validate(self)
+        admission = ProviderOutputStoreBinding._trusted_admission(self)
+        ledger = instance_values(admission.state).get("ledger")
         if type(ledger) is not EventLedger:
             raise ProviderOutputIntegrityError("provider output ledger is unavailable")
         return ledger
 
     def cas(self) -> EncryptedCAS:
-        self.validate()
-        cas = instance_values(self._trusted_admission().state).get("cas")
+        ProviderOutputStoreBinding.validate(self)
+        admission = ProviderOutputStoreBinding._trusted_admission(self)
+        cas = instance_values(admission.state).get("cas")
         if type(cas) is not EncryptedCAS:
             raise ProviderOutputIntegrityError("provider output CAS is unavailable")
         return cas
@@ -200,7 +195,7 @@ class ProviderOutputStoreBinding:
             receipt.run_id,
             receipt.receipt_digest,
         )
-        ledger = self.ledger()
+        ledger = ProviderOutputStoreBinding.ledger(self)
         after_seq = 0
         found: EventRecord | None = None
         while True:
@@ -227,14 +222,15 @@ class ProviderOutputStoreBinding:
         *,
         media_type: str,
     ) -> None:
+        admission = ProviderOutputStoreBinding._trusted_admission(self)
         metadata: Mapping[str, object] = expected_metadata(
             receipt,
-            engagement_id=self.engagement_id,
+            engagement_id=admission.engagement_id,
             media_type=media_type,
         )
         try:
             STATE_APPEND(
-                self._trusted_admission().state,
+                admission.state,
                 actor_stream=provider_output_actor_stream(
                     receipt.run_id,
                     receipt.receipt_digest,
@@ -250,7 +246,7 @@ class ProviderOutputStoreBinding:
             ) from exc
 
     def references(self) -> tuple[ArtifactRef, ...]:
-        return artifact_references(self)
+        return artifact_references(ProviderOutputStoreBinding.ledger(self))
 
     def read_page(
         self,
@@ -260,11 +256,11 @@ class ProviderOutputStoreBinding:
         max_bytes: int,
     ) -> RetrievalPage:
         return read_artifact_page(
-            self,
+            ProviderOutputStoreBinding.cas(self),
             reference,
             cursor=cursor,
             max_bytes=max_bytes,
         )
 
     def verify_artifact(self, reference: ArtifactRef) -> None:
-        verify_artifact_reference(self, reference)
+        verify_artifact_reference(ProviderOutputStoreBinding.cas(self), reference)

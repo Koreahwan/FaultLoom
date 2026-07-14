@@ -31,5 +31,5 @@ def trusted_reader_admission(
         raise ProviderOutputIntegrityError(
             "provider output reader admission changed"
         )
-    value.binding.validate()
+    ProviderOutputStoreBinding.validate(value.binding)
     return value

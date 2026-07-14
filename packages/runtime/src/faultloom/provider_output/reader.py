@@ -115,13 +115,16 @@ class ProviderOutputReader:
         cursor: str | None = None,
         max_bytes: int = 64 * 1024,
     ) -> ProviderOutputPage:
-        admission = self._trusted_admission()
+        admission = ProviderOutputReader._trusted_admission(self)
+        binding_admission = ProviderOutputStoreBinding._trusted_admission(
+            admission.binding
+        )
         validated = validated_invocation(invocation)
         output = validated.output_ref
         observation = output.observation
         if (
             type(expected_engagement_id) is not str
-            or expected_engagement_id != admission.binding.engagement_id
+            or expected_engagement_id != binding_admission.engagement_id
             or output.engagement_id != expected_engagement_id
         ):
             raise ProviderOutputScopeError(
@@ -143,9 +146,9 @@ class ProviderOutputReader:
             )
         _VERIFY_RECEIPT(admission.verifier, validated.receipt)
         binding = admission.binding
-        with binding.lock():
-            binding.verify()
-            event = binding.find(validated.receipt)
+        with ProviderOutputStoreBinding.lock(binding):
+            ProviderOutputStoreBinding.verify(binding)
+            event = ProviderOutputStoreBinding.find(binding, validated.receipt)
             if event is None:
                 raise ProviderOutputIntegrityError(
                     "provider output event is missing"
@@ -164,13 +167,14 @@ class ProviderOutputReader:
             inner_cursor = (
                 None
                 if cursor is None
-                else self._decode_cursor(
+                else ProviderOutputReader._decode_cursor(
                     validated,
                     cursor,
                     cursor_key=admission.cursor_key,
                 )
             )
-            page = binding.read_page(
+            page = ProviderOutputStoreBinding.read_page(
+                binding,
                 reference,
                 cursor=inner_cursor,
                 max_bytes=max_bytes,
@@ -188,7 +192,7 @@ class ProviderOutputReader:
             next_cursor = (
                 None
                 if page.next_cursor is None
-                else self._encode_cursor(
+                else ProviderOutputReader._encode_cursor(
                     validated,
                     page.next_cursor,
                     cursor_key=admission.cursor_key,
