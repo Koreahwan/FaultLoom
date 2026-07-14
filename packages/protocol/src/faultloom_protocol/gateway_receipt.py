@@ -17,8 +17,10 @@ from .base import (
     PROTOCOL_VERSION,
     SCHEMA_VERSION,
     _normalize_protocol_datetime,
+    _snapshot_protocol_enum_value,
 )
 from .canonical import canonical_json_bytes
+from .enum_integrity import _protocol_enum_member
 from .models import (
     Ed25519PublicKeyRecord,
     SignaturePurpose,
@@ -188,7 +190,14 @@ class GatewayEpochReceiptIssuer:
         receipt.extend(self.gateway_challenge)
         receipt.extend(_text(PROTOCOL_VERSION))
         receipt.extend(_text(SCHEMA_VERSION))
-        receipt.extend(_text(SignaturePurpose.SCOPE_EPOCH.value))
+        receipt.extend(
+            _text(
+                _snapshot_protocol_enum_value(
+                    _protocol_enum_member(SignaturePurpose, "SCOPE_EPOCH"),
+                    path="scope epoch receipt purpose",
+                )
+            )
+        )
         receipt.extend(struct.pack(">I", len(canonical_envelope)))
         receipt.extend(canonical_envelope)
         receipt.extend(hashlib.sha256(canonical_envelope).digest())

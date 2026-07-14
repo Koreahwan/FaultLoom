@@ -22,9 +22,11 @@ from .base import (
     SCHEMA_VERSION,
     _ProtocolSnapshotError,
     _normalize_protocol_datetime,
+    _snapshot_protocol_enum_value,
     _snapshot_protocol_model,
 )
 from .canonical import canonical_json_bytes, sha256_digest
+from .enum_integrity import _protocol_enum_member
 from .models import (
     AuthorityGrant,
     Ed25519PublicKeyRecord,
@@ -347,7 +349,7 @@ def _signature_document(
         "payload": payload,
         "payload_digest": payload_digest,
         "protocol_version": PROTOCOL_VERSION,
-        "purpose": purpose.value,
+        "purpose": _snapshot_protocol_enum_value(purpose, path="signature purpose"),
         "sequence": sequence,
         "signed_at": signed_at,
     }
@@ -468,7 +470,7 @@ def sign_authority_grant(
     block = _sign(
         grant,
         signer,
-        purpose=SignaturePurpose.AUTHORITY_GRANT,
+        purpose=_protocol_enum_member(SignaturePurpose, "AUTHORITY_GRANT"),
         sequence=grant.grant_version,
         signed_at=signed_at,
         expires_at=grant.expires_at,
@@ -491,7 +493,7 @@ def sign_scope_epoch(
     block = _sign(
         epoch,
         signer,
-        purpose=SignaturePurpose.SCOPE_EPOCH,
+        purpose=_protocol_enum_member(SignaturePurpose, "SCOPE_EPOCH"),
         sequence=epoch.epoch,
         signed_at=signed_at,
         expires_at=epoch.expires_at,
@@ -518,7 +520,7 @@ def sign_engagement_bundle(
     block = _sign(
         bundle,
         signer,
-        purpose=SignaturePurpose.ENGAGEMENT_BUNDLE,
+        purpose=_protocol_enum_member(SignaturePurpose, "ENGAGEMENT_BUNDLE"),
         sequence=bundle.bundle_version,
         signed_at=signed_at,
         expires_at=bundle.expires_at,
@@ -551,7 +553,7 @@ def sign_run_result_bundle(
     block = _sign(
         bundle,
         signer,
-        purpose=SignaturePurpose.RUN_RESULT_BUNDLE,
+        purpose=_protocol_enum_member(SignaturePurpose, "RUN_RESULT_BUNDLE"),
         sequence=bundle.bundle_version,
         signed_at=signed_at,
         expires_at=expires_at,
@@ -576,9 +578,17 @@ def _verify(
     now = _normalize_protocol_datetime(now, label="verification time")
     if type(minimum_sequence) is not int or not 1 <= minimum_sequence <= MAX_INT64:
         raise ValueError("minimum trusted sequence must be within signed int64")
+    block_purpose = _snapshot_protocol_enum_value(
+        block.purpose,
+        path="signature purpose",
+    )
+    expected_purpose = _snapshot_protocol_enum_value(
+        purpose,
+        path="expected signature purpose",
+    )
     if block.purpose is not purpose:
         raise SignatureTamperError(
-            f"signature purpose {block.purpose.value!r} does not match {purpose.value!r}"
+            f"signature purpose {block_purpose!r} does not match {expected_purpose!r}"
         )
     if block.key_id != trusted_public_key.key_id:
         raise UnknownKeyError("signature key_id is not the supplied trusted key")
@@ -631,7 +641,7 @@ def verify_authority_grant(
         envelope.payload,
         envelope.signature,
         trusted_public_key,
-        purpose=SignaturePurpose.AUTHORITY_GRANT,
+        purpose=_protocol_enum_member(SignaturePurpose, "AUTHORITY_GRANT"),
         expected_sequence=envelope.payload.grant_version,
         minimum_sequence=minimum_version,
         payload_issued_at=envelope.payload.issued_at,
@@ -674,7 +684,7 @@ def _verify_scope_epoch_status(
         envelope.payload,
         envelope.signature,
         trusted_public_key,
-        purpose=SignaturePurpose.SCOPE_EPOCH,
+        purpose=_protocol_enum_member(SignaturePurpose, "SCOPE_EPOCH"),
         expected_sequence=envelope.payload.epoch,
         minimum_sequence=minimum_epoch,
         payload_issued_at=envelope.payload.issued_at,
@@ -749,7 +759,7 @@ def verify_engagement_bundle(
         envelope.payload,
         envelope.signature,
         trusted_public_key,
-        purpose=SignaturePurpose.ENGAGEMENT_BUNDLE,
+        purpose=_protocol_enum_member(SignaturePurpose, "ENGAGEMENT_BUNDLE"),
         expected_sequence=envelope.payload.bundle_version,
         minimum_sequence=minimum_version,
         payload_issued_at=envelope.payload.created_at,
@@ -806,7 +816,7 @@ def verify_run_result_bundle(
         envelope.payload,
         envelope.signature,
         trusted_public_key,
-        purpose=SignaturePurpose.RUN_RESULT_BUNDLE,
+        purpose=_protocol_enum_member(SignaturePurpose, "RUN_RESULT_BUNDLE"),
         expected_sequence=envelope.payload.bundle_version,
         minimum_sequence=minimum_version,
         payload_issued_at=envelope.payload.generated_at,

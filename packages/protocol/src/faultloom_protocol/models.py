@@ -25,6 +25,7 @@ from .base import (
 )
 from .canonical import sha256_digest
 from .compatibility import SemVer, require_protocol_compatible
+from .enum_integrity import _install_protocol_enum_catalog
 
 Port = Annotated[int, Field(ge=1, le=65535)]
 PositiveInt = Annotated[int, Field(ge=1, le=MAX_INT64)]
@@ -1387,6 +1388,25 @@ class SignedEngagementBundle(ProtocolModel):
 class SignedRunResultBundle(ProtocolModel):
     payload: RunResultBundle
     signature: SignatureBlock
+
+
+_install_protocol_enum_catalog(
+    (
+        ActionClass,
+        ProvenanceKind,
+        ConfidenceClass,
+        FindingClass,
+        SignaturePurpose,
+        DecisionOutcome,
+        DispatchOutcome,
+        HypothesisStatus,
+        VerdictOutcome,
+        LicenseClass,
+        EvidenceCapability,
+        TelemetryPolicy,
+        OperationKind,
+    )
+)
 
 
 REQUIRED_MODEL_TYPES: tuple[type[ProtocolModel], ...] = (

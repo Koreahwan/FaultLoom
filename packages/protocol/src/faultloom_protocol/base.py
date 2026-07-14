@@ -19,6 +19,8 @@ from pydantic import (
 )
 from pydantic_core import TzInfo
 
+from .enum_integrity import _ProtocolEnumIntegrityError, _protocol_enum_value
+
 PROTOCOL_VERSION = "0.1.0"
 SCHEMA_VERSION = "0.1.0"
 SUPPORTED_PROTOCOL_RANGE = ">=0.1.0,<0.2.0"
@@ -135,47 +137,10 @@ def _safe_type_name(value_type: type[object]) -> str:
 
 
 def _snapshot_protocol_enum_value(value: Enum, *, path: str) -> str:
-    value_type = type(value)
-    if not _trusted_protocol_type(value_type):
-        raise _ProtocolSnapshotError(
-            path,
-            "enum",
-            f"{path} must contain an exact protocol enum",
-        )
-    member_name = object.__getattribute__(value, "_name_")
-    member_map = type.__getattribute__(value_type, "_member_map_")
-    if (
-        type(member_name) is not str
-        or type(member_map) is not dict
-        or dict.get(member_map, member_name) is not value
-    ):
-        raise _ProtocolSnapshotError(
-            path,
-            "enum",
-            f"{path} must contain a registered protocol enum member",
-        )
-    member_value = object.__getattribute__(value, "_value_")
-    if not issubclass(value_type, str):
-        raise _ProtocolSnapshotError(
-            path,
-            "enum",
-            f"{path} protocol enum must have an immutable string value",
-        )
-    expected_value = str.__str__(value)
-    value_map = type.__getattribute__(value_type, "_value2member_map_")
-    if (
-        type(member_value) is not str
-        or type(expected_value) is not str
-        or member_value != expected_value
-        or type(value_map) is not dict
-        or dict.get(value_map, expected_value) is not value
-    ):
-        raise _ProtocolSnapshotError(
-            path,
-            "enum",
-            f"{path} protocol enum member differs from its immutable expected value",
-        )
-    return expected_value
+    try:
+        return _protocol_enum_value(value)
+    except _ProtocolEnumIntegrityError as exc:
+        raise _ProtocolSnapshotError(path, "enum", f"{path} {exc}") from exc
 
 
 def _snapshot_protocol_value(
