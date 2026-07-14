@@ -235,6 +235,106 @@ def test_evidence_linked_reconciliation_atomically_resolves_unknown_action(
     assert restored.dispatch_ready is True
 
 
+def test_reconciliation_stage_is_bound_to_its_immediate_predecessor(
+    tmp_path: Path,
+) -> None:
+    old_clearing_context = make_context(
+        sequence=3,
+        watermark=12,
+        checkpoint_id="checkpoint.stale-clear",
+    )
+    old_reconciliation = make_reconciliation(old_clearing_context)
+    newer_evidence = b"newer durable operator reconciliation evidence\n"
+    intermediate_context = make_context(
+        sequence=2,
+        watermark=11,
+        checkpoint_id="checkpoint.after-stage",
+        unknown=("action.unknown",),
+        evidence_bytes=newer_evidence,
+        evidence_id="evidence.after-stage",
+        observation_ids=("observation.after-stage",),
+    )
+    new_clearing_context = make_context(
+        sequence=3,
+        watermark=12,
+        checkpoint_id="checkpoint.fresh-clear",
+        evidence_bytes=newer_evidence,
+        evidence_id="evidence.after-stage",
+        observation_ids=("observation.after-stage",),
+    )
+    new_reconciliation = make_reconciliation(new_clearing_context).model_copy(
+        update={"reconciliation_id": "reconciliation.action.unknown.after-stage"}
+    )
+
+    with open_store(tmp_path) as active:
+        controller = CheckpointController(active)
+        write_checkpoint(
+            controller,
+            make_context(unknown=("action.unknown",)),
+        )
+        controller.record_action_reconciliation(
+            old_reconciliation,
+            evidence=RECONCILIATION_EVIDENCE,
+        )
+        intermediate = write_checkpoint(controller, intermediate_context)
+        before_stale_clear = active.checkpoint()
+
+        with pytest.raises(CheckpointConflictError, match="different state or predecessor"):
+            controller.record_action_reconciliation(
+                old_reconciliation,
+                evidence=RECONCILIATION_EVIDENCE,
+            )
+        with pytest.raises(CheckpointConflictError, match="immediate predecessor"):
+            controller.write(
+                reason=CheckpointReason.BEFORE_STATE_CHANGE,
+                run_manifest=make_manifest(),
+                context_state=old_clearing_context,
+                action_reconciliations=(old_reconciliation,),
+            )
+
+        assert active.checkpoint() == before_stale_clear
+        assert active.ledger is not None
+        assert tuple(event.event_type for event in active.ledger.events()) == (
+            "runtime.checkpoint.v1",
+            "runtime.action_reconciliation.v1",
+            "runtime.checkpoint.v1",
+        )
+        stale_floor = active.checkpoint()
+        stale_policy = trust_policy_for(intermediate, minimum_anchor=stale_floor)
+
+    with open_store(tmp_path, minimum_anchor=stale_floor) as reopened:
+        controller = CheckpointController(reopened)
+        inspected = controller.inspect(stale_policy)
+        assert inspected.blocked_action_ids == ("action.unknown",)
+        with pytest.raises(ReconciliationRequiredError, match="action.unknown"):
+            controller.resume(stale_policy)
+        controller.record_action_reconciliation(
+            new_reconciliation,
+            evidence=newer_evidence,
+        )
+        resolved = controller.write(
+            reason=CheckpointReason.BEFORE_STATE_CHANGE,
+            run_manifest=make_manifest(),
+            context_state=new_clearing_context,
+            action_reconciliations=(new_reconciliation,),
+        )
+        floor = reopened.checkpoint()
+        policy = trust_policy_for(resolved, minimum_anchor=floor)
+
+    with open_store(tmp_path, minimum_anchor=floor) as final:
+        restored = CheckpointController(final).resume(policy)
+        assert restored.dispatch_ready is True
+        assert restored.action_reconciliations == (new_reconciliation,)
+        assert final.ledger is not None
+        assert tuple(event.event_type for event in final.ledger.events()) == (
+            "runtime.checkpoint.v1",
+            "runtime.action_reconciliation.v1",
+            "runtime.checkpoint.v1",
+            "runtime.action_reconciliation.v1",
+            "runtime.checkpoint.v1",
+        )
+
+
 def test_durable_reconciliation_without_clearing_checkpoint_stays_blocked(
     tmp_path: Path,
 ) -> None:

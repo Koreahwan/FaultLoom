@@ -5,7 +5,7 @@ import hmac
 from dataclasses import dataclass
 from typing import ClassVar, Literal
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from faultloom_protocol import canonical_json_bytes, sha256_digest
 
@@ -38,6 +38,21 @@ _CHECKPOINT_PAYLOAD_KEYS = frozenset(
 )
 
 
+class _ReconciliationPredecessor(BaseModel):
+    model_config: ClassVar[ConfigDict] = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        strict=True,
+    )
+
+    checkpoint_id: str
+    checkpoint_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    checkpoint_sequence: int = Field(gt=0)
+    stable_watermark: int = Field(gt=0)
+    event_sequence: int = Field(gt=0)
+    event_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class _ReconciliationMetadataValues(BaseModel):
     model_config: ClassVar[ConfigDict] = ConfigDict(
         extra="forbid",
@@ -46,6 +61,7 @@ class _ReconciliationMetadataValues(BaseModel):
     )
 
     action_reconciliation: ActionReconciliation
+    predecessor: _ReconciliationPredecessor
 
 
 class _ReconciliationMetadata(BaseModel):
@@ -65,6 +81,7 @@ class DurableActionReconciliation:
     event_hash: str
     evidence_artifact: ArtifactRef
     reconciliation: ActionReconciliation
+    predecessor: _ReconciliationPredecessor
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +121,7 @@ class CheckpointJournal:
         self,
         reconciliation: ActionReconciliation,
         evidence: bytes,
+        predecessor: CheckpointRecord,
     ) -> DurableActionReconciliation:
         if not hmac.compare_digest(
             reconciliation.evidence_ref.cas_digest,
@@ -116,7 +134,7 @@ class CheckpointJournal:
             actor_stream=CHECKPOINT_ACTOR_STREAM,
             event_type=ACTION_RECONCILIATION_EVENT_TYPE,
             raw_output=evidence,
-            metadata=_reconciliation_metadata_values(reconciliation),
+            metadata=_reconciliation_metadata_values(reconciliation, predecessor),
             media_type=ACTION_RECONCILIATION_MEDIA_TYPE,
         )
         return DurableActionReconciliation(
@@ -124,6 +142,7 @@ class CheckpointJournal:
             event_hash=event.event_hash,
             evidence_artifact=artifact,
             reconciliation=reconciliation,
+            predecessor=_predecessor_binding(predecessor),
         )
 
     def snapshot(self) -> JournalSnapshot:
@@ -144,21 +163,20 @@ class CheckpointJournal:
         reconciliation_ids_by_run: dict[str, set[str]] = {}
         durable_reconciliations: list[DurableActionReconciliation] = []
         durable_ids_by_run: dict[str, set[str]] = {}
-        durable_actions_by_run: dict[str, set[str]] = {}
+        durable_action_bindings_by_run: dict[str, set[tuple[int, str]]] = {}
         for event in events:
             if event.event_type == ACTION_RECONCILIATION_EVENT_TYPE:
                 durable = self._decode_action_reconciliation(event, cas)
                 reconciliation = durable.reconciliation
                 run_id = reconciliation.evidence_ref.run_id
                 durable_ids = durable_ids_by_run.setdefault(run_id, set())
-                durable_actions = durable_actions_by_run.setdefault(run_id, set())
+                durable_action_bindings = durable_action_bindings_by_run.setdefault(
+                    run_id,
+                    set(),
+                )
                 if reconciliation.reconciliation_id in durable_ids:
                     raise CheckpointIntegrityError(
                         "action reconciliation ID appears more than once"
-                    )
-                if reconciliation.action_id in durable_actions:
-                    raise CheckpointIntegrityError(
-                        "action has more than one durable reconciliation"
                     )
                 prior = latest_by_run.get(run_id)
                 if prior is None:
@@ -167,12 +185,21 @@ class CheckpointJournal:
                     )
                 try:
                     validate_reconciliation_stage(prior, reconciliation)
+                    validate_reconciliation_predecessor(durable, prior)
                 except CheckpointConflictError as exc:
                     raise CheckpointIntegrityError(
                         "action reconciliation differs from prior durable state"
                     ) from exc
+                action_binding = (
+                    durable.predecessor.event_sequence,
+                    reconciliation.action_id,
+                )
+                if action_binding in durable_action_bindings:
+                    raise CheckpointIntegrityError(
+                        "action has more than one reconciliation for its predecessor"
+                    )
                 durable_ids.add(reconciliation.reconciliation_id)
-                durable_actions.add(reconciliation.action_id)
+                durable_action_bindings.add(action_binding)
                 durable_reconciliations.append(durable)
                 continue
             if event.event_type != CHECKPOINT_EVENT_TYPE:
@@ -204,6 +231,7 @@ class CheckpointJournal:
                 validate_durable_reconciliations(
                     tuple(durable_reconciliations),
                     record.envelope,
+                    prior,
                 )
             except CheckpointConflictError as exc:
                 raise CheckpointIntegrityError(
@@ -311,10 +339,14 @@ class CheckpointJournal:
                 "action reconciliation metadata is invalid"
             ) from exc
         reconciliation = document.values.action_reconciliation
+        predecessor = document.values.predecessor
         expected_metadata = canonical_json(
             {
                 "schema_version": 1,
-                "values": _reconciliation_metadata_values(reconciliation),
+                "values": _reconciliation_metadata_values(
+                    reconciliation,
+                    predecessor,
+                ),
             }
         ).encode("utf-8")
         if metadata_bytes != expected_metadata:
@@ -333,6 +365,7 @@ class CheckpointJournal:
             event_hash=event.event_hash,
             evidence_artifact=artifact,
             reconciliation=reconciliation,
+            predecessor=predecessor,
         )
 
 
@@ -352,10 +385,31 @@ def _metadata_values(
 
 def _reconciliation_metadata_values(
     reconciliation: ActionReconciliation,
+    predecessor: CheckpointRecord | _ReconciliationPredecessor,
 ) -> dict[str, object]:
+    binding = (
+        predecessor
+        if isinstance(predecessor, _ReconciliationPredecessor)
+        else _predecessor_binding(predecessor)
+    )
     return {
         "action_reconciliation": reconciliation.model_dump(mode="json"),
+        "predecessor": binding.model_dump(mode="json"),
     }
+
+
+def _predecessor_binding(
+    predecessor: CheckpointRecord,
+) -> _ReconciliationPredecessor:
+    checkpoint = predecessor.envelope.context_state.checkpoint
+    return _ReconciliationPredecessor(
+        checkpoint_id=checkpoint.checkpoint_id,
+        checkpoint_digest=predecessor.checkpoint_digest,
+        checkpoint_sequence=checkpoint.sequence,
+        stable_watermark=checkpoint.stable_watermark,
+        event_sequence=predecessor.event_sequence,
+        event_hash=predecessor.event_hash,
+    )
 
 
 def evidence_digest(evidence: bytes) -> str:
@@ -398,6 +452,16 @@ def validate_reconciliation_stage(
         raise CheckpointConflictError(
             "action reconciliation evidence belongs to another run"
         )
+    if not any(
+        hmac.compare_digest(
+            canonical_json_bytes(reconciliation.evidence_ref),
+            canonical_json_bytes(reference),
+        )
+        for reference in checkpoint.recent_evidence_refs
+    ):
+        raise CheckpointConflictError(
+            "action reconciliation evidence is not linked to the durable predecessor"
+        )
     if reconciliation.action_id in checkpoint.pending_action_ids:
         expected_state = UnresolvedActionState.PENDING
     elif reconciliation.action_id in checkpoint.unknown_outcome_action_ids:
@@ -427,12 +491,38 @@ def validate_reconciliation_stage(
         )
 
 
+def validate_reconciliation_predecessor(
+    durable: DurableActionReconciliation,
+    predecessor: CheckpointRecord,
+) -> None:
+    if not reconciliation_matches_predecessor(durable, predecessor):
+        raise CheckpointConflictError(
+            "action reconciliation is not bound to the immediate predecessor"
+        )
+
+
+def reconciliation_matches_predecessor(
+    durable: DurableActionReconciliation,
+    predecessor: CheckpointRecord,
+) -> bool:
+    expected = _predecessor_binding(predecessor)
+    return durable.event_sequence > predecessor.event_sequence and hmac.compare_digest(
+        canonical_json_bytes(durable.predecessor),
+        canonical_json_bytes(expected),
+    )
+
+
 def validate_durable_reconciliations(
     durable_records: tuple[DurableActionReconciliation, ...],
     envelope: CheckpointEnvelope,
+    predecessor: CheckpointRecord | None,
 ) -> None:
     if not envelope.action_reconciliations:
         return
+    if predecessor is None:
+        raise CheckpointConflictError(
+            "action reconciliation requires an immediate predecessor"
+        )
     run_id = envelope.context_state.checkpoint.run_id
     by_id = {
         durable.reconciliation.reconciliation_id: durable
@@ -445,6 +535,8 @@ def validate_durable_reconciliations(
             raise CheckpointConflictError(
                 "action reconciliation requires prior durable evidence"
             )
+        validate_reconciliation_predecessor(durable, predecessor)
+        validate_reconciliation_stage(predecessor, reconciliation)
         if not hmac.compare_digest(
             canonical_json_bytes(durable.reconciliation),
             canonical_json_bytes(reconciliation),

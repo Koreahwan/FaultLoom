@@ -81,9 +81,13 @@ prior state, terminal outcome, exact authority and scope epoch, and a
 checkpoint-linked evidence reference. Before a clearing checkpoint can use the
 record, `record_action_reconciliation(..., evidence=...)` must bind the exact
 reconciliation and matching evidence bytes in a separate authenticated ledger
-event. A crash between that record and the clearing checkpoint leaves the
-action blocked; a successor-local reference or an unrelated observation cannot
-self-authenticate resolution. `inspect` reports blocked state without
-dispatching it. A provider-failover checkpoint likewise remains
+event. That stage is also bound to the immediate unresolved checkpoint digest,
+identity, sequence, stable watermark, and authenticated ledger position. Any
+intervening checkpoint expires it; resolution then requires a new reconciliation
+ID and stage bound to the newer predecessor. A crash between a stage and its
+clearing checkpoint leaves the action blocked; a successor-local reference,
+stale stage, or unrelated observation cannot self-authenticate resolution.
+`inspect` reports blocked state without dispatching it. A provider-failover
+checkpoint likewise remains
 non-dispatch-ready, exposes its exact `FailoverIntent`, and accepts only the
 immediate successor manifest whose model is the intent's exact target.

@@ -20,9 +20,6 @@ from tests.runtime.test_context import DEFAULT_RETRIEVAL_KEY, context_state
 
 KEY_BYTES = bytes(range(32))
 RECONCILIATION_EVIDENCE = b"durable operator reconciliation evidence\n"
-RECONCILIATION_EVIDENCE_DIGEST = (
-    f"sha256:{hashlib.sha256(RECONCILIATION_EVIDENCE).hexdigest()}"
-)
 
 
 def state_root(root: Path) -> Path:
@@ -55,11 +52,20 @@ def make_context(
     checkpoint_id: str | None = None,
     pending: tuple[str, ...] = (),
     unknown: tuple[str, ...] = (),
+    evidence_bytes: bytes = RECONCILIATION_EVIDENCE,
+    evidence_id: str | None = None,
+    observation_ids: tuple[str, ...] | None = None,
 ) -> ContextState:
     base = context_state()
-    evidence = base.checkpoint.recent_evidence_refs[0].model_copy(
-        update={"cas_digest": RECONCILIATION_EVIDENCE_DIGEST}
-    )
+    original_evidence = base.checkpoint.recent_evidence_refs[0]
+    evidence_updates: dict[str, object] = {
+        "cas_digest": f"sha256:{hashlib.sha256(evidence_bytes).hexdigest()}"
+    }
+    if evidence_id is not None:
+        evidence_updates["evidence_id"] = evidence_id
+    if observation_ids is not None:
+        evidence_updates["observation_ids"] = observation_ids
+    evidence = original_evidence.model_copy(update=evidence_updates)
     checkpoint = base.checkpoint.model_copy(
         update={
             "checkpoint_id": checkpoint_id or f"checkpoint.{sequence}",
@@ -74,11 +80,15 @@ def make_context(
         hypothesis.model_copy(
             update={
                 "supporting_evidence": tuple(
-                    evidence if reference.evidence_id == evidence.evidence_id else reference
+                    evidence
+                    if reference.evidence_id == original_evidence.evidence_id
+                    else reference
                     for reference in hypothesis.supporting_evidence
                 ),
                 "contradicting_evidence": tuple(
-                    evidence if reference.evidence_id == evidence.evidence_id else reference
+                    evidence
+                    if reference.evidence_id == original_evidence.evidence_id
+                    else reference
                     for reference in hypothesis.contradicting_evidence
                 ),
             }
@@ -89,7 +99,9 @@ def make_context(
         negative.model_copy(
             update={
                 "evidence_refs": tuple(
-                    evidence if reference.evidence_id == evidence.evidence_id else reference
+                    evidence
+                    if reference.evidence_id == original_evidence.evidence_id
+                    else reference
                     for reference in negative.evidence_refs
                 )
             }

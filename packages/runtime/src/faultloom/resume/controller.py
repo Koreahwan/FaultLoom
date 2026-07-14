@@ -10,6 +10,7 @@ from .journal import (
     CheckpointJournal,
     evidence_digest,
     latest_checkpoint,
+    reconciliation_matches_predecessor,
     validate_action_history,
     validate_durable_reconciliations,
     validate_initial,
@@ -67,24 +68,6 @@ class CheckpointController:
 
         with self._store.serialized():
             snapshot = self._journal.snapshot()
-            for durable in snapshot.action_reconciliations:
-                existing = durable.reconciliation
-                if existing.evidence_ref.run_id != exact.evidence_ref.run_id:
-                    continue
-                if existing.reconciliation_id == exact.reconciliation_id:
-                    if hmac.compare_digest(
-                        canonical_json_bytes(existing),
-                        canonical_json_bytes(exact),
-                    ):
-                        return existing
-                    raise CheckpointConflictError(
-                        "action reconciliation ID is already bound to different state"
-                    )
-                if existing.action_id == exact.action_id:
-                    raise CheckpointConflictError(
-                        "action already has a durable reconciliation"
-                    )
-
             prior = latest_checkpoint(
                 snapshot.checkpoints,
                 exact.evidence_ref.run_id,
@@ -93,10 +76,34 @@ class CheckpointController:
                 raise CheckpointConflictError(
                     "action reconciliation requires a prior checkpoint"
                 )
+            for durable in snapshot.action_reconciliations:
+                existing = durable.reconciliation
+                if existing.evidence_ref.run_id != exact.evidence_ref.run_id:
+                    continue
+                same_predecessor = reconciliation_matches_predecessor(
+                    durable,
+                    prior,
+                )
+                if existing.reconciliation_id == exact.reconciliation_id:
+                    if same_predecessor and hmac.compare_digest(
+                        canonical_json_bytes(existing),
+                        canonical_json_bytes(exact),
+                    ):
+                        return existing
+                    raise CheckpointConflictError(
+                        "action reconciliation ID is already bound to different state "
+                        "or predecessor"
+                    )
+                if existing.action_id == exact.action_id and same_predecessor:
+                    raise CheckpointConflictError(
+                        "action already has a durable reconciliation for its predecessor"
+                    )
+
             validate_reconciliation_stage(prior, exact)
             return self._journal.append_action_reconciliation(
                 exact,
                 evidence,
+                prior,
             ).reconciliation
 
     def write(
@@ -159,6 +166,7 @@ class CheckpointController:
             validate_durable_reconciliations(
                 snapshot.action_reconciliations,
                 envelope,
+                prior,
             )
             return self._packet(
                 self._journal.append(envelope, canonical, checkpoint_digest)
