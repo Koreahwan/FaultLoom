@@ -53,6 +53,7 @@ class EnumMemberSnapshot:
 @dataclass(frozen=True, slots=True)
 class EnumTypeSnapshot:
     enum_type: type[Enum]
+    module_registry: IdentityValue
     module: ModuleType
     module_name: str
     class_name: str
@@ -191,8 +192,10 @@ def module_entries(
 def validate_module_binding(
     snapshot: EnumTypeSnapshot, *, error: Exception
 ) -> None:
+    if sys.modules is not snapshot.module_registry:
+        raise error
     registry_entries = exact_dict_entries(
-        sys.modules,
+        snapshot.module_registry,
         value_type=None,
         error=error,
     )

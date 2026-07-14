@@ -21,12 +21,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from threading import RLock, local
-from typing import Annotated, Final, Literal, Protocol
+from typing import Annotated, Final, Literal, Protocol, Self
 from urllib.parse import urlsplit
 
 from cryptography.exceptions import InvalidSignature
 from pydantic import BeforeValidator, Field, model_validator
 
+import faultloom.egress_enum_integrity as enum_integrity
+from faultloom.egress_model_boundary import ExactModelBoundary
 from faultloom.egress_wire import ExactEnumCatalog, ExactEnumInput, WireValue
 from faultloom.egress_wire_snapshot import ExactWireBoundary
 
@@ -134,6 +136,19 @@ _EGRESS_ENUM_TYPES: Final = (
     ReconciliationDisposition,
 )
 _EGRESS_ENUM_CATALOG: Final = ExactEnumCatalog(_EGRESS_ENUM_TYPES)
+_EGRESS_MODEL_BOUNDARY: Final = ExactModelBoundary(_EGRESS_ENUM_CATALOG)
+
+
+def _prepare_exact_model_input(
+    value: enum_integrity.IdentityValue,
+) -> enum_integrity.IdentityValue:
+    return _EGRESS_MODEL_BOUNDARY.prepare(value)
+
+
+def _recheck_egress_enum_catalog[ModelT: ProtocolModel](model: ModelT) -> ModelT:
+    return _EGRESS_MODEL_BOUNDARY.finish(model)
+
+
 _DENIAL_CODE_VALUES: Final = tuple(member.value for member in DenialCode)
 _EXACT_PLANE_INPUT: Final = ExactEnumInput(
     _EGRESS_ENUM_CATALOG,
@@ -192,7 +207,16 @@ ExactReconciliationDisposition = Annotated[
 ]
 
 
-class ReconciliationAuthorization(ProtocolModel):
+class _ExactEgressModel(ProtocolModel):
+    @model_validator(mode="before")
+    @classmethod
+    def _exact_model_input(
+        cls, value: enum_integrity.IdentityValue
+    ) -> enum_integrity.IdentityValue:
+        return _prepare_exact_model_input(value)
+
+
+class ReconciliationAuthorization(_ExactEgressModel):
     """Exact one-use authority to resolve one uncertain semantic action."""
 
     capability_id: Identifier
@@ -212,12 +236,20 @@ class ReconciliationAuthorization(ProtocolModel):
             raise ValueError("reconciliation authorization expiry must follow issuance")
         return self
 
+    @model_validator(mode="after")
+    def _final_enum_catalog(self) -> Self:
+        return _recheck_egress_enum_catalog(self)
 
-class SignedReconciliationAuthorization(ProtocolModel):
+
+class SignedReconciliationAuthorization(_ExactEgressModel):
     payload: ReconciliationAuthorization
     key_id: NonEmptyStr
     payload_digest: Sha256Digest
     signature: NonEmptyStr
+
+    @model_validator(mode="after")
+    def _final_enum_catalog(self) -> Self:
+        return _recheck_egress_enum_catalog(self)
 
 
 def _reconciliation_signing_bytes(
@@ -357,12 +389,16 @@ def _path_is_below(path: str, prefix: str) -> bool:
     return path == base or path.startswith(base + "/")
 
 
-class ProviderTool(ProtocolModel):
+class ProviderTool(_ExactEgressModel):
     tool_id: Identifier
     kind: ExactProviderToolKind
 
+    @model_validator(mode="after")
+    def _final_enum_catalog(self) -> Self:
+        return _recheck_egress_enum_catalog(self)
 
-class ProviderEndpoint(ProtocolModel):
+
+class ProviderEndpoint(_ExactEgressModel):
     endpoint_id: Identifier
     provider_id: Identifier
     origin: ShortStr
@@ -376,8 +412,12 @@ class ProviderEndpoint(ProtocolModel):
             raise ValueError("provider endpoint tool IDs must be unique")
         return self
 
+    @model_validator(mode="after")
+    def _final_enum_catalog(self) -> Self:
+        return _recheck_egress_enum_catalog(self)
 
-class KnowledgeSource(ProtocolModel):
+
+class KnowledgeSource(_ExactEgressModel):
     source_id: Identifier
     origin: ShortStr
     allowed_path_prefixes: tuple[NonEmptyStr, ...]
@@ -403,8 +443,12 @@ class KnowledgeSource(ProtocolModel):
                 raise ValueError(f"knowledge source {name} must be unique")
         return self
 
+    @model_validator(mode="after")
+    def _final_enum_catalog(self) -> Self:
+        return _recheck_egress_enum_catalog(self)
 
-class DestinationResolution(ProtocolModel):
+
+class DestinationResolution(_ExactEgressModel):
     """Resolver result pinned into the transport request for one dispatch."""
 
     plane: ExactNonTargetPlane
@@ -426,6 +470,10 @@ class DestinationResolution(ProtocolModel):
             raise ValueError("CNAME chain entries must be unique")
         return self
 
+    @model_validator(mode="after")
+    def _final_enum_catalog(self) -> Self:
+        return _recheck_egress_enum_catalog(self)
+
 
 class DestinationResolver(Protocol):
     plane: EgressPlane
@@ -434,7 +482,7 @@ class DestinationResolver(Protocol):
     def resolve(self, origin: str) -> DestinationResolution: ...
 
 
-class ProviderRequest(ProtocolModel):
+class ProviderRequest(_ExactEgressModel):
     request_id: Identifier
     run_id: Identifier
     authority_digest: Sha256Digest
@@ -456,8 +504,12 @@ class ProviderRequest(ProtocolModel):
             raise ValueError("provider request tool IDs must be unique")
         return self
 
+    @model_validator(mode="after")
+    def _final_enum_catalog(self) -> Self:
+        return _recheck_egress_enum_catalog(self)
 
-class KnowledgeFetchIntent(ProtocolModel):
+
+class KnowledgeFetchIntent(_ExactEgressModel):
     request_id: Identifier
     run_id: Identifier
     authority_digest: Sha256Digest
@@ -473,8 +525,12 @@ class KnowledgeFetchIntent(ProtocolModel):
         _validate_path(self.path)
         return self
 
+    @model_validator(mode="after")
+    def _final_enum_catalog(self) -> Self:
+        return _recheck_egress_enum_catalog(self)
 
-class CompiledProviderRequest(ProtocolModel):
+
+class CompiledProviderRequest(_ExactEgressModel):
     plane: ExactProviderPlane = EgressPlane.MODEL_PROVIDER
     request_id: Identifier
     endpoint_id: Identifier
@@ -495,8 +551,12 @@ class CompiledProviderRequest(ProtocolModel):
     maximum_response_bytes: PositiveInt
     follow_redirects: Literal[False] = False
 
+    @model_validator(mode="after")
+    def _final_enum_catalog(self) -> Self:
+        return _recheck_egress_enum_catalog(self)
 
-class CompiledKnowledgeRequest(ProtocolModel):
+
+class CompiledKnowledgeRequest(_ExactEgressModel):
     plane: ExactKnowledgePlane = EgressPlane.KNOWLEDGE
     request_id: Identifier
     source_id: Identifier
@@ -513,8 +573,12 @@ class CompiledKnowledgeRequest(ProtocolModel):
     maximum_response_bytes: PositiveInt
     follow_redirects: Literal[False] = False
 
+    @model_validator(mode="after")
+    def _final_enum_catalog(self) -> Self:
+        return _recheck_egress_enum_catalog(self)
 
-class EgressTransportResult(ProtocolModel):
+
+class EgressTransportResult(_ExactEgressModel):
     plane: ExactEgressPlane
     outcome: ExactTransportOutcome
     response_digest: Sha256Digest | None = None
@@ -522,8 +586,12 @@ class EgressTransportResult(ProtocolModel):
     bytes_sent: NonNegativeInt
     bytes_received: NonNegativeInt
 
+    @model_validator(mode="after")
+    def _final_enum_catalog(self) -> Self:
+        return _recheck_egress_enum_catalog(self)
 
-class EgressReceipt(ProtocolModel):
+
+class EgressReceipt(_ExactEgressModel):
     receipt_digest: Sha256Digest
     plane: ExactEgressPlane
     request_id: Identifier
@@ -564,6 +632,10 @@ class EgressReceipt(ProtocolModel):
         if not hmac.compare_digest(self.receipt_digest, sha256_digest(payload)):
             raise ValueError("egress receipt digest does not match its fields")
         return self
+
+    @model_validator(mode="after")
+    def _final_enum_catalog(self) -> Self:
+        return _recheck_egress_enum_catalog(self)
 
 
 _EGRESS_MODEL_TYPES: Final = (

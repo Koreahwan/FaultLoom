@@ -53,10 +53,15 @@ class EgressWireError(ValueError):
 
 class ExactEnumCatalog:
     def __init__(self, enum_types: tuple[type[Enum], ...]) -> None:
+        identity_error = EgressWireError("catalog_identity")
+        module_registry = sys.modules
+        registry_entries = enum_integrity.exact_dict_entries(
+            module_registry, value_type=None, error=identity_error
+        )
         type_snapshots: list[enum_integrity.EnumTypeSnapshot] = []
         for enum_type in enum_types:
             class_entries = enum_integrity.exact_class_entries(
-                enum_type, error=EgressWireError("catalog_identity")
+                enum_type, error=identity_error
             )
             raw_member_map = enum_integrity.entry(class_entries, "_member_map_")
             raw_value_map = enum_integrity.entry(class_entries, "_value2member_map_")
@@ -84,7 +89,7 @@ class ExactEnumCatalog:
                     raise EgressWireError("catalog_member")
                 member = raw_member
                 member_name, member_value = enum_integrity.member_metadata(
-                    member, error=EgressWireError("catalog_identity")
+                    member, error=identity_error
                 )
                 backing_value = str.__str__(member)
                 if (
@@ -109,27 +114,19 @@ class ExactEnumCatalog:
                 module_name
             ) or not enum_integrity.is_exact_string(class_name):
                 raise EgressWireError("catalog_identity")
-            module = enum_integrity.entry(
-                enum_integrity.exact_dict_entries(
-                    sys.modules,
-                    value_type=None,
-                    error=EgressWireError("catalog_identity"),
-                ),
-                module_name,
-            )
+            module = enum_integrity.entry(registry_entries, module_name)
             if not enum_integrity.is_exact_module(module):
                 raise EgressWireError("catalog_identity")
             exact_module = module
             if enum_integrity.entry(
-                enum_integrity.module_entries(
-                    exact_module, error=EgressWireError("catalog_identity")
-                ),
+                enum_integrity.module_entries(exact_module, error=identity_error),
                 class_name,
             ) is not enum_type:
                 raise EgressWireError("catalog_identity")
             type_snapshots.append(
                 enum_integrity.EnumTypeSnapshot(
                     enum_type=enum_type,
+                    module_registry=module_registry,
                     module=exact_module,
                     module_name=module_name,
                     class_name=class_name,
@@ -139,9 +136,11 @@ class ExactEnumCatalog:
                     value_count=len(value_map),
                 )
             )
-        self._type_snapshots: tuple[enum_integrity.EnumTypeSnapshot, ...] = tuple(
-            type_snapshots
-        )
+        self._type_snapshots: tuple[enum_integrity.EnumTypeSnapshot, ...] = tuple(type_snapshots)
+
+    def validate_integrity(self) -> None:
+        for snapshot in self._type_snapshots:
+            self._validate_snapshot(snapshot)
 
     def normalize_input(
         self,
