@@ -7,7 +7,7 @@ import json
 import re
 import sys
 from datetime import datetime
-from typing import NoReturn
+from typing import NoReturn, TypeGuard
 
 MAX_RPC_BYTES = 1_048_576
 MAX_SCHEMA_BYTES = 131_072
@@ -20,7 +20,7 @@ WIRE_DATETIME = re.compile(
     r"(?:[Zz]|[+-](?P<offset_hour>\d{2}):(?P<offset_minute>\d{2}))$"
 )
 
-INPUT_SCHEMA_DIGEST = "sha256:6a084ecbce279e360616dbc5a945e42ea8c88163a84bc40551877a96975db02a"
+INPUT_SCHEMA_DIGEST = "sha256:b9e125b9dbc50501e1ee3fe043dcd7ca8bc9f9abdd3dba0edf1b779961a454fc"
 OUTPUT_SCHEMA_DIGEST = "sha256:c9397046a37dc06721f0f2010a88c0761636a05e5a98dccbad33b5ad8d75a64d"
 
 
@@ -209,7 +209,7 @@ def _load_input_schema(raw: str) -> dict[str, object] | None:
     return schema
 
 
-def _exact_mapping(value: object, fields: set[str]) -> bool:
+def _exact_mapping(value: object, fields: set[str]) -> TypeGuard[dict[str, object]]:
     return isinstance(value, dict) and set(value) == fields
 
 
@@ -275,6 +275,7 @@ def _valid_intent(value: object) -> bool:
         "requested_at",
         "parent_action_ids",
         "canary_ref",
+        "checkpoint_ref",
         "cleanup_plan_ref",
     }
     if not _exact_mapping(value, fields):
@@ -298,6 +299,7 @@ def _valid_intent(value: object) -> bool:
         and isinstance(value["parent_action_ids"], list)
         and all(_identifier(item) for item in value["parent_action_ids"])
         and (value["canary_ref"] is None or _identifier(value["canary_ref"]))
+        and (value["checkpoint_ref"] is None or _identifier(value["checkpoint_ref"]))
         and (value["cleanup_plan_ref"] is None or _identifier(value["cleanup_plan_ref"]))
     )
 

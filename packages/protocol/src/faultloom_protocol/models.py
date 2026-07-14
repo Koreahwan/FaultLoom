@@ -64,12 +64,29 @@ Base64Url = Annotated[
 KeyId = Annotated[str, Field(pattern=r"^ed25519:sha256:[0-9a-f]{64}$")]
 
 
+def _require_nonce_entropy(value: str) -> str:
+    if len(set(bytes.fromhex(value))) < 4:
+        raise ValueError("nonce must contain at least four distinct bytes")
+    return value
+
+
+Nonce128 = Annotated[
+    str,
+    Field(pattern=r"^[0-9a-f]{32}$"),
+    AfterValidator(_require_nonce_entropy),
+]
+
+
 class ActionClass(str, Enum):
     OBSERVE = "observe"
     SAFE_PROBE = "safe_probe"
     STATE_CHANGE = "state_change"
     HIGH_LOAD = "high_load"
     DESTRUCTIVE = "destructive"
+
+
+class EgressPlane(str, Enum):
+    TARGET_GATEWAY = "target_gateway"
 
 
 class ProvenanceKind(str, Enum):
@@ -343,29 +360,54 @@ class ActionIntent(ProtocolModel):
     requested_at: AwareDatetime
     parent_action_ids: tuple[Identifier, ...] = ()
     canary_ref: Identifier | None = None
+    checkpoint_ref: Identifier | None = None
     cleanup_plan_ref: Identifier | None = None
 
     @model_validator(mode="after")
     def _state_change_contract(self) -> "ActionIntent":
         if self.action_class is ActionClass.STATE_CHANGE:
-            if self.canary_ref is None or self.cleanup_plan_ref is None:
-                raise ValueError("state_change requires canary_ref and cleanup_plan_ref")
+            if (
+                self.canary_ref is None
+                or self.checkpoint_ref is None
+                or self.cleanup_plan_ref is None
+            ):
+                raise ValueError(
+                    "state_change requires canary_ref, checkpoint_ref, and cleanup_plan_ref"
+                )
         return self
 
 
 class BudgetReservation(ProtocolModel):
     action_count: PositiveInt = 1
-    request_bytes: NonNegativeInt = 0
+    request_bytes: PositiveInt
     response_bytes: NonNegativeInt = 0
     duration_seconds: PositiveInt
 
 
 class ActionLease(ProtocolModel):
     lease_id: Identifier
+    lease_key_id: Identifier
+    action_id: Identifier
+    correlation_id: Identifier
     intent_digest: Sha256Digest
+    decision_digest: Sha256Digest
     grant_id: Identifier
     grant_version: PositiveInt
     scope_epoch: PositiveInt
+    authority_key_id: KeyId
+    scope_epoch_binding_digest: Sha256Digest
+    gateway_boot_id: Identifier
+    boot_challenge_digest: Sha256Digest
+    target_id: Identifier
+    identity_id: Identifier
+    tenant_id: Identifier | None = None
+    action_kind: Identifier
+    semantic_action_digest: Sha256Digest
+    request_binding_digest: Sha256Digest
+    resolution_digest: Sha256Digest
+    egress_plane: EgressPlane
+    dispatch_nonce: Nonce128
+    retry_of_intent_digest: Sha256Digest | None = None
     issued_at: AwareDatetime
     expires_at: AwareDatetime
     maximum_dispatches: Literal[1] = 1
@@ -375,6 +417,12 @@ class ActionLease(ProtocolModel):
     def _lease_validity(self) -> "ActionLease":
         if self.expires_at <= self.issued_at:
             raise ValueError("lease expiry must follow issuance")
+        if (self.expires_at - self.issued_at).total_seconds() > 60:
+            raise ValueError("lease TTL cannot exceed sixty seconds")
+        if self.retry_of_intent_digest == self.intent_digest:
+            raise ValueError("retry alias must use a fresh intent digest")
+        if self.reservation.action_count != 1:
+            raise ValueError("a v0.1 lease reserves exactly one action")
         return self
 
 
@@ -411,10 +459,34 @@ class DispatchOutcome(str, Enum):
 
 class DispatchReceipt(ProtocolModel):
     receipt_id: Identifier
+    receipt_authentication_tag: Sha256Digest
+    action_id: Identifier
+    correlation_id: Identifier
     lease_id: Identifier
+    lease_key_id: Identifier
+    grant_id: Identifier
+    grant_version: PositiveInt
+    authority_key_id: KeyId
+    scope_epoch_binding_digest: Sha256Digest
+    gateway_boot_id: Identifier
+    boot_challenge_digest: Sha256Digest
     intent_digest: Sha256Digest
     decision_digest: Sha256Digest
     scope_epoch: PositiveInt
+    target_id: Identifier
+    identity_id: Identifier
+    tenant_id: Identifier | None = None
+    action_kind: Identifier
+    semantic_action_digest: Sha256Digest
+    request_binding_digest: Sha256Digest
+    request_frame_digest: Sha256Digest
+    resolution_digest: Sha256Digest
+    egress_plane: EgressPlane
+    dispatch_nonce: Nonce128
+    lease_issued_at: AwareDatetime
+    lease_expires_at: AwareDatetime
+    retry_of_intent_digest: Sha256Digest | None = None
+    reservation: BudgetReservation
     request_digest: Sha256Digest
     response_digest: Sha256Digest | None = None
     outcome: DispatchOutcome
@@ -429,6 +501,14 @@ class DispatchReceipt(ProtocolModel):
     def _outcome_contract(self) -> "DispatchReceipt":
         if self.completed_at is not None and self.completed_at < self.dispatched_at:
             raise ValueError("completed_at cannot precede dispatched_at")
+        if self.lease_expires_at <= self.lease_issued_at:
+            raise ValueError("receipt contains an invalid lease validity interval")
+        if (self.lease_expires_at - self.lease_issued_at).total_seconds() > 60:
+            raise ValueError("receipt lease TTL cannot exceed sixty seconds")
+        if self.retry_of_intent_digest == self.intent_digest:
+            raise ValueError("retry alias must use a fresh intent digest")
+        if self.reservation.action_count != 1:
+            raise ValueError("a v0.1 dispatch receipt reserves exactly one action")
         if self.outcome is DispatchOutcome.UNKNOWN_OUTCOME and not self.reconciliation_required:
             raise ValueError("unknown_outcome requires reconciliation")
         if self.outcome is not DispatchOutcome.UNKNOWN_OUTCOME and self.reconciliation_required:
@@ -1393,6 +1473,7 @@ class SignedRunResultBundle(ProtocolModel):
 _install_protocol_enum_catalog(
     (
         ActionClass,
+        EgressPlane,
         ProvenanceKind,
         ConfidenceClass,
         FindingClass,

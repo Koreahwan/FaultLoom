@@ -39,6 +39,18 @@ RPC. Receipts expire within five seconds and are consumed once by the Gateway
 kernel. The cross-language envelope and receipt fixtures under `tests/fixtures`
 are normative for this local channel.
 
+`ActionLease` and `DispatchReceipt` expose the durable T18 bindings without
+exposing a lease proof or channel secret. Dispatch receipts also require the
+Gateway-keyed authentication tag for their canonical receipt ID. They require
+the grant/version, authority key, authenticated scope epoch, Gateway boot,
+action/correlation, target and identity, semantic/request/resolution digests,
+target-only egress plane, one-use 128-bit nonce, at-most-60-second validity, and
+one-action budget.
+A state-changing `ActionIntent` additionally requires a canary, pre-action
+checkpoint, and cleanup-plan reference. Unknown outcomes can only proceed after
+the exact authenticated dispatch receipt and a separately keyed durable
+reconciliation authorization, followed by a fresh-intent retry alias.
+
 An `EngagementBundle` embeds the complete `SignedAuthorityGrant`; verification
 checks both signatures, current grant validity, and target, pack, identity, and
 adapter authorization. Result verification requires the caller's expected run

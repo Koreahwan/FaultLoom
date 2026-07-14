@@ -3,8 +3,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::Digest;
 use crate::ipc::{
     DenialCode, DeniedResponse, DispatchOutcome, DispatchReceipt, DispatchRequest, GatewayResponse,
+    encode_request,
 };
-use crate::policy::{ActionCompiler, LeaseVerifier, ScopeVerifier};
+use crate::policy::{ActionCompiler, LeaseApproval, LeaseCompletion, LeaseVerifier, ScopeVerifier};
 use crate::transport::{TargetTransport, TransportObservation};
 
 pub(crate) trait Clock {
@@ -58,6 +59,17 @@ where
         if let Err(reason) = request.validate() {
             return denied(&request, request_frame_digest, reason);
         }
+        let canonical_frame_digest = match encode_request(&request) {
+            Ok(frame) => Digest::of(&frame),
+            Err(reason) => return denied(&request, request_frame_digest, reason),
+        };
+        if canonical_frame_digest != request_frame_digest {
+            return denied(
+                &request,
+                canonical_frame_digest,
+                DenialCode::VerificationBindingMismatch,
+            );
+        }
         let scope = match self.scope.verify(&request) {
             Ok(approval) => approval,
             Err(reason) => return denied(&request, request_frame_digest, reason),
@@ -80,51 +92,128 @@ where
                 DenialCode::VerificationBindingMismatch,
             );
         }
-        let lease = match self.lease.verify(&request) {
+        let reserved_at_millis = self.clock.now_millis();
+        let lease = match self.lease.reserve(&request, reserved_at_millis) {
             Ok(approval) => approval,
             Err(reason) => return denied(&request, request_frame_digest, reason),
         };
         if lease.intent_digest != request.intent_digest
+            || lease.decision_digest != request.decision_digest
+            || lease.grant_id != request.grant_id
+            || lease.grant_version != request.grant_version
             || lease.lease_id != request.lease_id
             || lease.scope_epoch != request.scope_epoch
+            || lease.authority_key_id != scope.authority_key_id
+            || lease.scope_epoch_binding_digest != scope.scope_epoch_binding_digest
+            || lease.gateway_boot_id != scope.gateway_boot_id
+            || lease.boot_challenge_digest == Digest::ZERO
+            || lease.request_binding_digest != request.lease_binding_digest()
+            || lease.semantic_action_digest != request.semantic_action_digest
+            || lease.resolution_digest != request.resolution_digest
+            || lease.correlation_id != request.correlation_id
+            || lease.egress_plane != request.egress_plane
+            || lease.dispatch_nonce != request.dispatch_nonce
+            || lease.issued_at_millis != request.request_issued_at_millis
+            || lease.expires_at_millis != request.request_expires_at_millis
+            || lease.retry_of_intent_digest != request.retry_of_intent_digest
             || lease.maximum_dispatches != 1
+            || lease.reservation.action_count != 1
         {
-            return denied(
+            return self.abandon_then_deny(
                 &request,
                 request_frame_digest,
+                &lease,
                 DenialCode::VerificationBindingMismatch,
             );
         }
         let compiled = match self.compiler.compile(&request) {
             Ok(compiled) => compiled,
-            Err(reason) => return denied(&request, request_frame_digest, reason),
+            Err(reason) => {
+                return self.abandon_then_deny(&request, request_frame_digest, &lease, reason);
+            }
         };
         if compiled.intent_digest != request.intent_digest
             || compiled.action_kind != request.action_kind
             || compiled.target != scope.target
+            || compiled.egress_plane != request.egress_plane
+            || compiled.semantic_action_digest != request.semantic_action_digest
+            || compiled.resolution_digest != request.resolution_digest
+            || compiled.request_binding_digest != request.lease_binding_digest()
             || compiled.bytes.is_empty()
         {
-            return denied(
+            return self.abandon_then_deny(
                 &request,
                 request_frame_digest,
+                &lease,
                 DenialCode::VerificationBindingMismatch,
             );
         }
+        if !u64::try_from(compiled.bytes.len())
+            .is_ok_and(|length| length <= lease.reservation.request_bytes)
+        {
+            return self.abandon_then_deny(
+                &request,
+                request_frame_digest,
+                &lease,
+                DenialCode::LeaseReservationExceeded,
+            );
+        }
+        if let Err(reason) = self.scope.register_dispatch(&request, &lease) {
+            return self.abandon_then_deny(&request, request_frame_digest, &lease, reason);
+        }
 
         let dispatched_at_millis = self.clock.now_millis();
-        let observation = self.transport.dispatch(&compiled);
+        let mut observation = self
+            .transport
+            .dispatch_cancellable(&compiled, &lease.cancellation);
         let completed_at_millis = self.clock.now_millis().max(dispatched_at_millis);
-        let receipt = make_receipt(
+        if self.scope.finish_dispatch(&lease).is_err() {
+            observation.outcome = DispatchOutcome::UnknownOutcome;
+        }
+        let bytes_received = u64::try_from(observation.response.len()).unwrap_or(u64::MAX);
+        let finalization = self.lease.finalize(
+            &lease,
+            LeaseCompletion {
+                outcome: observation.outcome,
+                bytes_sent: observation.bytes_sent,
+                bytes_received,
+                elapsed_millis: completed_at_millis.saturating_sub(dispatched_at_millis),
+            },
+        );
+        if finalization.as_ref().map_or(true, |result| {
+            result.reconciliation_required || result.reservation_overrun
+        }) {
+            observation.outcome = DispatchOutcome::UnknownOutcome;
+        }
+        let mut receipt = make_receipt(
             &request,
+            request_frame_digest,
+            &scope,
+            &lease,
             &compiled.bytes,
             observation,
-            dispatched_at_millis,
-            completed_at_millis,
+            (dispatched_at_millis, completed_at_millis),
         );
+        receipt.receipt_authentication_tag = match self.lease.authenticate_receipt(&lease, &receipt)
+        {
+            Ok(authentication_tag) => authentication_tag,
+            Err(reason) => return denied(&request, request_frame_digest, reason),
+        };
         GatewayResponse::Receipt {
             action_id: request.action_id,
             receipt,
         }
+    }
+
+    fn abandon_then_deny(
+        &self,
+        request: &DispatchRequest,
+        request_frame_digest: Digest,
+        approval: &LeaseApproval,
+        reason: DenialCode,
+    ) -> GatewayResponse {
+        let final_reason = self.lease.abandon(approval).err().unwrap_or(reason);
+        denied(request, request_frame_digest, final_reason)
     }
 }
 
@@ -133,20 +222,23 @@ fn denied(
     request_frame_digest: Digest,
     reason: DenialCode,
 ) -> GatewayResponse {
-    GatewayResponse::Denied(DeniedResponse {
-        action_id: request.action_id.clone(),
-        request_digest: request_frame_digest,
+    GatewayResponse::Denied(DeniedResponse::bound(
+        request.action_id.clone(),
+        request_frame_digest,
         reason,
-    })
+    ))
 }
 
 fn make_receipt(
     request: &DispatchRequest,
+    request_frame_digest: Digest,
+    scope: &crate::policy::ScopeApproval,
+    lease: &LeaseApproval,
     compiled_bytes: &[u8],
     observation: TransportObservation,
-    dispatched_at_millis: u64,
-    completed_at_millis: u64,
+    timing: (u64, u64),
 ) -> DispatchReceipt {
+    let (dispatched_at_millis, completed_at_millis) = timing;
     let request_digest = Digest::of(compiled_bytes);
     let response_digest = match observation.outcome {
         DispatchOutcome::Completed => Some(Digest::of(&observation.response)),
@@ -155,25 +247,37 @@ fn make_receipt(
         }
         DispatchOutcome::Failed | DispatchOutcome::UnknownOutcome => None,
     };
-    let bytes_received = observation.response.len() as u64;
+    let bytes_received = u64::try_from(observation.response.len()).unwrap_or(u64::MAX);
     let reconciliation_required = observation.outcome == DispatchOutcome::UnknownOutcome;
-    let receipt_id = receipt_digest(
-        request,
-        request_digest,
-        response_digest,
-        observation.outcome,
-        dispatched_at_millis,
-        completed_at_millis,
-        observation.bytes_sent,
-        bytes_received,
-        reconciliation_required,
-    );
-    DispatchReceipt {
-        receipt_id,
+    let mut receipt = DispatchReceipt {
+        receipt_id: Digest::ZERO,
+        receipt_authentication_tag: Digest::ZERO,
+        action_id: request.action_id.clone(),
+        correlation_id: request.correlation_id.clone(),
         lease_id: request.lease_id.clone(),
+        grant_id: request.grant_id.clone(),
+        grant_version: request.grant_version,
+        authority_key_id: scope.authority_key_id.clone(),
+        scope_epoch_binding_digest: scope.scope_epoch_binding_digest,
+        lease_key_id: lease.lease_key_id.clone(),
+        gateway_boot_id: scope.gateway_boot_id.clone(),
+        boot_challenge_digest: lease.boot_challenge_digest,
         intent_digest: request.intent_digest,
         decision_digest: request.decision_digest,
         scope_epoch: request.scope_epoch,
+        semantic_action_digest: request.semantic_action_digest,
+        request_binding_digest: request.lease_binding_digest(),
+        request_frame_digest,
+        resolution_digest: request.resolution_digest,
+        egress_plane: request.egress_plane,
+        dispatch_nonce: request.dispatch_nonce,
+        lease_issued_at_millis: lease.issued_at_millis,
+        lease_expires_at_millis: lease.expires_at_millis,
+        retry_of_intent_digest: lease.retry_of_intent_digest,
+        reserved_action_count: lease.reservation.action_count,
+        reserved_request_bytes: lease.reservation.request_bytes,
+        reserved_response_bytes: lease.reservation.response_bytes,
+        reserved_duration_seconds: lease.reservation.duration_seconds,
         request_digest,
         response_digest,
         outcome: observation.outcome,
@@ -182,47 +286,9 @@ fn make_receipt(
         bytes_sent: observation.bytes_sent,
         bytes_received,
         reconciliation_required,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn receipt_digest(
-    request: &DispatchRequest,
-    request_digest: Digest,
-    response_digest: Option<Digest>,
-    outcome: DispatchOutcome,
-    dispatched_at_millis: u64,
-    completed_at_millis: u64,
-    bytes_sent: u64,
-    bytes_received: u64,
-    reconciliation_required: bool,
-) -> Digest {
-    let mut canonical = Vec::with_capacity(256);
-    canonical.extend_from_slice(b"faultloom-gateway-receipt-v1\0");
-    push_string(&mut canonical, &request.lease_id);
-    canonical.extend_from_slice(request.intent_digest.as_bytes());
-    canonical.extend_from_slice(request.decision_digest.as_bytes());
-    canonical.extend_from_slice(&request.scope_epoch.to_be_bytes());
-    canonical.extend_from_slice(request_digest.as_bytes());
-    match response_digest {
-        Some(digest) => {
-            canonical.push(1);
-            canonical.extend_from_slice(digest.as_bytes());
-        }
-        None => canonical.push(0),
-    }
-    canonical.push(outcome as u8);
-    canonical.extend_from_slice(&dispatched_at_millis.to_be_bytes());
-    canonical.extend_from_slice(&completed_at_millis.to_be_bytes());
-    canonical.extend_from_slice(&bytes_sent.to_be_bytes());
-    canonical.extend_from_slice(&bytes_received.to_be_bytes());
-    canonical.push(u8::from(reconciliation_required));
-    Digest::of(&canonical)
-}
-
-fn push_string(output: &mut Vec<u8>, value: &str) {
-    output.extend_from_slice(&(value.len() as u32).to_be_bytes());
-    output.extend_from_slice(value.as_bytes());
+    };
+    receipt.receipt_id = receipt.canonical_id();
+    receipt
 }
 
 #[cfg(test)]
@@ -234,9 +300,12 @@ mod tests {
     use std::thread;
 
     use super::*;
-    use crate::ipc::{ActionClass, ActionKind, FlowKind, RequiredFeature, encode_request};
+    use crate::ipc::{
+        ActionClass, ActionKind, EgressPlane, FlowKind, RequiredFeature, encode_request,
+    };
+    use crate::lease::{GrantBudget, LeaseAuthority, LeaseBudgetReservation, LeaseSpec};
     use crate::policy::{
-        CompiledAction, LeaseApproval, ScopeApproval, UnavailableActionCompiler,
+        CompiledAction, LeaseApproval, LeaseFinalization, ScopeApproval, UnavailableActionCompiler,
         UnavailableLeaseVerifier, UnavailableScopeVerifier,
     };
     use crate::transport::{TcpTargetTransport, TransportObservation};
@@ -250,16 +319,58 @@ mod tests {
             }
             Ok(ScopeApproval::fixture(request))
         }
+
+        fn register_dispatch(
+            &self,
+            _request: &DispatchRequest,
+            _approval: &LeaseApproval,
+        ) -> Result<(), DenialCode> {
+            Ok(())
+        }
+
+        fn finish_dispatch(&self, _approval: &LeaseApproval) -> Result<(), DenialCode> {
+            Ok(())
+        }
     }
 
     struct FixtureLease;
 
     impl LeaseVerifier for FixtureLease {
-        fn verify(&self, request: &DispatchRequest) -> Result<LeaseApproval, DenialCode> {
+        fn reserve(
+            &self,
+            request: &DispatchRequest,
+            _now_millis: u64,
+        ) -> Result<LeaseApproval, DenialCode> {
             if request.lease_proof != b"fixture-lease-proof" {
                 return Err(DenialCode::LeaseDenied);
             }
             Ok(LeaseApproval::fixture(request))
+        }
+
+        fn abandon(&self, _approval: &LeaseApproval) -> Result<(), DenialCode> {
+            Ok(())
+        }
+
+        fn finalize(
+            &self,
+            _approval: &LeaseApproval,
+            completion: LeaseCompletion,
+        ) -> Result<LeaseFinalization, DenialCode> {
+            Ok(LeaseFinalization {
+                reconciliation_required: completion.outcome == DispatchOutcome::UnknownOutcome,
+                reservation_overrun: false,
+            })
+        }
+
+        fn authenticate_receipt(
+            &self,
+            _approval: &LeaseApproval,
+            receipt: &DispatchReceipt,
+        ) -> Result<Digest, DenialCode> {
+            if receipt.receipt_id != receipt.canonical_id() {
+                return Err(DenialCode::LeaseBindingMismatch);
+            }
+            Ok(Digest::of(b"fixture receipt authentication"))
         }
     }
 
@@ -275,27 +386,24 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct FixedClock {
-        calls: Arc<AtomicUsize>,
-    }
+    struct FixedClock;
 
     impl FixedClock {
-        fn new() -> Self {
-            Self {
-                calls: Arc::new(AtomicUsize::new(0)),
-            }
+        const fn new() -> Self {
+            Self
         }
     }
 
     impl Clock for FixedClock {
         fn now_millis(&self) -> u64 {
-            1_000 + (self.calls.fetch_add(1, Ordering::SeqCst) % 2) as u64
+            1_000
         }
     }
 
     fn request(target: std::net::SocketAddr) -> DispatchRequest {
-        DispatchRequest {
+        let mut request = DispatchRequest {
             action_id: "action:loopback".to_owned(),
+            correlation_id: "correlation:loopback".to_owned(),
             grant_id: "grant:fixture".to_owned(),
             grant_version: 1,
             target_id: "target:owned-loopback".to_owned(),
@@ -309,6 +417,7 @@ mod tests {
             scope_epoch: 7,
             action_kind: ActionKind::SemanticHttpV1,
             action_class: ActionClass::SafeProbe,
+            egress_plane: EgressPlane::TargetGateway,
             flow_kind: FlowKind::TopLevel,
             parent_action_id: None,
             required_features: vec![RequiredFeature::GatewayDispatchV1],
@@ -317,13 +426,22 @@ mod tests {
             method: "GET".to_owned(),
             path: "/".to_owned(),
             target,
+            resolution_digest: Digest::ZERO,
+            semantic_action_digest: Digest::ZERO,
+            dispatch_nonce: *b"0123456789abcdef",
+            request_issued_at_millis: 999,
+            request_expires_at_millis: 6_000,
+            retry_of_intent_digest: None,
             payload: b"PING".to_vec(),
             scope_proof: b"fixture-scope-proof".to_vec(),
             lease_proof: b"fixture-lease-proof".to_vec(),
             compiler_proof: b"fixture-compiler-proof".to_vec(),
             canary_ref: None,
+            checkpoint_ref: None,
             cleanup_plan_ref: None,
-        }
+        };
+        request.bind_canonical_semantics();
+        request
     }
 
     fn handle<S, L, C, T, K>(
@@ -438,6 +556,234 @@ mod tests {
         assert_eq!(receipt.response_digest, None);
     }
 
+    #[derive(Clone)]
+    struct RecordingTransport {
+        dispatches: Arc<AtomicUsize>,
+        outcome: DispatchOutcome,
+        response: Vec<u8>,
+    }
+
+    impl TargetTransport for RecordingTransport {
+        fn dispatch(&self, action: &CompiledAction) -> TransportObservation {
+            self.dispatches.fetch_add(1, Ordering::SeqCst);
+            TransportObservation {
+                outcome: self.outcome,
+                bytes_sent: action.bytes.len() as u64,
+                response: self.response.clone(),
+            }
+        }
+    }
+
+    fn lease_authority() -> LeaseAuthority {
+        let authority = LeaseAuthority::new(
+            "lease-key:fixture".to_owned(),
+            std::array::from_fn(|index| u8::try_from(index + 17).expect("small fixture key byte")),
+            "gateway:boot:fixture".to_owned(),
+            Digest::of(b"fixture-gateway-challenge"),
+        )
+        .expect("lease authority");
+        authority
+            .register_grant(
+                "grant:fixture",
+                1,
+                GrantBudget {
+                    total_actions: 10,
+                    rate_per_minute: 10,
+                    max_concurrency: 2,
+                    max_request_bytes: 64,
+                    max_response_bytes: 64,
+                    max_duration_seconds: 5,
+                },
+            )
+            .expect("register grant");
+        authority
+    }
+
+    fn issue_request(authority: &LeaseAuthority, request: &mut DispatchRequest) {
+        let spec = lease_spec(request);
+        let issued = authority.issue(spec).expect("issue request lease");
+        request.lease_proof = issued.proof;
+    }
+
+    fn lease_spec(request: &DispatchRequest) -> LeaseSpec {
+        LeaseSpec {
+            lease_id: request.lease_id.clone(),
+            intent_digest: request.intent_digest,
+            decision_digest: request.decision_digest,
+            grant_id: request.grant_id.clone(),
+            grant_version: request.grant_version,
+            scope_epoch: request.scope_epoch,
+            authority_key_id: format!("ed25519:sha256:{}", "11".repeat(32)),
+            scope_epoch_binding_digest: Digest::of(b"fixture-scope-epoch-binding"),
+            gateway_boot_id: "gateway:boot:fixture".to_owned(),
+            request_binding_digest: request.lease_binding_digest(),
+            semantic_action_digest: request.semantic_action_digest,
+            resolution_digest: request.resolution_digest,
+            correlation_id: request.correlation_id.clone(),
+            egress_plane: request.egress_plane,
+            dispatch_nonce: request.dispatch_nonce,
+            retry_of_intent_digest: request.retry_of_intent_digest,
+            issued_at_millis: request.request_issued_at_millis,
+            expires_at_millis: request.request_expires_at_millis,
+            reservation: LeaseBudgetReservation {
+                action_count: 1,
+                request_bytes: request.payload.len() as u64,
+                response_bytes: 8,
+                duration_seconds: 2,
+            },
+        }
+    }
+
+    #[test]
+    fn authenticated_lease_replay_never_reaches_mock_transport() {
+        let authority = lease_authority();
+        let mut request = request("127.0.0.1:9".parse().expect("address"));
+        issue_request(&authority, &mut request);
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let gateway = Gateway::new(
+            FixtureScope,
+            authority,
+            FixtureCompiler,
+            RecordingTransport {
+                dispatches: Arc::clone(&dispatches),
+                outcome: DispatchOutcome::Completed,
+                response: b"PONG".to_vec(),
+            },
+            FixedClock::new(),
+        );
+
+        let first = handle(&gateway, request.clone());
+        let GatewayResponse::Receipt { receipt, .. } = &first else {
+            panic!("first dispatch must produce a receipt");
+        };
+        assert_eq!(receipt.receipt_id, receipt.canonical_id());
+        let encoded = crate::ipc::encode_response(&first).expect("canonical receipt frame");
+        assert_eq!(crate::ipc::decode_response(&encoded), Ok(first));
+        assert!(matches!(
+            handle(&gateway, request),
+            GatewayResponse::Denied(DeniedResponse {
+                reason: DenialCode::LeaseReplay,
+                ..
+            })
+        ));
+        assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn compiler_failure_consumes_lease_without_target_dispatch() {
+        let authority = lease_authority();
+        let mut request = request("127.0.0.1:9".parse().expect("address"));
+        issue_request(&authority, &mut request);
+        request.compiler_proof = b"forged".to_vec();
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let gateway = Gateway::new(
+            FixtureScope,
+            authority,
+            FixtureCompiler,
+            RecordingTransport {
+                dispatches: Arc::clone(&dispatches),
+                outcome: DispatchOutcome::Completed,
+                response: b"PONG".to_vec(),
+            },
+            FixedClock::new(),
+        );
+        assert!(matches!(
+            handle(&gateway, request.clone()),
+            GatewayResponse::Denied(DeniedResponse {
+                reason: DenialCode::CompilerDenied,
+                ..
+            })
+        ));
+        request.compiler_proof = b"fixture-compiler-proof".to_vec();
+        assert!(matches!(
+            handle(&gateway, request),
+            GatewayResponse::Denied(DeniedResponse {
+                reason: DenialCode::LeaseReplay,
+                ..
+            })
+        ));
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn expired_lease_is_denied_before_mock_transport() {
+        let authority = lease_authority();
+        let mut request = request("127.0.0.1:9".parse().expect("address"));
+        request.request_expires_at_millis = 1_000;
+        let issued = authority
+            .issue(lease_spec(&request))
+            .expect("issue expiring lease");
+        request.lease_proof = issued.proof;
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let gateway = Gateway::new(
+            FixtureScope,
+            authority,
+            FixtureCompiler,
+            RecordingTransport {
+                dispatches: Arc::clone(&dispatches),
+                outcome: DispatchOutcome::Completed,
+                response: b"PONG".to_vec(),
+            },
+            FixedClock::new(),
+        );
+        assert!(matches!(
+            handle(&gateway, request),
+            GatewayResponse::Denied(DeniedResponse {
+                reason: DenialCode::LeaseExpired,
+                ..
+            })
+        ));
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn unknown_outcome_blocks_a_fresh_lease_for_the_same_intent() {
+        let authority = lease_authority();
+        let mut first = request("127.0.0.1:9".parse().expect("address"));
+        first.lease_id = "lease:unknown-first".to_owned();
+        first.decision_digest = Digest::of(b"decision:unknown-first");
+        first.bind_canonical_semantics();
+        issue_request(&authority, &mut first);
+        let mut retry = first.clone();
+        retry.action_id = "action:unknown-retry".to_owned();
+        retry.lease_id = "lease:unknown-retry".to_owned();
+        retry.decision_digest = Digest::of(b"decision:unknown-retry");
+        retry.dispatch_nonce = *b"fedcba9876543210";
+        retry.bind_canonical_semantics();
+        issue_request(&authority, &mut retry);
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let gateway = Gateway::new(
+            FixtureScope,
+            authority,
+            FixtureCompiler,
+            RecordingTransport {
+                dispatches: Arc::clone(&dispatches),
+                outcome: DispatchOutcome::UnknownOutcome,
+                response: Vec::new(),
+            },
+            FixedClock::new(),
+        );
+        assert!(matches!(
+            handle(&gateway, first),
+            GatewayResponse::Receipt {
+                receipt: DispatchReceipt {
+                    outcome: DispatchOutcome::UnknownOutcome,
+                    reconciliation_required: true,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            handle(&gateway, retry),
+            GatewayResponse::Denied(DeniedResponse {
+                reason: DenialCode::LeaseReconciliationRequired,
+                ..
+            })
+        ));
+        assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+    }
+
     struct MismatchedScope;
 
     impl ScopeVerifier for MismatchedScope {
@@ -445,6 +791,14 @@ mod tests {
             let mut approval = ScopeApproval::fixture(request);
             approval.scope_epoch += 1;
             Ok(approval)
+        }
+    }
+
+    struct UncoupledScope;
+
+    impl ScopeVerifier for UncoupledScope {
+        fn verify(&self, request: &DispatchRequest) -> Result<ScopeApproval, DenialCode> {
+            Ok(ScopeApproval::fixture(request))
         }
     }
 
@@ -467,6 +821,118 @@ mod tests {
         );
         assert!(matches!(
             handle(&gateway, request("127.0.0.1:9".parse().expect("address")),),
+            GatewayResponse::Denied(DeniedResponse {
+                reason: DenialCode::VerificationBindingMismatch,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn verifier_without_cancellation_registration_cannot_dispatch() {
+        let gateway = Gateway::new(
+            UncoupledScope,
+            FixtureLease,
+            FixtureCompiler,
+            PanicTransport,
+            FixedClock::new(),
+        );
+        assert!(matches!(
+            handle(&gateway, request("127.0.0.1:9".parse().expect("address"))),
+            GatewayResponse::Denied(DeniedResponse {
+                reason: DenialCode::ScopeDenied,
+                ..
+            })
+        ));
+    }
+
+    struct MismatchedLease;
+
+    impl LeaseVerifier for MismatchedLease {
+        fn reserve(
+            &self,
+            request: &DispatchRequest,
+            _now_millis: u64,
+        ) -> Result<LeaseApproval, DenialCode> {
+            let mut approval = LeaseApproval::fixture(request);
+            approval.request_binding_digest = Digest::of(b"substituted request binding");
+            Ok(approval)
+        }
+
+        fn abandon(&self, _approval: &LeaseApproval) -> Result<(), DenialCode> {
+            Ok(())
+        }
+
+        fn finalize(
+            &self,
+            _approval: &LeaseApproval,
+            _completion: LeaseCompletion,
+        ) -> Result<LeaseFinalization, DenialCode> {
+            panic!("mismatched lease reached finalization")
+        }
+
+        fn authenticate_receipt(
+            &self,
+            _approval: &LeaseApproval,
+            _receipt: &DispatchReceipt,
+        ) -> Result<Digest, DenialCode> {
+            panic!("mismatched lease reached receipt authentication")
+        }
+    }
+
+    struct MismatchedCompiler;
+
+    impl ActionCompiler for MismatchedCompiler {
+        fn compile(&self, request: &DispatchRequest) -> Result<CompiledAction, DenialCode> {
+            let mut compiled = CompiledAction::fixture(request);
+            compiled.resolution_digest = Digest::of(b"mutable resolver substitution");
+            Ok(compiled)
+        }
+    }
+
+    #[test]
+    fn forged_frame_digest_lease_binding_and_resolver_output_never_dispatch() {
+        let target = "127.0.0.1:9".parse().expect("address");
+        let request = request(target);
+        let gateway = Gateway::new(
+            FixtureScope,
+            FixtureLease,
+            FixtureCompiler,
+            PanicTransport,
+            FixedClock::new(),
+        );
+        assert!(matches!(
+            gateway.handle(request.clone(), Digest::of(b"substituted request frame")),
+            GatewayResponse::Denied(DeniedResponse {
+                reason: DenialCode::VerificationBindingMismatch,
+                ..
+            })
+        ));
+
+        let gateway = Gateway::new(
+            FixtureScope,
+            MismatchedLease,
+            FixtureCompiler,
+            PanicTransport,
+            FixedClock::new(),
+        );
+        assert!(matches!(
+            handle(&gateway, request.clone()),
+            GatewayResponse::Denied(DeniedResponse {
+                reason: DenialCode::VerificationBindingMismatch,
+                ..
+            })
+        ));
+
+        let gateway = Gateway::new(
+            FixtureScope,
+            FixtureLease,
+            MismatchedCompiler,
+            PanicTransport,
+            FixedClock::new(),
+        );
+        assert!(matches!(
+            handle(&gateway, request),
             GatewayResponse::Denied(DeniedResponse {
                 reason: DenialCode::VerificationBindingMismatch,
                 ..

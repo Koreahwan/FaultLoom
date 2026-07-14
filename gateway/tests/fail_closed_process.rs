@@ -4,13 +4,14 @@ use std::process::{Command, Stdio};
 
 use faultloom_gateway::Digest;
 use faultloom_gateway::ipc::{
-    ActionClass, ActionKind, DenialCode, DeniedResponse, DispatchRequest, FlowKind,
+    ActionClass, ActionKind, DenialCode, DeniedResponse, DispatchRequest, EgressPlane, FlowKind,
     GatewayResponse, RequiredFeature, decode_response, encode_request, read_frame, write_frame,
 };
 
 fn request(target: std::net::SocketAddr) -> DispatchRequest {
-    DispatchRequest {
+    let mut request = DispatchRequest {
         action_id: "action:process".to_owned(),
+        correlation_id: "correlation:process".to_owned(),
         grant_id: "grant:process".to_owned(),
         grant_version: 1,
         target_id: "target:owned-loopback".to_owned(),
@@ -24,6 +25,7 @@ fn request(target: std::net::SocketAddr) -> DispatchRequest {
         scope_epoch: 1,
         action_kind: ActionKind::SemanticHttpV1,
         action_class: ActionClass::Observe,
+        egress_plane: EgressPlane::TargetGateway,
         flow_kind: FlowKind::TopLevel,
         parent_action_id: None,
         required_features: vec![RequiredFeature::GatewayDispatchV1],
@@ -32,13 +34,22 @@ fn request(target: std::net::SocketAddr) -> DispatchRequest {
         method: "GET".to_owned(),
         path: "/".to_owned(),
         target,
+        resolution_digest: Digest::ZERO,
+        semantic_action_digest: Digest::ZERO,
+        dispatch_nonce: *b"0123456789abcdef",
+        request_issued_at_millis: 1,
+        request_expires_at_millis: 5_001,
+        retry_of_intent_digest: None,
         payload: b"PING".to_vec(),
         scope_proof: b"untrusted-scope-proof".to_vec(),
         lease_proof: b"untrusted-lease-proof".to_vec(),
         compiler_proof: b"untrusted-compiler-proof".to_vec(),
         canary_ref: None,
+        checkpoint_ref: None,
         cleanup_plan_ref: None,
-    }
+    };
+    request.bind_canonical_semantics();
+    request
 }
 
 fn skip_string(encoded: &[u8], offset: &mut usize) {
@@ -57,6 +68,7 @@ fn skip_optional_string(encoded: &[u8], offset: &mut usize) {
 fn action_kind_offset(encoded: &[u8]) -> usize {
     let mut offset = 6;
     skip_string(encoded, &mut offset); // action ID
+    skip_string(encoded, &mut offset); // correlation ID
     skip_string(encoded, &mut offset); // grant ID
     offset += 8; // grant version
     skip_string(encoded, &mut offset); // target ID
@@ -104,7 +116,7 @@ fn separate_process_denies_untrusted_proofs_without_target_egress() {
     assert!(matches!(
         run_frame(&encoded),
         GatewayResponse::Denied(DeniedResponse {
-            reason: DenialCode::ScopeVerifierUnavailable,
+            reason: DenialCode::IpcAuthenticationRequired,
             ..
         })
     ));
@@ -125,7 +137,7 @@ fn process_returns_a_typed_denial_for_unknown_action_kind() {
     assert!(matches!(
         response,
         GatewayResponse::Denied(DeniedResponse {
-            reason: DenialCode::UnknownActionKind,
+            reason: DenialCode::IpcAuthenticationRequired,
             ..
         })
     ));
@@ -159,7 +171,8 @@ fn denial_digest_binds_the_entire_canonical_request() {
     variants.push(compiler);
 
     let mut denial_digests = std::collections::HashSet::new();
-    for variant in variants {
+    for mut variant in variants {
+        variant.bind_canonical_semantics();
         let encoded = encode_request(&variant).expect("canonical request");
         let response = run_frame(&encoded);
         let GatewayResponse::Denied(denied) = response else {

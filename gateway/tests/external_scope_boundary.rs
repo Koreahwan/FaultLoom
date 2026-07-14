@@ -105,3 +105,62 @@ fn main() {
         "opaque verified epoch constructor was not enforced: {stderr}"
     );
 }
+
+#[test]
+fn external_crate_cannot_supply_a_lease_verifier_or_dispatch_transport() {
+    let fixture = TempFixture::new("external-lease-forgery");
+    let gateway = Path::new(env!("CARGO_MANIFEST_DIR"));
+    fs::write(
+        fixture.0.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"lease-forgery\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\
+             [dependencies]\nfaultloom-gateway = {{ path = \"{}\" }}\n",
+            toml_path(gateway)
+        ),
+    )
+    .expect("write external manifest");
+    fs::write(
+        fixture.0.join("src/main.rs"),
+        r#"
+use faultloom_gateway::kernel::Gateway;
+use faultloom_gateway::lease::LeaseAuthority;
+use faultloom_gateway::policy::LeaseVerifier;
+use faultloom_gateway::transport::TargetTransport;
+
+fn main() {
+    let _ = LeaseAuthority::reserve;
+    let _ = std::mem::size_of::<Gateway<(), (), (), (), ()>>();
+    let _ = std::mem::size_of::<&dyn LeaseVerifier>();
+    let _ = std::mem::size_of::<&dyn TargetTransport>();
+}
+"#,
+    )
+    .expect("write external source");
+
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+    let output = Command::new(cargo)
+        .args(["check", "--offline", "--quiet"])
+        .current_dir(&fixture.0)
+        .env("CARGO_NET_OFFLINE", "true")
+        .env("CARGO_TARGET_DIR", fixture.0.join("target"))
+        .output()
+        .expect("run external cargo check");
+    assert!(
+        !output.status.success(),
+        "external lease/dispatch forgery unexpectedly compiled"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for boundary in ["kernel", "policy", "transport"] {
+        assert!(
+            stderr.contains(boundary) && stderr.contains("private"),
+            "external {boundary} boundary was not private: {stderr}"
+        );
+    }
+    assert!(
+        stderr.contains("reserve")
+            && (stderr.contains("not found")
+                || stderr.contains("no function or associated item")
+                || stderr.contains("private")),
+        "LeaseAuthority unexpectedly exposed reservation admission: {stderr}"
+    );
+}

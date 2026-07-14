@@ -6,10 +6,18 @@ standard input and output. Each request carries a resolved IP socket address plu
 canonical hostname, protocol, method, path, identity, tenant, pack, action family,
 and parent-flow metadata. The scope binding digest covers all of those fields.
 
-The T15 binary is intentionally fail closed. It contains no production scope,
-lease, or semantic action compiler, so every well-formed dispatch request is
-denied before the target transport is reached. Later tasks must implement all
-three internal verifier interfaces before a production dispatch can occur.
+The default binary remains intentionally fail closed. Its unauthenticated stdio
+surface returns `IpcAuthenticationRequired` for every frame and never enters a
+scope, lease, compiler, or target transport. A trusted supervisor can instead
+use `run_authenticated_fail_closed_stdio` with an inherited 32-byte channel key
+and a fresh, bounded boot challenge. The authenticated envelope binds the exact
+request and response frames to the key ID, boot ID, challenge digest, session,
+strict sequence, one-use nonce, and TTL with HMAC-SHA-256. Wrong keys, stale
+boots, tamper, replay, sequence gaps, and expired sessions fail before inner
+request decoding. No secret is represented by the model/plugin dispatch RPC.
+The reference authenticated surface still contains no configured production
+scope or semantic action compiler, so a valid envelope receives an authenticated
+typed denial without target egress.
 Tests inject fixture-only verifiers and use owned loopback listeners.
 Every denied response binds `request_digest` to the complete canonical typed request
 frame (or to the original raw frame when decoding fails), so changes to the target,
@@ -18,7 +26,8 @@ intent, decision, proofs, or payload cannot share a denial receipt digest.
 Only `observe`, `safe_probe`, and `state_change` are representable in the typed
 client API. Raw wire tags for `high_load`, `destructive`, unknown action kinds,
 or unknown Gateway features are denied. A state-changing request must carry
-both a canary reference and a cleanup-plan reference.
+a canary reference, a stable pre-action checkpoint reference, and a cleanup-plan
+reference. All three are part of the semantic action and lease binding.
 
 The T16 library policy is deterministic and fail closed. It applies
 `explicit deny > explicit allow > ambiguity deny`, rechecks every DNS, redirect,
@@ -58,8 +67,53 @@ reverified; an earlier T13 `fully_done` receipt does not cover this delta.
 
 Advancing or revoking an epoch atomically invalidates approved parent actions and
 cancels registered queued actions, open connections, WebSockets, callback leases,
-polling, and long scanner jobs. Expiry performs the same cancellation. The records
-are deterministic integration instructions; T19 owns physical handle closure.
+polling, and long scanner jobs. Expiry performs the same cancellation. A resource
+cannot register without a cancellation sink. Gateway dispatch registration is
+serialized with epoch transition, and the lease-held TCP cancellation capability
+prevents a socket from opening after cancellation completes. An already registered
+stream is closed with `Shutdown::Both`; any interrupted egress becomes an
+authenticated `unknown_outcome` receipt and an exact reconciliation hold.
+
+The T18 lease kernel issues Gateway-authenticated, one-use capability proofs.
+Each proof binds the lease/key IDs, intent and policy-decision digests, grant ID
+and version, authority key, scope epoch and authenticated epoch digest, Gateway
+boot, correlation, semantic action, resolver result, target-only egress plane,
+dispatch nonce, validity interval, optional retry parent, and reservation. The
+semantic and request bindings include action kind, target, identity, tenant,
+parent/child flow, payload digest, state-change contract, and resolved socket.
+Reservation is atomic: total-action, sliding one-minute rate, concurrency,
+request, response, and duration limits are checked before any transport call.
+A lease consumed before a compiler failure is not restored. Grant revocation
+atomically consumes queued leases, interrupts active reservations, and puts
+interrupted intents on reconciliation hold.
+
+An `unknown_outcome` or a post-dispatch reservation overrun blocks the intent.
+Reconciliation requires the exact Gateway-authenticated unknown-outcome receipt
+and a terminal-evidence receipt authenticated by a separately provisioned
+control-plane key. Crash and revocation holds require the same separately keyed
+authorization without inventing a dispatch receipt. Reconciliation consumes
+stale leases only for the exact grant ID, grant version, and intent digest, and
+permits retry only through a fresh-intent, append-only alias in that same grant.
+The signed reconciliation authorization includes the grant ID and version, so a
+same-intent receipt from another grant cannot clear a hold or authorize a retry.
+The HMAC-sealed recovery checkpoint preserves grant usage, sliding-window
+timestamps, revocation, issued lease IDs, dispatch nonces, retry aliases, and
+typed reconciliation holds and receipts. Restoring requires the externally
+anchored checkpoint digest, the same lease key, and a different fresh Gateway
+boot. Receipt-bound holds cannot be downgraded to crash/revocation holds across
+recovery, and version 3 persists every reconciliation key as grant ID, grant
+version, and intent digest. Any lease active at the crash becomes an
+unknown-outcome hold; old
+proofs can never dispatch.
+
+Dispatch receipts use one canonical field ordering, self-verify their ID, and
+carry a Gateway-keyed authentication tag over that exact ID. The ID and tag are
+both encoded and decoded. Receipts carry the authority/epoch/lease/boot bindings,
+correlation, semantic/request/resolution/frame digests, transport plane, nonce,
+TTL, retry parent, complete reservation, compiled request digest, response,
+outcome, timestamps, and byte counts. Denials likewise self-bind the exact raw
+request-frame digest and reason. The authenticated response envelope prevents a
+caller from substituting either a receipt or a denial.
 
 Build and test with the pinned toolchain and no dependency downloads:
 
@@ -76,6 +130,6 @@ and emits `faultloom-gateway-0.1.0-x86_64-unknown-linux-gnu` with a checksum, SB
 component, and provenance subject. Direct Cargo commands remain developer checks and
 do not create an official build receipt.
 
-The crate has no external dependencies. Installation does not grant authority.
-T18 lease/budget accounting and T19 semantic HTTP/browser execution remain separate
-layers and cannot bypass the T16 decision.
+The crate has no external dependencies. Installation does not grant authority,
+and the default process does not enable target dispatch or implement T19
+semantic HTTP/browser execution.

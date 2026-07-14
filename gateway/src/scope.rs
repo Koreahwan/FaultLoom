@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::Digest;
 use crate::ipc::{ActionClass, DenialCode, DispatchRequest, FlowKind, valid_identifier};
-use crate::policy::{ScopeApproval, ScopeVerifier};
+use crate::policy::{LeaseApproval, ScopeApproval, ScopeVerifier};
 
 const MAX_SIGNED_EPOCH_BYTES: usize = 16_384;
 const MAX_EPOCH_RECEIPT_BYTES: usize = MAX_SIGNED_EPOCH_BYTES * 2 + 4_096;
@@ -545,6 +545,19 @@ pub struct CancellationRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScopeCancellation {
+    pub grant_id: String,
+    pub grant_version: u64,
+    pub invalidated_through_epoch: u64,
+    pub revoked_at_epoch: Option<u64>,
+    pub cause: CancellationCause,
+}
+
+pub trait ScopeCancellationSink: Send + Sync {
+    fn cancel_scope(&self, cancellation: &ScopeCancellation) -> Result<(), DenialCode>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EpochTransition {
     pub previous_epoch: Option<u64>,
     pub current_epoch: u64,
@@ -559,6 +572,9 @@ struct AdmittedEpoch {
     expires_at_millis: u64,
     revoked: bool,
     binding_digest: Digest,
+    authority_key_id: String,
+    gateway_boot_id: String,
+    cancellation_applied: bool,
 }
 
 #[derive(Default)]
@@ -574,6 +590,7 @@ pub struct DeterministicScopeKernel<V, C> {
     policy: ScopePolicy,
     verifier: V,
     clock: C,
+    cancellation_sink: Option<Arc<dyn ScopeCancellationSink>>,
     state: Mutex<ScopeState>,
 }
 
@@ -583,11 +600,30 @@ where
     C: ScopeClock,
 {
     pub fn new(policy: ScopePolicy, verifier: V, clock: C) -> Result<Self, ScopePolicyError> {
+        Self::build(policy, verifier, clock, None)
+    }
+
+    pub fn new_with_cancellation_sink(
+        policy: ScopePolicy,
+        verifier: V,
+        clock: C,
+        cancellation_sink: Arc<dyn ScopeCancellationSink>,
+    ) -> Result<Self, ScopePolicyError> {
+        Self::build(policy, verifier, clock, Some(cancellation_sink))
+    }
+
+    fn build(
+        policy: ScopePolicy,
+        verifier: V,
+        clock: C,
+        cancellation_sink: Option<Arc<dyn ScopeCancellationSink>>,
+    ) -> Result<Self, ScopePolicyError> {
         policy.validate()?;
         Ok(Self {
             policy,
             verifier,
             clock,
+            cancellation_sink,
             state: Mutex::new(ScopeState::default()),
         })
     }
@@ -606,6 +642,10 @@ where
         let verified = self.verifier.verify(envelope, now)?;
         self.validate_verified_epoch(envelope, &verified, now)?;
         let previous_epoch = state.current_epoch.as_ref().map(|epoch| epoch.epoch);
+        let previous_cancellation_applied = state
+            .current_epoch
+            .as_ref()
+            .is_some_and(|epoch| epoch.cancellation_applied);
         if let Some(current) = &state.current_epoch {
             if verified.epoch < current.epoch {
                 return Err(EpochAdmissionError::Rollback);
@@ -625,6 +665,29 @@ where
         } else {
             CancellationCause::EpochAdvanced
         };
+        let scope_cancellation = if verified.revoked {
+            Some(ScopeCancellation {
+                grant_id: self.policy.grant_id.clone(),
+                grant_version: self.policy.grant_version,
+                invalidated_through_epoch: verified.epoch,
+                revoked_at_epoch: Some(verified.epoch),
+                cause,
+            })
+        } else if previous_cancellation_applied {
+            None
+        } else {
+            previous_epoch.map(|epoch| ScopeCancellation {
+                grant_id: self.policy.grant_id.clone(),
+                grant_version: self.policy.grant_version,
+                invalidated_through_epoch: epoch,
+                revoked_at_epoch: None,
+                cause,
+            })
+        };
+        if let Some(cancellation) = scope_cancellation.as_ref() {
+            self.notify_cancellation(cancellation)
+                .map_err(|_| EpochAdmissionError::StateUnavailable)?;
+        }
         let cancellations = cancel_all(&mut state, verified.epoch, cause);
         let binding_digest = verified_epoch_binding(&verified);
         state.current_epoch = Some(AdmittedEpoch {
@@ -633,6 +696,9 @@ where
             expires_at_millis: verified.expires_at_millis,
             revoked: verified.revoked,
             binding_digest,
+            authority_key_id: verified.key_id,
+            gateway_boot_id: verified.gateway_boot_id,
+            cancellation_applied: verified.revoked,
         });
         state
             .consumed_epoch_nonces
@@ -680,7 +746,7 @@ where
     pub fn issue_scope_proof(&self, request: &DispatchRequest) -> Result<Vec<u8>, DenialCode> {
         let now = self.clock.now_millis();
         let mut state = self.state.lock().map_err(|_| DenialCode::ScopeDenied)?;
-        reconcile_expiry(&mut state, now);
+        self.reconcile_expiry(&mut state, now)?;
         let epoch = evaluate(&self.policy, &state, request, now)?;
         Ok(scope_proof(epoch.binding_digest, request)
             .as_bytes()
@@ -688,13 +754,16 @@ where
     }
 
     pub fn register_resource(&self, resource: ScopedResource) -> Result<(), DenialCode> {
+        if self.cancellation_sink.is_none() {
+            return Err(DenialCode::ScopeDenied);
+        }
         if !valid_identifier(&resource.resource_id) || !valid_identifier(&resource.owner_action_id)
         {
             return Err(DenialCode::InvalidRequest);
         }
         let now = self.clock.now_millis();
         let mut state = self.state.lock().map_err(|_| DenialCode::ScopeDenied)?;
-        reconcile_expiry(&mut state, now);
+        self.reconcile_expiry(&mut state, now)?;
         let epoch = state
             .current_epoch
             .as_ref()
@@ -740,6 +809,40 @@ where
             .map(|state| state.resources.len())
             .map_err(|_| DenialCode::ScopeDenied)
     }
+
+    fn reconcile_expiry(&self, state: &mut ScopeState, now: u64) -> Result<(), DenialCode> {
+        let Some(cancellation) = state.current_epoch.as_ref().and_then(|epoch| {
+            (now >= epoch.expires_at_millis && !epoch.cancellation_applied).then(|| {
+                ScopeCancellation {
+                    grant_id: self.policy.grant_id.clone(),
+                    grant_version: self.policy.grant_version,
+                    invalidated_through_epoch: epoch.epoch,
+                    revoked_at_epoch: None,
+                    cause: CancellationCause::EpochExpired,
+                }
+            })
+        }) else {
+            return Ok(());
+        };
+        self.notify_cancellation(&cancellation)?;
+        cancel_all(
+            state,
+            cancellation.invalidated_through_epoch,
+            cancellation.cause,
+        );
+        if let Some(epoch) = state.current_epoch.as_mut() {
+            epoch.cancellation_applied = true;
+        }
+        Ok(())
+    }
+
+    fn notify_cancellation(&self, cancellation: &ScopeCancellation) -> Result<(), DenialCode> {
+        if let Some(sink) = self.cancellation_sink.as_ref() {
+            sink.cancel_scope(cancellation)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl<V, C> ScopeVerifier for DeterministicScopeKernel<V, C>
@@ -750,9 +853,12 @@ where
     fn verify(&self, request: &DispatchRequest) -> Result<ScopeApproval, DenialCode> {
         let now = self.clock.now_millis();
         let mut state = self.state.lock().map_err(|_| DenialCode::ScopeDenied)?;
-        reconcile_expiry(&mut state, now);
+        self.reconcile_expiry(&mut state, now)?;
         let epoch = evaluate(&self.policy, &state, request, now)?;
-        let expected_proof = scope_proof(epoch.binding_digest, request);
+        let authority_key_id = epoch.authority_key_id.clone();
+        let scope_epoch_binding_digest = epoch.binding_digest;
+        let gateway_boot_id = epoch.gateway_boot_id.clone();
+        let expected_proof = scope_proof(scope_epoch_binding_digest, request);
         if request.scope_proof.as_slice() != expected_proof.as_bytes() {
             return Err(DenialCode::ScopeProofInvalid);
         }
@@ -769,12 +875,44 @@ where
             grant_id: request.grant_id.clone(),
             grant_version: request.grant_version,
             scope_epoch: request.scope_epoch,
+            authority_key_id,
+            scope_epoch_binding_digest,
+            gateway_boot_id,
             scope_binding_digest: request.scope_binding_digest(),
             target: request.target,
             action_kind: request.action_kind,
             action_class: request.action_class,
             required_features: request.required_features.clone(),
         })
+    }
+
+    fn register_dispatch(
+        &self,
+        request: &DispatchRequest,
+        approval: &LeaseApproval,
+    ) -> Result<(), DenialCode> {
+        if self.cancellation_sink.is_none()
+            || approval.lease_id != request.lease_id
+            || approval.grant_id != request.grant_id
+            || approval.grant_version != request.grant_version
+            || approval.scope_epoch != request.scope_epoch
+        {
+            return Err(DenialCode::ScopeDenied);
+        }
+        self.register_resource(ScopedResource {
+            resource_id: approval.lease_id.clone(),
+            owner_action_id: request.action_id.clone(),
+            kind: ResourceKind::OpenConnection,
+            scope_epoch: approval.scope_epoch,
+        })
+    }
+
+    fn finish_dispatch(&self, approval: &LeaseApproval) -> Result<(), DenialCode> {
+        match self.finish_resource(&approval.lease_id) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(DenialCode::ScopeDenied),
+            Err(reason) => Err(reason),
+        }
     }
 }
 
@@ -987,16 +1125,6 @@ fn verified_epoch_binding(epoch: &VerifiedScopeEpoch) -> Digest {
     Digest::of(&bytes)
 }
 
-fn reconcile_expiry(state: &mut ScopeState, now: u64) {
-    let Some(epoch) = &state.current_epoch else {
-        return;
-    };
-    if now >= epoch.expires_at_millis {
-        let epoch_number = epoch.epoch;
-        cancel_all(state, epoch_number, CancellationCause::EpochExpired);
-    }
-}
-
 fn cancel_all(
     state: &mut ScopeState,
     cancelled_by_epoch: u64,
@@ -1017,11 +1145,24 @@ fn cancel_all(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+    use std::net::TcpListener;
     use std::sync::Arc;
+    use std::sync::Mutex as TestMutex;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
 
     use super::*;
-    use crate::ipc::{ActionKind, RequiredFeature};
+    use crate::ipc::{
+        ActionKind, DispatchOutcome, EgressPlane, GatewayResponse, RequiredFeature, encode_request,
+    };
+    use crate::kernel::{Clock, Gateway};
+    use crate::lease::{
+        GrantBudget, LeaseAuthority, LeaseBudgetReservation, LeaseSpec, ReconciliationAuthority,
+    };
+    use crate::policy::{ActionCompiler, CompiledAction, LeaseVerifier};
+    use crate::transport::TcpTargetTransport;
 
     #[derive(Clone)]
     struct FixedClock(Arc<AtomicU64>);
@@ -1039,6 +1180,139 @@ mod tests {
     impl ScopeClock for FixedClock {
         fn now_millis(&self) -> u64 {
             self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Clock for FixedClock {
+        fn now_millis(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    struct ExactCompiler;
+
+    impl ActionCompiler for ExactCompiler {
+        fn compile(&self, request: &DispatchRequest) -> Result<CompiledAction, DenialCode> {
+            Ok(CompiledAction {
+                intent_digest: request.intent_digest,
+                action_kind: request.action_kind,
+                target: request.target,
+                egress_plane: request.egress_plane,
+                semantic_action_digest: request.semantic_action_digest,
+                resolution_digest: request.resolution_digest,
+                request_binding_digest: request.lease_binding_digest(),
+                bytes: request.payload.clone(),
+            })
+        }
+    }
+
+    struct BlockingCompiler {
+        entered: mpsc::SyncSender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl ActionCompiler for BlockingCompiler {
+        fn compile(&self, request: &DispatchRequest) -> Result<CompiledAction, DenialCode> {
+            self.entered
+                .send(())
+                .map_err(|_| DenialCode::CompilerUnavailable)?;
+            self.release
+                .recv()
+                .map_err(|_| DenialCode::CompilerUnavailable)?;
+            ExactCompiler.compile(request)
+        }
+    }
+
+    fn cancellation_authority() -> (Arc<LeaseAuthority>, ReconciliationAuthority) {
+        let signing_key = std::array::from_fn(|index| {
+            u8::try_from(index + 1).expect("small lease signing key byte")
+        });
+        let reconciliation_key = std::array::from_fn(|index| {
+            u8::try_from(index + 65).expect("small reconciliation key byte")
+        });
+        let authority = LeaseAuthority::new_with_reconciliation_verifier(
+            "lease-key:scope-cancellation".to_owned(),
+            signing_key,
+            "gateway-boot:fixture".to_owned(),
+            Digest::of(b"scope cancellation gateway challenge"),
+            "reconciliation-key:scope-cancellation".to_owned(),
+            reconciliation_key,
+        )
+        .expect("cancellation-aware lease authority");
+        authority
+            .register_grant(
+                "grant:owned",
+                3,
+                GrantBudget {
+                    total_actions: 8,
+                    rate_per_minute: 8,
+                    max_concurrency: 2,
+                    max_request_bytes: 256,
+                    max_response_bytes: 256,
+                    max_duration_seconds: 5,
+                },
+            )
+            .expect("scope cancellation grant");
+        let reconciler = ReconciliationAuthority::new(
+            "reconciliation-key:scope-cancellation".to_owned(),
+            reconciliation_key,
+        )
+        .expect("scope cancellation reconciler");
+        (Arc::new(authority), reconciler)
+    }
+
+    fn cancellation_lease_spec(
+        request: &DispatchRequest,
+        scope_epoch_binding_digest: Digest,
+    ) -> LeaseSpec {
+        LeaseSpec {
+            lease_id: request.lease_id.clone(),
+            intent_digest: request.intent_digest,
+            decision_digest: request.decision_digest,
+            grant_id: request.grant_id.clone(),
+            grant_version: request.grant_version,
+            scope_epoch: request.scope_epoch,
+            authority_key_id: "authority-key:1".to_owned(),
+            scope_epoch_binding_digest,
+            gateway_boot_id: "gateway-boot:fixture".to_owned(),
+            request_binding_digest: request.lease_binding_digest(),
+            semantic_action_digest: request.semantic_action_digest,
+            resolution_digest: request.resolution_digest,
+            correlation_id: request.correlation_id.clone(),
+            egress_plane: request.egress_plane,
+            dispatch_nonce: request.dispatch_nonce,
+            retry_of_intent_digest: request.retry_of_intent_digest,
+            issued_at_millis: request.request_issued_at_millis,
+            expires_at_millis: request.request_expires_at_millis,
+            reservation: LeaseBudgetReservation {
+                action_count: 1,
+                request_bytes: request.payload.len() as u64,
+                response_bytes: 64,
+                duration_seconds: 2,
+            },
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingCancellationSink {
+        events: TestMutex<Vec<ScopeCancellation>>,
+    }
+
+    impl ScopeCancellationSink for RecordingCancellationSink {
+        fn cancel_scope(&self, cancellation: &ScopeCancellation) -> Result<(), DenialCode> {
+            self.events
+                .lock()
+                .map_err(|_| DenialCode::ScopeDenied)?
+                .push(cancellation.clone());
+            Ok(())
+        }
+    }
+
+    struct FailingCancellationSink;
+
+    impl ScopeCancellationSink for FailingCancellationSink {
+        fn cancel_scope(&self, _cancellation: &ScopeCancellation) -> Result<(), DenialCode> {
+            Err(DenialCode::LeaseAccountingUnavailable)
         }
     }
 
@@ -1137,7 +1411,7 @@ mod tests {
                 "grant:owned".to_owned(),
                 *epoch,
                 900,
-                2_000,
+                2_000_u64.saturating_add(epoch.saturating_sub(7).saturating_mul(1_000)),
                 *revoked,
                 revoked.then(|| "operator revoke".to_owned()),
                 "authority-key:1".to_owned(),
@@ -1200,8 +1474,9 @@ mod tests {
     }
 
     fn request() -> DispatchRequest {
-        DispatchRequest {
+        let mut request = DispatchRequest {
             action_id: "action:root".to_owned(),
+            correlation_id: "correlation:root".to_owned(),
             grant_id: "grant:owned".to_owned(),
             grant_version: 3,
             target_id: "target:loopback".to_owned(),
@@ -1215,6 +1490,7 @@ mod tests {
             scope_epoch: 7,
             action_kind: ActionKind::SemanticHttpV1,
             action_class: ActionClass::SafeProbe,
+            egress_plane: EgressPlane::TargetGateway,
             flow_kind: FlowKind::TopLevel,
             parent_action_id: None,
             required_features: vec![RequiredFeature::GatewayDispatchV1],
@@ -1223,20 +1499,35 @@ mod tests {
             method: "GET".to_owned(),
             path: "/api/item".to_owned(),
             target: "127.0.0.1:8080".parse().unwrap(),
+            resolution_digest: Digest::ZERO,
+            semantic_action_digest: Digest::ZERO,
+            dispatch_nonce: *b"0123456789abcdef",
+            request_issued_at_millis: 999,
+            request_expires_at_millis: 6_000,
+            retry_of_intent_digest: None,
             payload: b"GET /api/item HTTP/1.1\r\n\r\n".to_vec(),
             scope_proof: vec![1],
             lease_proof: b"lease-proof".to_vec(),
             compiler_proof: b"compiler-proof".to_vec(),
             canary_ref: None,
+            checkpoint_ref: None,
             cleanup_plan_ref: None,
-        }
+        };
+        request.bind_canonical_semantics();
+        request
     }
 
     fn make_kernel(
         verifier: FixtureVerifier,
         clock: FixedClock,
     ) -> DeterministicScopeKernel<FixtureVerifier, FixedClock> {
-        DeterministicScopeKernel::new(policy(), verifier, clock).unwrap()
+        DeterministicScopeKernel::new_with_cancellation_sink(
+            policy(),
+            verifier,
+            clock,
+            Arc::new(RecordingCancellationSink::default()),
+        )
+        .unwrap()
     }
 
     fn authorize<V: EpochVerifier, C: ScopeClock>(
@@ -1342,6 +1633,26 @@ mod tests {
         assert_eq!(
             kernel.issue_scope_proof(&wrong_tenant),
             Err(DenialCode::ScopeTenantDenied)
+        );
+    }
+
+    #[test]
+    fn resource_registration_without_a_cancellation_sink_fails_closed() {
+        let clock = FixedClock::new(1_000);
+        let (signed, verifier) = envelope(7, false);
+        let kernel =
+            DeterministicScopeKernel::new(policy(), verifier, clock).expect("scope kernel");
+        kernel.admit_epoch(&signed).expect("initial epoch");
+        let mut root = request();
+        authorize(&kernel, &mut root).expect("authorized root");
+        assert_eq!(
+            kernel.register_resource(ScopedResource {
+                resource_id: "resource:uncoupled".to_owned(),
+                owner_action_id: root.action_id,
+                kind: ResourceKind::OpenConnection,
+                scope_epoch: 7,
+            }),
+            Err(DenialCode::ScopeDenied)
         );
     }
 
@@ -1663,7 +1974,13 @@ mod tests {
                 (revoked.digest(), 8, true),
             ],
         };
-        let kernel = DeterministicScopeKernel::new(policy(), verifier, clock).unwrap();
+        let kernel = DeterministicScopeKernel::new_with_cancellation_sink(
+            policy(),
+            verifier,
+            clock,
+            Arc::new(RecordingCancellationSink::default()),
+        )
+        .unwrap();
         kernel.admit_epoch(&signed_seven).unwrap();
         let mut root = request();
         authorize(&kernel, &mut root).unwrap();
@@ -1712,6 +2029,399 @@ mod tests {
     }
 
     #[test]
+    fn epoch_transitions_notify_the_cancellation_sink_once_with_exact_grant_scope() {
+        let clock = FixedClock::new(1_000);
+        let (signed_seven, _) = envelope(7, false);
+        let (signed_eight, _) = envelope(8, false);
+        let (revoked_nine, _) = envelope(9, true);
+        let verifier = SequenceVerifier {
+            accepted: vec![
+                (signed_seven.digest(), 7, false),
+                (signed_eight.digest(), 8, false),
+                (revoked_nine.digest(), 9, true),
+            ],
+        };
+        let sink = Arc::new(RecordingCancellationSink::default());
+        let kernel = DeterministicScopeKernel::new_with_cancellation_sink(
+            policy(),
+            verifier,
+            clock,
+            Arc::clone(&sink) as Arc<dyn ScopeCancellationSink>,
+        )
+        .expect("scope kernel with cancellation sink");
+
+        kernel.admit_epoch(&signed_seven).expect("initial epoch");
+        assert!(sink.events.lock().expect("events").is_empty());
+        kernel.admit_epoch(&signed_eight).expect("advance epoch");
+        kernel.admit_epoch(&revoked_nine).expect("revoke scope");
+
+        assert_eq!(
+            *sink.events.lock().expect("events"),
+            vec![
+                ScopeCancellation {
+                    grant_id: "grant:owned".to_owned(),
+                    grant_version: 3,
+                    invalidated_through_epoch: 7,
+                    revoked_at_epoch: None,
+                    cause: CancellationCause::EpochAdvanced,
+                },
+                ScopeCancellation {
+                    grant_id: "grant:owned".to_owned(),
+                    grant_version: 3,
+                    invalidated_through_epoch: 9,
+                    revoked_at_epoch: Some(9),
+                    cause: CancellationCause::ScopeRevoked,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn cancellation_sink_failure_cannot_commit_an_epoch_transition_or_expiry() {
+        let clock = FixedClock::new(1_000);
+        let (signed_seven, _) = envelope(7, false);
+        let (signed_eight, _) = envelope(8, false);
+        let verifier = SequenceVerifier {
+            accepted: vec![
+                (signed_seven.digest(), 7, false),
+                (signed_eight.digest(), 8, false),
+            ],
+        };
+        let kernel = DeterministicScopeKernel::new_with_cancellation_sink(
+            policy(),
+            verifier,
+            clock.clone(),
+            Arc::new(FailingCancellationSink),
+        )
+        .expect("scope kernel with failing sink");
+        kernel.admit_epoch(&signed_seven).expect("initial epoch");
+        let mut dispatch = request();
+        authorize(&kernel, &mut dispatch).expect("authorized dispatch");
+        kernel
+            .register_resource(ScopedResource {
+                resource_id: "resource:failed-cancellation".to_owned(),
+                owner_action_id: dispatch.action_id,
+                kind: ResourceKind::OpenConnection,
+                scope_epoch: 7,
+            })
+            .expect("registered resource");
+
+        assert_eq!(
+            kernel.admit_epoch(&signed_eight),
+            Err(EpochAdmissionError::StateUnavailable)
+        );
+        assert_eq!(kernel.active_resource_count(), Ok(1));
+        assert!(
+            kernel
+                .take_cancellations()
+                .expect("cancellations")
+                .is_empty()
+        );
+
+        clock.set(2_000);
+        assert_eq!(
+            kernel.issue_scope_proof(&request()),
+            Err(DenialCode::LeaseAccountingUnavailable)
+        );
+        assert_eq!(kernel.active_resource_count(), Ok(1));
+    }
+
+    #[test]
+    fn canceled_dispatch_resource_cannot_finish_as_success() {
+        let clock = FixedClock::new(1_000);
+        let (signed_seven, _) = envelope(7, false);
+        let (signed_eight, _) = envelope(8, false);
+        let verifier = SequenceVerifier {
+            accepted: vec![
+                (signed_seven.digest(), 7, false),
+                (signed_eight.digest(), 8, false),
+            ],
+        };
+        let kernel = DeterministicScopeKernel::new_with_cancellation_sink(
+            policy(),
+            verifier,
+            clock,
+            Arc::new(RecordingCancellationSink::default()),
+        )
+        .expect("scope kernel with cancellation sink");
+        kernel.admit_epoch(&signed_seven).expect("initial epoch");
+        let mut dispatch = request();
+        authorize(&kernel, &mut dispatch).expect("authorized dispatch");
+        let approval = LeaseApproval::fixture(&dispatch);
+        ScopeVerifier::register_dispatch(&kernel, &dispatch, &approval)
+            .expect("registered dispatch");
+
+        kernel.admit_epoch(&signed_eight).expect("advance epoch");
+        assert_eq!(
+            ScopeVerifier::finish_dispatch(&kernel, &approval),
+            Err(DenialCode::ScopeDenied)
+        );
+    }
+
+    #[test]
+    fn epoch_expiry_notifies_the_cancellation_sink_once() {
+        let clock = FixedClock::new(1_000);
+        let (signed_seven, _) = envelope(7, false);
+        let (signed_eight, _) = envelope(8, false);
+        let verifier = SequenceVerifier {
+            accepted: vec![
+                (signed_seven.digest(), 7, false),
+                (signed_eight.digest(), 8, false),
+            ],
+        };
+        let sink = Arc::new(RecordingCancellationSink::default());
+        let kernel = DeterministicScopeKernel::new_with_cancellation_sink(
+            policy(),
+            verifier,
+            clock.clone(),
+            Arc::clone(&sink) as Arc<dyn ScopeCancellationSink>,
+        )
+        .expect("scope kernel with cancellation sink");
+        kernel.admit_epoch(&signed_seven).expect("initial epoch");
+
+        clock.set(2_000);
+        assert_eq!(
+            kernel.issue_scope_proof(&request()),
+            Err(DenialCode::ScopeEpochExpired)
+        );
+        assert_eq!(
+            kernel.issue_scope_proof(&request()),
+            Err(DenialCode::ScopeEpochExpired)
+        );
+        kernel
+            .admit_epoch(&signed_eight)
+            .expect("advance after expired epoch");
+        assert_eq!(
+            *sink.events.lock().expect("events"),
+            vec![ScopeCancellation {
+                grant_id: "grant:owned".to_owned(),
+                grant_version: 3,
+                invalidated_through_epoch: 7,
+                revoked_at_epoch: None,
+                cause: CancellationCause::EpochExpired,
+            }]
+        );
+    }
+
+    #[test]
+    fn epoch_advance_physically_interrupts_gateway_transport_and_holds_the_exact_lease() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("owned listener");
+        let target = listener.local_addr().expect("listener address");
+        let (signed_seven, _) = envelope(7, false);
+        let (signed_eight, _) = envelope(8, false);
+        let verifier = SequenceVerifier {
+            accepted: vec![
+                (signed_seven.digest(), 7, false),
+                (signed_eight.digest(), 8, false),
+            ],
+        };
+        let binding_seven = verified_epoch_binding(
+            &verifier
+                .verify(&signed_seven, 1_000)
+                .expect("verified epoch seven"),
+        );
+        let binding_eight = verified_epoch_binding(
+            &verifier
+                .verify(&signed_eight, 1_000)
+                .expect("verified epoch eight"),
+        );
+        let (authority, reconciler) = cancellation_authority();
+        let mut coupled_policy = policy();
+        coupled_policy.targets[0].ports = vec![target.port()];
+        let clock = FixedClock::new(1_000);
+        let scope = Arc::new(
+            DeterministicScopeKernel::new_with_cancellation_sink(
+                coupled_policy,
+                verifier,
+                clock.clone(),
+                Arc::clone(&authority) as Arc<dyn ScopeCancellationSink>,
+            )
+            .expect("coupled scope kernel"),
+        );
+        scope.admit_epoch(&signed_seven).expect("initial epoch");
+
+        let mut dispatch = request();
+        dispatch.target = target;
+        dispatch.bind_canonical_semantics();
+        dispatch.scope_proof = scope
+            .issue_scope_proof(&dispatch)
+            .expect("epoch-seven scope proof");
+        dispatch.lease_proof = authority
+            .issue(cancellation_lease_spec(&dispatch, binding_seven))
+            .expect("epoch-seven lease")
+            .proof;
+        let frame_digest = Digest::of(&encode_request(&dispatch).expect("canonical request"));
+        let intent_digest = dispatch.intent_digest;
+        let request_bytes = dispatch.payload.clone();
+        let request_byte_count = request_bytes.len() as u64;
+        let (request_read_tx, request_read_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("Gateway connection");
+            let mut received = vec![0_u8; request_bytes.len()];
+            stream.read_exact(&mut received).expect("request bytes");
+            assert_eq!(received, request_bytes);
+            request_read_tx.send(()).expect("request-read signal");
+            release_rx.recv().expect("release target connection");
+        });
+        let gateway = Gateway::new(
+            Arc::clone(&scope),
+            Arc::clone(&authority),
+            ExactCompiler,
+            TcpTargetTransport::new(),
+            clock,
+        );
+        let worker = thread::spawn(move || gateway.handle(dispatch, frame_digest));
+        request_read_rx.recv().expect("target received request");
+
+        let transition = scope.admit_epoch(&signed_eight).expect("advance epoch");
+        assert_eq!(transition.cancellations.len(), 1);
+        assert_eq!(
+            transition.cancellations[0].cause,
+            CancellationCause::EpochAdvanced
+        );
+        let response = worker.join().expect("Gateway worker");
+        let GatewayResponse::Receipt { receipt, .. } = response else {
+            panic!("interrupted dispatch must produce an authenticated receipt");
+        };
+        assert_eq!(receipt.outcome, DispatchOutcome::UnknownOutcome);
+        assert!(receipt.reconciliation_required);
+        assert_eq!(receipt.bytes_sent, request_byte_count);
+        assert_eq!(
+            authority
+                .usage("grant:owned", 3)
+                .expect("usage")
+                .active_dispatches,
+            0
+        );
+        release_tx.send(()).expect("release target");
+        server.join().expect("target worker");
+
+        let mut same_intent = request();
+        same_intent.action_id = "action:epoch-eight-retry".to_owned();
+        same_intent.correlation_id = "correlation:epoch-eight-retry".to_owned();
+        same_intent.lease_id = "lease:epoch-eight-retry".to_owned();
+        same_intent.scope_epoch = 8;
+        same_intent.target = target;
+        same_intent.decision_digest = Digest::of(b"epoch-eight retry decision");
+        same_intent.dispatch_nonce = *b"epoch-eight-0001";
+        same_intent.bind_canonical_semantics();
+        same_intent.scope_proof = scope
+            .issue_scope_proof(&same_intent)
+            .expect("epoch-eight scope proof");
+        same_intent.lease_proof = authority
+            .issue(cancellation_lease_spec(&same_intent, binding_eight))
+            .expect("same-intent epoch-eight lease")
+            .proof;
+        assert_eq!(
+            authority.reserve(&same_intent, 1_000),
+            Err(DenialCode::LeaseReconciliationRequired)
+        );
+
+        let reconciliation = reconciler
+            .issue_control_plane_hold(
+                ("grant:owned", 3),
+                intent_digest,
+                DispatchOutcome::Failed,
+                Digest::of(b"scope cancellation terminal evidence"),
+                *b"scope-cancel-001",
+                1_002,
+            )
+            .expect("scope cancellation reconciliation");
+        assert_eq!(
+            authority.reconcile_control_plane_hold(&reconciliation),
+            Ok(())
+        );
+        assert_eq!(
+            authority.reconcile_control_plane_hold(&reconciliation),
+            Err(DenialCode::LeaseReplay)
+        );
+    }
+
+    #[test]
+    fn scope_revoke_between_reservation_and_registration_opens_no_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("owned listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let target = listener.local_addr().expect("listener address");
+        let (signed_seven, _) = envelope(7, false);
+        let (revoked_eight, _) = envelope(8, true);
+        let verifier = SequenceVerifier {
+            accepted: vec![
+                (signed_seven.digest(), 7, false),
+                (revoked_eight.digest(), 8, true),
+            ],
+        };
+        let binding_seven = verified_epoch_binding(
+            &verifier
+                .verify(&signed_seven, 1_000)
+                .expect("verified epoch seven"),
+        );
+        let (authority, _) = cancellation_authority();
+        let mut coupled_policy = policy();
+        coupled_policy.targets[0].ports = vec![target.port()];
+        let clock = FixedClock::new(1_000);
+        let scope = Arc::new(
+            DeterministicScopeKernel::new_with_cancellation_sink(
+                coupled_policy,
+                verifier,
+                clock.clone(),
+                Arc::clone(&authority) as Arc<dyn ScopeCancellationSink>,
+            )
+            .expect("coupled scope kernel"),
+        );
+        scope.admit_epoch(&signed_seven).expect("initial epoch");
+        let mut dispatch = request();
+        dispatch.target = target;
+        dispatch.bind_canonical_semantics();
+        dispatch.scope_proof = scope.issue_scope_proof(&dispatch).expect("scope proof");
+        dispatch.lease_proof = authority
+            .issue(cancellation_lease_spec(&dispatch, binding_seven))
+            .expect("lease")
+            .proof;
+        let frame_digest = Digest::of(&encode_request(&dispatch).expect("canonical request"));
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let gateway = Gateway::new(
+            Arc::clone(&scope),
+            Arc::clone(&authority),
+            BlockingCompiler {
+                entered: entered_tx,
+                release: release_rx,
+            },
+            TcpTargetTransport::new(),
+            clock,
+        );
+        let worker = thread::spawn(move || gateway.handle(dispatch, frame_digest));
+        entered_rx.recv().expect("lease reserved before compiler");
+        let transition = scope
+            .admit_epoch(&revoked_eight)
+            .expect("revoke while compiler is blocked");
+        assert!(transition.revoked);
+        assert!(transition.cancellations.is_empty());
+        release_tx.send(()).expect("release compiler");
+        assert!(matches!(
+            worker.join().expect("Gateway worker"),
+            GatewayResponse::Denied(_)
+        ));
+        assert_eq!(
+            listener
+                .accept()
+                .expect_err("post-revoke dispatch cannot connect")
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            authority
+                .usage("grant:owned", 3)
+                .expect("usage")
+                .active_dispatches,
+            0
+        );
+    }
+
+    #[test]
     fn newer_non_revoked_epoch_invalidates_old_actions_and_resources() {
         let clock = FixedClock::new(1_000);
         let (signed_seven, _) = envelope(7, false);
@@ -1722,7 +2432,13 @@ mod tests {
                 (signed_eight.digest(), 8, false),
             ],
         };
-        let kernel = DeterministicScopeKernel::new(policy(), verifier, clock).unwrap();
+        let kernel = DeterministicScopeKernel::new_with_cancellation_sink(
+            policy(),
+            verifier,
+            clock,
+            Arc::new(RecordingCancellationSink::default()),
+        )
+        .unwrap();
         kernel.admit_epoch(&signed_seven).unwrap();
         let mut old = request();
         authorize(&kernel, &mut old).unwrap();

@@ -86,6 +86,36 @@ def test_unknown_dispatch_outcome_requires_reconciliation() -> None:
         m.DispatchReceipt.model_validate(document)
 
 
+def test_dispatch_receipt_requires_gateway_authentication_tag() -> None:
+    receipt = sample_models()["DispatchReceipt"].model_dump(mode="python")
+    receipt.pop("receipt_authentication_tag")
+    with pytest.raises(ValidationError, match="receipt_authentication_tag"):
+        m.DispatchReceipt.model_validate(receipt)
+
+
+def test_action_lease_and_receipt_bind_nonce_ttl_budget_and_retry_alias() -> None:
+    samples = sample_models()
+    lease = samples["ActionLease"].model_dump(mode="python")
+    lease["dispatch_nonce"] = "00" * 16
+    with pytest.raises(ValidationError, match="four distinct bytes"):
+        m.ActionLease.model_validate(lease)
+
+    lease = samples["ActionLease"].model_dump(mode="python")
+    lease["expires_at"] = lease["issued_at"] + timedelta(seconds=61)
+    with pytest.raises(ValidationError, match="sixty seconds"):
+        m.ActionLease.model_validate(lease)
+
+    lease = samples["ActionLease"].model_dump(mode="python")
+    lease["retry_of_intent_digest"] = lease["intent_digest"]
+    with pytest.raises(ValidationError, match="fresh intent digest"):
+        m.ActionLease.model_validate(lease)
+
+    receipt = samples["DispatchReceipt"].model_dump(mode="python")
+    receipt["reservation"]["action_count"] = 2
+    with pytest.raises(ValidationError, match="exactly one action"):
+        m.DispatchReceipt.model_validate(receipt)
+
+
 def test_engagement_bundle_binds_embedded_grant_digest() -> None:
     bundle = sample_models()["EngagementBundle"]
     wrong_manifest = bundle.run_manifest.model_copy(update={"authority_digest": D1})
