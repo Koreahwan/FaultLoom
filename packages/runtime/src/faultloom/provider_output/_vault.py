@@ -17,7 +17,10 @@ def identity_vault(
     Callable[[_Owner, _Value], None],
     Callable[[_Owner], _Value],
 ]:
-    entries: dict[int, tuple[ReferenceType[_Owner], _Value]] = {}
+    entries: dict[
+        int,
+        tuple[ReferenceType[_Owner], type[_Owner], _Value],
+    ] = {}
     lock = RLock()
 
     def bind(owner: _Owner, value: _Value) -> None:
@@ -30,7 +33,11 @@ def identity_vault(
         ) -> None:
             with lock:
                 current = entries.get(identity)
-                if current is not None and current[0] is owner_ref:
+                if (
+                    current is not None
+                    and current[0] is owner_ref
+                    and owner_ref() is None
+                ):
                     entries.pop(identity, None)
 
         try:
@@ -45,7 +52,7 @@ def identity_vault(
                 raise ProviderOutputIntegrityError(
                     f"{label} is already initialized"
                 )
-            entries[key] = (owner_ref, value)
+            entries[key] = (owner_ref, type(owner), value)
 
     def read(owner: _Owner) -> _Value:
         with lock:
@@ -54,6 +61,10 @@ def identity_vault(
                 raise ProviderOutputIntegrityError(
                     f"{label} identity binding is unavailable"
                 )
-            return current[1]
+            if type(owner) is not current[1]:
+                raise ProviderOutputIntegrityError(
+                    f"{label} runtime type changed"
+                )
+            return current[2]
 
     return bind, read

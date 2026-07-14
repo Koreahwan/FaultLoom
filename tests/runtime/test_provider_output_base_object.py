@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from weakref import getweakrefs
 
 import pytest
 from faultloom.provider_output import (
@@ -221,3 +222,39 @@ def test_capability_instances_have_no_mutable_state_slot(
     assert getattr(capability, "__slots__", None) == ("__weakref__",)
     with pytest.raises(ProviderOutputIntegrityError):
         type(f"Derived{capability.__name__}", (capability,), {})
+
+
+def test_live_weakref_callback_cannot_clear_or_rebind_cursor() -> None:
+    original = bytes(range(32))
+    key = ProviderOutputCursorKey(original)
+    references = [
+        reference
+        for reference in getweakrefs(key)
+        if reference.__callback__ is not None
+    ]
+    assert len(references) == 1
+    reference = references[0]
+    callback = reference.__callback__
+    assert callback is not None
+    callback(reference)
+    assert key._copy_for_hmac() == original
+    with pytest.raises(ProviderOutputIntegrityError):
+        ProviderOutputCursorKey.__init__(key, bytes(reversed(range(32))))
+    assert key._copy_for_hmac() == original
+
+
+def test_vault_rejects_type_substitution_at_trusted_dispatch() -> None:
+    class SameLayoutCursor:
+        __slots__ = ("__weakref__",)
+
+        def _copy_for_hmac(self) -> bytes:
+            return b"x" * 32
+
+    original = bytes(range(32))
+    key = ProviderOutputCursorKey(original)
+    object.__setattr__(key, "__class__", SameLayoutCursor)
+    assert key._copy_for_hmac() == b"x" * 32
+    with pytest.raises(ProviderOutputIntegrityError):
+        ProviderOutputCursorKey._copy_for_hmac(key)
+    object.__setattr__(key, "__class__", ProviderOutputCursorKey)
+    assert key._copy_for_hmac() == original
