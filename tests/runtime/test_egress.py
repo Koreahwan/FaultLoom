@@ -39,6 +39,7 @@ from faultloom.egress import (
     TrustedAuthorityState,
     knowledge_action_digest,
     provider_action_digest,
+    sha256_digest,
     sign_reconciliation_authorization,
 )
 from faultloom_protocol import (
@@ -51,7 +52,6 @@ from faultloom_protocol import (
     SignedAuthorityGrant,
     SignedScopeEpoch,
     SignatureExpiredError,
-    sha256_digest,
     sign_authority_grant,
     sign_scope_epoch,
 )

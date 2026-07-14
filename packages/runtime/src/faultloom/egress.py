@@ -21,11 +21,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from threading import RLock, local
-from typing import Annotated, Literal, Protocol
+from typing import Annotated, Final, Literal, Protocol
 from urllib.parse import urlsplit
 
 from cryptography.exceptions import InvalidSignature
-from pydantic import Field, model_validator
+from pydantic import BeforeValidator, Field, model_validator
+
+from faultloom.egress_wire import ExactEnumCatalog, ExactEnumInput, WireValue
+from faultloom.egress_wire_snapshot import ExactWireBoundary
 
 from faultloom_protocol import (
     AuthorityGrant,
@@ -41,9 +44,7 @@ from faultloom_protocol import (
     SignatureVerificationError,
     SignedAuthorityGrant,
     SignedScopeEpoch,
-    canonical_json_bytes,
     load_public_key,
-    sha256_digest,
     verify_authority_grant,
     verify_scope_epoch,
 )
@@ -124,17 +125,84 @@ class ReconciliationDisposition(str, Enum):
     EFFECT_CONFIRMED = "effect_confirmed"
 
 
+_EGRESS_ENUM_TYPES: Final = (
+    EgressPlane,
+    ProviderToolKind,
+    TransportOutcome,
+    EgressOutcome,
+    DenialCode,
+    ReconciliationDisposition,
+)
+_EGRESS_ENUM_CATALOG: Final = ExactEnumCatalog(_EGRESS_ENUM_TYPES)
+_DENIAL_CODE_VALUES: Final = tuple(member.value for member in DenialCode)
+_EXACT_PLANE_INPUT: Final = ExactEnumInput(
+    _EGRESS_ENUM_CATALOG,
+    EgressPlane,
+    ("target", "model_provider", "knowledge"),
+)
+_EXACT_PROVIDER_TOOL_INPUT: Final = ExactEnumInput(
+    _EGRESS_ENUM_CATALOG,
+    ProviderToolKind,
+    ("local", "provider_web", "provider_computer"),
+)
+_EXACT_TRANSPORT_OUTCOME_INPUT: Final = ExactEnumInput(
+    _EGRESS_ENUM_CATALOG,
+    TransportOutcome,
+    ("completed", "failed", "unknown_outcome"),
+)
+_EXACT_EGRESS_OUTCOME_INPUT: Final = ExactEnumInput(
+    _EGRESS_ENUM_CATALOG,
+    EgressOutcome,
+    ("denied", "completed", "failed", "unknown_outcome"),
+)
+_EXACT_DENIAL_CODE_INPUT: Final = ExactEnumInput(
+    _EGRESS_ENUM_CATALOG, DenialCode, _DENIAL_CODE_VALUES
+)
+_EXACT_RECONCILIATION_INPUT: Final = ExactEnumInput(
+    _EGRESS_ENUM_CATALOG,
+    ReconciliationDisposition,
+    ("retry_authorized", "effect_confirmed"),
+)
+
+
+ExactEgressPlane = Annotated[EgressPlane, BeforeValidator(_EXACT_PLANE_INPUT)]
+ExactNonTargetPlane = Annotated[
+    Literal[EgressPlane.MODEL_PROVIDER, EgressPlane.KNOWLEDGE],
+    BeforeValidator(_EXACT_PLANE_INPUT),
+]
+ExactProviderPlane = Annotated[
+    Literal[EgressPlane.MODEL_PROVIDER], BeforeValidator(_EXACT_PLANE_INPUT)
+]
+ExactKnowledgePlane = Annotated[
+    Literal[EgressPlane.KNOWLEDGE], BeforeValidator(_EXACT_PLANE_INPUT)
+]
+ExactProviderToolKind = Annotated[
+    ProviderToolKind, BeforeValidator(_EXACT_PROVIDER_TOOL_INPUT)
+]
+ExactTransportOutcome = Annotated[
+    TransportOutcome, BeforeValidator(_EXACT_TRANSPORT_OUTCOME_INPUT)
+]
+ExactEgressOutcome = Annotated[
+    EgressOutcome, BeforeValidator(_EXACT_EGRESS_OUTCOME_INPUT)
+]
+ExactDenialCode = Annotated[DenialCode, BeforeValidator(_EXACT_DENIAL_CODE_INPUT)]
+ExactReconciliationDisposition = Annotated[
+    ReconciliationDisposition,
+    BeforeValidator(_EXACT_RECONCILIATION_INPUT),
+]
+
+
 class ReconciliationAuthorization(ProtocolModel):
     """Exact one-use authority to resolve one uncertain semantic action."""
 
     capability_id: Identifier
     sequence: PositiveInt
-    plane: Literal[EgressPlane.MODEL_PROVIDER, EgressPlane.KNOWLEDGE]
+    plane: ExactNonTargetPlane
     action_digest: Sha256Digest
     request_digest: Sha256Digest
     authority_digest: Sha256Digest
     scope_epoch: PositiveInt
-    disposition: ReconciliationDisposition
+    disposition: ExactReconciliationDisposition
     issued_at: AwareDatetime
     expires_at: AwareDatetime
 
@@ -291,7 +359,7 @@ def _path_is_below(path: str, prefix: str) -> bool:
 
 class ProviderTool(ProtocolModel):
     tool_id: Identifier
-    kind: ProviderToolKind
+    kind: ExactProviderToolKind
 
 
 class ProviderEndpoint(ProtocolModel):
@@ -339,7 +407,7 @@ class KnowledgeSource(ProtocolModel):
 class DestinationResolution(ProtocolModel):
     """Resolver result pinned into the transport request for one dispatch."""
 
-    plane: Literal[EgressPlane.MODEL_PROVIDER, EgressPlane.KNOWLEDGE]
+    plane: ExactNonTargetPlane
     origin: ShortStr
     cname_chain: tuple[ShortStr, ...] = ()
     addresses: tuple[ShortStr, ...]
@@ -407,7 +475,7 @@ class KnowledgeFetchIntent(ProtocolModel):
 
 
 class CompiledProviderRequest(ProtocolModel):
-    plane: Literal[EgressPlane.MODEL_PROVIDER] = EgressPlane.MODEL_PROVIDER
+    plane: ExactProviderPlane = EgressPlane.MODEL_PROVIDER
     request_id: Identifier
     endpoint_id: Identifier
     provider_id: Identifier
@@ -429,7 +497,7 @@ class CompiledProviderRequest(ProtocolModel):
 
 
 class CompiledKnowledgeRequest(ProtocolModel):
-    plane: Literal[EgressPlane.KNOWLEDGE] = EgressPlane.KNOWLEDGE
+    plane: ExactKnowledgePlane = EgressPlane.KNOWLEDGE
     request_id: Identifier
     source_id: Identifier
     origin: ShortStr
@@ -447,8 +515,8 @@ class CompiledKnowledgeRequest(ProtocolModel):
 
 
 class EgressTransportResult(ProtocolModel):
-    plane: EgressPlane
-    outcome: TransportOutcome
+    plane: ExactEgressPlane
+    outcome: ExactTransportOutcome
     response_digest: Sha256Digest | None = None
     response_status: NonNegativeInt | None = None
     bytes_sent: NonNegativeInt
@@ -457,7 +525,7 @@ class EgressTransportResult(ProtocolModel):
 
 class EgressReceipt(ProtocolModel):
     receipt_digest: Sha256Digest
-    plane: EgressPlane
+    plane: ExactEgressPlane
     request_id: Identifier
     request_digest: Sha256Digest
     authority_digest: Sha256Digest
@@ -466,8 +534,8 @@ class EgressReceipt(ProtocolModel):
     destination_digest: Sha256Digest | None
     execution_component_digest: Sha256Digest | None
     dispatch_authorization_digest: Sha256Digest | None
-    outcome: EgressOutcome
-    denial_code: DenialCode | None
+    outcome: ExactEgressOutcome
+    denial_code: ExactDenialCode | None
     response_digest: Sha256Digest | None
     response_status: NonNegativeInt | None
     bytes_sent: NonNegativeInt
@@ -496,6 +564,35 @@ class EgressReceipt(ProtocolModel):
         if not hmac.compare_digest(self.receipt_digest, sha256_digest(payload)):
             raise ValueError("egress receipt digest does not match its fields")
         return self
+
+
+_EGRESS_MODEL_TYPES: Final = (
+    ReconciliationAuthorization,
+    SignedReconciliationAuthorization,
+    ProviderTool,
+    ProviderEndpoint,
+    KnowledgeSource,
+    DestinationResolution,
+    ProviderRequest,
+    KnowledgeFetchIntent,
+    CompiledProviderRequest,
+    CompiledKnowledgeRequest,
+    EgressTransportResult,
+    EgressReceipt,
+)
+_EGRESS_WIRE: Final = ExactWireBoundary(
+    enum_catalog=_EGRESS_ENUM_CATALOG,
+    enum_types=_EGRESS_ENUM_TYPES,
+    model_types=_EGRESS_MODEL_TYPES,
+)
+
+
+def canonical_json_bytes(value: WireValue) -> bytes:
+    return _EGRESS_WIRE.canonical_json_bytes(value)
+
+
+def sha256_digest(value: WireValue) -> str:
+    return _EGRESS_WIRE.digest(value)
 
 
 class ProviderTransport(Protocol):
@@ -1293,6 +1390,7 @@ class ProviderProxy:
                 denial=DenialCode.TRANSPORT_PLANE_MISMATCH,
                 now=admitted_at,
             )
+        assert execution_component_digest is not None
         destination_digest = sha256_digest(
             {
                 "plane": EgressPlane.MODEL_PROVIDER,
@@ -1513,8 +1611,8 @@ class ProviderProxy:
                 "resolution_digest": compiled.resolution_digest,
             }
         )
+        dispatch_now = now
         try:
-            dispatch_now = now
             with self._authority.dispatch_guard(
                 expected=generation, clock=self._clock
             ) as revalidate:
@@ -1895,6 +1993,7 @@ class KnowledgeFetcher:
                 denial=DenialCode.TRANSPORT_PLANE_MISMATCH,
                 now=admitted_at,
             )
+        assert execution_component_digest is not None
         resolution_digest = sha256_digest(resolution)
         destination_digest = sha256_digest(
             {
@@ -1964,8 +2063,8 @@ class KnowledgeFetcher:
                 denial=DenialCode.REQUEST_REPLAY_DENIED,
                 now=admitted_at,
             )
+        dispatch_now = admitted_at
         try:
-            dispatch_now = admitted_at
             with self._authority.dispatch_guard(
                 expected=generation, clock=self._clock
             ) as revalidate:
