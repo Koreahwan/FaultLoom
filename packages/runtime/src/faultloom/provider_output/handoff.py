@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
-from typing import NamedTuple, NoReturn, final
+from collections.abc import Callable
+from typing import TYPE_CHECKING, NamedTuple, NoReturn, final
+from weakref import ReferenceType
 
 from faultloom.provider import ProviderCallReceipt
 from faultloom.state import StateStore
@@ -10,6 +12,7 @@ from faultloom_protocol import Ed25519PublicKeyRecord
 from ._events import invocation_from_event
 from ._receipt import ProviderReceiptVerifier
 from ._store import ProviderOutputStoreBinding
+from ._vault import identity_vault
 from .contracts import (
     ProviderInvocationResult,
     ProviderOutputIntegrityError,
@@ -28,10 +31,21 @@ class _HandoffAdmission(NamedTuple):
     verifier: ProviderReceiptVerifier
 
 
+_handoff_vault: tuple[
+    Callable[[ProviderOutputHandoff, _HandoffAdmission], None],
+    Callable[[ProviderOutputHandoff], _HandoffAdmission],
+] = identity_vault(
+    "provider output handoff"
+)
+_bind_handoff, _read_handoff = _handoff_vault
+
+
 @final
 class ProviderOutputHandoff:
-    __slots__ = ("__admission",)
-    __admission: _HandoffAdmission
+    __slots__ = ("__weakref__",)
+
+    def __init_subclass__(cls) -> None:
+        raise ProviderOutputIntegrityError("ProviderOutputHandoff is final")
 
     def __init__(
         self,
@@ -42,6 +56,8 @@ class ProviderOutputHandoff:
         media_type: str = "application/json",
         maximum_output_bytes: int = 1024 * 1024,
     ) -> None:
+        if TYPE_CHECKING:
+            self.__weakref__: ReferenceType[ProviderOutputHandoff] | None = None
         binding = ProviderOutputStoreBinding(state)
         if type(engagement_id) is not str or engagement_id != binding.engagement_id:
             raise ProviderOutputScopeError(
@@ -55,30 +71,24 @@ class ProviderOutputHandoff:
             )
         ):
             raise ValueError("provider output maximum byte count is invalid")
-        self.__admission = _HandoffAdmission(
-            binding,
-            require_media_type(media_type),
-            maximum_output_bytes,
-            ProviderReceiptVerifier(trusted_proxy_attestation_key),
+        _bind_handoff(
+            self,
+            _HandoffAdmission(
+                binding,
+                require_media_type(media_type),
+                maximum_output_bytes,
+                ProviderReceiptVerifier(trusted_proxy_attestation_key),
+            ),
         )
 
     def __setattr__(self, name: str, value: object) -> None:
-        if name == "_ProviderOutputHandoff__admission":
-            try:
-                object.__getattribute__(self, name)
-            except AttributeError:
-                object.__setattr__(self, name, value)
-                return
         raise AttributeError("ProviderOutputHandoff is immutable")
 
     def __delattr__(self, name: str) -> NoReturn:
         raise AttributeError("ProviderOutputHandoff is immutable")
 
     def _trusted_admission(self) -> _HandoffAdmission:
-        admission = object.__getattribute__(
-            self,
-            "_ProviderOutputHandoff__admission",
-        )
+        admission = _read_handoff(self)
         if (
             type(admission) is not _HandoffAdmission
             or type(admission.binding) is not ProviderOutputStoreBinding

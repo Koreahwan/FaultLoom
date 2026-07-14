@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hmac
 import json
-from typing import NoReturn, final
+from collections.abc import Callable
+from typing import TYPE_CHECKING, NoReturn, final
+from weakref import ReferenceType
 
 from faultloom.state import StateStore
 from faultloom_protocol import Ed25519PublicKeyRecord, canonical_json
@@ -18,6 +20,7 @@ from ._events import event_artifacts, invocation_from_event
 from ._receipt import ProviderReceiptVerifier
 from ._reader_admission import ReaderAdmission, trusted_reader_admission
 from ._store import ProviderOutputStoreBinding
+from ._vault import identity_vault
 from .contracts import (
     ProviderInvocationResult,
     ProviderOutputCursorKey,
@@ -29,12 +32,19 @@ from .contracts import (
 MAX_PAGE_BYTES = 1024 * 1024
 _CURSOR_KEY_COPY = ProviderOutputCursorKey._copy_for_hmac
 _VERIFY_RECEIPT = ProviderReceiptVerifier.validate
+_reader_vault: tuple[
+    Callable[[ProviderOutputReader, ReaderAdmission], None],
+    Callable[[ProviderOutputReader], ReaderAdmission],
+] = identity_vault("provider output reader")
+_bind_reader, _read_reader = _reader_vault
 
 
 @final
 class ProviderOutputReader:
-    __slots__ = ("__admission",)
-    __admission: ReaderAdmission
+    __slots__ = ("__weakref__",)
+
+    def __init_subclass__(cls) -> None:
+        raise ProviderOutputIntegrityError("ProviderOutputReader is final")
 
     def __init__(
         self,
@@ -44,6 +54,8 @@ class ProviderOutputReader:
         trusted_proxy_attestation_key: Ed25519PublicKeyRecord,
         maximum_page_bytes: int = 64 * 1024,
     ) -> None:
+        if TYPE_CHECKING:
+            self.__weakref__: ReferenceType[ProviderOutputReader] | None = None
         if (
             type(cursor_key) is not ProviderOutputCursorKey
             or type.__getattribute__(
@@ -72,20 +84,17 @@ class ProviderOutputReader:
             + binding.engagement_id.encode("utf-8"),
             "sha256",
         )
-        self.__admission = ReaderAdmission(
-            binding,
-            derived_key,
-            maximum_page_bytes,
-            ProviderReceiptVerifier(trusted_proxy_attestation_key),
+        _bind_reader(
+            self,
+            ReaderAdmission(
+                binding,
+                derived_key,
+                maximum_page_bytes,
+                ProviderReceiptVerifier(trusted_proxy_attestation_key),
+            ),
         )
 
     def __setattr__(self, name: str, value: object) -> None:
-        if name == "_ProviderOutputReader__admission":
-            try:
-                object.__getattribute__(self, name)
-            except AttributeError:
-                object.__setattr__(self, name, value)
-                return
         raise AttributeError("ProviderOutputReader is immutable")
 
     def __delattr__(self, name: str) -> NoReturn:
@@ -93,10 +102,7 @@ class ProviderOutputReader:
 
     def _trusted_admission(self) -> ReaderAdmission:
         return trusted_reader_admission(
-            object.__getattribute__(
-                self,
-                "_ProviderOutputReader__admission",
-            ),
+            _read_reader(self),
             maximum_page_bytes=MAX_PAGE_BYTES,
         )
 

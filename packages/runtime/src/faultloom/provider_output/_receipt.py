@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
-from typing import NamedTuple, NoReturn, final
+from collections.abc import Callable
+from typing import TYPE_CHECKING, NamedTuple, NoReturn, final
+from weakref import ReferenceType
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from faultloom.provider import (
@@ -18,6 +20,7 @@ from faultloom_protocol import (
 )
 
 from .contracts import ProviderOutputIntegrityError
+from ._vault import identity_vault
 
 _KEY_DUMP = Ed25519PublicKeyRecord.model_dump
 _KEY_VALIDATE = Ed25519PublicKeyRecord.model_validate
@@ -70,12 +73,25 @@ class _VerifierAdmission(NamedTuple):
     public_key: Ed25519PublicKey
 
 
+_verifier_vault: tuple[
+    Callable[[ProviderReceiptVerifier, _VerifierAdmission], None],
+    Callable[[ProviderReceiptVerifier], _VerifierAdmission],
+] = identity_vault(
+    "provider output receipt verifier"
+)
+_bind_verifier, _read_verifier = _verifier_vault
+
+
 @final
 class ProviderReceiptVerifier:
-    __slots__ = ("__admission",)
-    __admission: _VerifierAdmission
+    __slots__ = ("__weakref__",)
+
+    def __init_subclass__(cls) -> None:
+        raise ProviderOutputIntegrityError("ProviderReceiptVerifier is final")
 
     def __init__(self, trusted_key: Ed25519PublicKeyRecord) -> None:
+        if TYPE_CHECKING:
+            self.__weakref__: ReferenceType[ProviderReceiptVerifier] | None = None
         if type(trusted_key) is not Ed25519PublicKeyRecord:
             raise ProviderOutputIntegrityError(
                 "provider output requires an exact proxy attestation key"
@@ -93,25 +109,19 @@ class ProviderReceiptVerifier:
             raise ProviderOutputIntegrityError(
                 "provider output proxy attestation key is invalid"
             )
-        self.__admission = _VerifierAdmission(validated.key_id, public_key)
+        _bind_verifier(
+            self,
+            _VerifierAdmission(validated.key_id, public_key),
+        )
 
     def __setattr__(self, name: str, value: object) -> None:
-        if name == "_ProviderReceiptVerifier__admission":
-            try:
-                object.__getattribute__(self, name)
-            except AttributeError:
-                object.__setattr__(self, name, value)
-                return
         raise AttributeError("ProviderReceiptVerifier is immutable")
 
     def __delattr__(self, name: str) -> NoReturn:
         raise AttributeError("ProviderReceiptVerifier is immutable")
 
     def _trusted_admission(self) -> _VerifierAdmission:
-        admission = object.__getattribute__(
-            self,
-            "_ProviderReceiptVerifier__admission",
-        )
+        admission = _read_verifier(self)
         if (
             type(admission) is not _VerifierAdmission
             or type(admission.key_id) is not str

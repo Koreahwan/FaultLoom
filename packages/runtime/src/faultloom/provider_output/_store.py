@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import NoReturn, final
+from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING, NoReturn, final
+from weakref import ReferenceType
 
 from faultloom.provider import ProviderCallReceipt
 from faultloom.state import (
@@ -35,14 +36,25 @@ from ._store_artifacts import (
     read_artifact_page,
     verify_artifact_reference,
 )
+from ._vault import identity_vault
+
+_store_vault: tuple[
+    Callable[[ProviderOutputStoreBinding, StoreAdmission], None],
+    Callable[[ProviderOutputStoreBinding], StoreAdmission],
+] = identity_vault("provider output store binding")
+_bind_store, _read_store = _store_vault
 
 
 @final
 class ProviderOutputStoreBinding:
-    __slots__ = ("__admission",)
-    __admission: StoreAdmission
+    __slots__ = ("__weakref__",)
+
+    def __init_subclass__(cls) -> None:
+        raise ProviderOutputIntegrityError("ProviderOutputStoreBinding is final")
 
     def __init__(self, state: StateStore) -> None:
+        if TYPE_CHECKING:
+            self.__weakref__: ReferenceType[ProviderOutputStoreBinding] | None = None
         if type(state) is not StateStore:
             raise ProviderOutputIntegrityError(
                 "provider output requires the exact T20 StateStore"
@@ -63,28 +75,20 @@ class ProviderOutputStoreBinding:
             raise ProviderOutputIntegrityError(
                 "provider output CAS byte ceiling is invalid"
             )
-        self.__admission = StoreAdmission(state, engagement_id, maximum)
+        _bind_store(
+            self,
+            StoreAdmission(state, engagement_id, maximum),
+        )
         self.validate()
 
     def __setattr__(self, name: str, value: object) -> None:
-        if name == "_ProviderOutputStoreBinding__admission":
-            try:
-                object.__getattribute__(self, name)
-            except AttributeError:
-                object.__setattr__(self, name, value)
-                return
         raise AttributeError("ProviderOutputStoreBinding is immutable")
 
     def __delattr__(self, name: str) -> NoReturn:
         raise AttributeError("ProviderOutputStoreBinding is immutable")
 
     def _trusted_admission(self) -> StoreAdmission:
-        return trusted_store_admission(
-            object.__getattribute__(
-                self,
-                "_ProviderOutputStoreBinding__admission",
-            )
-        )
+        return trusted_store_admission(_read_store(self))
 
     @property
     def engagement_id(self) -> str:

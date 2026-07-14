@@ -111,12 +111,8 @@ def test_cross_engagement_capabilities_cannot_replace_admitted_binding(
             engagement_id=state_b.engagement_id,
             trusted_proxy_attestation_key=TRUSTED_PROXY_KEY,
         )
-        admission_b = object.__getattribute__(
-            handoff_b,
-            "_ProviderOutputHandoff__admission",
-        )
         with pytest.raises(AttributeError):
-            setattr(handoff_a, "_binding", admission_b.binding)
+            setattr(handoff_a, "_binding", handoff_b)
         invocation_a = handoff_a.publish(receipt, body)
         assert state_a.checkpoint().seq == 1
         assert state_b.checkpoint().seq == 0
@@ -132,12 +128,8 @@ def test_cross_engagement_capabilities_cannot_replace_admitted_binding(
             key,
             trusted_proxy_attestation_key=TRUSTED_PROXY_KEY,
         )
-        reader_admission_b = object.__getattribute__(
-            reader_b,
-            "_ProviderOutputReader__admission",
-        )
         with pytest.raises(AttributeError):
-            setattr(reader_a, "_binding", reader_admission_b.binding)
+            setattr(reader_a, "_binding", reader_b)
         page = reader_a.read_page(
             invocation_a,
             expected_engagement_id=state_a.engagement_id,
