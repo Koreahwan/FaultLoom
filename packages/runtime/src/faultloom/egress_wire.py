@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Literal
+from types import ModuleType
+from typing import Literal, cast
 
+import faultloom.egress_enum_integrity as enum_integrity
 from faultloom_protocol import ProtocolModel
 
 type WireValue = (
@@ -49,55 +52,87 @@ class EgressWireError(ValueError):
         super().__init__(f"{path}: {code}")
 
 
-@dataclass(frozen=True, slots=True)
-class _EnumMemberSnapshot:
-    enum_type: type[Enum]
-    name: str
-    member: Enum
-    value: str
-
-
 class ExactEnumCatalog:
     def __init__(self, enum_types: tuple[type[Enum], ...]) -> None:
-        snapshots: list[_EnumMemberSnapshot] = []
+        type_snapshots: list[enum_integrity.EnumTypeSnapshot] = []
         for enum_type in enum_types:
-            member_map: dict[str, Enum] = type.__getattribute__(enum_type, "_member_map_")
-            value_map: dict[str, Enum] = type.__getattribute__(
-                enum_type, "_value2member_map_"
+            class_entries = enum_integrity.exact_class_entries(
+                enum_type, error=EgressWireError("catalog_identity")
             )
-            if (
-                type(member_map) is not dict
-                or not isinstance(member_map, dict)
-                or type(value_map) is not dict
-                or not isinstance(value_map, dict)
-            ):
+            raw_member_map = enum_integrity.entry(class_entries, "_member_map_")
+            raw_value_map = enum_integrity.entry(class_entries, "_value2member_map_")
+            if type(raw_member_map) is not dict or type(raw_value_map) is not dict:
                 raise EgressWireError("catalog_storage")
-            for name, member in member_map.items():
+            member_map = cast(dict[object, object], raw_member_map)
+            value_map = cast(dict[object, object], raw_value_map)
+            member_entries = enum_integrity.exact_dict_entries(
+                member_map,
+                value_type=enum_type,
+                error=EgressWireError("catalog_member"),
+            )
+            value_entries = enum_integrity.exact_dict_entries(
+                value_map,
+                value_type=enum_type,
+                error=EgressWireError("catalog_value"),
+            )
+            members: list[enum_integrity.EnumMemberSnapshot] = []
+            for name, raw_member in member_entries:
+                member = cast(Enum, raw_member)
+                member_name, member_value = enum_integrity.member_metadata(
+                    member, error=EgressWireError("catalog_identity")
+                )
+                backing_value = str.__str__(cast(str, cast(object, member)))
                 if (
-                    type(name) is not str
-                    or type(member) is not enum_type
-                    or not isinstance(member, Enum)
-                    or not isinstance(member, str)
+                    type(member_name) is not str
+                    or type(member_value) is not str
+                    or type(backing_value) is not str
                 ):
                     raise EgressWireError("catalog_member")
-                raw_value: str = object.__getattribute__(member, "_value_")
-                if type(raw_value) is not str or not isinstance(raw_value, str):
-                    raise EgressWireError("catalog_value")
                 if (
-                    type.__getattribute__(enum_type, name) is not member
-                    or value_map.get(raw_value) is not member
-                    or str.__str__(member) != raw_value
+                    member_name != name
+                    or member_value != backing_value
+                    or enum_integrity.entry(class_entries, name) is not member
+                    or not enum_integrity.contains_identity(value_entries, backing_value, member)
                 ):
                     raise EgressWireError("catalog_identity")
-                snapshots.append(
-                    _EnumMemberSnapshot(
-                        enum_type=enum_type,
-                        name=name,
-                        member=member,
-                        value=raw_value,
-                    )
+                members.append(
+                    enum_integrity.EnumMemberSnapshot(name=name, member=member, value=backing_value)
                 )
-        self._snapshots = tuple(snapshots)
+            module_name = enum_integrity.entry(class_entries, "__module__")
+            class_name = cast(object, type.__getattribute__(enum_type, "__name__"))
+            if type(module_name) is not str or type(class_name) is not str:
+                raise EgressWireError("catalog_identity")
+            module = enum_integrity.entry(
+                enum_integrity.exact_dict_entries(
+                    sys.modules,
+                    value_type=None,
+                    error=EgressWireError("catalog_identity"),
+                ),
+                module_name,
+            )
+            if type(module) is not ModuleType:
+                raise EgressWireError("catalog_identity")
+            exact_module = cast(ModuleType, module)
+            if enum_integrity.entry(
+                enum_integrity.module_entries(
+                    exact_module, error=EgressWireError("catalog_identity")
+                ),
+                class_name,
+            ) is not enum_type:
+                raise EgressWireError("catalog_identity")
+            type_snapshots.append(
+                enum_integrity.EnumTypeSnapshot(
+                    enum_type=enum_type,
+                    module=exact_module,
+                    module_name=module_name,
+                    class_name=class_name,
+                    class_entry_count=len(class_entries),
+                    members=tuple(members),
+                    member_count=dict.__len__(member_map),
+                    value_count=dict.__len__(value_map),
+                )
+            )
+        self._type_snapshots = tuple(type_snapshots)
 
     def normalize_input(
         self,
@@ -106,56 +141,113 @@ class ExactEnumCatalog:
         enum_type: type[Enum],
         allowed_values: tuple[str, ...],
     ) -> WireValue:
+        snapshot = self._snapshot_for_type(enum_type)
+        self._validate_snapshot(snapshot)
         if type(value) is str and isinstance(value, str):
             if value not in allowed_values:
                 raise EgressWireError("enum_value")
             return value
-        exact_value = self.exact_value(value, expected_type=enum_type)
+        exact_value = self._member_value(value, snapshot)
         if exact_value not in allowed_values:
             raise EgressWireError("enum_value")
         return value
 
-    def exact_value(
-        self, value: WireValue, *, expected_type: type[Enum] | None = None
-    ) -> str:
+    def exact_value(self, value: WireValue, *, expected_type: type[Enum] | None = None) -> str:
         value_type = type(value)
-        for snapshot in self._snapshots:
-            if (
-                value_type is snapshot.enum_type
-                and (expected_type is None or value_type is expected_type)
-                and value is snapshot.member
-            ):
-                return self._validate_snapshot(snapshot)
+        if expected_type is not None and value_type is not expected_type:
+            raise EgressWireError("enum_member")
+        for snapshot in self._type_snapshots:
+            if value_type is snapshot.enum_type:
+                exact_value = self._member_value(value, snapshot)
+                self._validate_snapshot(snapshot)
+                return exact_value
         raise EgressWireError("enum_member")
 
     @staticmethod
-    def _validate_snapshot(snapshot: _EnumMemberSnapshot) -> str:
-        member_map: dict[str, Enum] = type.__getattribute__(
-            snapshot.enum_type, "_member_map_"
+    def _member_value(value: WireValue, snapshot: enum_integrity.EnumTypeSnapshot) -> str:
+        if type(value) is snapshot.enum_type:
+            for member_snapshot in snapshot.members:
+                if value is member_snapshot.member:
+                    return member_snapshot.value
+        raise EgressWireError("enum_member")
+
+    def _snapshot_for_type(self, enum_type: type[Enum]) -> enum_integrity.EnumTypeSnapshot:
+        for snapshot in self._type_snapshots:
+            if snapshot.enum_type is enum_type:
+                return snapshot
+        raise EgressWireError("enum_member")
+
+    @staticmethod
+    def _validate_snapshot(snapshot: enum_integrity.EnumTypeSnapshot) -> None:
+        identity_error = EgressWireError("enum_identity")
+        class_entries = enum_integrity.exact_class_entries(
+            snapshot.enum_type, error=identity_error
         )
-        value_map: dict[str, Enum] = type.__getattribute__(
-            snapshot.enum_type, "_value2member_map_"
+        current_class_name = cast(
+            object, type.__getattribute__(snapshot.enum_type, "__name__")
         )
-        member_name: str = object.__getattribute__(snapshot.member, "_name_")
-        member_value: str = object.__getattribute__(snapshot.member, "_value_")
+        current_module_name = enum_integrity.entry(class_entries, "__module__")
         if (
-            type(member_map) is not dict
-            or not isinstance(member_map, dict)
-            or type(value_map) is not dict
-            or not isinstance(value_map, dict)
-            or type(member_name) is not str
-            or not isinstance(member_name, str)
-            or type(member_value) is not str
-            or not isinstance(member_value, str)
-            or member_name != snapshot.name
-            or member_value != snapshot.value
-            or member_map.get(snapshot.name) is not snapshot.member
-            or value_map.get(snapshot.value) is not snapshot.member
-            or type.__getattribute__(snapshot.enum_type, snapshot.name)
-            is not snapshot.member
+            len(class_entries) != snapshot.class_entry_count
+            or type(current_class_name) is not str
+            or current_class_name != snapshot.class_name
+            or type(current_module_name) is not str
+            or current_module_name != snapshot.module_name
         ):
             raise EgressWireError("enum_identity")
-        return snapshot.value
+        raw_member_map = enum_integrity.entry(class_entries, "_member_map_")
+        raw_value_map = enum_integrity.entry(class_entries, "_value2member_map_")
+        if type(raw_member_map) is not dict or type(raw_value_map) is not dict:
+            raise EgressWireError("enum_identity")
+        member_map = cast(dict[object, object], raw_member_map)
+        value_map = cast(dict[object, object], raw_value_map)
+        if (
+            dict.__len__(member_map) != snapshot.member_count
+            or dict.__len__(value_map) != snapshot.value_count
+        ):
+            raise EgressWireError("enum_identity")
+        member_entries = enum_integrity.exact_dict_entries(
+            member_map,
+            value_type=snapshot.enum_type,
+            error=EgressWireError("enum_identity"),
+        )
+        value_entries = enum_integrity.exact_dict_entries(
+            value_map,
+            value_type=snapshot.enum_type,
+            error=EgressWireError("enum_identity"),
+        )
+        module_entries = enum_integrity.module_entries(
+            snapshot.module, error=EgressWireError("enum_identity")
+        )
+        if (
+            enum_integrity.entry(module_entries, snapshot.class_name)
+            is not snapshot.enum_type
+        ):
+            raise EgressWireError("enum_identity")
+        for member_snapshot in snapshot.members:
+            member_name, member_value = enum_integrity.member_metadata(
+                member_snapshot.member, error=EgressWireError("enum_identity")
+            )
+            backing_value = str.__str__(
+                cast(str, cast(object, member_snapshot.member))
+            )
+            if (
+                type(member_name) is not str
+                or member_name != member_snapshot.name
+                or type(member_value) is not str
+                or member_value != member_snapshot.value
+                or type(backing_value) is not str
+                or backing_value != member_snapshot.value
+                or enum_integrity.entry(class_entries, member_snapshot.name)
+                is not member_snapshot.member
+                or not enum_integrity.contains_identity(
+                    member_entries, member_snapshot.name, member_snapshot.member
+                )
+                or not enum_integrity.contains_identity(
+                    value_entries, member_snapshot.value, member_snapshot.member
+                )
+            ):
+                raise EgressWireError("enum_identity")
 
 
 @dataclass(frozen=True, slots=True)
