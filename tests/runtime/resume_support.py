@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from faultloom.context import ContextState, checkpoint_binding_tag_for
@@ -18,6 +19,10 @@ from tests.runtime.test_context import DEFAULT_RETRIEVAL_KEY, context_state
 
 
 KEY_BYTES = bytes(range(32))
+RECONCILIATION_EVIDENCE = b"durable operator reconciliation evidence\n"
+RECONCILIATION_EVIDENCE_DIGEST = (
+    f"sha256:{hashlib.sha256(RECONCILIATION_EVIDENCE).hexdigest()}"
+)
 
 
 def state_root(root: Path) -> Path:
@@ -52,6 +57,9 @@ def make_context(
     unknown: tuple[str, ...] = (),
 ) -> ContextState:
     base = context_state()
+    evidence = base.checkpoint.recent_evidence_refs[0].model_copy(
+        update={"cas_digest": RECONCILIATION_EVIDENCE_DIGEST}
+    )
     checkpoint = base.checkpoint.model_copy(
         update={
             "checkpoint_id": checkpoint_id or f"checkpoint.{sequence}",
@@ -59,7 +67,34 @@ def make_context(
             "stable_watermark": watermark,
             "pending_action_ids": pending,
             "unknown_outcome_action_ids": unknown,
+            "recent_evidence_refs": (evidence,),
         }
+    )
+    hypotheses = tuple(
+        hypothesis.model_copy(
+            update={
+                "supporting_evidence": tuple(
+                    evidence if reference.evidence_id == evidence.evidence_id else reference
+                    for reference in hypothesis.supporting_evidence
+                ),
+                "contradicting_evidence": tuple(
+                    evidence if reference.evidence_id == evidence.evidence_id else reference
+                    for reference in hypothesis.contradicting_evidence
+                ),
+            }
+        )
+        for hypothesis in base.active_hypotheses
+    )
+    negative_results = tuple(
+        negative.model_copy(
+            update={
+                "evidence_refs": tuple(
+                    evidence if reference.evidence_id == evidence.evidence_id else reference
+                    for reference in negative.evidence_refs
+                )
+            }
+        )
+        for negative in base.important_negative_results
     )
     return base.model_copy(
         update={
@@ -69,6 +104,8 @@ def make_context(
                 engagement_id=base.engagement_id,
                 binding_key=DEFAULT_RETRIEVAL_KEY,
             ),
+            "active_hypotheses": hypotheses,
+            "important_negative_results": negative_results,
         }
     )
 

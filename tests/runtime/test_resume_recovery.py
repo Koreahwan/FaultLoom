@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from faultloom.context import checkpoint_binding_tag_for
 from faultloom.resume import (
     CheckpointConflictError,
     CheckpointController,
@@ -21,6 +22,7 @@ from faultloom.state import ArtifactRef, ChainIntegrityError, EventRecord, Stora
 from faultloom_protocol import DispatchOutcome
 from tests.protocol.factories import D1
 from tests.runtime.resume_support import (
+    RECONCILIATION_EVIDENCE,
     make_context,
     make_failover_intent,
     make_manifest,
@@ -29,6 +31,7 @@ from tests.runtime.resume_support import (
     state_root,
     write_checkpoint,
 )
+from tests.runtime.test_context import DEFAULT_RETRIEVAL_KEY
 
 
 def test_ten_crash_resets_preserve_ids_without_duplicate_effects(tmp_path: Path) -> None:
@@ -131,6 +134,56 @@ def test_pending_action_can_advance_to_unknown_but_stays_blocked(
             controller.resume(policy)
 
 
+def test_reconciliation_rejects_successor_only_fabricated_evidence(
+    tmp_path: Path,
+) -> None:
+    resolved_context = make_context(
+        sequence=2,
+        checkpoint_id="checkpoint.fabricated-evidence",
+    )
+    fabricated = resolved_context.checkpoint.recent_evidence_refs[0].model_copy(
+        update={
+            "evidence_id": "evidence.fabricated",
+            "cas_digest": "sha256:" + "f" * 64,
+            "observation_ids": ("observation.fabricated",),
+        }
+    )
+    checkpoint = resolved_context.checkpoint.model_copy(
+        update={"recent_evidence_refs": (fabricated,)}
+    )
+    resolved_context = resolved_context.model_copy(
+        update={
+            "checkpoint": checkpoint,
+            "checkpoint_binding_tag": checkpoint_binding_tag_for(
+                checkpoint,
+                engagement_id=resolved_context.engagement_id,
+                binding_key=DEFAULT_RETRIEVAL_KEY,
+            ),
+        }
+    )
+    reconciliation = make_reconciliation(resolved_context)
+
+    with open_store(tmp_path) as active:
+        controller = CheckpointController(active)
+        write_checkpoint(
+            controller,
+            make_context(unknown=("action.unknown",)),
+        )
+
+        with pytest.raises(CheckpointConflictError, match="durable evidence"):
+            controller.write(
+                reason=CheckpointReason.BEFORE_STATE_CHANGE,
+                run_manifest=make_manifest(),
+                context_state=resolved_context,
+                action_reconciliations=(reconciliation,),
+            )
+
+        assert active.ledger is not None
+        assert tuple(event.event_type for event in active.ledger.events()) == (
+            "runtime.checkpoint.v1",
+        )
+
+
 def test_evidence_linked_reconciliation_atomically_resolves_unknown_action(
     tmp_path: Path,
 ) -> None:
@@ -144,6 +197,25 @@ def test_evidence_linked_reconciliation_atomically_resolves_unknown_action(
         write_checkpoint(
             controller,
             make_context(unknown=("action.unknown",)),
+        )
+        assert (
+            controller.record_action_reconciliation(
+                reconciliation,
+                evidence=RECONCILIATION_EVIDENCE,
+            )
+            == reconciliation
+        )
+        assert (
+            controller.record_action_reconciliation(
+                reconciliation,
+                evidence=RECONCILIATION_EVIDENCE,
+            )
+            == reconciliation
+        )
+        assert active.ledger is not None
+        assert tuple(event.event_type for event in active.ledger.events()) == (
+            "runtime.checkpoint.v1",
+            "runtime.action_reconciliation.v1",
         )
         packet = controller.write(
             reason=CheckpointReason.BEFORE_STATE_CHANGE,
@@ -161,6 +233,129 @@ def test_evidence_linked_reconciliation_atomically_resolves_unknown_action(
     assert restored.blocked_action_ids == ()
     assert restored.requires_reconciliation is False
     assert restored.dispatch_ready is True
+
+
+def test_durable_reconciliation_without_clearing_checkpoint_stays_blocked(
+    tmp_path: Path,
+) -> None:
+    resolved_context = make_context(
+        sequence=2,
+        checkpoint_id="checkpoint.reconciled",
+    )
+    reconciliation = make_reconciliation(resolved_context)
+    with open_store(tmp_path) as active:
+        controller = CheckpointController(active)
+        blocked = write_checkpoint(
+            controller,
+            make_context(unknown=("action.unknown",)),
+        )
+        controller.record_action_reconciliation(
+            reconciliation,
+            evidence=RECONCILIATION_EVIDENCE,
+        )
+        floor = active.checkpoint()
+        policy = trust_policy_for(blocked, minimum_anchor=floor)
+
+    with open_store(tmp_path, minimum_anchor=floor) as reopened:
+        controller = CheckpointController(reopened)
+        with pytest.raises(ReconciliationRequiredError, match="action.unknown"):
+            controller.resume(policy)
+        assert reopened.ledger is not None
+        assert tuple(event.event_type for event in reopened.ledger.events()) == (
+            "runtime.checkpoint.v1",
+            "runtime.action_reconciliation.v1",
+        )
+
+
+def test_recorded_reconciliation_requires_exact_evidence_bytes(tmp_path: Path) -> None:
+    resolved_context = make_context(
+        sequence=2,
+        checkpoint_id="checkpoint.reconciled",
+    )
+    reconciliation = make_reconciliation(resolved_context)
+    with open_store(tmp_path) as active:
+        controller = CheckpointController(active)
+        write_checkpoint(
+            controller,
+            make_context(unknown=("action.unknown",)),
+        )
+
+        with pytest.raises(CheckpointConflictError, match="evidence bytes"):
+            controller.record_action_reconciliation(
+                reconciliation,
+                evidence=b"fabricated replacement",
+            )
+
+        assert active.ledger is not None
+        assert len(active.ledger.events()) == 1
+
+
+def test_untyped_observation_cannot_authenticate_action_reconciliation(
+    tmp_path: Path,
+) -> None:
+    resolved_context = make_context(
+        sequence=2,
+        checkpoint_id="checkpoint.reconciled",
+    )
+    reconciliation = make_reconciliation(resolved_context)
+    with open_store(tmp_path) as active:
+        controller = CheckpointController(active)
+        write_checkpoint(
+            controller,
+            make_context(unknown=("action.unknown",)),
+        )
+        active.append_observation(
+            actor_stream="researcher",
+            event_type="tool.observation",
+            raw_output=RECONCILIATION_EVIDENCE,
+            metadata={"observation_id": "observation.1"},
+        )
+
+        with pytest.raises(CheckpointConflictError, match="durable evidence"):
+            controller.write(
+                reason=CheckpointReason.BEFORE_STATE_CHANGE,
+                run_manifest=make_manifest(),
+                context_state=resolved_context,
+                action_reconciliations=(reconciliation,),
+            )
+
+        assert active.ledger is not None
+        assert tuple(event.event_type for event in active.ledger.events()) == (
+            "runtime.checkpoint.v1",
+            "tool.observation",
+        )
+
+
+def test_clearing_checkpoint_must_match_exact_durable_reconciliation(
+    tmp_path: Path,
+) -> None:
+    resolved_context = make_context(
+        sequence=2,
+        checkpoint_id="checkpoint.reconciled",
+    )
+    recorded = make_reconciliation(resolved_context)
+    conflicting = recorded.model_copy(update={"outcome": DispatchOutcome.FAILED})
+    with open_store(tmp_path) as active:
+        controller = CheckpointController(active)
+        write_checkpoint(
+            controller,
+            make_context(unknown=("action.unknown",)),
+        )
+        controller.record_action_reconciliation(
+            recorded,
+            evidence=RECONCILIATION_EVIDENCE,
+        )
+
+        with pytest.raises(CheckpointConflictError, match="differs from prior"):
+            controller.write(
+                reason=CheckpointReason.BEFORE_STATE_CHANGE,
+                run_manifest=make_manifest(),
+                context_state=resolved_context,
+                action_reconciliations=(conflicting,),
+            )
+
+        assert active.ledger is not None
+        assert len(active.ledger.events()) == 2
 
 
 def test_reconciliation_must_match_the_prior_unresolved_state(
@@ -244,11 +439,16 @@ def test_reconciled_action_id_cannot_be_reintroduced_as_unresolved(
             controller,
             make_context(unknown=("action.unknown",)),
         )
+        reconciliation = make_reconciliation(resolved_context)
+        controller.record_action_reconciliation(
+            reconciliation,
+            evidence=RECONCILIATION_EVIDENCE,
+        )
         controller.write(
             reason=CheckpointReason.BEFORE_STATE_CHANGE,
             run_manifest=make_manifest(),
             context_state=resolved_context,
-            action_reconciliations=(make_reconciliation(resolved_context),),
+            action_reconciliations=(reconciliation,),
         )
 
         with pytest.raises(CheckpointConflictError, match="become unresolved"):

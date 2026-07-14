@@ -8,9 +8,12 @@ from ..context import ContextState
 from ..state import AnchorCheckpoint, StateStore
 from .journal import (
     CheckpointJournal,
+    evidence_digest,
     latest_checkpoint,
     validate_action_history,
+    validate_durable_reconciliations,
     validate_initial,
+    validate_reconciliation_stage,
     validate_successor,
 )
 from .models import (
@@ -30,6 +33,9 @@ from .models import (
 
 
 class CheckpointController:
+    _store: StateStore
+    _journal: CheckpointJournal
+
     def __init__(self, store: StateStore) -> None:
         self._store = store
         self._journal = CheckpointJournal(store)
@@ -38,6 +44,60 @@ class CheckpointController:
     def model_digest(model: ModelIdentity) -> str:
         exact = ModelIdentity.model_validate(model.model_dump(mode="python"))
         return sha256_digest(exact)
+
+    def record_action_reconciliation(
+        self,
+        reconciliation: ActionReconciliation,
+        *,
+        evidence: bytes,
+    ) -> ActionReconciliation:
+        exact = ActionReconciliation.model_validate(
+            reconciliation.model_dump(mode="python")
+        )
+        if type(evidence) is not bytes or not evidence:
+            raise ResumeError("action reconciliation evidence must be non-empty bytes")
+        actual_evidence_digest = evidence_digest(evidence)
+        if not hmac.compare_digest(
+            exact.evidence_ref.cas_digest,
+            actual_evidence_digest,
+        ):
+            raise CheckpointConflictError(
+                "action reconciliation evidence bytes differ from the evidence reference"
+            )
+
+        with self._store.serialized():
+            snapshot = self._journal.snapshot()
+            for durable in snapshot.action_reconciliations:
+                existing = durable.reconciliation
+                if existing.evidence_ref.run_id != exact.evidence_ref.run_id:
+                    continue
+                if existing.reconciliation_id == exact.reconciliation_id:
+                    if hmac.compare_digest(
+                        canonical_json_bytes(existing),
+                        canonical_json_bytes(exact),
+                    ):
+                        return existing
+                    raise CheckpointConflictError(
+                        "action reconciliation ID is already bound to different state"
+                    )
+                if existing.action_id == exact.action_id:
+                    raise CheckpointConflictError(
+                        "action already has a durable reconciliation"
+                    )
+
+            prior = latest_checkpoint(
+                snapshot.checkpoints,
+                exact.evidence_ref.run_id,
+            )
+            if prior is None:
+                raise CheckpointConflictError(
+                    "action reconciliation requires a prior checkpoint"
+                )
+            validate_reconciliation_stage(prior, exact)
+            return self._journal.append_action_reconciliation(
+                exact,
+                evidence,
+            ).reconciliation
 
     def write(
         self,
@@ -75,7 +135,8 @@ class CheckpointController:
         checkpoint_digest = sha256_digest(envelope)
 
         with self._store.serialized():
-            records = self._journal.records()
+            snapshot = self._journal.snapshot()
+            records = snapshot.checkpoints
             checkpoint = envelope.context_state.checkpoint
             for record in records:
                 existing = record.envelope.context_state.checkpoint
@@ -95,6 +156,10 @@ class CheckpointController:
                 validate_initial(envelope)
             else:
                 validate_successor(prior, envelope)
+            validate_durable_reconciliations(
+                snapshot.action_reconciliations,
+                envelope,
+            )
             return self._packet(
                 self._journal.append(envelope, canonical, checkpoint_digest)
             )
@@ -105,14 +170,17 @@ class CheckpointController:
             raise ResumeTrustError("resume policy belongs to another engagement")
         with self._store.serialized():
             self._verify_anchor_floor(policy)
-            record = latest_checkpoint(self._journal.records(), policy.run_id)
+            record = latest_checkpoint(
+                self._journal.snapshot().checkpoints,
+                policy.run_id,
+            )
             if record is None:
                 raise CheckpointNotFoundError("no durable checkpoint exists for the run")
             self._verify_trust(record, policy)
             return self._packet(record)
 
     def resume(self, trust: ResumeTrustPolicy) -> ResumePacket:
-        self._store.recover()
+        _ = self._store.recover()
         packet = self.inspect(trust)
         if packet.blocked_action_ids:
             actions = ", ".join(packet.blocked_action_ids)
