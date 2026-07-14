@@ -160,6 +160,31 @@ def test_boundaries_reject_replaced_sys_modules_mapping_identity() -> None:
         sys.modules = original_registry
 
 
+def test_boundaries_type_missing_sys_modules_attribute() -> None:
+    original_registry = sys.modules
+    baseline_digest = egress_module.sha256_digest(EgressPlane.MODEL_PROVIDER)
+    digest_error: EgressWireError | AttributeError | None = None
+    model_error: ValidationError | AttributeError | None = None
+
+    try:
+        delattr(sys, "modules")
+        try:
+            _ = egress_module.sha256_digest(EgressPlane.MODEL_PROVIDER)
+        except (EgressWireError, AttributeError) as exc:
+            digest_error = exc
+        try:
+            _ = DestinationResolution.model_validate(_resolution_input())
+        except (ValidationError, AttributeError) as exc:
+            model_error = exc
+    finally:
+        sys.modules = original_registry
+
+    assert isinstance(digest_error, EgressWireError)
+    assert isinstance(model_error, ValidationError)
+    assert sys.modules is original_registry
+    assert egress_module.sha256_digest(EgressPlane.MODEL_PROVIDER) == baseline_digest
+
+
 def test_model_boundary_preserves_stable_dict_and_instance_inputs() -> None:
     expected_digest = (
         "sha256:a93368aa650a25a4ed52ecd750e29ec4031455e1ebbf2fcfb6ca9c84b4424d06"

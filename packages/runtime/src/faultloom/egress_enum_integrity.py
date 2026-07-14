@@ -192,7 +192,11 @@ def module_entries(
 def validate_module_binding(
     snapshot: EnumTypeSnapshot, *, error: Exception
 ) -> None:
-    if sys.modules is not snapshot.module_registry:
+    try:
+        module_registry = sys.modules
+    except AttributeError as exc:
+        raise error from exc
+    if module_registry is not snapshot.module_registry:
         raise error
     registry_entries = exact_dict_entries(
         snapshot.module_registry,
