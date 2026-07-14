@@ -23,6 +23,7 @@ from faultloom_protocol import (
 from faultloom_protocol.signing import SignatureVerificationError
 
 from . import __version__
+from .resume_cli import ResumeCliError, ResumeOperation, configure_resume_parser
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -371,8 +372,22 @@ def _reconcile_bound_protocol_file(bound: _BoundProtocolFile) -> None:
 def _capture_protocol_file_pair(
     authority_path: Path,
     key_path: Path,
+    *,
+    private_second: bool = False,
 ) -> tuple[bytes, bytes]:
     key_snapshot = _snapshot_protocol_file_path(key_path)
+    if private_second:
+        mode = stat.S_IMODE(key_snapshot.leaf_stat.st_mode)
+        owner_id = (
+            os.geteuid()
+            if hasattr(os, "geteuid")
+            else key_snapshot.leaf_stat.st_uid
+        )
+        if mode != 0o600 or key_snapshot.leaf_stat.st_uid != owner_id:
+            raise _protocol_file_error(
+                key_path,
+                "secret input must be owned by the current user with mode 0600",
+            )
     authority_snapshot = _snapshot_protocol_file_path(authority_path)
     key = _open_bound_protocol_file(key_snapshot)
     try:
@@ -671,11 +686,21 @@ def build_parser() -> argparse.ArgumentParser:
     run.set_defaults(handler=_run)
 
     resume = commands.add_parser("resume", help="resume a durable run")
-    resume.add_argument("run_id")
-    _set_unavailable(resume, "resume")
+    configure_resume_parser(
+        resume,
+        operation=ResumeOperation.RESUME,
+        capture_protocol_pair=_capture_protocol_file_pair,
+        validate_json_depth=_validate_json_depth,
+        reject_duplicate_keys=_reject_duplicate_keys,
+    )
     inspect = commands.add_parser("inspect", help="inspect durable run state")
-    inspect.add_argument("run_id")
-    _set_unavailable(inspect, "inspect")
+    configure_resume_parser(
+        inspect,
+        operation=ResumeOperation.INSPECT,
+        capture_protocol_pair=_capture_protocol_file_pair,
+        validate_json_depth=_validate_json_depth,
+        reject_duplicate_keys=_reject_duplicate_keys,
+    )
     verify = commands.add_parser("verify", help="verify a finding candidate")
     verify.add_argument("candidate_id")
     _set_unavailable(verify, "verify")
@@ -710,6 +735,9 @@ def main(argv: list[str] | None = None) -> int:
     except CliError as exc:
         print(f"faultloom: error: {exc}", file=sys.stderr)
         return exc.exit_code
+    except ResumeCliError as exc:
+        print(f"faultloom: error: {exc}", file=sys.stderr)
+        return EXIT_AUTHORITY
 
 
 if __name__ == "__main__":
