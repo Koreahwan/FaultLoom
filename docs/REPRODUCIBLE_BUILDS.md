@@ -81,10 +81,51 @@ libc, dynamic-loader, and kernel bytes remain explicitly `unverified`; therefore
 is still a reproducibility candidate rather than a hermetic release receipt. Artifacts
 include root `LICENSE` and `NOTICE` files and `SHA256SUMS`.
 
-The explicit `[gateway]` policy admits exactly the root workspace manifest, lock,
-Gateway package manifest, dependency-free package, and deterministic release profile.
-Tracked Cargo inputs without that policy, additional manifests or locks, build scripts,
-Cargo configuration, dependency sections, and lock drift fail before Cargo executes.
+The explicit `[gateway]` and `[cargo_vendor]` policies admit exactly the root workspace
+manifest, lock, Gateway package manifest, deterministic release profile, four exact direct
+pins with default features disabled (`base64` and `ed25519-dalek` with no features,
+`serde` with `derive,std`, and `serde_json` with `std`), and one generated crates.io source
+replacement. The current lock contains 31 registry
+packages and 43 dependency edges. Its registry package set must be bijective with the
+versioned directories under `vendor/`. Every lock checksum must equal the package checksum
+in that crate's `.cargo-checksum.json`, and every file named by that manifest is re-hashed.
+Missing, extra, symlink, git, path, checksum-drifted, and unlisted-source inputs fail before
+Cargo executes. First-party `build.rs` files remain forbidden. The policy separately names
+all nine admitted vendored build scripts; the observed set must match that list exactly, and
+each script must also be inside the lock/vendor graph and covered by its crate's file checksum
+manifest.
+
+Cargo runs with `--frozen --locked --offline` from the immutable source snapshot, using a
+new private empty `CARGO_HOME`; it cannot resolve dependencies from an ambient Cargo cache.
+The admitted `.cargo/config.toml` is byte-exact and can only replace crates.io with the
+tracked `vendor` directory. Package manifests must declare an approved SPDX expression.
+Declared package MSRVs may not exceed Rust 1.96.1; an absent upstream MSRV is retained as
+`undeclared`, not silently inferred. Every admitted crate must retain at least one non-empty
+top-level `LICENSE*`, `COPYING*`, or `COPYRIGHT*` file; those exact names travel in build
+context, SBOM, provenance, and the human inventory.
+
+Build-context schema 3 carries every Cargo purl, version, registry package checksum, license
+expression, declared-or-undeclared MSRV status, build-script flag, and dependency edge.
+CycloneDX emits 31 Cargo library components and the complete 43-edge transitive graph; the
+Gateway application node points to its four exact direct dependencies. The same records are
+included in provenance resolved dependencies. `docs/THIRD_PARTY_LICENSES.md` is the human
+inventory, while the authoritative license texts remain checksum-bound inside each vendored
+crate.
+
+The resolution-only verification lane may validate the complete graph without compiling:
+
+```bash
+cargo_home="$(mktemp -d)"
+trap 'rm -rf -- "$cargo_home"' EXIT
+CARGO_HOME="$cargo_home" CARGO_NET_OFFLINE=true \
+  cargo metadata --manifest-path Cargo.toml --format-version 1 \
+  --frozen --locked --offline
+```
+
+The temporary `CARGO_HOME` must be empty before invocation and removed afterward.
+
+Tracked Cargo inputs without the two applicable policies, additional first-party manifests
+or locks, non-canonical Cargo configuration, and lock drift fail before Cargo executes.
 The standalone builder uses the same staged toolchain path and cannot silently emit a
 Python-only artifact set when the Gateway policy is present:
 

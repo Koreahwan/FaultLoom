@@ -16,6 +16,10 @@ name = "faultloom-gateway"
 path = "src/main.rs"
 
 [dependencies]
+base64 = { version = "=0.22.1", default-features = false }
+ed25519-dalek = { version = "=2.2.0", default-features = false }
+serde = { version = "=1.0.228", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "=1.0.150", default-features = false, features = ["std"] }
 
 [lints.rust]
 unsafe_code = "forbid"

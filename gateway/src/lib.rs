@@ -1,17 +1,54 @@
+mod authority;
+mod boot_binding;
+mod canonical_json;
 pub mod channel;
 mod digest;
+mod installed_cli;
+mod installed_startup;
+mod installed_trust;
 pub mod ipc;
 mod kernel;
 pub mod lease;
 mod policy;
+mod protocol_time;
 pub mod scope;
+mod semantic_http;
+mod signed_protocol;
+mod signed_protocol_parse;
+mod supervisor_assembly;
+mod supervisor_bootstrap_io;
+mod supervisor_bootstrap_v4;
+mod supervisor_bootstrap_v4_codec;
+mod supervisor_durable;
+mod supervisor_install;
+pub mod supervisor_journal;
+mod supervisor_journal_codec;
+mod supervisor_journal_io;
+mod supervisor_policy;
+pub mod supervisor_protocol;
+mod supervisor_protocol_codec;
+mod supervisor_stdio;
+mod supervisor_wire;
 mod t13_epoch;
 mod transport;
+mod transport_outcome;
+
+#[cfg(test)]
+mod canonical_json_tests;
+#[cfg(test)]
+mod installed_startup_source_tests;
+#[cfg(test)]
+mod protocol_time_tests;
+#[cfg(test)]
+mod signed_protocol_tests;
+#[cfg(test)]
+mod t18_cancellation_tests;
 
 use std::io::{self, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use digest::Digest;
+pub use installed_cli::run_installed_cli;
 
 use ipc::{
     DeniedResponse, GatewayResponse, decode_request, encode_response, read_frame, write_frame,
@@ -176,76 +213,4 @@ mod authenticated_stdio_tests {
 }
 
 #[cfg(test)]
-mod source_boundary_tests {
-    use std::fs;
-    use std::path::Path;
-
-    #[test]
-    fn target_network_apis_exist_only_in_the_private_transport_module() {
-        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut matches = Vec::new();
-        for entry in fs::read_dir(&source).expect("read gateway source") {
-            let path = entry.expect("source entry").path();
-            if path.extension().and_then(|value| value.to_str()) != Some("rs") {
-                continue;
-            }
-            let text = fs::read_to_string(&path).expect("read Rust source");
-            let production = text.split("#[cfg(test)]").next().expect("source prefix");
-            if production.contains("TcpStream")
-                || production.contains("TcpListener")
-                || production.contains("UdpSocket")
-                || production.contains("ToSocketAddrs")
-            {
-                matches.push(path.file_name().expect("file name").to_owned());
-            }
-        }
-        assert_eq!(matches, ["transport.rs"]);
-    }
-
-    #[test]
-    fn crate_has_no_external_dependencies() {
-        let manifest = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
-            .expect("read Cargo manifest");
-        let dependency_section = manifest
-            .split("[dependencies]")
-            .nth(1)
-            .expect("dependency section")
-            .split("\n[")
-            .next()
-            .expect("next manifest section");
-        assert!(dependency_section.trim().is_empty());
-    }
-
-    #[test]
-    fn unsupported_action_classes_are_not_in_the_typed_api() {
-        let ipc = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ipc.rs"))
-            .expect("read IPC source");
-        let action_class = ipc
-            .split("pub enum ActionClass")
-            .nth(1)
-            .expect("ActionClass enum")
-            .split('}')
-            .next()
-            .expect("ActionClass body");
-        assert!(!action_class.contains("HighLoad"));
-        assert!(!action_class.contains("Destructive"));
-    }
-
-    #[test]
-    fn model_facing_dispatch_rpc_cannot_supply_boot_keys_or_epoch_receipts() {
-        let ipc = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ipc.rs"))
-            .expect("read IPC source");
-        for forbidden in [
-            "FLER",
-            "channel_key",
-            "gateway_challenge",
-            "SignedEpochEnvelope",
-            "verifier_receipt",
-        ] {
-            assert!(
-                !ipc.contains(forbidden),
-                "dispatch RPC unexpectedly exposes trusted epoch channel token {forbidden}"
-            );
-        }
-    }
-}
+mod source_boundary_tests;

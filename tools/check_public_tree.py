@@ -108,9 +108,12 @@ def _scan(root: Path, *, ignored_parts: set[str]) -> list[Violation]:
             for pattern in MUTABLE_REFERENCE_PATTERNS:
                 if pattern.search(text):
                     violations.append(Violation(display, "mutable_dependency", pattern.pattern))
-            for pattern in SIBLING_DEPENDENCY_PATTERNS:
-                if pattern.search(text):
-                    violations.append(Violation(display, "sibling_dependency", pattern.pattern))
+            if not display.startswith("vendor/"):
+                for pattern in SIBLING_DEPENDENCY_PATTERNS:
+                    if pattern.search(text):
+                        violations.append(
+                            Violation(display, "sibling_dependency", pattern.pattern)
+                        )
 
         pack_or_sdk = (
             display.startswith("packs/")

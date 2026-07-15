@@ -547,6 +547,11 @@ def verify(root: Path, *, rust_toolchain: str, run_tests: bool = True) -> dict[s
         "network": NETWORK_EXECUTION,
         "toolchain_verification": {
             "rust": "staged_rustc_cargo_closure_digest_probe_and_build_verified",
+            "cargo_vendor": (
+                "not_used"
+                if policy.cargo_vendor is None
+                else "lock_vendor_bijection_and_file_checksums_verified"
+            ),
             "source_revision": revision,
         },
     }

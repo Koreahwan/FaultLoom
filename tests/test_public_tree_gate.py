@@ -60,6 +60,16 @@ def test_untracked_generated_output_is_ignored(tmp_path: Path) -> None:
     assert scan(tmp_path) == []
 
 
+def test_vendored_source_skips_only_first_party_sibling_heuristic(tmp_path: Path) -> None:
+    make_policies(tmp_path)
+    crate = tmp_path / "vendor/example-1.0.0"
+    crate.mkdir(parents=True)
+    (crate / "Cargo.toml").write_text('path = "../core"\n', encoding="utf-8")
+    assert scan(tmp_path) == []
+    (crate / "README.md").write_text('image = "tool:latest"\n', encoding="utf-8")
+    assert {item.rule for item in scan(tmp_path)} == {"mutable_dependency"}
+
+
 def test_current_public_tree_passes() -> None:
     root = Path(__file__).resolve().parents[1]
     assert scan(root) == []

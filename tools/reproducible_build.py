@@ -26,7 +26,7 @@ import zipfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Literal, overload
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -38,6 +38,14 @@ from tools.rust_toolchain import (
     rustc_closure_sha256,
     sha256_file,
     stage_verified_toolchain,
+)
+from tools.cargo_vendor_graph import validate_vendor_graph
+from tools.cargo_vendor_policy import (
+    CargoVendorError,
+    CargoVendorGraph,
+    CargoVendorPolicy,
+    SnapshotFile,
+    parse_vendor_policy,
 )
 
 
@@ -74,13 +82,16 @@ UNSAFE_CI_ENVIRONMENT_KEYS = {
     "VIRTUAL_ENV",
 }
 CI_GATE_COMMAND = "python3 tools/verify_clean_checkout.py"
-NETWORK_EXECUTION = {
+NETWORK_EXECUTION: dict[str, Any] = {
     "mode": "offline_requested",
     "enforced": False,
     "controls": [
         "PIP_NO_INDEX",
         "UV_OFFLINE",
         "CARGO_NET_OFFLINE",
+        "CARGO_FROZEN_LOCKED_OFFLINE",
+        "CARGO_HOME_PRIVATE_EMPTY",
+        "CARGO_VENDOR_FILE_CHECKSUMS",
         "GIT_NO_LAZY_FETCH",
     ],
 }
@@ -205,6 +216,7 @@ class Policy:
     release_enabled: bool
     ci_external_trust_anchor: bool
     gateway: GatewayPolicy | None
+    cargo_vendor: CargoVendorPolicy | None
 
 
 @dataclass(frozen=True)
@@ -281,12 +293,10 @@ def _read_toml_bytes(data: bytes, display: str) -> dict[str, Any]:
 
 def load_policy(root: Path, *, revision: str = "HEAD") -> Policy:
     root = root.resolve()
-    raw = _read_toml_bytes(
-        _head_blob_for_path(root, "build-policy.toml", revision=revision),
-        f"build-policy.toml at {revision}",
-    )
-    if raw.get("schema_version") != 1:
-        raise BuildPolicyError("build-policy.toml must use schema_version = 1")
+    policy_bytes = _head_blob_for_path(root, "build-policy.toml", revision=revision)
+    raw = _read_toml_bytes(policy_bytes, f"build-policy.toml at {revision}")
+    if raw.get("schema_version") != 2:
+        raise BuildPolicyError("build-policy.toml must use schema_version = 2")
     hooks = raw.get("hooks")
     if not isinstance(hooks, dict):
         raise BuildPolicyError("build-policy.toml must define [hooks]")
@@ -349,6 +359,10 @@ def load_policy(root: Path, *, revision: str = "HEAD") -> Policy:
                 target=gateway_raw["target"],
                 cargo_sha256=gateway_raw["cargo_sha256"],
             )
+        try:
+            cargo_vendor = parse_vendor_policy(policy_bytes, raw["rust_version"])
+        except CargoVendorError as exc:
+            raise BuildPolicyError(str(exc)) from exc
         policy = Policy(
             python_version=raw["python_version"],
             python_runtime_verification=raw["python_runtime_verification"],
@@ -367,6 +381,7 @@ def load_policy(root: Path, *, revision: str = "HEAD") -> Policy:
             release_enabled=raw["release_enabled"],
             ci_external_trust_anchor=raw["ci_external_trust_anchor"],
             gateway=gateway,
+            cargo_vendor=cargo_vendor,
         )
     except (KeyError, TypeError) as exc:
         raise BuildPolicyError(f"invalid build policy field: {exc}") from exc
@@ -734,6 +749,10 @@ def validate_repository_policy(
         *policy.license_files,
         policy.sbom_hook,
         policy.provenance_hook,
+        root / "tools/__init__.py",
+        root / "tools/cargo_sbom.py",
+        root / "tools/cargo_vendor_graph.py",
+        root / "tools/cargo_vendor_policy.py",
     )
     for path in required_paths:
         head_bytes(path.relative_to(root).as_posix())
@@ -846,15 +865,32 @@ def _validate_gateway_repository(
     entries: dict[str, TrackedFile],
     head_bytes: Any,
 ) -> None:
-    manifests = {path for path in entries if PurePosixPath(path).name == "Cargo.toml"}
-    locks = {path for path in entries if PurePosixPath(path).name == "Cargo.lock"}
+    vendor_prefix = (
+        "" if policy.cargo_vendor is None else f"{policy.cargo_vendor.directory}/"
+    )
+    manifests = {
+        path
+        for path in entries
+        if PurePosixPath(path).name == "Cargo.toml"
+        and (not vendor_prefix or not path.startswith(vendor_prefix))
+    }
+    locks = {
+        path
+        for path in entries
+        if PurePosixPath(path).name == "Cargo.lock"
+        and (not vendor_prefix or not path.startswith(vendor_prefix))
+    }
     unsafe_controls = sorted(
         path
         for path in entries
-        if PurePosixPath(path).name == "build.rs"
+        if (
+            PurePosixPath(path).name == "build.rs"
+            and (not vendor_prefix or not path.startswith(vendor_prefix))
+        )
         or (
             ".cargo" in PurePosixPath(path).parts
             and PurePosixPath(path).name in {"config", "config.toml"}
+            and policy.cargo_vendor is None
         )
     )
     gateway = policy.gateway
@@ -915,7 +951,9 @@ def _validate_gateway_repository(
         },
         "lib": {"name": "faultloom_gateway", "path": "src/lib.rs"},
         "bin": [{"name": gateway.binary, "path": "src/main.rs"}],
-        "dependencies": {},
+        "dependencies": (
+            manifest.get("dependencies") if policy.cargo_vendor is not None else {}
+        ),
         "lints": {"rust": {"unsafe_code": "forbid"}},
     }
     if manifest != expected_manifest:
@@ -923,17 +961,49 @@ def _validate_gateway_repository(
             "Gateway package manifest contains an unsupported field or dependency"
         )
 
-    lock = _read_toml_bytes(head_bytes("Cargo.lock"), "Gateway Cargo.lock at HEAD")
-    if lock != {
-        "version": 4,
-        "package": [{"name": gateway.package, "version": gateway.version}],
-    }:
-        raise BuildPolicyError(
-            "Gateway lock must contain exactly one source-less package and no dependencies"
-        )
+    if policy.cargo_vendor is None:
+        lock = _read_toml_bytes(head_bytes("Cargo.lock"), "Gateway Cargo.lock at HEAD")
+        if lock != {
+            "version": 4,
+            "package": [{"name": gateway.package, "version": gateway.version}],
+        }:
+            raise BuildPolicyError(
+                "Gateway lock must contain exactly one source-less package and no dependencies"
+            )
+    else:
+        _cargo_graph_from_snapshot(policy, entries=entries, head_bytes=head_bytes)
     required_sources = {"gateway/src/lib.rs", "gateway/src/main.rs"}
     if not required_sources <= entries.keys():
         raise BuildPolicyError("Gateway library or binary source is missing from HEAD")
+
+
+def _cargo_graph_from_snapshot(
+    policy: Policy,
+    *,
+    entries: dict[str, TrackedFile],
+    head_bytes: Any,
+) -> CargoVendorGraph:
+    cargo_vendor = policy.cargo_vendor
+    if cargo_vendor is None:
+        raise BuildPolicyError("internal error: Cargo vendor graph requested without policy")
+    paths = sorted(
+        path
+        for path in entries
+        if path.startswith(".cargo/") or path.startswith(f"{cargo_vendor.directory}/")
+    )
+    snapshot = tuple(
+        SnapshotFile(path=path, mode=entries[path].mode, content=head_bytes(path))
+        for path in paths
+    )
+    try:
+        return validate_vendor_graph(
+            cargo_vendor,
+            head_bytes("gateway/Cargo.toml"),
+            head_bytes("Cargo.lock"),
+            snapshot,
+        )
+    except CargoVendorError as exc:
+        raise BuildPolicyError(str(exc)) from exc
 
 
 def rust_toolchain_spec(policy: Policy) -> RustToolchainSpec:
@@ -1574,6 +1644,18 @@ def build_wheel(
     return f"{distribution}-{version}-py3-none-any.whl", output.getvalue()
 
 
+@overload
+def _git(
+    root: Path, *arguments: str, binary: Literal[True]
+) -> bytes: ...
+
+
+@overload
+def _git(
+    root: Path, *arguments: str, binary: Literal[False] = False
+) -> str: ...
+
+
 def _git(root: Path, *arguments: str, binary: bool = False) -> bytes | str:
     environment = {
         key: value
@@ -1943,6 +2025,9 @@ def build_gateway_release(
     if gateway is None:
         raise BuildPolicyError("internal error: Gateway build requested without policy")
     admitted = _require_gateway_toolchain(policy, toolchain)
+    cargo = admitted.cargo
+    if cargo is None:
+        raise BuildPolicyError("internal error: admitted Gateway toolchain lacks Cargo")
     for ambient in (Path("/.cargo/config"), Path("/.cargo/config.toml")):
         if ambient.exists():
             raise BuildPolicyError(
@@ -1974,7 +2059,7 @@ def build_gateway_release(
             "TZ": "UTC",
         }
         command = [
-            str(admitted.cargo),
+            str(cargo),
             "build",
             "--manifest-path",
             str(snapshot / "Cargo.toml"),
@@ -1991,7 +2076,7 @@ def build_gateway_release(
         ]
         result = subprocess.run(
             command,
-            cwd=Path("/"),
+            cwd=snapshot,
             env=environment,
             check=False,
             capture_output=True,
@@ -2007,7 +2092,7 @@ def build_gateway_release(
         lock_sha256 = _sha256((snapshot / "Cargo.lock").read_bytes())
     if sha256_file(admitted.rustc) != policy.rustc_sha256:
         raise BuildPolicyError("Gateway staged rustc changed during the build")
-    if sha256_file(admitted.cargo) != gateway.cargo_sha256:
+    if sha256_file(cargo) != gateway.cargo_sha256:
         raise BuildPolicyError("Gateway staged Cargo changed during the build")
     if rustc_closure_sha256(admitted.rustc, policy.rustc_host) != policy.rustc_closure_sha256:
         raise BuildPolicyError("Gateway staged Rust closure changed during the build")
@@ -2077,8 +2162,26 @@ def make_build_context(
 ) -> dict[str, Any]:
     source_identity = git_identity(root) if source is None else dict(source)
     native_context = [_native_component(item) for item in native_artifacts]
+    cargo_graph = None
+    if policy.cargo_vendor is not None:
+        revision = source_identity["commit"]
+        entries = {
+            entry.path: entry for entry in _head_entries(root.resolve(), revision=revision)
+        }
+
+        def head_bytes(path: str) -> bytes:
+            entry = entries.get(path)
+            if entry is None:
+                raise BuildPolicyError(f"required Cargo vendor file is missing: {path}")
+            return _head_blob(root.resolve(), entry.object_id)
+
+        cargo_graph = _cargo_graph_from_snapshot(
+            policy,
+            entries=entries,
+            head_bytes=head_bytes,
+        )
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "builder": BUILDER_ID,
         "source_date_epoch": epoch,
         "source": source_identity,
@@ -2120,6 +2223,7 @@ def make_build_context(
         },
         "components": [_component(project) for project in projects],
         "native_artifacts": native_context,
+        "cargo_vendor": None if cargo_graph is None else cargo_graph.context(),
         "locked_dependencies": [
             {
                 "name": name,
@@ -2156,12 +2260,16 @@ def _run_metadata_hook(
         "UV_OFFLINE": "1",
         "CARGO_NET_OFFLINE": "true",
     }
-    hook_data = _head_blob_for_path(
-        root, hook.relative_to(root).as_posix(), revision=revision
-    )
     with tempfile.TemporaryDirectory(prefix=f"faultloom-{kind}-hook-") as raw_hook:
-        immutable_hook = Path(raw_hook) / "build_metadata_hook.py"
-        immutable_hook.write_bytes(hook_data)
+        hook_root = Path(raw_hook)
+        immutable_hook = hook_root / "tools/build_metadata_hook.py"
+        immutable_hook.parent.mkdir()
+        immutable_hook.write_bytes(
+            _head_blob_for_path(root, hook.relative_to(root).as_posix(), revision=revision)
+        )
+        for helper in ("tools/cargo_sbom.py", "tools/cargo_vendor_policy.py"):
+            helper_path = hook_root / helper
+            helper_path.write_bytes(_head_blob_for_path(root, helper, revision=revision))
         immutable_hook.chmod(0o700)
         result = subprocess.run(
             [
@@ -2171,7 +2279,7 @@ def _run_metadata_hook(
                 str(context_path),
                 str(output_path),
             ],
-            cwd=root,
+            cwd=hook_root,
             env=environment,
             check=False,
             capture_output=True,

@@ -1,516 +1,38 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::Digest;
 use crate::ipc::{ActionClass, DenialCode, DispatchRequest, FlowKind, valid_identifier};
 use crate::policy::{LeaseApproval, ScopeApproval, ScopeVerifier};
 
-const MAX_SIGNED_EPOCH_BYTES: usize = 16_384;
-const MAX_EPOCH_RECEIPT_BYTES: usize = MAX_SIGNED_EPOCH_BYTES * 2 + 4_096;
+mod clock;
+mod epoch;
+mod error;
+mod network;
+mod policy;
+mod supervisor;
 
-pub(crate) mod epoch_verifier_private {
-    pub trait Sealed {}
-}
-
-pub use crate::t13_epoch::{
-    AuthorityKeyStatus, ChannelTrustError, PinnedAuthorityKey, T13ReceiptEpochVerifier,
+pub use clock::{ScopeClock, SystemScopeClock};
+use epoch::verified_epoch_binding;
+pub use epoch::{
+    EpochAdmissionError, EpochVerifier, SignedEpochEnvelope, UnavailableEpochVerifier,
+    VerifiedScopeEpoch,
+};
+pub(crate) use epoch::{VerifiedScopeEpochParts, epoch_verifier_private};
+pub use error::ScopePolicyError;
+pub use network::IpNetwork;
+use network::is_special_address;
+pub use policy::{ExplicitDenyRule, ScopePolicy, TargetRule, TimeWindow};
+pub use supervisor::{
+    CancellationCause, ScopeCancellation, ScopeCancellationReport, ScopeCancellationSink,
 };
 
-pub trait ScopeClock {
-    fn now_millis(&self) -> u64;
-}
-
-pub struct SystemScopeClock;
-
-impl ScopeClock for SystemScopeClock {
-    fn now_millis(&self) -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |value| value.as_millis().try_into().unwrap_or(u64::MAX))
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SignedEpochEnvelope {
-    canonical_bytes: Vec<u8>,
-    verifier_receipt: Option<Vec<u8>>,
-}
-
-impl SignedEpochEnvelope {
-    pub fn new(canonical_bytes: Vec<u8>) -> Result<Self, EpochAdmissionError> {
-        if canonical_bytes.is_empty() || canonical_bytes.len() > MAX_SIGNED_EPOCH_BYTES {
-            return Err(EpochAdmissionError::InvalidEnvelope);
-        }
-        Ok(Self {
-            canonical_bytes,
-            verifier_receipt: None,
-        })
-    }
-
-    pub fn with_verifier_receipt(
-        canonical_bytes: Vec<u8>,
-        verifier_receipt: Vec<u8>,
-    ) -> Result<Self, EpochAdmissionError> {
-        let mut envelope = Self::new(canonical_bytes)?;
-        if verifier_receipt.is_empty() || verifier_receipt.len() > MAX_EPOCH_RECEIPT_BYTES {
-            return Err(EpochAdmissionError::InvalidVerificationReceipt);
-        }
-        envelope.verifier_receipt = Some(verifier_receipt);
-        Ok(envelope)
-    }
-
-    pub fn canonical_bytes(&self) -> &[u8] {
-        &self.canonical_bytes
-    }
-
-    pub(crate) fn digest(&self) -> Digest {
-        Digest::of(&self.canonical_bytes)
-    }
-
-    pub fn verifier_receipt_bytes(&self) -> Option<&[u8]> {
-        self.verifier_receipt.as_deref()
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VerifiedScopeEpoch {
-    grant_id: String,
-    epoch: u64,
-    issued_at_millis: u64,
-    expires_at_millis: u64,
-    revoked: bool,
-    revocation_reason: Option<String>,
-    key_id: String,
-    signature_sequence: u64,
-    envelope_digest: Digest,
-    payload_digest: Digest,
-    verifier_receipt_digest: Digest,
-    gateway_boot_id: String,
-    verification_nonce: [u8; 16],
-}
-
-impl VerifiedScopeEpoch {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn from_trusted_verifier(
-        grant_id: String,
-        epoch: u64,
-        issued_at_millis: u64,
-        expires_at_millis: u64,
-        revoked: bool,
-        revocation_reason: Option<String>,
-        key_id: String,
-        signature_sequence: u64,
-        envelope_digest: Digest,
-        payload_digest: Digest,
-        verifier_receipt_digest: Digest,
-        gateway_boot_id: String,
-        verification_nonce: [u8; 16],
-    ) -> Self {
-        Self {
-            grant_id,
-            epoch,
-            issued_at_millis,
-            expires_at_millis,
-            revoked,
-            revocation_reason,
-            key_id,
-            signature_sequence,
-            envelope_digest,
-            payload_digest,
-            verifier_receipt_digest,
-            gateway_boot_id,
-            verification_nonce,
-        }
-    }
-
-    pub fn grant_id(&self) -> &str {
-        &self.grant_id
-    }
-
-    pub fn epoch(&self) -> u64 {
-        self.epoch
-    }
-}
-
-pub trait EpochVerifier: epoch_verifier_private::Sealed {
-    fn verify(
-        &self,
-        envelope: &SignedEpochEnvelope,
-        now_millis: u64,
-    ) -> Result<VerifiedScopeEpoch, EpochAdmissionError>;
-}
-
-pub struct UnavailableEpochVerifier;
-
-impl epoch_verifier_private::Sealed for UnavailableEpochVerifier {}
-
-impl EpochVerifier for UnavailableEpochVerifier {
-    fn verify(
-        &self,
-        _envelope: &SignedEpochEnvelope,
-        _now_millis: u64,
-    ) -> Result<VerifiedScopeEpoch, EpochAdmissionError> {
-        Err(EpochAdmissionError::VerifierUnavailable)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EpochAdmissionError {
-    InvalidEnvelope,
-    VerifierUnavailable,
-    VerificationFailed,
-    UnknownKey,
-    TrustAnchorRevoked,
-    GrantMismatch,
-    NotYetValid,
-    Expired,
-    InvalidValidity,
-    InvalidVerificationReceipt,
-    Rollback,
-    Replay,
-    StateUnavailable,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct IpNetwork {
-    address: IpAddr,
-    prefix: u8,
-}
-
-impl IpNetwork {
-    pub fn new(address: IpAddr, prefix: u8) -> Result<Self, ScopePolicyError> {
-        let (address, prefix) = canonical_network(address, prefix)?;
-        let maximum = if address.is_ipv4() { 32 } else { 128 };
-        if prefix > maximum {
-            return Err(ScopePolicyError::InvalidNetwork);
-        }
-        Ok(Self {
-            address: mask_ip(address, prefix),
-            prefix,
-        })
-    }
-
-    fn contains(self, candidate: IpAddr) -> bool {
-        match (self.address, canonical_ip(candidate)) {
-            (IpAddr::V4(network), IpAddr::V4(candidate)) => {
-                mask_v4(candidate, self.prefix) == network
-            }
-            (IpAddr::V6(network), IpAddr::V6(candidate)) => {
-                mask_v6(candidate, self.prefix) == network
-            }
-            _ => false,
-        }
-    }
-}
-
-fn canonical_network(address: IpAddr, prefix: u8) -> Result<(IpAddr, u8), ScopePolicyError> {
-    match address {
-        IpAddr::V6(address) => match address.to_ipv4_mapped() {
-            Some(mapped) if prefix >= 96 => Ok((IpAddr::V4(mapped), prefix - 96)),
-            Some(_) => Err(ScopePolicyError::InvalidNetwork),
-            None => Ok((IpAddr::V6(address), prefix)),
-        },
-        IpAddr::V4(address) => Ok((IpAddr::V4(address), prefix)),
-    }
-}
-
-fn canonical_ip(address: IpAddr) -> IpAddr {
-    match address {
-        IpAddr::V6(address) => address
-            .to_ipv4_mapped()
-            .map_or(IpAddr::V6(address), IpAddr::V4),
-        IpAddr::V4(address) => IpAddr::V4(address),
-    }
-}
-
-fn mask_ip(address: IpAddr, prefix: u8) -> IpAddr {
-    match address {
-        IpAddr::V4(address) => IpAddr::V4(mask_v4(address, prefix)),
-        IpAddr::V6(address) => IpAddr::V6(mask_v6(address, prefix)),
-    }
-}
-
-fn mask_v4(address: Ipv4Addr, prefix: u8) -> Ipv4Addr {
-    let mask = if prefix == 0 {
-        0
-    } else {
-        u32::MAX << (32 - prefix)
-    };
-    Ipv4Addr::from(u32::from(address) & mask)
-}
-
-fn mask_v6(address: Ipv6Addr, prefix: u8) -> Ipv6Addr {
-    let mask = if prefix == 0 {
-        0
-    } else {
-        u128::MAX << (128 - prefix)
-    };
-    Ipv6Addr::from(u128::from(address) & mask)
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TimeWindow {
-    pub starts_at_millis: u64,
-    pub ends_at_millis: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TargetRule {
-    pub target_id: String,
-    pub host_patterns: Vec<String>,
-    pub networks: Vec<IpNetwork>,
-    pub ports: Vec<u16>,
-    pub protocols: Vec<String>,
-    pub path_patterns: Vec<String>,
-    pub methods: Vec<String>,
-    pub supporting_read_only: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExplicitDenyRule {
-    pub deny_id: String,
-    pub target_id: Option<String>,
-    pub host_pattern: Option<String>,
-    pub path_pattern: Option<String>,
-    pub methods: Vec<String>,
-    pub action_families: Vec<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ScopePolicy {
-    pub grant_id: String,
-    pub grant_version: u64,
-    pub targets: Vec<TargetRule>,
-    pub pack_ids: Vec<String>,
-    pub allowed_classes: Vec<ActionClass>,
-    pub allowed_families: Vec<String>,
-    pub allowed_methods: Vec<String>,
-    pub allowed_path_patterns: Vec<String>,
-    pub denied: Vec<ExplicitDenyRule>,
-    pub identities: Vec<String>,
-    pub tenants: Vec<String>,
-    pub execution_windows: Vec<TimeWindow>,
-    pub state_change_families: Vec<String>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ScopePolicyError {
-    InvalidIdentifier,
-    DuplicateIdentifier,
-    InvalidHostPattern,
-    InvalidNetwork,
-    InvalidPort,
-    InvalidProtocol,
-    InvalidMethod,
-    InvalidPathPattern,
-    InvalidTimeWindow,
-    EmptyRequiredAllowlist,
-}
-
-impl ScopePolicy {
-    fn validate(&self) -> Result<(), ScopePolicyError> {
-        if !valid_identifier(&self.grant_id) || self.grant_version == 0 {
-            return Err(ScopePolicyError::InvalidIdentifier);
-        }
-        validate_identifiers(&self.pack_ids, true)?;
-        validate_identifiers(&self.allowed_families, true)?;
-        validate_identifiers(&self.identities, true)?;
-        validate_identifiers(&self.tenants, false)?;
-        validate_identifiers(&self.state_change_families, false)?;
-        validate_methods(&self.allowed_methods, true)?;
-        validate_paths(&self.allowed_path_patterns, true)?;
-        if self.allowed_classes.is_empty() || self.execution_windows.is_empty() {
-            return Err(ScopePolicyError::EmptyRequiredAllowlist);
-        }
-        let class_count = self
-            .allowed_classes
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>()
-            .len();
-        if class_count != self.allowed_classes.len() {
-            return Err(ScopePolicyError::DuplicateIdentifier);
-        }
-        for window in &self.execution_windows {
-            if window.ends_at_millis <= window.starts_at_millis {
-                return Err(ScopePolicyError::InvalidTimeWindow);
-            }
-        }
-        let mut target_ids = BTreeSet::new();
-        if self.targets.is_empty() {
-            return Err(ScopePolicyError::EmptyRequiredAllowlist);
-        }
-        for target in &self.targets {
-            if !valid_identifier(&target.target_id) || !target_ids.insert(&target.target_id) {
-                return Err(if valid_identifier(&target.target_id) {
-                    ScopePolicyError::DuplicateIdentifier
-                } else {
-                    ScopePolicyError::InvalidIdentifier
-                });
-            }
-            if target.host_patterns.is_empty() && target.networks.is_empty() {
-                return Err(ScopePolicyError::EmptyRequiredAllowlist);
-            }
-            validate_host_patterns(&target.host_patterns)?;
-            validate_unique_ports(&target.ports)?;
-            validate_protocols(&target.protocols, true)?;
-            validate_methods(&target.methods, true)?;
-            validate_paths(&target.path_patterns, true)?;
-        }
-        let mut deny_ids = BTreeSet::new();
-        for deny in &self.denied {
-            if !valid_identifier(&deny.deny_id) || !deny_ids.insert(&deny.deny_id) {
-                return Err(if valid_identifier(&deny.deny_id) {
-                    ScopePolicyError::DuplicateIdentifier
-                } else {
-                    ScopePolicyError::InvalidIdentifier
-                });
-            }
-            if deny
-                .target_id
-                .as_deref()
-                .is_some_and(|value| !valid_identifier(value))
-            {
-                return Err(ScopePolicyError::InvalidIdentifier);
-            }
-            if let Some(pattern) = &deny.host_pattern {
-                validate_host_pattern(pattern)?;
-            }
-            if let Some(pattern) = &deny.path_pattern {
-                validate_path_pattern(pattern)?;
-            }
-            validate_methods(&deny.methods, false)?;
-            validate_identifiers(&deny.action_families, false)?;
-        }
-        Ok(())
-    }
-}
-
-fn validate_identifiers(values: &[String], required: bool) -> Result<(), ScopePolicyError> {
-    if required && values.is_empty() {
-        return Err(ScopePolicyError::EmptyRequiredAllowlist);
-    }
-    if values.iter().any(|value| !valid_identifier(value)) {
-        return Err(ScopePolicyError::InvalidIdentifier);
-    }
-    if values.iter().collect::<BTreeSet<_>>().len() != values.len() {
-        return Err(ScopePolicyError::DuplicateIdentifier);
-    }
-    Ok(())
-}
-
-fn validate_unique_ports(values: &[u16]) -> Result<(), ScopePolicyError> {
-    if values.is_empty() {
-        return Err(ScopePolicyError::EmptyRequiredAllowlist);
-    }
-    if values.contains(&0) {
-        return Err(ScopePolicyError::InvalidPort);
-    }
-    if values.iter().collect::<BTreeSet<_>>().len() != values.len() {
-        return Err(ScopePolicyError::DuplicateIdentifier);
-    }
-    Ok(())
-}
-
-fn validate_protocols(values: &[String], required: bool) -> Result<(), ScopePolicyError> {
-    if required && values.is_empty() {
-        return Err(ScopePolicyError::EmptyRequiredAllowlist);
-    }
-    if values.iter().any(|value| {
-        value.is_empty()
-            || value.len() > 16
-            || value != &value.to_ascii_lowercase()
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-    }) {
-        return Err(ScopePolicyError::InvalidProtocol);
-    }
-    if values.iter().collect::<BTreeSet<_>>().len() != values.len() {
-        return Err(ScopePolicyError::DuplicateIdentifier);
-    }
-    Ok(())
-}
-
-fn validate_methods(values: &[String], required: bool) -> Result<(), ScopePolicyError> {
-    if required && values.is_empty() {
-        return Err(ScopePolicyError::EmptyRequiredAllowlist);
-    }
-    if values.iter().any(|value| {
-        value.is_empty()
-            || value.len() > 32
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'-')
-    }) {
-        return Err(ScopePolicyError::InvalidMethod);
-    }
-    if values.iter().collect::<BTreeSet<_>>().len() != values.len() {
-        return Err(ScopePolicyError::DuplicateIdentifier);
-    }
-    Ok(())
-}
-
-fn validate_paths(values: &[String], required: bool) -> Result<(), ScopePolicyError> {
-    if required && values.is_empty() {
-        return Err(ScopePolicyError::EmptyRequiredAllowlist);
-    }
-    for value in values {
-        validate_path_pattern(value)?;
-    }
-    if values.iter().collect::<BTreeSet<_>>().len() != values.len() {
-        return Err(ScopePolicyError::DuplicateIdentifier);
-    }
-    Ok(())
-}
-
-fn validate_path_pattern(value: &str) -> Result<(), ScopePolicyError> {
-    let prefix = value.strip_suffix('*').unwrap_or(value);
-    if value.is_empty()
-        || value.len() > 4_096
-        || !value.starts_with('/')
-        || prefix.contains('*')
-        || value
-            .bytes()
-            .any(|byte| !byte.is_ascii_graphic() || byte == b'#' || byte == b'?')
-    {
-        return Err(ScopePolicyError::InvalidPathPattern);
-    }
-    Ok(())
-}
-
-fn validate_host_patterns(values: &[String]) -> Result<(), ScopePolicyError> {
-    for value in values {
-        validate_host_pattern(value)?;
-    }
-    if values.iter().collect::<BTreeSet<_>>().len() != values.len() {
-        return Err(ScopePolicyError::DuplicateIdentifier);
-    }
-    Ok(())
-}
-
-fn validate_host_pattern(value: &str) -> Result<(), ScopePolicyError> {
-    let host = value.strip_prefix("*.").unwrap_or(value);
-    if host.is_empty()
-        || host.len() > 253
-        || host != host.to_ascii_lowercase()
-        || host.ends_with('.')
-        || host.split('.').any(|label| {
-            label.is_empty()
-                || label.len() > 63
-                || !label.as_bytes()[0].is_ascii_alphanumeric()
-                || !label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
-                || !label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        })
-    {
-        return Err(ScopePolicyError::InvalidHostPattern);
-    }
-    Ok(())
-}
+pub use crate::t13_epoch::T13ReceiptEpochVerifier;
+pub(crate) use crate::t13_epoch::{
+    ExpectedScopeEpochGrant, GatewayBootBinding, ReceiptAuthenticationChannel,
+    T13EpochVerifierConfig,
+};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ResourceKind {
@@ -530,13 +52,6 @@ pub struct ScopedResource {
     pub scope_epoch: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CancellationCause {
-    EpochAdvanced,
-    ScopeRevoked,
-    EpochExpired,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CancellationRecord {
     pub resource: ScopedResource,
@@ -545,24 +60,28 @@ pub struct CancellationRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ScopeCancellation {
-    pub grant_id: String,
-    pub grant_version: u64,
-    pub invalidated_through_epoch: u64,
-    pub revoked_at_epoch: Option<u64>,
-    pub cause: CancellationCause,
-}
-
-pub trait ScopeCancellationSink: Send + Sync {
-    fn cancel_scope(&self, cancellation: &ScopeCancellation) -> Result<(), DenialCode>;
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EpochTransition {
     pub previous_epoch: Option<u64>,
     pub current_epoch: u64,
     pub revoked: bool,
     pub cancellations: Vec<CancellationRecord>,
+    pub interrupted_active: u64,
+}
+
+impl EpochTransition {
+    pub fn interrupted_resources(&self) -> u64 {
+        u64::try_from(self.cancellations.len())
+            .unwrap_or(u64::MAX)
+            .max(self.interrupted_active)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PreparedScopeDispatch {
+    pub(crate) scope_proof: Vec<u8>,
+    pub(crate) authority_key_id: String,
+    pub(crate) scope_epoch_binding_digest: Digest,
+    pub(crate) gateway_boot_id: String,
 }
 
 #[derive(Clone, Debug)]
@@ -601,15 +120,6 @@ where
 {
     pub fn new(policy: ScopePolicy, verifier: V, clock: C) -> Result<Self, ScopePolicyError> {
         Self::build(policy, verifier, clock, None)
-    }
-
-    pub fn new_with_cancellation_sink(
-        policy: ScopePolicy,
-        verifier: V,
-        clock: C,
-        cancellation_sink: Arc<dyn ScopeCancellationSink>,
-    ) -> Result<Self, ScopePolicyError> {
-        Self::build(policy, verifier, clock, Some(cancellation_sink))
     }
 
     fn build(
@@ -684,10 +194,12 @@ where
                 cause,
             })
         };
-        if let Some(cancellation) = scope_cancellation.as_ref() {
+        let cancellation_report = if let Some(cancellation) = scope_cancellation.as_ref() {
             self.notify_cancellation(cancellation)
-                .map_err(|_| EpochAdmissionError::StateUnavailable)?;
-        }
+                .map_err(|_| EpochAdmissionError::StateUnavailable)?
+        } else {
+            ScopeCancellationReport::default()
+        };
         let cancellations = cancel_all(&mut state, verified.epoch, cause);
         let binding_digest = verified_epoch_binding(&verified);
         state.current_epoch = Some(AdmittedEpoch {
@@ -708,6 +220,7 @@ where
             current_epoch: verified.epoch,
             revoked: verified.revoked,
             cancellations,
+            interrupted_active: cancellation_report.interrupted_active,
         })
     }
 
@@ -744,13 +257,41 @@ where
     }
 
     pub fn issue_scope_proof(&self, request: &DispatchRequest) -> Result<Vec<u8>, DenialCode> {
+        self.prepare_dispatch(request)
+            .map(|prepared| prepared.scope_proof)
+    }
+
+    pub(crate) fn prepare_dispatch(
+        &self,
+        request: &DispatchRequest,
+    ) -> Result<PreparedScopeDispatch, DenialCode> {
         let now = self.clock.now_millis();
         let mut state = self.state.lock().map_err(|_| DenialCode::ScopeDenied)?;
         self.reconcile_expiry(&mut state, now)?;
         let epoch = evaluate(&self.policy, &state, request, now)?;
-        Ok(scope_proof(epoch.binding_digest, request)
-            .as_bytes()
-            .to_vec())
+        Ok(PreparedScopeDispatch {
+            scope_proof: scope_proof(epoch.binding_digest, request)
+                .as_bytes()
+                .to_vec(),
+            authority_key_id: epoch.authority_key_id.clone(),
+            scope_epoch_binding_digest: epoch.binding_digest,
+            gateway_boot_id: epoch.gateway_boot_id.clone(),
+        })
+    }
+
+    pub fn reconcile_expiry_now(&self) -> Result<u64, DenialCode> {
+        let now = self.clock.now_millis();
+        let mut state = self.state.lock().map_err(|_| DenialCode::ScopeDenied)?;
+        let cancellation_count = state.cancellation_log.len();
+        let cancellation_report = self.reconcile_expiry(&mut state, now)?;
+        let interrupted_resources = u64::try_from(
+            state
+                .cancellation_log
+                .len()
+                .saturating_sub(cancellation_count),
+        )
+        .map_err(|_| DenialCode::ScopeDenied)?;
+        Ok(interrupted_resources.max(cancellation_report.interrupted_active))
     }
 
     pub fn register_resource(&self, resource: ScopedResource) -> Result<(), DenialCode> {
@@ -810,7 +351,11 @@ where
             .map_err(|_| DenialCode::ScopeDenied)
     }
 
-    fn reconcile_expiry(&self, state: &mut ScopeState, now: u64) -> Result<(), DenialCode> {
+    fn reconcile_expiry(
+        &self,
+        state: &mut ScopeState,
+        now: u64,
+    ) -> Result<ScopeCancellationReport, DenialCode> {
         let Some(cancellation) = state.current_epoch.as_ref().and_then(|epoch| {
             (now >= epoch.expires_at_millis && !epoch.cancellation_applied).then(|| {
                 ScopeCancellation {
@@ -822,9 +367,9 @@ where
                 }
             })
         }) else {
-            return Ok(());
+            return Ok(ScopeCancellationReport::default());
         };
-        self.notify_cancellation(&cancellation)?;
+        let cancellation_report = self.notify_cancellation(&cancellation)?;
         cancel_all(
             state,
             cancellation.invalidated_through_epoch,
@@ -833,15 +378,7 @@ where
         if let Some(epoch) = state.current_epoch.as_mut() {
             epoch.cancellation_applied = true;
         }
-        Ok(())
-    }
-
-    fn notify_cancellation(&self, cancellation: &ScopeCancellation) -> Result<(), DenialCode> {
-        if let Some(sink) = self.cancellation_sink.as_ref() {
-            sink.cancel_scope(cancellation)
-        } else {
-            Ok(())
-        }
+        Ok(cancellation_report)
     }
 }
 
@@ -858,6 +395,15 @@ where
         let authority_key_id = epoch.authority_key_id.clone();
         let scope_epoch_binding_digest = epoch.binding_digest;
         let gateway_boot_id = epoch.gateway_boot_id.clone();
+        let valid_until_millis = self
+            .policy
+            .execution_windows
+            .iter()
+            .filter(|window| window.starts_at_millis <= now && now < window.ends_at_millis)
+            .map(|window| window.ends_at_millis)
+            .max()
+            .unwrap_or(now)
+            .min(epoch.expires_at_millis);
         let expected_proof = scope_proof(scope_epoch_binding_digest, request);
         if request.scope_proof.as_slice() != expected_proof.as_bytes() {
             return Err(DenialCode::ScopeProofInvalid);
@@ -883,6 +429,7 @@ where
             action_kind: request.action_kind,
             action_class: request.action_class,
             required_features: request.required_features.clone(),
+            valid_until_millis,
         })
     }
 
@@ -1041,39 +588,6 @@ fn target_matches(target: &TargetRule, request: &DispatchRequest) -> bool {
         && matches_any_path(&target.path_patterns, &request.path)
 }
 
-fn is_special_address(address: IpAddr) -> bool {
-    match canonical_ip(address) {
-        IpAddr::V4(address) => {
-            let value = u32::from(address);
-            value >> 24 == 0
-                || address.is_loopback()
-                || address.is_private()
-                || address.is_link_local()
-                || address.is_multicast()
-                || value >> 22 == u32::from(Ipv4Addr::new(100, 64, 0, 0)) >> 22
-                || value >> 8 == u32::from(Ipv4Addr::new(192, 0, 0, 0)) >> 8
-                || value >> 8 == u32::from(Ipv4Addr::new(192, 0, 2, 0)) >> 8
-                || value >> 17 == u32::from(Ipv4Addr::new(198, 18, 0, 0)) >> 17
-                || value >= u32::from(Ipv4Addr::new(240, 0, 0, 0))
-                || value >> 8 == u32::from(Ipv4Addr::new(198, 51, 100, 0)) >> 8
-                || value >> 8 == u32::from(Ipv4Addr::new(203, 0, 113, 0)) >> 8
-        }
-        IpAddr::V6(address) => {
-            let value = u128::from(address);
-            address.is_unspecified()
-                || address.is_loopback()
-                || address.is_multicast()
-                || value >> 32 == 0
-                || value >> 64 == u128::from(Ipv6Addr::new(0x0100, 0, 0, 0, 0, 0, 0, 0)) >> 64
-                || value >> 121 == u128::from(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0)) >> 121
-                || value >> 118 == u128::from(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0)) >> 118
-                || value >> 118 == u128::from(Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 0)) >> 118
-                || value >> 80 == u128::from(Ipv6Addr::new(0x2001, 2, 0, 0, 0, 0, 0, 0)) >> 80
-                || value >> 96 == u128::from(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0)) >> 96
-        }
-    }
-}
-
 fn matches_host(pattern: &str, hostname: &str) -> bool {
     pattern.strip_prefix("*.").map_or_else(
         || pattern == hostname,
@@ -1105,23 +619,6 @@ fn scope_proof(epoch_binding: Digest, request: &DispatchRequest) -> Digest {
     bytes.extend_from_slice(request.decision_digest.as_bytes());
     bytes.extend_from_slice(&(request.lease_id.len() as u32).to_be_bytes());
     bytes.extend_from_slice(request.lease_id.as_bytes());
-    Digest::of(&bytes)
-}
-
-fn verified_epoch_binding(epoch: &VerifiedScopeEpoch) -> Digest {
-    let mut bytes = Vec::with_capacity(256);
-    bytes.extend_from_slice(b"faultloom-verified-scope-epoch-v1\0");
-    bytes.extend_from_slice(epoch.envelope_digest.as_bytes());
-    bytes.extend_from_slice(epoch.payload_digest.as_bytes());
-    bytes.extend_from_slice(epoch.verifier_receipt_digest.as_bytes());
-    bytes.extend_from_slice(&(epoch.grant_id.len() as u32).to_be_bytes());
-    bytes.extend_from_slice(epoch.grant_id.as_bytes());
-    bytes.extend_from_slice(&epoch.epoch.to_be_bytes());
-    bytes.extend_from_slice(&epoch.issued_at_millis.to_be_bytes());
-    bytes.extend_from_slice(&epoch.expires_at_millis.to_be_bytes());
-    bytes.push(u8::from(epoch.revoked));
-    bytes.extend_from_slice(&(epoch.key_id.len() as u32).to_be_bytes());
-    bytes.extend_from_slice(epoch.key_id.as_bytes());
     Digest::of(&bytes)
 }
 
@@ -1161,7 +658,7 @@ mod tests {
     use crate::lease::{
         GrantBudget, LeaseAuthority, LeaseBudgetReservation, LeaseSpec, ReconciliationAuthority,
     };
-    use crate::policy::{ActionCompiler, CompiledAction, LeaseVerifier};
+    use crate::policy::{ActionCompiler, CompiledAction};
     use crate::transport::TcpTargetTransport;
 
     #[derive(Clone)]
@@ -1201,6 +698,12 @@ mod tests {
                 semantic_action_digest: request.semantic_action_digest,
                 resolution_digest: request.resolution_digest,
                 request_binding_digest: request.lease_binding_digest(),
+                effect_digest: crate::policy::target_effect_digest(
+                    request.action_kind,
+                    request.egress_plane,
+                    request.resolution_digest,
+                    Digest::of(&request.payload),
+                ),
                 bytes: request.payload.clone(),
             })
         }
@@ -1275,9 +778,17 @@ mod tests {
             authority_key_id: "authority-key:1".to_owned(),
             scope_epoch_binding_digest,
             gateway_boot_id: "gateway-boot:fixture".to_owned(),
+            control_envelope_id: Digest::of(b"fixture authenticated control envelope"),
             request_binding_digest: request.lease_binding_digest(),
             semantic_action_digest: request.semantic_action_digest,
             resolution_digest: request.resolution_digest,
+            compiled_request_digest: Digest::of(&request.payload),
+            effect_digest: crate::policy::target_effect_digest(
+                request.action_kind,
+                request.egress_plane,
+                request.resolution_digest,
+                Digest::of(&request.payload),
+            ),
             correlation_id: request.correlation_id.clone(),
             egress_plane: request.egress_plane,
             dispatch_nonce: request.dispatch_nonce,
@@ -1316,6 +827,25 @@ mod tests {
         }
     }
 
+    struct ReportingCancellationSink {
+        interrupted_active: u64,
+    }
+
+    impl ScopeCancellationSink for ReportingCancellationSink {
+        fn cancel_scope(&self, _cancellation: &ScopeCancellation) -> Result<(), DenialCode> {
+            Ok(())
+        }
+
+        fn cancel_scope_with_report(
+            &self,
+            _cancellation: &ScopeCancellation,
+        ) -> Result<ScopeCancellationReport, DenialCode> {
+            Ok(ScopeCancellationReport {
+                interrupted_active: self.interrupted_active,
+            })
+        }
+    }
+
     #[derive(Clone)]
     struct FixtureVerifier {
         envelope_digest: Digest,
@@ -1335,19 +865,21 @@ mod tests {
                 return Err(EpochAdmissionError::VerificationFailed);
             }
             Ok(VerifiedScopeEpoch::from_trusted_verifier(
-                "grant:owned".to_owned(),
-                self.epoch,
-                900,
-                2_000,
-                self.revoked,
-                self.revoked.then(|| "operator revoke".to_owned()),
-                "authority-key:1".to_owned(),
-                self.epoch,
-                envelope.digest(),
-                Digest::of(b"signed-payload"),
-                Digest::of(b"t13-verification-receipt"),
-                "gateway-boot:fixture".to_owned(),
-                [self.epoch as u8; 16],
+                VerifiedScopeEpochParts {
+                    grant_id: "grant:owned".to_owned(),
+                    epoch: self.epoch,
+                    issued_at_millis: 900,
+                    expires_at_millis: 2_000,
+                    revoked: self.revoked,
+                    revocation_reason: self.revoked.then(|| "operator revoke".to_owned()),
+                    key_id: "authority-key:1".to_owned(),
+                    signature_sequence: self.epoch,
+                    envelope_digest: envelope.digest(),
+                    payload_digest: Digest::of(b"signed-payload"),
+                    verifier_receipt_digest: Digest::of(b"t13-verification-receipt"),
+                    gateway_boot_id: "gateway-boot:fixture".to_owned(),
+                    verification_nonce: [self.epoch as u8; 16],
+                },
             ))
         }
     }
@@ -1376,19 +908,21 @@ mod tests {
                 .find(|(candidate, _, _, _)| *candidate == digest)
                 .ok_or(EpochAdmissionError::VerificationFailed)?;
             Ok(VerifiedScopeEpoch::from_trusted_verifier(
-                grant_id.clone(),
-                *epoch,
-                900,
-                2_000,
-                false,
-                None,
-                "authority-key:1".to_owned(),
-                *epoch,
-                digest,
-                Digest::of(b"signed-payload"),
-                Digest::of(envelope.canonical_bytes()),
-                "gateway-boot:fixture".to_owned(),
-                *nonce,
+                VerifiedScopeEpochParts {
+                    grant_id: grant_id.clone(),
+                    epoch: *epoch,
+                    issued_at_millis: 900,
+                    expires_at_millis: 2_000,
+                    revoked: false,
+                    revocation_reason: None,
+                    key_id: "authority-key:1".to_owned(),
+                    signature_sequence: *epoch,
+                    envelope_digest: digest,
+                    payload_digest: Digest::of(b"signed-payload"),
+                    verifier_receipt_digest: Digest::of(envelope.canonical_bytes()),
+                    gateway_boot_id: "gateway-boot:fixture".to_owned(),
+                    verification_nonce: *nonce,
+                },
             ))
         }
     }
@@ -1408,19 +942,22 @@ mod tests {
                 .find(|(candidate, _, _)| *candidate == digest)
                 .ok_or(EpochAdmissionError::VerificationFailed)?;
             Ok(VerifiedScopeEpoch::from_trusted_verifier(
-                "grant:owned".to_owned(),
-                *epoch,
-                900,
-                2_000_u64.saturating_add(epoch.saturating_sub(7).saturating_mul(1_000)),
-                *revoked,
-                revoked.then(|| "operator revoke".to_owned()),
-                "authority-key:1".to_owned(),
-                *epoch,
-                digest,
-                Digest::of(b"signed-payload"),
-                Digest::of(b"t13-verification-receipt"),
-                "gateway-boot:fixture".to_owned(),
-                [*epoch as u8; 16],
+                VerifiedScopeEpochParts {
+                    grant_id: "grant:owned".to_owned(),
+                    epoch: *epoch,
+                    issued_at_millis: 900,
+                    expires_at_millis: 2_000_u64
+                        .saturating_add(epoch.saturating_sub(7).saturating_mul(1_000)),
+                    revoked: *revoked,
+                    revocation_reason: revoked.then(|| "operator revoke".to_owned()),
+                    key_id: "authority-key:1".to_owned(),
+                    signature_sequence: *epoch,
+                    envelope_digest: digest,
+                    payload_digest: Digest::of(b"signed-payload"),
+                    verifier_receipt_digest: Digest::of(b"t13-verification-receipt"),
+                    gateway_boot_id: "gateway-boot:fixture".to_owned(),
+                    verification_nonce: [*epoch as u8; 16],
+                },
             ))
         }
     }
@@ -1634,6 +1171,56 @@ mod tests {
             kernel.issue_scope_proof(&wrong_tenant),
             Err(DenialCode::ScopeTenantDenied)
         );
+    }
+
+    #[test]
+    fn overlapping_active_windows_extend_live_expiry_as_a_union() {
+        let clock = FixedClock::new(1_000);
+        let (envelope, verifier) = envelope(7, false);
+        let mut overlapping_policy = policy();
+        overlapping_policy.execution_windows = vec![
+            TimeWindow {
+                starts_at_millis: 800,
+                ends_at_millis: 1_200,
+            },
+            TimeWindow {
+                starts_at_millis: 900,
+                ends_at_millis: 1_800,
+            },
+        ];
+        let kernel = DeterministicScopeKernel::new(overlapping_policy, verifier, clock)
+            .expect("overlapping-window policy");
+        kernel.admit_epoch(&envelope).expect("current epoch");
+        let mut dispatch = request();
+
+        let approval = authorize(&kernel, &mut dispatch).expect("scope approval");
+
+        assert_eq!(approval.valid_until_millis, 1_800);
+    }
+
+    #[test]
+    fn inactive_disjoint_window_does_not_extend_live_expiry() {
+        let clock = FixedClock::new(1_000);
+        let (envelope, verifier) = envelope(7, false);
+        let mut disjoint_policy = policy();
+        disjoint_policy.execution_windows = vec![
+            TimeWindow {
+                starts_at_millis: 800,
+                ends_at_millis: 1_200,
+            },
+            TimeWindow {
+                starts_at_millis: 1_300,
+                ends_at_millis: 1_800,
+            },
+        ];
+        let kernel = DeterministicScopeKernel::new(disjoint_policy, verifier, clock)
+            .expect("disjoint-window policy");
+        kernel.admit_epoch(&envelope).expect("current epoch");
+        let mut dispatch = request();
+
+        let approval = authorize(&kernel, &mut dispatch).expect("scope approval");
+
+        assert_eq!(approval.valid_until_millis, 1_200);
     }
 
     #[test]
@@ -1862,19 +1449,21 @@ mod tests {
                 _now_millis: u64,
             ) -> Result<VerifiedScopeEpoch, EpochAdmissionError> {
                 Ok(VerifiedScopeEpoch::from_trusted_verifier(
-                    "grant:owned".to_owned(),
-                    8,
-                    900,
-                    2_000,
-                    false,
-                    None,
-                    "authority-key:1".to_owned(),
-                    9,
-                    envelope.digest(),
-                    Digest::of(b"payload"),
-                    Digest::ZERO,
-                    "gateway-boot:fixture".to_owned(),
-                    [8; 16],
+                    VerifiedScopeEpochParts {
+                        grant_id: "grant:owned".to_owned(),
+                        epoch: 8,
+                        issued_at_millis: 900,
+                        expires_at_millis: 2_000,
+                        revoked: false,
+                        revocation_reason: None,
+                        key_id: "authority-key:1".to_owned(),
+                        signature_sequence: 9,
+                        envelope_digest: envelope.digest(),
+                        payload_digest: Digest::of(b"payload"),
+                        verifier_receipt_digest: Digest::ZERO,
+                        gateway_boot_id: "gateway-boot:fixture".to_owned(),
+                        verification_nonce: [8; 16],
+                    },
                 ))
             }
         }
@@ -1938,15 +1527,28 @@ mod tests {
             .map(|index| u8::from_str_radix(&receipt_hex[index..index + 2], 16).unwrap())
             .collect();
         let envelope = SignedEpochEnvelope::with_verifier_receipt(canonical, receipt).unwrap();
-        let authority = PinnedAuthorityKey::active(AUTHORITY_KEY_ID.to_owned()).unwrap();
-        let verifier = T13ReceiptEpochVerifier::from_gateway_held_key(
-            "gateway-channel:test".to_owned(),
-            std::array::from_fn(|index| index as u8),
-            "gateway-boot:test-1".to_owned(),
-            std::array::from_fn(|index| index as u8 + 0x80),
-            vec![authority],
+        let trust_bytes = format!(
+            "{{\"authority_keys\":[{{\"key_id\":\"{AUTHORITY_KEY_ID}\",\"public_key_base64url\":\"A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg\",\"status\":\"active\"}}],\"controller_keys\":[{{\"key_id\":\"ed25519:sha256:39f713d0a644253f04529421b9f51b9b08979d08295959c4f3990ee617f5139f\",\"public_key_base64url\":\"PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw\",\"status\":\"active\"}}],\"generation\":1,\"grant_pins\":[{{\"authority_key_ids\":[\"{AUTHORITY_KEY_ID}\"],\"controller_key_ids\":[\"ed25519:sha256:39f713d0a644253f04529421b9f51b9b08979d08295959c4f3990ee617f5139f\"],\"grant_id\":\"grant.golden\",\"minimum_version\":1}}],\"schema_version\":1}}"
+        );
+        let trust = crate::installed_trust::installed_trust_store_from_canonical_bytes_for_test(
+            trust_bytes.as_bytes(),
         )
         .unwrap();
+        let channel_key =
+            std::array::from_fn(|index| u8::try_from(index).expect("epoch channel key byte"));
+        let challenge = std::array::from_fn(|index| {
+            0x80_u8.saturating_add(u8::try_from(index).expect("gateway challenge byte"))
+        });
+        let boot = GatewayBootBinding::new("gateway-boot:test-1".to_owned(), challenge).unwrap();
+        let channel =
+            ReceiptAuthenticationChannel::new("gateway-channel:test".to_owned(), channel_key, boot)
+                .unwrap();
+        let expected_grant = ExpectedScopeEpochGrant::new("grant.golden".to_owned(), 1).unwrap();
+        let verifier = T13ReceiptEpochVerifier::new(T13EpochVerifierConfig::new(
+            channel,
+            Arc::new(trust),
+            expected_grant,
+        ));
         let mut golden_policy = policy();
         golden_policy.grant_id = "grant.golden".to_owned();
         golden_policy.execution_windows = vec![TimeWindow {
@@ -2159,6 +1761,43 @@ mod tests {
     }
 
     #[test]
+    fn scope_finish_before_lease_finalize_is_counted_from_cancellation_report() {
+        let clock = FixedClock::new(1_000);
+        let (signed_seven, _) = envelope(7, false);
+        let (signed_eight, _) = envelope(8, false);
+        let verifier = SequenceVerifier {
+            accepted: vec![
+                (signed_seven.digest(), 7, false),
+                (signed_eight.digest(), 8, false),
+            ],
+        };
+        let kernel = DeterministicScopeKernel::new_with_cancellation_sink(
+            policy(),
+            verifier,
+            clock,
+            Arc::new(ReportingCancellationSink {
+                interrupted_active: 1,
+            }),
+        )
+        .expect("scope kernel with reporting cancellation sink");
+        kernel.admit_epoch(&signed_seven).expect("initial epoch");
+        let mut dispatch = request();
+        authorize(&kernel, &mut dispatch).expect("authorized dispatch");
+        let approval = LeaseApproval::fixture(&dispatch);
+        ScopeVerifier::register_dispatch(&kernel, &dispatch, &approval)
+            .expect("registered dispatch");
+        ScopeVerifier::finish_dispatch(&kernel, &approval).expect("scope finish wins race");
+
+        let transition = kernel
+            .admit_epoch(&signed_eight)
+            .expect("advance while lease remains active");
+
+        assert!(transition.cancellations.is_empty());
+        assert_eq!(transition.interrupted_active, 1);
+        assert_eq!(transition.interrupted_resources(), 1);
+    }
+
+    #[test]
     fn epoch_expiry_notifies_the_cancellation_sink_once() {
         let clock = FixedClock::new(1_000);
         let (signed_seven, _) = envelope(7, false);
@@ -2286,6 +1925,12 @@ mod tests {
         };
         assert_eq!(receipt.outcome, DispatchOutcome::UnknownOutcome);
         assert!(receipt.reconciliation_required);
+        let effect_digest = crate::policy::target_effect_digest(
+            ActionKind::SemanticHttpV1,
+            receipt.egress_plane,
+            receipt.resolution_digest,
+            receipt.request_digest,
+        );
         assert_eq!(receipt.bytes_sent, request_byte_count);
         assert_eq!(
             authority
@@ -2309,23 +1954,26 @@ mod tests {
         same_intent.scope_proof = scope
             .issue_scope_proof(&same_intent)
             .expect("epoch-eight scope proof");
-        same_intent.lease_proof = authority
-            .issue(cancellation_lease_spec(&same_intent, binding_eight))
-            .expect("same-intent epoch-eight lease")
-            .proof;
         assert_eq!(
-            authority.reserve(&same_intent, 1_000),
+            authority.issue(cancellation_lease_spec(&same_intent, binding_eight)),
             Err(DenialCode::LeaseReconciliationRequired)
         );
 
         let reconciliation = reconciler
             .issue_control_plane_hold(
-                ("grant:owned", 3),
-                intent_digest,
-                DispatchOutcome::Failed,
-                Digest::of(b"scope cancellation terminal evidence"),
-                *b"scope-cancel-001",
-                1_002,
+                crate::lease::ControlPlaneReconciliationHold {
+                    grant_id: "grant:owned".to_owned(),
+                    grant_version: 3,
+                    intent_digest,
+                    effect_digest,
+                    hold_binding_digest: receipt.hold_binding_digest,
+                },
+                crate::lease::ReconciliationTerminal {
+                    outcome: DispatchOutcome::Failed,
+                    evidence_digest: Digest::of(b"scope cancellation terminal evidence"),
+                    nonce: *b"scope-cancel-001",
+                    resolved_at_millis: 1_002,
+                },
             )
             .expect("scope cancellation reconciliation");
         assert_eq!(

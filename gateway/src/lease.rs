@@ -4,14 +4,57 @@ use std::sync::Mutex;
 use crate::Digest;
 use crate::ipc::{DenialCode, DispatchOutcome, DispatchReceipt, DispatchRequest, EgressPlane};
 use crate::policy::{LeaseApproval, LeaseCompletion, LeaseFinalization, LeaseVerifier};
-use crate::scope::{CancellationCause, ScopeCancellation, ScopeCancellationSink};
+use crate::scope::{
+    CancellationCause, ScopeCancellation, ScopeCancellationReport, ScopeCancellationSink,
+};
 use crate::transport::DispatchCancellation;
+
+use self::crypto::{
+    constant_time_eq, hmac_sha256, push_optional_digest, push_optional_string, push_optional_u64,
+    push_string, valid_boot_secret, valid_identifier, valid_nonce,
+};
+use self::recovery_decode::RecoveryDecoder;
+use self::recovery_encode::{
+    push_count, push_effect_digests, push_reconciliation_holds, push_reconciliation_key,
+    push_reconciliation_receipts, push_retry_aliases, recovery_checkpoint_id,
+};
+use self::state::held_effect_for_exact_key;
+
+#[path = "lease/state.rs"]
+mod state;
+
+#[path = "lease/crypto.rs"]
+mod crypto;
+
+#[path = "lease/bindings.rs"]
+mod bindings;
+
+#[path = "lease/reconciliation_authority.rs"]
+mod reconciliation_authority;
+
+#[path = "lease/recovery_encode.rs"]
+mod recovery_encode;
+
+#[path = "lease/recovery_decode.rs"]
+mod recovery_decode;
+
+#[path = "lease/authority.rs"]
+mod authority;
+
+#[path = "lease/issuance.rs"]
+mod issuance;
+
+#[path = "lease/cancellation.rs"]
+mod cancellation;
+
+#[path = "lease/checkpoint.rs"]
+mod checkpoint;
 
 const RATE_WINDOW_MILLIS: u64 = 60_000;
 const MAX_LEASE_TTL_MILLIS: u64 = 60_000;
 const HMAC_BLOCK_BYTES: usize = 64;
 const RECOVERY_MAGIC: &[u8; 4] = b"FLRC";
-const RECOVERY_VERSION: u8 = 3;
+const RECOVERY_VERSION: u8 = 7;
 const MAX_RECOVERY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RECOVERY_ITEMS: usize = 100_000;
 
@@ -23,17 +66,6 @@ pub struct GrantBudget {
     pub max_request_bytes: u64,
     pub max_response_bytes: u64,
     pub max_duration_seconds: u64,
-}
-
-impl GrantBudget {
-    fn valid(&self) -> bool {
-        self.total_actions > 0
-            && self.rate_per_minute > 0
-            && self.max_concurrency > 0
-            && self.max_request_bytes > 0
-            && self.max_response_bytes > 0
-            && self.max_duration_seconds > 0
-    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -49,35 +81,6 @@ struct ReconciliationKey {
     intent_digest: Digest,
 }
 
-impl ReconciliationKey {
-    fn new(grant_id: String, grant_version: u64, intent_digest: Digest) -> Self {
-        Self {
-            grant_id,
-            grant_version,
-            intent_digest,
-        }
-    }
-
-    fn from_spec(spec: &LeaseSpec) -> Self {
-        Self::new(
-            spec.grant_id.clone(),
-            spec.grant_version,
-            spec.intent_digest,
-        )
-    }
-
-    fn canonical_cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.grant_id
-            .cmp(&other.grant_id)
-            .then(self.grant_version.cmp(&other.grant_version))
-            .then_with(|| {
-                self.intent_digest
-                    .as_bytes()
-                    .cmp(other.intent_digest.as_bytes())
-            })
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LeaseSpec {
     pub lease_id: String,
@@ -89,9 +92,12 @@ pub struct LeaseSpec {
     pub authority_key_id: String,
     pub scope_epoch_binding_digest: Digest,
     pub gateway_boot_id: String,
+    pub control_envelope_id: Digest,
     pub request_binding_digest: Digest,
     pub semantic_action_digest: Digest,
     pub resolution_digest: Digest,
+    pub compiled_request_digest: Digest,
+    pub effect_digest: Digest,
     pub correlation_id: String,
     pub egress_plane: EgressPlane,
     pub dispatch_nonce: [u8; 16],
@@ -125,47 +131,14 @@ pub struct ReconciliationReceipt {
     pub grant_id: String,
     pub grant_version: u64,
     pub intent_digest: Digest,
+    pub effect_digest: Digest,
+    pub hold_binding_digest: Digest,
     pub unknown_dispatch_receipt_id: Option<Digest>,
     pub terminal_outcome: DispatchOutcome,
     pub terminal_evidence_digest: Digest,
     pub nonce: [u8; 16],
     pub resolved_at_millis: u64,
     pub authentication_tag: Digest,
-}
-
-impl ReconciliationReceipt {
-    fn unsigned_bytes(&self) -> Vec<u8> {
-        let mut message = Vec::with_capacity(256);
-        message.extend_from_slice(b"faultloom-lease-reconciliation-v1\0");
-        push_string(&mut message, &self.key_id);
-        push_string(&mut message, &self.grant_id);
-        message.extend_from_slice(&self.grant_version.to_be_bytes());
-        message.extend_from_slice(self.intent_digest.as_bytes());
-        push_optional_digest(&mut message, self.unknown_dispatch_receipt_id);
-        message.push(self.terminal_outcome as u8);
-        message.extend_from_slice(self.terminal_evidence_digest.as_bytes());
-        message.extend_from_slice(&self.nonce);
-        message.extend_from_slice(&self.resolved_at_millis.to_be_bytes());
-        message
-    }
-
-    fn canonical_id(&self) -> Digest {
-        Digest::of(&self.unsigned_bytes())
-    }
-
-    fn valid_shape(&self) -> bool {
-        valid_identifier(&self.key_id)
-            && valid_identifier(&self.grant_id)
-            && self.grant_version > 0
-            && self.intent_digest != Digest::ZERO
-            && self.unknown_dispatch_receipt_id != Some(Digest::ZERO)
-            && self.terminal_outcome != DispatchOutcome::UnknownOutcome
-            && self.terminal_evidence_digest != Digest::ZERO
-            && valid_nonce(&self.nonce)
-            && self.resolved_at_millis > 0
-            && self.reconciliation_id == self.canonical_id()
-            && self.authentication_tag != Digest::ZERO
-    }
 }
 
 /// Separate capability for the durable control plane that resolves an
@@ -176,105 +149,28 @@ pub struct ReconciliationAuthority {
     signing_key: [u8; 32],
 }
 
-impl ReconciliationAuthority {
-    pub fn new(key_id: String, signing_key: [u8; 32]) -> Result<Self, DenialCode> {
-        if !valid_identifier(&key_id) || !valid_boot_secret(&signing_key) {
-            return Err(DenialCode::LeaseAccountingUnavailable);
-        }
-        Ok(Self {
-            key_id,
-            signing_key,
-        })
-    }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ControlPlaneReconciliationHold {
+    pub grant_id: String,
+    pub grant_version: u64,
+    pub intent_digest: Digest,
+    pub effect_digest: Digest,
+    pub hold_binding_digest: Digest,
+}
 
-    pub fn issue(
-        &self,
-        unknown_receipt: &DispatchReceipt,
-        terminal_outcome: DispatchOutcome,
-        terminal_evidence_digest: Digest,
-        nonce: [u8; 16],
-        resolved_at_millis: u64,
-    ) -> Result<ReconciliationReceipt, DenialCode> {
-        if !unknown_receipt.validate()
-            || unknown_receipt.outcome != DispatchOutcome::UnknownOutcome
-            || !unknown_receipt.reconciliation_required
-            || terminal_outcome == DispatchOutcome::UnknownOutcome
-            || terminal_evidence_digest == Digest::ZERO
-            || !valid_nonce(&nonce)
-            || resolved_at_millis < unknown_receipt.completed_at_millis
-        {
-            return Err(DenialCode::LeaseReconciliationRequired);
-        }
-        self.issue_bound(
-            ReconciliationKey::new(
-                unknown_receipt.grant_id.clone(),
-                unknown_receipt.grant_version,
-                unknown_receipt.intent_digest,
-            ),
-            Some(unknown_receipt.receipt_id),
-            terminal_outcome,
-            terminal_evidence_digest,
-            nonce,
-            resolved_at_millis,
-        )
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReconciliationTerminal {
+    pub outcome: DispatchOutcome,
+    pub evidence_digest: Digest,
+    pub nonce: [u8; 16],
+    pub resolved_at_millis: u64,
+}
 
-    pub fn issue_control_plane_hold(
-        &self,
-        grant: (&str, u64),
-        intent_digest: Digest,
-        terminal_outcome: DispatchOutcome,
-        terminal_evidence_digest: Digest,
-        nonce: [u8; 16],
-        resolved_at_millis: u64,
-    ) -> Result<ReconciliationReceipt, DenialCode> {
-        self.issue_bound(
-            ReconciliationKey::new(grant.0.to_owned(), grant.1, intent_digest),
-            None,
-            terminal_outcome,
-            terminal_evidence_digest,
-            nonce,
-            resolved_at_millis,
-        )
-    }
-
-    fn issue_bound(
-        &self,
-        reconciliation_key: ReconciliationKey,
-        unknown_dispatch_receipt_id: Option<Digest>,
-        terminal_outcome: DispatchOutcome,
-        terminal_evidence_digest: Digest,
-        nonce: [u8; 16],
-        resolved_at_millis: u64,
-    ) -> Result<ReconciliationReceipt, DenialCode> {
-        let mut receipt = ReconciliationReceipt {
-            reconciliation_id: Digest::ZERO,
-            key_id: self.key_id.clone(),
-            grant_id: reconciliation_key.grant_id,
-            grant_version: reconciliation_key.grant_version,
-            intent_digest: reconciliation_key.intent_digest,
-            unknown_dispatch_receipt_id,
-            terminal_outcome,
-            terminal_evidence_digest,
-            nonce,
-            resolved_at_millis,
-            authentication_tag: Digest::ZERO,
-        };
-        if !valid_identifier(&receipt.grant_id)
-            || receipt.grant_version == 0
-            || receipt.intent_digest == Digest::ZERO
-            || receipt.unknown_dispatch_receipt_id == Some(Digest::ZERO)
-            || receipt.terminal_outcome == DispatchOutcome::UnknownOutcome
-            || receipt.terminal_evidence_digest == Digest::ZERO
-            || !valid_nonce(&receipt.nonce)
-            || receipt.resolved_at_millis == 0
-        {
-            return Err(DenialCode::LeaseReconciliationRequired);
-        }
-        receipt.reconciliation_id = receipt.canonical_id();
-        receipt.authentication_tag = hmac_sha256(&self.signing_key, &receipt.unsigned_bytes());
-        Ok(receipt)
-    }
+struct ReconciliationBinding {
+    key: ReconciliationKey,
+    effect_digest: Digest,
+    hold_binding_digest: Digest,
+    unknown_dispatch_receipt_id: Option<Digest>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -307,11 +203,29 @@ enum ReconciliationHoldKind {
     ControlPlane = 2,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReconciliationHold {
+    kind: ReconciliationHoldKind,
+    binding_digest: Digest,
+    retry_invariant_digest: Digest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReconciliationResolution {
+    receipt_id: Digest,
+    terminal_outcome: DispatchOutcome,
+    hold_binding_digest: Digest,
+    effect_digest: Digest,
+    retry_invariant_digest: Digest,
+    retry_consumed: bool,
+}
+
 #[derive(Clone, Debug)]
 struct LeaseEntry {
     spec: LeaseSpec,
     proof: Digest,
     status: LeaseStatus,
+    retry_invariant_digest: Option<Digest>,
 }
 
 #[derive(Clone, Debug)]
@@ -327,11 +241,13 @@ struct GrantAccount {
 struct LeaseState {
     grants: HashMap<GrantKey, GrantAccount>,
     leases: HashMap<String, LeaseEntry>,
-    reconciliation_required: HashMap<ReconciliationKey, ReconciliationHoldKind>,
-    reconciliation_receipts: HashMap<ReconciliationKey, Digest>,
+    reconciliation_required: HashMap<ReconciliationKey, ReconciliationHold>,
+    held_effects: HashMap<ReconciliationKey, Digest>,
+    reconciliation_receipts: HashMap<ReconciliationKey, ReconciliationResolution>,
     retry_aliases: HashMap<ReconciliationKey, ReconciliationKey>,
     dispatch_nonces: HashSet<[u8; 16]>,
     retired_lease_ids: HashSet<String>,
+    retired_intents: HashSet<ReconciliationKey>,
     checkpoint_sequence: u64,
 }
 
@@ -347,43 +263,12 @@ pub struct LeaseRecoveryCheckpoint {
     checkpoint_id: Digest,
 }
 
-impl LeaseRecoveryCheckpoint {
-    pub fn from_bytes(encoded: Vec<u8>) -> Result<Self, DenialCode> {
-        if encoded.len() < 4 + 1 + 4 + 32 || encoded.len() > MAX_RECOVERY_BYTES {
-            return Err(DenialCode::RecoveryCheckpointInvalid);
-        }
-        if &encoded[..4] != RECOVERY_MAGIC || encoded[4] != RECOVERY_VERSION {
-            return Err(DenialCode::RecoveryCheckpointInvalid);
-        }
-        let payload_len = u32::from_be_bytes(
-            encoded[5..9]
-                .try_into()
-                .map_err(|_| DenialCode::RecoveryCheckpointInvalid)?,
-        ) as usize;
-        if payload_len.checked_add(4 + 1 + 4 + 32) != Some(encoded.len()) {
-            return Err(DenialCode::RecoveryCheckpointInvalid);
-        }
-        let checkpoint_id = recovery_checkpoint_id(&encoded);
-        Ok(Self {
-            encoded,
-            checkpoint_id,
-        })
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.encoded
-    }
-
-    pub const fn checkpoint_id(&self) -> Digest {
-        self.checkpoint_id
-    }
-}
-
 /// Gateway-owned capability issuer and atomic lease/budget accountant.
 ///
-/// The key never crosses the local Gateway boundary. A restart forgets all
-/// issued capabilities and therefore fails closed instead of accepting stale
-/// leases or resetting their one-use state.
+/// The key never crosses the local Gateway boundary. A fresh boot may restore
+/// only an authenticated checkpoint whose digest was anchored by the external
+/// durable control plane. Without that anchor, restart fails closed instead of
+/// accepting stale leases or resetting one-use and budget state.
 pub struct LeaseAuthority {
     lease_key_id: String,
     signing_key: [u8; 32],
@@ -395,462 +280,6 @@ pub struct LeaseAuthority {
 }
 
 impl LeaseAuthority {
-    pub fn new(
-        lease_key_id: String,
-        signing_key: [u8; 32],
-        gateway_boot_id: String,
-        boot_challenge_digest: Digest,
-    ) -> Result<Self, DenialCode> {
-        if !valid_identifier(&lease_key_id)
-            || !valid_identifier(&gateway_boot_id)
-            || !valid_boot_secret(&signing_key)
-            || boot_challenge_digest == Digest::ZERO
-            || boot_challenge_digest == Digest::of(&signing_key)
-        {
-            return Err(DenialCode::LeaseAccountingUnavailable);
-        }
-        Ok(Self {
-            lease_key_id,
-            signing_key,
-            gateway_boot_id,
-            boot_challenge_digest,
-            reconciliation_key_id: None,
-            reconciliation_verification_key: None,
-            state: Mutex::new(LeaseState::default()),
-        })
-    }
-
-    pub fn new_with_reconciliation_verifier(
-        lease_key_id: String,
-        signing_key: [u8; 32],
-        gateway_boot_id: String,
-        boot_challenge_digest: Digest,
-        reconciliation_key_id: String,
-        reconciliation_verification_key: [u8; 32],
-    ) -> Result<Self, DenialCode> {
-        let mut authority = Self::new(
-            lease_key_id,
-            signing_key,
-            gateway_boot_id,
-            boot_challenge_digest,
-        )?;
-        if !valid_identifier(&reconciliation_key_id)
-            || reconciliation_key_id == authority.lease_key_id
-            || !valid_boot_secret(&reconciliation_verification_key)
-            || reconciliation_verification_key == authority.signing_key
-        {
-            return Err(DenialCode::LeaseAccountingUnavailable);
-        }
-        authority.reconciliation_key_id = Some(reconciliation_key_id);
-        authority.reconciliation_verification_key = Some(reconciliation_verification_key);
-        Ok(authority)
-    }
-
-    pub fn register_grant(
-        &self,
-        grant_id: &str,
-        grant_version: u64,
-        budget: GrantBudget,
-    ) -> Result<(), DenialCode> {
-        if !valid_identifier(grant_id) || grant_version == 0 || !budget.valid() {
-            return Err(DenialCode::LeaseReservationExceeded);
-        }
-        let key = GrantKey {
-            grant_id: grant_id.to_owned(),
-            grant_version,
-        };
-        let mut state = self.lock_state()?;
-        if state.grants.contains_key(&key) {
-            return Err(DenialCode::LeaseBindingMismatch);
-        }
-        state.grants.insert(
-            key,
-            GrantAccount {
-                budget,
-                usage: GrantUsage::default(),
-                dispatch_times: VecDeque::new(),
-                last_clock_millis: 0,
-                revoked_at_epoch: None,
-            },
-        );
-        Ok(())
-    }
-
-    pub fn issue(&self, spec: LeaseSpec) -> Result<IssuedLease, DenialCode> {
-        if !valid_identifier(&spec.lease_id)
-            || !valid_identifier(&spec.grant_id)
-            || !valid_identifier(&spec.authority_key_id)
-            || !valid_identifier(&spec.gateway_boot_id)
-            || !valid_identifier(&spec.correlation_id)
-            || spec.grant_version == 0
-            || spec.scope_epoch == 0
-            || spec.scope_epoch_binding_digest == Digest::ZERO
-            || spec.request_binding_digest == Digest::ZERO
-            || spec.semantic_action_digest == Digest::ZERO
-            || spec.resolution_digest == Digest::ZERO
-            || !valid_nonce(&spec.dispatch_nonce)
-            || spec.retry_of_intent_digest == Some(Digest::ZERO)
-            || spec.retry_of_intent_digest == Some(spec.intent_digest)
-            || spec.gateway_boot_id != self.gateway_boot_id
-            || spec.issued_at_millis >= spec.expires_at_millis
-            || spec.expires_at_millis.saturating_sub(spec.issued_at_millis) > MAX_LEASE_TTL_MILLIS
-            || spec.intent_digest == Digest::ZERO
-            || spec.decision_digest == Digest::ZERO
-        {
-            return Err(DenialCode::LeaseBindingMismatch);
-        }
-
-        let grant_key = GrantKey {
-            grant_id: spec.grant_id.clone(),
-            grant_version: spec.grant_version,
-        };
-        let mut state = self.lock_state()?;
-        let account = state
-            .grants
-            .get(&grant_key)
-            .ok_or(DenialCode::LeaseBindingMismatch)?;
-        if account.revoked_at_epoch.is_some() {
-            return Err(DenialCode::LeaseRevoked);
-        }
-        if spec.reservation.action_count != 1
-            || spec.reservation.request_bytes == 0
-            || spec.reservation.request_bytes > account.budget.max_request_bytes
-            || spec.reservation.response_bytes > account.budget.max_response_bytes
-            || spec.reservation.duration_seconds == 0
-            || spec.reservation.duration_seconds > account.budget.max_duration_seconds
-        {
-            return Err(DenialCode::LeaseReservationExceeded);
-        }
-        if state.leases.contains_key(&spec.lease_id)
-            || state.retired_lease_ids.contains(&spec.lease_id)
-            || state.dispatch_nonces.contains(&spec.dispatch_nonce)
-        {
-            return Err(DenialCode::LeaseReplay);
-        }
-        let intent_key = ReconciliationKey::from_spec(&spec);
-        if let Some(parent_intent) = spec.retry_of_intent_digest {
-            let parent_key =
-                ReconciliationKey::new(spec.grant_id.clone(), spec.grant_version, parent_intent);
-            if !state.reconciliation_receipts.contains_key(&parent_key)
-                || state.retry_aliases.contains_key(&intent_key)
-            {
-                return Err(DenialCode::RetryAliasInvalid);
-            }
-        } else if state.reconciliation_receipts.contains_key(&intent_key) {
-            return Err(DenialCode::RetryAliasInvalid);
-        }
-
-        let proof = self.sign_spec(&spec);
-        let lease_id = spec.lease_id.clone();
-        if let Some(parent_intent) = spec.retry_of_intent_digest {
-            let parent_key =
-                ReconciliationKey::new(spec.grant_id.clone(), spec.grant_version, parent_intent);
-            state.retry_aliases.insert(intent_key, parent_key);
-        }
-        state.dispatch_nonces.insert(spec.dispatch_nonce);
-        state.retired_lease_ids.insert(lease_id.clone());
-        state.leases.insert(
-            lease_id.clone(),
-            LeaseEntry {
-                spec,
-                proof,
-                status: LeaseStatus::Available,
-            },
-        );
-        Ok(IssuedLease {
-            lease_id,
-            lease_key_id: self.lease_key_id.clone(),
-            gateway_boot_id: self.gateway_boot_id.clone(),
-            boot_challenge_digest: self.boot_challenge_digest,
-            proof: proof.as_bytes().to_vec(),
-        })
-    }
-
-    pub fn usage(&self, grant_id: &str, grant_version: u64) -> Result<GrantUsage, DenialCode> {
-        let state = self.lock_state()?;
-        let key = GrantKey {
-            grant_id: grant_id.to_owned(),
-            grant_version,
-        };
-        state
-            .grants
-            .get(&key)
-            .map(|account| {
-                let mut usage = account.usage.clone();
-                usage.rate_window_actions =
-                    u64::try_from(account.dispatch_times.len()).unwrap_or(u64::MAX);
-                usage
-            })
-            .ok_or(DenialCode::LeaseBindingMismatch)
-    }
-
-    pub fn revoke_grant(
-        &self,
-        grant_id: &str,
-        grant_version: u64,
-        revoked_at_epoch: u64,
-    ) -> Result<LeaseRevocationSummary, DenialCode> {
-        self.cancel_grant_scope(grant_id, grant_version, revoked_at_epoch, true)
-    }
-
-    fn cancel_grant_scope(
-        &self,
-        grant_id: &str,
-        grant_version: u64,
-        invalidated_through_epoch: u64,
-        revoke_grant: bool,
-    ) -> Result<LeaseRevocationSummary, DenialCode> {
-        if !valid_identifier(grant_id) || grant_version == 0 || invalidated_through_epoch == 0 {
-            return Err(DenialCode::LeaseBindingMismatch);
-        }
-        let key = GrantKey {
-            grant_id: grant_id.to_owned(),
-            grant_version,
-        };
-        let mut state = self.lock_state()?;
-        let previous = state
-            .grants
-            .get(&key)
-            .ok_or(DenialCode::LeaseBindingMismatch)?
-            .revoked_at_epoch;
-        if previous.is_some_and(|epoch| invalidated_through_epoch <= epoch) {
-            return Err(DenialCode::LeaseRevoked);
-        }
-
-        let mut available_ids = Vec::new();
-        let mut interrupted = Vec::new();
-        for (lease_id, entry) in state.leases.iter().filter(|(_, entry)| {
-            entry.spec.grant_id == grant_id
-                && entry.spec.grant_version == grant_version
-                && (revoke_grant || entry.spec.scope_epoch <= invalidated_through_epoch)
-        }) {
-            match &entry.status {
-                LeaseStatus::Available => available_ids.push(lease_id.clone()),
-                LeaseStatus::Active { cancellation, .. } => {
-                    interrupted.push((
-                        lease_id.clone(),
-                        entry.spec.intent_digest,
-                        entry.spec.reservation.clone(),
-                        cancellation.clone(),
-                    ));
-                }
-                LeaseStatus::Consumed => {}
-            }
-        }
-        let totals = interrupted
-            .iter()
-            .try_fold(
-                (0_u64, 0_u64, 0_u64, 0_u64),
-                |(actions, requests, responses, durations), (_, _, reservation, _)| {
-                    Some((
-                        actions.checked_add(1)?,
-                        requests.checked_add(reservation.request_bytes)?,
-                        responses.checked_add(reservation.response_bytes)?,
-                        durations.checked_add(reservation.duration_seconds)?,
-                    ))
-                },
-            )
-            .ok_or(DenialCode::LeaseAccountingUnavailable)?;
-        let account = state
-            .grants
-            .get(&key)
-            .expect("grant existence was checked while the state lock is held");
-        if account.usage.active_dispatches < totals.0
-            || account.usage.active_reserved_request_bytes < totals.1
-            || account.usage.active_reserved_response_bytes < totals.2
-            || account.usage.active_reserved_duration_seconds < totals.3
-        {
-            return Err(DenialCode::LeaseAccountingUnavailable);
-        }
-        for lease_id in available_ids
-            .iter()
-            .chain(interrupted.iter().map(|value| &value.0))
-        {
-            state
-                .leases
-                .get_mut(lease_id)
-                .expect("collected lease remains present while state is locked")
-                .status = LeaseStatus::Consumed;
-        }
-        for (_, intent, _, _) in &interrupted {
-            state
-                .reconciliation_required
-                .entry(ReconciliationKey::new(
-                    grant_id.to_owned(),
-                    grant_version,
-                    *intent,
-                ))
-                .or_insert(ReconciliationHoldKind::ControlPlane);
-        }
-        let account = state
-            .grants
-            .get_mut(&key)
-            .expect("grant existence was checked while the state lock is held");
-        account.usage.active_dispatches -= totals.0;
-        account.usage.active_reserved_request_bytes -= totals.1;
-        account.usage.active_reserved_response_bytes -= totals.2;
-        account.usage.active_reserved_duration_seconds -= totals.3;
-        if revoke_grant {
-            account.revoked_at_epoch = Some(invalidated_through_epoch);
-        }
-        let summary = LeaseRevocationSummary {
-            canceled_available: u64::try_from(available_ids.len()).unwrap_or(u64::MAX),
-            interrupted_active: u64::try_from(interrupted.len()).unwrap_or(u64::MAX),
-        };
-        drop(state);
-        let mut cancellation_failed = false;
-        for (_, _, _, cancellation) in interrupted {
-            cancellation_failed |= cancellation.cancel().is_err();
-        }
-        if cancellation_failed {
-            return Err(DenialCode::LeaseAccountingUnavailable);
-        }
-        Ok(summary)
-    }
-
-    fn cancel_scope_transports(
-        &self,
-        grant_id: &str,
-        grant_version: u64,
-        invalidated_through_epoch: u64,
-        revoke_grant: bool,
-    ) -> Result<(), DenialCode> {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let cancellations = state
-            .leases
-            .values()
-            .filter(|entry| {
-                entry.spec.grant_id == grant_id
-                    && entry.spec.grant_version == grant_version
-                    && (revoke_grant || entry.spec.scope_epoch <= invalidated_through_epoch)
-            })
-            .filter_map(|entry| match &entry.status {
-                LeaseStatus::Active { cancellation, .. } => Some(cancellation.clone()),
-                LeaseStatus::Available | LeaseStatus::Consumed => None,
-            })
-            .collect::<Vec<_>>();
-        drop(state);
-        let mut cancellation_failed = false;
-        for cancellation in cancellations {
-            cancellation_failed |= cancellation.cancel().is_err();
-        }
-        if cancellation_failed {
-            Err(DenialCode::LeaseAccountingUnavailable)
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Seal the durable accounting state. Active reservations are restored as
-    /// unknown outcomes, never as dispatchable leases.
-    pub fn checkpoint(&self) -> Result<LeaseRecoveryCheckpoint, DenialCode> {
-        let mut state = self.lock_state()?;
-        for count in [
-            state.grants.len(),
-            state.reconciliation_required.len(),
-            state.reconciliation_receipts.len(),
-            state.retry_aliases.len(),
-            state.dispatch_nonces.len(),
-            state.retired_lease_ids.len(),
-        ] {
-            if count > MAX_RECOVERY_ITEMS {
-                return Err(DenialCode::RecoveryCheckpointInvalid);
-            }
-        }
-        state.checkpoint_sequence = state
-            .checkpoint_sequence
-            .checked_add(1)
-            .ok_or(DenialCode::RecoveryCheckpointInvalid)?;
-
-        let mut payload = Vec::new();
-        payload.extend_from_slice(b"faultloom-lease-recovery-state-v3\0");
-        push_string(&mut payload, &self.lease_key_id);
-        push_string(&mut payload, &self.gateway_boot_id);
-        payload.extend_from_slice(self.boot_challenge_digest.as_bytes());
-        payload.extend_from_slice(&state.checkpoint_sequence.to_be_bytes());
-
-        let mut grants: Vec<_> = state.grants.iter().collect();
-        grants.sort_by(|(left, _), (right, _)| {
-            left.grant_id
-                .cmp(&right.grant_id)
-                .then(left.grant_version.cmp(&right.grant_version))
-        });
-        push_count(&mut payload, grants.len())?;
-        for (key, account) in grants {
-            push_string(&mut payload, &key.grant_id);
-            payload.extend_from_slice(&key.grant_version.to_be_bytes());
-            for value in [
-                account.budget.total_actions,
-                account.budget.rate_per_minute,
-                account.budget.max_concurrency,
-                account.budget.max_request_bytes,
-                account.budget.max_response_bytes,
-                account.budget.max_duration_seconds,
-                account.usage.dispatched_actions,
-                account.usage.actual_request_bytes,
-                account.usage.actual_response_bytes,
-                account.usage.actual_duration_millis,
-                account.last_clock_millis,
-            ] {
-                payload.extend_from_slice(&value.to_be_bytes());
-            }
-            push_optional_u64(&mut payload, account.revoked_at_epoch);
-            push_count(&mut payload, account.dispatch_times.len())?;
-            for timestamp in &account.dispatch_times {
-                payload.extend_from_slice(&timestamp.to_be_bytes());
-            }
-        }
-
-        let mut holds = state.reconciliation_required.clone();
-        for reconciliation_key in state
-            .leases
-            .values()
-            .filter(|entry| matches!(entry.status, LeaseStatus::Active { .. }))
-            .map(|entry| ReconciliationKey::from_spec(&entry.spec))
-        {
-            holds
-                .entry(reconciliation_key)
-                .or_insert(ReconciliationHoldKind::ControlPlane);
-        }
-        push_reconciliation_holds(&mut payload, &holds)?;
-        push_reconciliation_receipts(&mut payload, &state.reconciliation_receipts)?;
-        push_retry_aliases(&mut payload, &state.retry_aliases)?;
-
-        let mut nonces: Vec<_> = state.dispatch_nonces.iter().copied().collect();
-        nonces.sort_unstable();
-        push_count(&mut payload, nonces.len())?;
-        for nonce in nonces {
-            payload.extend_from_slice(&nonce);
-        }
-
-        let mut retired: Vec<_> = state.retired_lease_ids.iter().collect();
-        retired.sort_unstable();
-        push_count(&mut payload, retired.len())?;
-        for lease_id in retired {
-            push_string(&mut payload, lease_id);
-        }
-
-        let mut authenticated = Vec::with_capacity(payload.len() + 48);
-        authenticated.extend_from_slice(b"faultloom-lease-recovery-checkpoint-v3\0");
-        authenticated.extend_from_slice(&payload);
-        let tag = hmac_sha256(&self.signing_key, &authenticated);
-        let payload_len =
-            u32::try_from(payload.len()).map_err(|_| DenialCode::RecoveryCheckpointInvalid)?;
-        let mut encoded = Vec::with_capacity(9 + payload.len() + 32);
-        encoded.extend_from_slice(RECOVERY_MAGIC);
-        encoded.push(RECOVERY_VERSION);
-        encoded.extend_from_slice(&payload_len.to_be_bytes());
-        encoded.extend_from_slice(&payload);
-        encoded.extend_from_slice(tag.as_bytes());
-        if encoded.len() > MAX_RECOVERY_BYTES {
-            return Err(DenialCode::RecoveryCheckpointInvalid);
-        }
-        LeaseRecoveryCheckpoint::from_bytes(encoded)
-    }
-
     /// Restore only into a fresh authority boot and only for the externally
     /// anchored checkpoint digest supplied by the durable control plane.
     pub fn restore_checkpoint(
@@ -870,7 +299,7 @@ impl LeaseAuthority {
         let payload = &encoded[9..9 + payload_len];
         let supplied_tag = &encoded[9 + payload_len..];
         let mut authenticated = Vec::with_capacity(payload.len() + 48);
-        authenticated.extend_from_slice(b"faultloom-lease-recovery-checkpoint-v3\0");
+        authenticated.extend_from_slice(b"faultloom-lease-recovery-checkpoint-v7\0");
         authenticated.extend_from_slice(payload);
         let expected_tag = hmac_sha256(&self.signing_key, &authenticated);
         if !constant_time_eq(expected_tag.as_bytes(), supplied_tag) {
@@ -878,7 +307,7 @@ impl LeaseAuthority {
         }
 
         let mut decoder = RecoveryDecoder::new(payload);
-        decoder.expect_prefix(b"faultloom-lease-recovery-state-v3\0")?;
+        decoder.expect_prefix(b"faultloom-lease-recovery-state-v7\0")?;
         let key_id = decoder.string()?;
         let source_boot_id = decoder.string()?;
         let source_challenge = decoder.digest()?;
@@ -957,6 +386,7 @@ impl LeaseAuthority {
         }
 
         restored.reconciliation_required = decoder.reconciliation_holds()?;
+        restored.held_effects = decoder.effect_digests()?;
         restored.reconciliation_receipts = decoder.reconciliation_receipts()?;
         restored.retry_aliases = decoder.retry_aliases()?;
         let registered_grant = |key: &ReconciliationKey| {
@@ -968,23 +398,59 @@ impl LeaseAuthority {
         let unique_receipt_count = restored
             .reconciliation_receipts
             .values()
-            .copied()
+            .map(|resolution| resolution.receipt_id)
             .collect::<HashSet<_>>()
             .len();
-        if restored
+        let alias_parents: HashSet<_> = restored.retry_aliases.values().cloned().collect();
+        let consumed_parents: HashSet<_> = restored
+            .reconciliation_receipts
+            .iter()
+            .filter(|(_, resolution)| resolution.retry_consumed)
+            .map(|(key, _)| key.clone())
+            .collect();
+        if restored.reconciliation_required.iter().any(|(key, hold)| {
+            !registered_grant(key)
+                || restored.reconciliation_receipts.contains_key(key)
+                || hold.binding_digest == Digest::ZERO
+                || hold.retry_invariant_digest == Digest::ZERO
+        }) || restored
             .reconciliation_required
             .keys()
-            .any(|key| !registered_grant(key) || restored.reconciliation_receipts.contains_key(key))
+            .collect::<HashSet<_>>()
+            != restored.held_effects.keys().collect::<HashSet<_>>()
+            || restored
+                .held_effects
+                .values()
+                .any(|digest| *digest == Digest::ZERO)
             || restored
                 .reconciliation_receipts
-                .keys()
-                .any(|key| !registered_grant(key))
+                .iter()
+                .any(|(key, resolution)| {
+                    !registered_grant(key)
+                        || resolution.receipt_id == Digest::ZERO
+                        || resolution.terminal_outcome == DispatchOutcome::UnknownOutcome
+                        || resolution.hold_binding_digest == Digest::ZERO
+                        || resolution.effect_digest == Digest::ZERO
+                        || resolution.retry_invariant_digest == Digest::ZERO
+                        || (resolution.terminal_outcome == DispatchOutcome::Completed
+                            && resolution.retry_consumed)
+                })
             || unique_receipt_count != restored.reconciliation_receipts.len()
+            || alias_parents.len() != restored.retry_aliases.len()
+            || alias_parents != consumed_parents
             || restored.retry_aliases.iter().any(|(retry, parent)| {
                 !registered_grant(retry)
                     || !registered_grant(parent)
                     || retry == parent
-                    || !restored.reconciliation_receipts.contains_key(parent)
+                    || retry.grant_id != parent.grant_id
+                    || retry.grant_version != parent.grant_version
+                    || restored
+                        .reconciliation_receipts
+                        .get(parent)
+                        .is_none_or(|resolution| {
+                            resolution.terminal_outcome != DispatchOutcome::Failed
+                                || !resolution.retry_consumed
+                        })
             })
         {
             return Err(DenialCode::RecoveryCheckpointInvalid);
@@ -1003,16 +469,48 @@ impl LeaseAuthority {
                 return Err(DenialCode::RecoveryCheckpointInvalid);
             }
         }
+        let retired_intent_count = decoder.count()?;
+        for _ in 0..retired_intent_count {
+            let intent_key = decoder.reconciliation_key()?;
+            if !restored.retired_intents.insert(intent_key) {
+                return Err(DenialCode::RecoveryCheckpointInvalid);
+            }
+        }
         decoder.finish()?;
+        if restored.retired_intents.len() != restored.dispatch_nonces.len()
+            || restored.retired_intents.len() != restored.retired_lease_ids.len()
+            || restored.retired_intents.iter().any(|key| {
+                !restored.grants.contains_key(&GrantKey {
+                    grant_id: key.grant_id.clone(),
+                    grant_version: key.grant_version,
+                })
+            })
+            || restored
+                .reconciliation_required
+                .keys()
+                .any(|key| !restored.retired_intents.contains(key))
+            || restored
+                .reconciliation_receipts
+                .keys()
+                .any(|key| !restored.retired_intents.contains(key))
+            || restored.retry_aliases.iter().any(|(retry, parent)| {
+                !restored.retired_intents.contains(retry)
+                    || !restored.retired_intents.contains(parent)
+            })
+        {
+            return Err(DenialCode::RecoveryCheckpointInvalid);
+        }
 
         let mut state = self.lock_state()?;
         if !state.grants.is_empty()
             || !state.leases.is_empty()
             || !state.reconciliation_required.is_empty()
+            || !state.held_effects.is_empty()
             || !state.reconciliation_receipts.is_empty()
             || !state.retry_aliases.is_empty()
             || !state.dispatch_nonces.is_empty()
             || !state.retired_lease_ids.is_empty()
+            || !state.retired_intents.is_empty()
             || state.checkpoint_sequence != 0
         {
             return Err(DenialCode::RecoveryCheckpointInvalid);
@@ -1061,26 +559,47 @@ impl LeaseAuthority {
         let mut state = self.lock_state()?;
         if state
             .reconciliation_receipts
-            .values()
-            .any(|digest| *digest == reconciliation.reconciliation_id)
+            .contains_key(&reconciliation_key)
         {
             return Err(DenialCode::LeaseReplay);
         }
-        match state
+        if state
+            .reconciliation_receipts
+            .values()
+            .any(|resolution| resolution.receipt_id == reconciliation.reconciliation_id)
+        {
+            return Err(DenialCode::LeaseReplay);
+        }
+        let hold = match state
             .reconciliation_required
             .get(&reconciliation_key)
             .copied()
         {
             None => return Err(DenialCode::LeaseBindingMismatch),
-            Some(actual_hold_kind) if actual_hold_kind != expected_hold_kind => {
+            Some(actual_hold)
+                if actual_hold.kind != expected_hold_kind
+                    || actual_hold.binding_digest != reconciliation.hold_binding_digest =>
+            {
                 return Err(DenialCode::LeaseReconciliationRequired);
             }
-            Some(_) => {}
+            Some(actual_hold) => actual_hold,
+        };
+        if state.held_effects.get(&reconciliation_key) != Some(&reconciliation.effect_digest) {
+            return Err(DenialCode::LeaseReconciliationRequired);
         }
         state.reconciliation_required.remove(&reconciliation_key);
-        state
-            .reconciliation_receipts
-            .insert(reconciliation_key, reconciliation.reconciliation_id);
+        state.held_effects.remove(&reconciliation_key);
+        state.reconciliation_receipts.insert(
+            reconciliation_key,
+            ReconciliationResolution {
+                receipt_id: reconciliation.reconciliation_id,
+                terminal_outcome: reconciliation.terminal_outcome,
+                hold_binding_digest: hold.binding_digest,
+                effect_digest: reconciliation.effect_digest,
+                retry_invariant_digest: hold.retry_invariant_digest,
+                retry_consumed: false,
+            },
+        );
         for entry in state.leases.values_mut().filter(|entry| {
             entry.spec.grant_id == reconciliation.grant_id
                 && entry.spec.grant_version == reconciliation.grant_version
@@ -1110,6 +629,8 @@ impl LeaseAuthority {
                 reconciliation.grant_id != receipt.grant_id
                     || reconciliation.grant_version != receipt.grant_version
                     || reconciliation.intent_digest != receipt.intent_digest
+                    || reconciliation.effect_digest != receipt.effect_digest
+                    || reconciliation.hold_binding_digest != receipt.hold_binding_digest
                     || reconciliation.resolved_at_millis < receipt.completed_at_millis
             })
         {
@@ -1156,90 +677,10 @@ impl LeaseAuthority {
                 grant_version,
                 intent_digest,
             ))
-            .copied())
+            .map(|resolution| resolution.receipt_id))
     }
 
-    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, LeaseState>, DenialCode> {
-        self.state
-            .lock()
-            .map_err(|_| DenialCode::LeaseAccountingUnavailable)
-    }
-
-    fn sign_spec(&self, spec: &LeaseSpec) -> Digest {
-        let mut message = Vec::with_capacity(256);
-        message.extend_from_slice(b"faultloom-action-lease-v2\0");
-        push_string(&mut message, &self.lease_key_id);
-        push_string(&mut message, &self.gateway_boot_id);
-        message.extend_from_slice(self.boot_challenge_digest.as_bytes());
-        push_string(&mut message, &spec.lease_id);
-        message.extend_from_slice(spec.intent_digest.as_bytes());
-        message.extend_from_slice(spec.decision_digest.as_bytes());
-        push_string(&mut message, &spec.grant_id);
-        message.extend_from_slice(&spec.grant_version.to_be_bytes());
-        message.extend_from_slice(&spec.scope_epoch.to_be_bytes());
-        push_string(&mut message, &spec.authority_key_id);
-        message.extend_from_slice(spec.scope_epoch_binding_digest.as_bytes());
-        push_string(&mut message, &spec.gateway_boot_id);
-        message.extend_from_slice(spec.request_binding_digest.as_bytes());
-        message.extend_from_slice(spec.semantic_action_digest.as_bytes());
-        message.extend_from_slice(spec.resolution_digest.as_bytes());
-        push_string(&mut message, &spec.correlation_id);
-        message.push(spec.egress_plane as u8);
-        message.extend_from_slice(&spec.dispatch_nonce);
-        push_optional_digest(&mut message, spec.retry_of_intent_digest);
-        message.extend_from_slice(&spec.issued_at_millis.to_be_bytes());
-        message.extend_from_slice(&spec.expires_at_millis.to_be_bytes());
-        message.extend_from_slice(&spec.reservation.action_count.to_be_bytes());
-        message.extend_from_slice(&spec.reservation.request_bytes.to_be_bytes());
-        message.extend_from_slice(&spec.reservation.response_bytes.to_be_bytes());
-        message.extend_from_slice(&spec.reservation.duration_seconds.to_be_bytes());
-        hmac_sha256(&self.signing_key, &message)
-    }
-
-    fn dispatch_receipt_authentication_tag(&self, receipt: &DispatchReceipt) -> Digest {
-        let mut message = Vec::with_capacity(128);
-        message.extend_from_slice(b"faultloom-dispatch-receipt-authentication-v1\0");
-        push_string(&mut message, &self.lease_key_id);
-        message.extend_from_slice(receipt.receipt_id.as_bytes());
-        hmac_sha256(&self.signing_key, &message)
-    }
-
-    fn receipt_matches_approval(receipt: &DispatchReceipt, approval: &LeaseApproval) -> bool {
-        receipt.intent_digest == approval.intent_digest
-            && receipt.decision_digest == approval.decision_digest
-            && receipt.grant_id == approval.grant_id
-            && receipt.grant_version == approval.grant_version
-            && receipt.lease_id == approval.lease_id
-            && receipt.scope_epoch == approval.scope_epoch
-            && receipt.authority_key_id == approval.authority_key_id
-            && receipt.scope_epoch_binding_digest == approval.scope_epoch_binding_digest
-            && receipt.lease_key_id == approval.lease_key_id
-            && receipt.gateway_boot_id == approval.gateway_boot_id
-            && receipt.boot_challenge_digest == approval.boot_challenge_digest
-            && receipt.request_binding_digest == approval.request_binding_digest
-            && receipt.semantic_action_digest == approval.semantic_action_digest
-            && receipt.resolution_digest == approval.resolution_digest
-            && receipt.correlation_id == approval.correlation_id
-            && receipt.egress_plane == approval.egress_plane
-            && receipt.dispatch_nonce == approval.dispatch_nonce
-            && receipt.lease_issued_at_millis == approval.issued_at_millis
-            && receipt.lease_expires_at_millis == approval.expires_at_millis
-            && receipt.retry_of_intent_digest == approval.retry_of_intent_digest
-            && receipt.reserved_action_count == approval.reservation.action_count
-            && receipt.reserved_request_bytes == approval.reservation.request_bytes
-            && receipt.reserved_response_bytes == approval.reservation.response_bytes
-            && receipt.reserved_duration_seconds == approval.reservation.duration_seconds
-    }
-
-    fn reservation_token(&self, entry: &LeaseEntry, reserved_at_millis: u64) -> Digest {
-        let mut message = Vec::with_capacity(128);
-        message.extend_from_slice(b"faultloom-lease-reservation-v1\0");
-        message.extend_from_slice(entry.proof.as_bytes());
-        message.extend_from_slice(&reserved_at_millis.to_be_bytes());
-        hmac_sha256(&self.signing_key, &message)
-    }
-
-    fn release_active(
+    fn active_spec_and_key(
         state: &mut LeaseState,
         approval: &LeaseApproval,
     ) -> Result<(LeaseSpec, GrantKey), DenialCode> {
@@ -1256,9 +697,18 @@ impl LeaseAuthority {
             || entry.spec.scope_epoch_binding_digest != approval.scope_epoch_binding_digest
             || approval.lease_key_id.is_empty()
             || entry.spec.gateway_boot_id != approval.gateway_boot_id
+            || entry.spec.control_envelope_id != approval.control_envelope_id
             || entry.spec.request_binding_digest != approval.request_binding_digest
             || entry.spec.semantic_action_digest != approval.semantic_action_digest
             || entry.spec.resolution_digest != approval.resolution_digest
+            || entry.spec.compiled_request_digest != approval.compiled_request_digest
+            || entry.spec.effect_digest != approval.effect_digest
+            || approval.retry_invariant_digest == Digest::ZERO
+            || entry.retry_invariant_digest != Some(approval.retry_invariant_digest)
+            || entry
+                .spec
+                .hold_binding_digest(&approval.lease_key_id, approval.boot_challenge_digest)
+                != approval.hold_binding_digest
             || entry.spec.correlation_id != approval.correlation_id
             || entry.spec.egress_plane != approval.egress_plane
             || entry.spec.dispatch_nonce != approval.dispatch_nonce
@@ -1290,6 +740,14 @@ impl LeaseAuthority {
         {
             return Err(DenialCode::LeaseAccountingUnavailable);
         }
+        Ok((spec, key))
+    }
+
+    fn release_active(
+        state: &mut LeaseState,
+        approval: &LeaseApproval,
+    ) -> Result<(LeaseSpec, GrantKey), DenialCode> {
+        let (spec, key) = Self::active_spec_and_key(state, approval)?;
         state
             .leases
             .get_mut(&approval.lease_id)
@@ -1304,33 +762,6 @@ impl LeaseAuthority {
         account.usage.active_reserved_response_bytes -= spec.reservation.response_bytes;
         account.usage.active_reserved_duration_seconds -= spec.reservation.duration_seconds;
         Ok((spec, key))
-    }
-}
-
-impl ScopeCancellationSink for LeaseAuthority {
-    fn cancel_scope(&self, cancellation: &ScopeCancellation) -> Result<(), DenialCode> {
-        let revoke_grant = match (cancellation.cause, cancellation.revoked_at_epoch) {
-            (CancellationCause::ScopeRevoked, Some(epoch))
-                if epoch == cancellation.invalidated_through_epoch =>
-            {
-                true
-            }
-            (CancellationCause::EpochAdvanced | CancellationCause::EpochExpired, None) => false,
-            _ => return Err(DenialCode::LeaseBindingMismatch),
-        };
-        self.cancel_scope_transports(
-            &cancellation.grant_id,
-            cancellation.grant_version,
-            cancellation.invalidated_through_epoch,
-            revoke_grant,
-        )?;
-        self.cancel_grant_scope(
-            &cancellation.grant_id,
-            cancellation.grant_version,
-            cancellation.invalidated_through_epoch,
-            revoke_grant,
-        )
-        .map(|_| ())
     }
 }
 
@@ -1379,19 +810,37 @@ impl LeaseVerifier for LeaseAuthority {
         if state.reconciliation_required.contains_key(&intent_key) {
             return Err(DenialCode::LeaseReconciliationRequired);
         }
-        if let Some(parent) = entry.spec.retry_of_intent_digest
-            && {
-                let parent_key = ReconciliationKey::new(
-                    entry.spec.grant_id.clone(),
-                    entry.spec.grant_version,
-                    parent,
-                );
-                state.retry_aliases.get(&intent_key) != Some(&parent_key)
-                    || !state.reconciliation_receipts.contains_key(&parent_key)
-            }
-        {
-            return Err(DenialCode::RetryAliasInvalid);
+        if state.held_effects.iter().any(|(key, effect)| {
+            key.grant_id == entry.spec.grant_id
+                && key.grant_version == entry.spec.grant_version
+                && *effect == entry.spec.effect_digest
+        }) {
+            return Err(DenialCode::LeaseReconciliationRequired);
         }
+        let retry_invariant_digest = self.retry_invariant_digest(request, &entry.spec);
+        let retry_parent_key = if let Some(parent) = entry.spec.retry_of_intent_digest {
+            let parent_key = ReconciliationKey::new(
+                entry.spec.grant_id.clone(),
+                entry.spec.grant_version,
+                parent,
+            );
+            if state.retry_aliases.contains_key(&intent_key)
+                || state
+                    .reconciliation_receipts
+                    .get(&parent_key)
+                    .is_none_or(|resolution| {
+                        resolution.terminal_outcome != DispatchOutcome::Failed
+                            || resolution.retry_consumed
+                            || resolution.effect_digest != entry.spec.effect_digest
+                            || resolution.retry_invariant_digest != retry_invariant_digest
+                    })
+            {
+                return Err(DenialCode::RetryAliasInvalid);
+            }
+            Some(parent_key)
+        } else {
+            None
+        };
         let request_bytes = u64::try_from(request.payload.len())
             .map_err(|_| DenialCode::LeaseReservationExceeded)?;
         if request_bytes > entry.spec.reservation.request_bytes {
@@ -1402,69 +851,92 @@ impl LeaseVerifier for LeaseAuthority {
             grant_id: entry.spec.grant_id.clone(),
             grant_version: entry.spec.grant_version,
         };
-        let account = state
-            .grants
-            .get_mut(&key)
-            .ok_or(DenialCode::LeaseBindingMismatch)?;
-        if account.revoked_at_epoch.is_some() {
-            return Err(DenialCode::LeaseRevoked);
-        }
-        if now_millis < account.last_clock_millis {
-            return Err(DenialCode::LeaseAccountingUnavailable);
-        }
-        account.last_clock_millis = now_millis;
-        let cutoff = now_millis.saturating_sub(RATE_WINDOW_MILLIS);
-        while account
-            .dispatch_times
-            .front()
-            .is_some_and(|timestamp| *timestamp <= cutoff)
-        {
-            account.dispatch_times.pop_front();
-        }
-        if account.usage.dispatched_actions >= account.budget.total_actions {
-            return Err(DenialCode::GrantBudgetExhausted);
-        }
-        if u64::try_from(account.dispatch_times.len()).unwrap_or(u64::MAX)
-            >= account.budget.rate_per_minute
-        {
-            return Err(DenialCode::LeaseRateExceeded);
-        }
-        if account.usage.active_dispatches >= account.budget.max_concurrency {
-            return Err(DenialCode::LeaseConcurrencyExceeded);
-        }
+        let (reserved_request_bytes, reserved_response_bytes, reserved_duration_seconds) = {
+            let account = state
+                .grants
+                .get_mut(&key)
+                .ok_or(DenialCode::LeaseBindingMismatch)?;
+            if account.revoked_at_epoch.is_some() {
+                return Err(DenialCode::LeaseRevoked);
+            }
+            if now_millis < account.last_clock_millis {
+                return Err(DenialCode::LeaseAccountingUnavailable);
+            }
+            account.last_clock_millis = now_millis;
+            let cutoff = now_millis.saturating_sub(RATE_WINDOW_MILLIS);
+            while account
+                .dispatch_times
+                .front()
+                .is_some_and(|timestamp| *timestamp <= cutoff)
+            {
+                account.dispatch_times.pop_front();
+            }
+            if account.usage.dispatched_actions >= account.budget.total_actions {
+                return Err(DenialCode::GrantBudgetExhausted);
+            }
+            if u64::try_from(account.dispatch_times.len()).unwrap_or(u64::MAX)
+                >= account.budget.rate_per_minute
+            {
+                return Err(DenialCode::LeaseRateExceeded);
+            }
+            if account.usage.active_dispatches >= account.budget.max_concurrency {
+                return Err(DenialCode::LeaseConcurrencyExceeded);
+            }
 
-        let reserved_request_bytes = account
-            .usage
-            .active_reserved_request_bytes
-            .checked_add(entry.spec.reservation.request_bytes)
-            .ok_or(DenialCode::LeaseAccountingUnavailable)?;
-        let reserved_response_bytes = account
-            .usage
-            .active_reserved_response_bytes
-            .checked_add(entry.spec.reservation.response_bytes)
-            .ok_or(DenialCode::LeaseAccountingUnavailable)?;
-        let reserved_duration_seconds = account
-            .usage
-            .active_reserved_duration_seconds
-            .checked_add(entry.spec.reservation.duration_seconds)
-            .ok_or(DenialCode::LeaseAccountingUnavailable)?;
+            let reserved_request_bytes = account
+                .usage
+                .active_reserved_request_bytes
+                .checked_add(entry.spec.reservation.request_bytes)
+                .ok_or(DenialCode::LeaseAccountingUnavailable)?;
+            let reserved_response_bytes = account
+                .usage
+                .active_reserved_response_bytes
+                .checked_add(entry.spec.reservation.response_bytes)
+                .ok_or(DenialCode::LeaseAccountingUnavailable)?;
+            let reserved_duration_seconds = account
+                .usage
+                .active_reserved_duration_seconds
+                .checked_add(entry.spec.reservation.duration_seconds)
+                .ok_or(DenialCode::LeaseAccountingUnavailable)?;
+            (
+                reserved_request_bytes,
+                reserved_response_bytes,
+                reserved_duration_seconds,
+            )
+        };
 
         let reservation_token = self.reservation_token(&entry, now_millis);
         let cancellation = DispatchCancellation::new();
+        let hold_binding_digest = entry
+            .spec
+            .hold_binding_digest(&self.lease_key_id, self.boot_challenge_digest);
+        if let Some(parent_key) = retry_parent_key {
+            state
+                .reconciliation_receipts
+                .get_mut(&parent_key)
+                .expect("retry parent was validated while the state lock is held")
+                .retry_consumed = true;
+            state.retry_aliases.insert(intent_key, parent_key);
+        }
+        let account = state
+            .grants
+            .get_mut(&key)
+            .expect("grant existence was checked while the state lock is held");
         account.usage.dispatched_actions += 1;
         account.usage.active_dispatches += 1;
         account.usage.active_reserved_request_bytes = reserved_request_bytes;
         account.usage.active_reserved_response_bytes = reserved_response_bytes;
         account.usage.active_reserved_duration_seconds = reserved_duration_seconds;
         account.dispatch_times.push_back(now_millis);
-        state
+        let active_entry = state
             .leases
             .get_mut(&entry.spec.lease_id)
-            .expect("lease exists while state lock is held")
-            .status = LeaseStatus::Active {
+            .expect("lease exists while state lock is held");
+        active_entry.status = LeaseStatus::Active {
             reservation_token,
             cancellation: cancellation.clone(),
         };
+        active_entry.retry_invariant_digest = Some(retry_invariant_digest);
 
         Ok(LeaseApproval {
             intent_digest: entry.spec.intent_digest,
@@ -1478,9 +950,14 @@ impl LeaseVerifier for LeaseAuthority {
             lease_key_id: self.lease_key_id.clone(),
             gateway_boot_id: entry.spec.gateway_boot_id,
             boot_challenge_digest: self.boot_challenge_digest,
+            control_envelope_id: entry.spec.control_envelope_id,
             request_binding_digest: entry.spec.request_binding_digest,
             semantic_action_digest: entry.spec.semantic_action_digest,
             resolution_digest: entry.spec.resolution_digest,
+            compiled_request_digest: entry.spec.compiled_request_digest,
+            effect_digest: entry.spec.effect_digest,
+            hold_binding_digest,
+            retry_invariant_digest,
             correlation_id: entry.spec.correlation_id,
             egress_plane: entry.spec.egress_plane,
             dispatch_nonce: entry.spec.dispatch_nonce,
@@ -1506,10 +983,10 @@ impl LeaseVerifier for LeaseAuthority {
         completion: LeaseCompletion,
     ) -> Result<LeaseFinalization, DenialCode> {
         let mut state = self.lock_state()?;
-        let (spec, key) = Self::release_active(&mut state, approval)?;
+        let (spec, key) = Self::active_spec_and_key(&mut state, approval)?;
         let account = state
             .grants
-            .get_mut(&key)
+            .get(&key)
             .ok_or(DenialCode::LeaseAccountingUnavailable)?;
         let request_total = account
             .usage
@@ -1525,10 +1002,6 @@ impl LeaseVerifier for LeaseAuthority {
             .checked_add(completion.elapsed_millis);
         let accounting_overflow =
             request_total.is_none() || response_total.is_none() || duration_total.is_none();
-        account.usage.actual_request_bytes = request_total.unwrap_or(u64::MAX);
-        account.usage.actual_response_bytes = response_total.unwrap_or(u64::MAX);
-        account.usage.actual_duration_millis = duration_total.unwrap_or(u64::MAX);
-
         let duration_limit_millis = spec.reservation.duration_seconds.saturating_mul(1_000);
         let reservation_overrun = completion.bytes_sent > spec.reservation.request_bytes
             || completion.bytes_received > spec.reservation.response_bytes
@@ -1536,11 +1009,40 @@ impl LeaseVerifier for LeaseAuthority {
             || accounting_overflow;
         let reconciliation_required =
             completion.outcome == DispatchOutcome::UnknownOutcome || reservation_overrun;
+        let reconciliation_key = ReconciliationKey::from_spec(&spec);
+        let hold = ReconciliationHold {
+            kind: ReconciliationHoldKind::DispatchReceipt,
+            binding_digest: approval.hold_binding_digest,
+            retry_invariant_digest: approval.retry_invariant_digest,
+        };
+        if reconciliation_required
+            && (state.held_effects.contains_key(&reconciliation_key)
+                || state
+                    .reconciliation_required
+                    .contains_key(&reconciliation_key)
+                || state
+                    .reconciliation_receipts
+                    .contains_key(&reconciliation_key))
+        {
+            return Err(DenialCode::LeaseAccountingUnavailable);
+        }
+
+        Self::release_active(&mut state, approval)?;
+        let account = state
+            .grants
+            .get_mut(&key)
+            .expect("grant existence was validated while the state lock is held");
+        account.usage.actual_request_bytes = request_total.unwrap_or(u64::MAX);
+        account.usage.actual_response_bytes = response_total.unwrap_or(u64::MAX);
+        account.usage.actual_duration_millis = duration_total.unwrap_or(u64::MAX);
         if reconciliation_required {
-            state.reconciliation_required.insert(
-                ReconciliationKey::from_spec(&spec),
-                ReconciliationHoldKind::DispatchReceipt,
-            );
+            state
+                .reconciliation_required
+                .insert(reconciliation_key.clone(), hold);
+            state
+                .held_effects
+                .entry(reconciliation_key)
+                .or_insert(spec.effect_digest);
         }
         Ok(LeaseFinalization {
             reconciliation_required,
@@ -1561,327 +1063,6 @@ impl LeaseVerifier for LeaseAuthority {
         }
         Ok(self.dispatch_receipt_authentication_tag(receipt))
     }
-}
-
-fn valid_identifier(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    !bytes.is_empty()
-        && bytes.len() <= 256
-        && bytes[0].is_ascii_alphanumeric()
-        && bytes.iter().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'/' | b'-')
-        })
-}
-
-fn valid_boot_secret(value: &[u8; 32]) -> bool {
-    let mut seen = [false; 256];
-    for byte in value {
-        seen[usize::from(*byte)] = true;
-    }
-    seen.into_iter().filter(|present| *present).take(4).count() == 4
-}
-
-fn valid_nonce(value: &[u8; 16]) -> bool {
-    let mut seen = [false; 256];
-    for byte in value {
-        seen[usize::from(*byte)] = true;
-    }
-    seen.into_iter().filter(|present| *present).take(4).count() == 4
-}
-
-fn push_string(output: &mut Vec<u8>, value: &str) {
-    output.extend_from_slice(&(value.len() as u32).to_be_bytes());
-    output.extend_from_slice(value.as_bytes());
-}
-
-fn push_optional_digest(output: &mut Vec<u8>, value: Option<Digest>) {
-    match value {
-        Some(value) => {
-            output.push(1);
-            output.extend_from_slice(value.as_bytes());
-        }
-        None => output.push(0),
-    }
-}
-
-fn push_optional_u64(output: &mut Vec<u8>, value: Option<u64>) {
-    match value {
-        Some(value) => {
-            output.push(1);
-            output.extend_from_slice(&value.to_be_bytes());
-        }
-        None => output.push(0),
-    }
-}
-
-fn push_count(output: &mut Vec<u8>, count: usize) -> Result<(), DenialCode> {
-    if count > MAX_RECOVERY_ITEMS {
-        return Err(DenialCode::RecoveryCheckpointInvalid);
-    }
-    output.extend_from_slice(
-        &u32::try_from(count)
-            .map_err(|_| DenialCode::RecoveryCheckpointInvalid)?
-            .to_be_bytes(),
-    );
-    Ok(())
-}
-
-fn push_reconciliation_holds(
-    output: &mut Vec<u8>,
-    values: &HashMap<ReconciliationKey, ReconciliationHoldKind>,
-) -> Result<(), DenialCode> {
-    let mut values: Vec<_> = values.iter().collect();
-    values.sort_unstable_by(|(left, _), (right, _)| left.canonical_cmp(right));
-    push_count(output, values.len())?;
-    for (reconciliation_key, hold_kind) in values {
-        push_reconciliation_key(output, reconciliation_key);
-        output.push(*hold_kind as u8);
-    }
-    Ok(())
-}
-
-fn push_reconciliation_receipts(
-    output: &mut Vec<u8>,
-    values: &HashMap<ReconciliationKey, Digest>,
-) -> Result<(), DenialCode> {
-    let mut values: Vec<_> = values.iter().collect();
-    values.sort_unstable_by(|(left, _), (right, _)| left.canonical_cmp(right));
-    push_count(output, values.len())?;
-    for (key, value) in values {
-        push_reconciliation_key(output, key);
-        output.extend_from_slice(value.as_bytes());
-    }
-    Ok(())
-}
-
-fn push_retry_aliases(
-    output: &mut Vec<u8>,
-    values: &HashMap<ReconciliationKey, ReconciliationKey>,
-) -> Result<(), DenialCode> {
-    let mut values: Vec<_> = values.iter().collect();
-    values.sort_unstable_by(|(left, _), (right, _)| left.canonical_cmp(right));
-    push_count(output, values.len())?;
-    for (retry, parent) in values {
-        push_reconciliation_key(output, retry);
-        push_reconciliation_key(output, parent);
-    }
-    Ok(())
-}
-
-fn push_reconciliation_key(output: &mut Vec<u8>, value: &ReconciliationKey) {
-    push_string(output, &value.grant_id);
-    output.extend_from_slice(&value.grant_version.to_be_bytes());
-    output.extend_from_slice(value.intent_digest.as_bytes());
-}
-
-fn recovery_checkpoint_id(encoded: &[u8]) -> Digest {
-    let mut canonical = Vec::with_capacity(encoded.len() + 48);
-    canonical.extend_from_slice(b"faultloom-lease-recovery-checkpoint-id-v3\0");
-    canonical.extend_from_slice(encoded);
-    Digest::of(&canonical)
-}
-
-struct RecoveryDecoder<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> RecoveryDecoder<'a> {
-    const fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
-    }
-
-    fn take(&mut self, length: usize) -> Result<&'a [u8], DenialCode> {
-        let end = self
-            .offset
-            .checked_add(length)
-            .ok_or(DenialCode::RecoveryCheckpointInvalid)?;
-        let value = self
-            .bytes
-            .get(self.offset..end)
-            .ok_or(DenialCode::RecoveryCheckpointInvalid)?;
-        self.offset = end;
-        Ok(value)
-    }
-
-    fn expect_prefix(&mut self, expected: &[u8]) -> Result<(), DenialCode> {
-        if self.take(expected.len())? == expected {
-            Ok(())
-        } else {
-            Err(DenialCode::RecoveryCheckpointInvalid)
-        }
-    }
-
-    fn byte(&mut self) -> Result<u8, DenialCode> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn u32(&mut self) -> Result<u32, DenialCode> {
-        Ok(u32::from_be_bytes(
-            self.take(4)?
-                .try_into()
-                .map_err(|_| DenialCode::RecoveryCheckpointInvalid)?,
-        ))
-    }
-
-    fn u64(&mut self) -> Result<u64, DenialCode> {
-        Ok(u64::from_be_bytes(
-            self.take(8)?
-                .try_into()
-                .map_err(|_| DenialCode::RecoveryCheckpointInvalid)?,
-        ))
-    }
-
-    fn count(&mut self) -> Result<usize, DenialCode> {
-        let count = self.u32()? as usize;
-        if count > MAX_RECOVERY_ITEMS {
-            Err(DenialCode::RecoveryCheckpointInvalid)
-        } else {
-            Ok(count)
-        }
-    }
-
-    fn string(&mut self) -> Result<String, DenialCode> {
-        let length = self.u32()? as usize;
-        if length == 0 || length > 256 {
-            return Err(DenialCode::RecoveryCheckpointInvalid);
-        }
-        String::from_utf8(self.take(length)?.to_vec())
-            .map_err(|_| DenialCode::RecoveryCheckpointInvalid)
-    }
-
-    fn digest(&mut self) -> Result<Digest, DenialCode> {
-        Ok(Digest::from_bytes(
-            self.take(32)?
-                .try_into()
-                .map_err(|_| DenialCode::RecoveryCheckpointInvalid)?,
-        ))
-    }
-
-    fn nonce(&mut self) -> Result<[u8; 16], DenialCode> {
-        self.take(16)?
-            .try_into()
-            .map_err(|_| DenialCode::RecoveryCheckpointInvalid)
-    }
-
-    fn optional_u64(&mut self) -> Result<Option<u64>, DenialCode> {
-        match self.byte()? {
-            0 => Ok(None),
-            1 => Ok(Some(self.u64()?)),
-            _ => Err(DenialCode::RecoveryCheckpointInvalid),
-        }
-    }
-
-    fn reconciliation_holds(
-        &mut self,
-    ) -> Result<HashMap<ReconciliationKey, ReconciliationHoldKind>, DenialCode> {
-        let count = self.count()?;
-        let mut values = HashMap::with_capacity(count);
-        for _ in 0..count {
-            let reconciliation_key = self.reconciliation_key()?;
-            let hold_kind = match self.byte()? {
-                1 => ReconciliationHoldKind::DispatchReceipt,
-                2 => ReconciliationHoldKind::ControlPlane,
-                _ => return Err(DenialCode::RecoveryCheckpointInvalid),
-            };
-            if values.insert(reconciliation_key, hold_kind).is_some() {
-                return Err(DenialCode::RecoveryCheckpointInvalid);
-            }
-        }
-        Ok(values)
-    }
-
-    fn reconciliation_receipts(
-        &mut self,
-    ) -> Result<HashMap<ReconciliationKey, Digest>, DenialCode> {
-        let count = self.count()?;
-        let mut values = HashMap::with_capacity(count);
-        for _ in 0..count {
-            let key = self.reconciliation_key()?;
-            let value = self.digest()?;
-            if value == Digest::ZERO || values.insert(key, value).is_some() {
-                return Err(DenialCode::RecoveryCheckpointInvalid);
-            }
-        }
-        Ok(values)
-    }
-
-    fn retry_aliases(
-        &mut self,
-    ) -> Result<HashMap<ReconciliationKey, ReconciliationKey>, DenialCode> {
-        let count = self.count()?;
-        let mut values = HashMap::with_capacity(count);
-        for _ in 0..count {
-            let retry = self.reconciliation_key()?;
-            let parent = self.reconciliation_key()?;
-            if retry == parent
-                || retry.grant_id != parent.grant_id
-                || retry.grant_version != parent.grant_version
-                || values.insert(retry, parent).is_some()
-            {
-                return Err(DenialCode::RecoveryCheckpointInvalid);
-            }
-        }
-        Ok(values)
-    }
-
-    fn reconciliation_key(&mut self) -> Result<ReconciliationKey, DenialCode> {
-        let grant_id = self.string()?;
-        let grant_version = self.u64()?;
-        let intent_digest = self.digest()?;
-        if !valid_identifier(&grant_id) || grant_version == 0 || intent_digest == Digest::ZERO {
-            return Err(DenialCode::RecoveryCheckpointInvalid);
-        }
-        Ok(ReconciliationKey::new(
-            grant_id,
-            grant_version,
-            intent_digest,
-        ))
-    }
-
-    fn finish(self) -> Result<(), DenialCode> {
-        if self.offset == self.bytes.len() {
-            Ok(())
-        } else {
-            Err(DenialCode::RecoveryCheckpointInvalid)
-        }
-    }
-}
-
-fn constant_time_eq(expected: &[u8; 32], actual: &[u8]) -> bool {
-    if actual.len() != expected.len() {
-        return false;
-    }
-    expected
-        .iter()
-        .zip(actual)
-        .fold(0_u8, |difference, (left, right)| {
-            difference | (left ^ right)
-        })
-        == 0
-}
-
-fn hmac_sha256(key: &[u8], message: &[u8]) -> Digest {
-    let mut key_block = [0_u8; HMAC_BLOCK_BYTES];
-    if key.len() > HMAC_BLOCK_BYTES {
-        key_block[..32].copy_from_slice(Digest::of(key).as_bytes());
-    } else {
-        key_block[..key.len()].copy_from_slice(key);
-    }
-    let mut inner_pad = [0x36_u8; HMAC_BLOCK_BYTES];
-    let mut outer_pad = [0x5c_u8; HMAC_BLOCK_BYTES];
-    for (index, byte) in key_block.iter().enumerate() {
-        inner_pad[index] ^= byte;
-        outer_pad[index] ^= byte;
-    }
-    let mut inner = Vec::with_capacity(HMAC_BLOCK_BYTES + message.len());
-    inner.extend_from_slice(&inner_pad);
-    inner.extend_from_slice(message);
-    let inner_digest = Digest::of(&inner);
-    let mut outer = Vec::with_capacity(HMAC_BLOCK_BYTES + 32);
-    outer.extend_from_slice(&outer_pad);
-    outer.extend_from_slice(inner_digest.as_bytes());
-    Digest::of(&outer)
 }
 
 #[cfg(test)]
@@ -1943,9 +1124,12 @@ mod tests {
             authority_key_id: "authority-key:test".to_owned(),
             scope_epoch_binding_digest: Digest::of(b"scope epoch binding:test"),
             gateway_boot_id: "gateway:boot:test".to_owned(),
+            control_envelope_id: Digest::of(format!("control-envelope:{lease_id}").as_bytes()),
             request_binding_digest: Digest::ZERO,
             semantic_action_digest: Digest::ZERO,
             resolution_digest: Digest::ZERO,
+            compiled_request_digest: Digest::ZERO,
+            effect_digest: Digest::ZERO,
             correlation_id: "correlation:1".to_owned(),
             egress_plane: EgressPlane::TargetGateway,
             dispatch_nonce,
@@ -1968,6 +1152,13 @@ mod tests {
         spec.request_binding_digest = bound.lease_binding_digest();
         spec.semantic_action_digest = bound.semantic_action_digest;
         spec.resolution_digest = bound.resolution_digest;
+        spec.compiled_request_digest = Digest::of(&bound.payload);
+        spec.effect_digest = crate::policy::target_effect_digest(
+            bound.action_kind,
+            bound.egress_plane,
+            bound.resolution_digest,
+            Digest::of(&bound.payload),
+        );
     }
 
     fn request(spec: &LeaseSpec, proof: Vec<u8>) -> DispatchRequest {
@@ -2025,9 +1216,17 @@ mod tests {
             authority_key_id: "authority-key:test".to_owned(),
             scope_epoch_binding_digest: Digest::of(b"scope epoch binding:test"),
             gateway_boot_id: "gateway:boot:test".to_owned(),
+            control_envelope_id: Digest::of(b"control-envelope:request-fixture"),
             request_binding_digest: request.lease_binding_digest(),
             semantic_action_digest: request.semantic_action_digest,
             resolution_digest: request.resolution_digest,
+            compiled_request_digest: Digest::of(&request.payload),
+            effect_digest: crate::policy::target_effect_digest(
+                request.action_kind,
+                request.egress_plane,
+                request.resolution_digest,
+                Digest::of(&request.payload),
+            ),
             correlation_id: request.correlation_id.clone(),
             egress_plane: request.egress_plane,
             dispatch_nonce: request.dispatch_nonce,
@@ -2041,6 +1240,31 @@ mod tests {
                 duration_seconds: 2,
             },
         }
+    }
+
+    fn retry_candidate(
+        parent: &LeaseSpec,
+        coordinates: (&str, &[u8]),
+        mutate: impl FnOnce(&mut DispatchRequest),
+    ) -> (LeaseSpec, DispatchRequest) {
+        let (lease_id, intent) = coordinates;
+        let mut seed = spec(lease_id, intent);
+        seed.decision_digest = parent.decision_digest;
+        seed.grant_id.clone_from(&parent.grant_id);
+        seed.grant_version = parent.grant_version;
+        seed.scope_epoch = parent.scope_epoch;
+        seed.authority_key_id.clone_from(&parent.authority_key_id);
+        seed.scope_epoch_binding_digest = parent.scope_epoch_binding_digest;
+        seed.gateway_boot_id.clone_from(&parent.gateway_boot_id);
+        seed.retry_of_intent_digest = Some(parent.intent_digest);
+        seal_spec(&mut seed);
+        let mut candidate = request(&seed, vec![1]);
+        mutate(&mut candidate);
+        candidate.bind_canonical_semantics();
+        let mut lease = spec_for_request(&candidate);
+        lease.control_envelope_id =
+            Digest::of(format!("retry-control-envelope:{lease_id}").as_bytes());
+        (lease, candidate)
     }
 
     fn completion(outcome: DispatchOutcome) -> LeaseCompletion {
@@ -2122,8 +1346,12 @@ mod tests {
             semantic_action_digest: request.semantic_action_digest,
             request_binding_digest,
             request_frame_digest: Digest::of(b"canonical request frame"),
+            control_envelope_id: approval.control_envelope_id,
+            hold_binding_digest: approval.hold_binding_digest,
             resolution_digest: request.resolution_digest,
+            action_kind: request.action_kind,
             egress_plane: request.egress_plane,
+            effect_digest: lease.effect_digest,
             dispatch_nonce: request.dispatch_nonce,
             lease_issued_at_millis: request.request_issued_at_millis,
             lease_expires_at_millis: request.request_expires_at_millis,
@@ -2263,6 +1491,360 @@ mod tests {
     }
 
     #[test]
+    fn exact_hold_collision_is_rejected_before_active_accounting_changes() {
+        let authority = authority(budget());
+        let first = spec("lease:hold-collision-a", b"intent:hold-collision");
+        let first_proof = authority
+            .issue(first.clone())
+            .expect("issue first lease")
+            .proof;
+        let first_request = request(&first, first_proof);
+        let approval = authority
+            .reserve(&first_request, NOW)
+            .expect("reserve first lease");
+
+        let second = spec("lease:hold-collision-b", b"intent:hold-collision");
+        assert_eq!(
+            authority.issue(second),
+            Err(DenialCode::LeaseBindingMismatch),
+            "one intent key cannot name two exact hold bindings"
+        );
+
+        let key = ReconciliationKey::from_spec(&first);
+        let mut state = authority
+            .state
+            .lock()
+            .expect("inject conflicting durable hold");
+        state.reconciliation_required.insert(
+            key.clone(),
+            ReconciliationHold {
+                kind: ReconciliationHoldKind::DispatchReceipt,
+                binding_digest: Digest::of(b"conflicting exact hold"),
+                retry_invariant_digest: Digest::of(b"conflicting retry invariant"),
+            },
+        );
+        state.held_effects.insert(key, first.effect_digest);
+        drop(state);
+
+        let before = authority
+            .usage("grant:1", 3)
+            .expect("usage before collision");
+        assert_eq!(
+            authority.finalize(&approval, completion(DispatchOutcome::UnknownOutcome)),
+            Err(DenialCode::LeaseAccountingUnavailable)
+        );
+        let after = authority
+            .usage("grant:1", 3)
+            .expect("usage after collision");
+        assert_eq!(
+            after, before,
+            "failed finalization cannot consume accounting"
+        );
+        let state = authority
+            .state
+            .lock()
+            .expect("inspect active lease after collision");
+        assert!(matches!(
+            state.leases.get(&first.lease_id).map(|entry| &entry.status),
+            Some(LeaseStatus::Active { .. })
+        ));
+    }
+
+    #[test]
+    fn same_effect_reconciliation_hold_denies_issue_without_state_consumption() {
+        let authority = authority(budget());
+        let held = spec("lease:held-effect", b"intent:held-effect");
+        let _receipt = authenticated_unknown_receipt(&authority, &held);
+        let candidate = spec("lease:same-held-effect", b"intent:held-effect");
+        assert_eq!(candidate.effect_digest, held.effect_digest);
+        let usage_before = authority
+            .usage(&candidate.grant_id, candidate.grant_version)
+            .expect("usage before denied issue");
+
+        assert_eq!(
+            authority.issue(candidate.clone()),
+            Err(DenialCode::LeaseReconciliationRequired)
+        );
+
+        assert_eq!(
+            authority
+                .usage(&candidate.grant_id, candidate.grant_version)
+                .expect("usage after denied issue"),
+            usage_before
+        );
+        let key = ReconciliationKey::from_spec(&candidate);
+        let state = authority.state.lock().expect("inspect denied issue state");
+        assert!(!state.leases.contains_key(&candidate.lease_id));
+        assert!(!state.dispatch_nonces.contains(&candidate.dispatch_nonce));
+        assert!(!state.retired_lease_ids.contains(&candidate.lease_id));
+        assert!(state.reconciliation_required.contains_key(&key));
+        assert_eq!(state.held_effects.get(&key), Some(&held.effect_digest));
+    }
+
+    #[test]
+    fn preflight_denies_an_exact_held_intent_without_mutating_lease_state() {
+        // Given: an exact intent key is held for reconciliation after an
+        // ambiguous dispatch.
+        let authority = authority(budget());
+        let held = spec("lease:preflight-held", b"intent:preflight-held");
+        let _receipt = authenticated_unknown_receipt(&authority, &held);
+        let usage_before = authority
+            .usage(&held.grant_id, held.grant_version)
+            .expect("usage before preflight");
+        let key = ReconciliationKey::from_spec(&held);
+        let state_before = authority.state.lock().expect("inspect held state");
+        let lease_count_before = state_before.leases.len();
+        let nonce_count_before = state_before.dispatch_nonces.len();
+        let retired_count_before = state_before.retired_lease_ids.len();
+        let checkpoint_sequence_before = state_before.checkpoint_sequence;
+        let hold_before = state_before
+            .reconciliation_required
+            .get(&key)
+            .copied()
+            .expect("exact reconciliation hold");
+        let effect_before = *state_before
+            .held_effects
+            .get(&key)
+            .expect("exact held effect");
+        drop(state_before);
+
+        // When: the main thread performs the read-only precompile check.
+        let result =
+            authority.preflight_issue(&held.grant_id, held.grant_version, held.intent_digest);
+
+        // Then: reconciliation is required and no lease, proof, nonce, budget,
+        // hold, or checkpoint state changes.
+        assert_eq!(result, Err(DenialCode::LeaseReconciliationRequired));
+        assert_eq!(
+            authority
+                .usage(&held.grant_id, held.grant_version)
+                .expect("usage after preflight"),
+            usage_before
+        );
+        let state_after = authority.state.lock().expect("inspect denied state");
+        assert_eq!(state_after.leases.len(), lease_count_before);
+        assert_eq!(state_after.dispatch_nonces.len(), nonce_count_before);
+        assert_eq!(state_after.retired_lease_ids.len(), retired_count_before);
+        assert_eq!(state_after.checkpoint_sequence, checkpoint_sequence_before);
+        assert_eq!(
+            state_after.reconciliation_required.get(&key),
+            Some(&hold_before)
+        );
+        assert_eq!(state_after.held_effects.get(&key), Some(&effect_before));
+    }
+
+    #[test]
+    fn preflight_conservatively_denies_a_held_intent_before_effect_compilation() {
+        // Given: a held intent and a later request that would compile to a
+        // different effect under the same exact intent key.
+        let authority = authority(budget());
+        let held = spec(
+            "lease:preflight-effect-held",
+            b"intent:preflight-effect-held",
+        );
+        let _receipt = authenticated_unknown_receipt(&authority, &held);
+        let mut different_effect = spec(
+            "lease:preflight-effect-different",
+            b"intent:preflight-effect-held",
+        );
+        different_effect.effect_digest = Digest::of(b"different preflight effect");
+
+        // When: the effect-free preflight and the later effect-aware issuance
+        // inspect the same key.
+        let preflight = authority.preflight_issue(
+            &different_effect.grant_id,
+            different_effect.grant_version,
+            different_effect.intent_digest,
+        );
+        let issue = authority.issue(different_effect);
+
+        // Then: preflight never guesses an effect mismatch, while issuance
+        // retains the exact effect-aware precedence contract.
+        assert_eq!(preflight, Err(DenialCode::LeaseReconciliationRequired));
+        assert_eq!(issue, Err(DenialCode::LeaseBindingMismatch));
+    }
+
+    #[test]
+    fn preflight_allows_a_distinct_nonheld_intent_to_reach_normal_issuance() {
+        // Given: one intent is held and another well-formed intent is distinct.
+        let authority = authority(budget());
+        let held = spec(
+            "lease:preflight-distinct-held",
+            b"intent:preflight-distinct-held",
+        );
+        let _receipt = authenticated_unknown_receipt(&authority, &held);
+        let candidate = spec(
+            "lease:preflight-distinct-candidate",
+            b"intent:preflight-distinct-candidate",
+        );
+
+        // When: the distinct intent is preflighted and issued normally.
+        let preflight = authority.preflight_issue(
+            &candidate.grant_id,
+            candidate.grant_version,
+            candidate.intent_digest,
+        );
+        let issue = authority.issue(candidate);
+
+        // Then: the exact-key gate does not broaden the hold.
+        assert_eq!(preflight, Ok(()));
+        assert!(issue.is_ok());
+    }
+
+    #[test]
+    fn preflight_fails_closed_for_one_sided_hold_state() {
+        // Given: each impossible one-sided durable hold representation.
+        for hold_present in [true, false] {
+            let authority = authority(budget());
+            let candidate = spec("lease:preflight-one-sided", b"intent:preflight-one-sided");
+            let key = ReconciliationKey::from_spec(&candidate);
+            let mut state = authority.state.lock().expect("inject one-sided hold");
+            if hold_present {
+                state.reconciliation_required.insert(
+                    key,
+                    ReconciliationHold {
+                        kind: ReconciliationHoldKind::ControlPlane,
+                        binding_digest: Digest::of(b"preflight one-sided binding"),
+                        retry_invariant_digest: Digest::of(b"preflight one-sided retry"),
+                    },
+                );
+            } else {
+                state.held_effects.insert(key, candidate.effect_digest);
+            }
+            drop(state);
+
+            // When: the key is preflighted.
+            let result = authority.preflight_issue(
+                &candidate.grant_id,
+                candidate.grant_version,
+                candidate.intent_digest,
+            );
+
+            // Then: corrupt paired state is never treated as unheld.
+            assert_eq!(result, Err(DenialCode::LeaseAccountingUnavailable));
+        }
+    }
+
+    #[test]
+    fn different_effect_reconciliation_hold_remains_a_binding_mismatch() {
+        let authority = authority(budget());
+        let held = spec("lease:held-other-effect", b"intent:held-other-effect");
+        let _receipt = authenticated_unknown_receipt(&authority, &held);
+        let mut candidate = spec("lease:different-held-effect", b"intent:held-other-effect");
+        candidate.effect_digest = Digest::of(b"different candidate effect");
+        let usage_before = authority
+            .usage(&candidate.grant_id, candidate.grant_version)
+            .expect("usage before denied issue");
+
+        assert_eq!(
+            authority.issue(candidate.clone()),
+            Err(DenialCode::LeaseBindingMismatch)
+        );
+
+        assert_eq!(
+            authority
+                .usage(&candidate.grant_id, candidate.grant_version)
+                .expect("usage after denied issue"),
+            usage_before
+        );
+        let key = ReconciliationKey::from_spec(&candidate);
+        let state = authority.state.lock().expect("inspect denied issue state");
+        assert!(!state.leases.contains_key(&candidate.lease_id));
+        assert!(!state.dispatch_nonces.contains(&candidate.dispatch_nonce));
+        assert!(!state.retired_lease_ids.contains(&candidate.lease_id));
+        assert!(state.reconciliation_required.contains_key(&key));
+        assert_eq!(state.held_effects.get(&key), Some(&held.effect_digest));
+    }
+
+    #[test]
+    fn one_sided_reconciliation_hold_state_fails_closed() {
+        for hold_present in [true, false] {
+            let authority = authority(budget());
+            let candidate = spec("lease:one-sided-hold", b"intent:one-sided-hold");
+            let key = ReconciliationKey::from_spec(&candidate);
+            let mut state = authority.state.lock().expect("inject one-sided hold");
+            if hold_present {
+                state.reconciliation_required.insert(
+                    key,
+                    ReconciliationHold {
+                        kind: ReconciliationHoldKind::DispatchReceipt,
+                        binding_digest: Digest::of(b"one-sided hold binding"),
+                        retry_invariant_digest: Digest::of(b"one-sided retry invariant"),
+                    },
+                );
+            } else {
+                state.held_effects.insert(key, candidate.effect_digest);
+            }
+            drop(state);
+
+            assert_eq!(
+                authority.issue(candidate.clone()),
+                Err(DenialCode::LeaseAccountingUnavailable)
+            );
+            let state = authority.state.lock().expect("inspect denied issue state");
+            assert!(!state.leases.contains_key(&candidate.lease_id));
+            assert!(!state.dispatch_nonces.contains(&candidate.dispatch_nonce));
+            assert!(!state.retired_lease_ids.contains(&candidate.lease_id));
+        }
+    }
+
+    #[test]
+    fn completed_resolution_is_monotonic_and_checkpoint_remains_restorable() {
+        let (authority, reconciler) = authority_with_reconciliation(budget());
+        let lease = spec("lease:monotonic-resolution", b"intent:monotonic-resolution");
+        let receipt = authenticated_unknown_receipt(&authority, &lease);
+        let completed = reconciler
+            .issue(
+                &receipt,
+                DispatchOutcome::Completed,
+                Digest::of(b"completed terminal evidence"),
+                *b"completed-proof1",
+                NOW + 2,
+            )
+            .expect("completed reconciliation");
+        authority
+            .reconcile(&receipt, &completed)
+            .expect("store completed resolution");
+        let failed = reconciler
+            .issue(
+                &receipt,
+                DispatchOutcome::Failed,
+                Digest::of(b"later contradictory evidence"),
+                *b"failed-proof-001",
+                NOW + 3,
+            )
+            .expect("well-formed contradictory reconciliation");
+        assert_eq!(
+            authority.reconcile(&receipt, &failed),
+            Err(DenialCode::LeaseReplay),
+            "a terminal resolution cannot be overwritten"
+        );
+
+        let checkpoint = authority
+            .checkpoint()
+            .expect("checkpoint monotonic resolution");
+        let restored = LeaseAuthority::new_with_reconciliation_verifier(
+            "lease-key:test".to_owned(),
+            lease_key(),
+            "gateway:boot:monotonic-restored".to_owned(),
+            Digest::of(b"monotonic restored challenge"),
+            "reconciliation-key:test".to_owned(),
+            reconciliation_key(),
+        )
+        .expect("fresh restore authority");
+        restored
+            .restore_checkpoint(&checkpoint, checkpoint.checkpoint_id())
+            .expect("every emitted checkpoint must restore");
+        let state = restored.state.lock().expect("inspect restored resolution");
+        let resolution = state
+            .reconciliation_receipts
+            .get(&ReconciliationKey::from_spec(&lease))
+            .expect("restored resolution");
+        assert_eq!(resolution.terminal_outcome, DispatchOutcome::Completed);
+        assert!(!resolution.retry_consumed);
+    }
+
+    #[test]
     fn reconciliation_grant_binding_cannot_be_recomputed_without_the_control_plane_key() {
         let (authority, reconciler) = authority_with_reconciliation(budget());
         authority
@@ -2362,12 +1944,19 @@ mod tests {
         let receipt = authenticated_unknown_receipt(&authority, &lease);
         let bypass = reconciler
             .issue_control_plane_hold(
-                (&lease.grant_id, lease.grant_version),
-                lease.intent_digest,
-                DispatchOutcome::Completed,
-                Digest::of(b"unbound terminal evidence"),
-                *b"bypass-proof-001",
-                NOW + 2,
+                ControlPlaneReconciliationHold {
+                    grant_id: lease.grant_id.clone(),
+                    grant_version: lease.grant_version,
+                    intent_digest: lease.intent_digest,
+                    effect_digest: lease.effect_digest,
+                    hold_binding_digest: receipt.hold_binding_digest,
+                },
+                ReconciliationTerminal {
+                    outcome: DispatchOutcome::Completed,
+                    evidence_digest: Digest::of(b"unbound terminal evidence"),
+                    nonce: *b"bypass-proof-001",
+                    resolved_at_millis: NOW + 2,
+                },
             )
             .expect("well-formed but unbound proof");
 
@@ -2433,6 +2022,17 @@ mod tests {
         authority
             .reconcile(&first_receipt, &first_reconciliation)
             .expect("reconcile first grant only");
+        let mut completed_retry = spec(
+            "lease:grant-1-completed-retry",
+            b"intent:grant-1-completed-retry",
+        );
+        completed_retry.retry_of_intent_digest = Some(first.intent_digest);
+        seal_spec(&mut completed_retry);
+        assert_eq!(
+            authority.issue(completed_retry),
+            Err(DenialCode::RetryAliasInvalid),
+            "a terminally completed dispatch cannot be retried"
+        );
 
         let mut unauthorized_retry = spec(
             "lease:grant-2-unauthorized-retry",
@@ -2451,31 +2051,32 @@ mod tests {
         let second_reconciliation = reconciler
             .issue(
                 &second_receipt,
-                DispatchOutcome::Completed,
+                DispatchOutcome::Failed,
                 Digest::of(b"second grant terminal evidence"),
                 *b"reconcile-grant2",
                 NOW + 2,
             )
-            .expect("second grant reconciliation");
+            .expect("failed second-grant reconciliation");
         authority
             .reconcile(&second_receipt, &second_reconciliation)
             .expect("second grant retains an independent hold");
 
-        let mut authorized_retry = spec(
-            "lease:grant-2-authorized-retry",
-            b"intent:grant-2-authorized-retry",
+        let (authorized_retry, mut authorized_request) = retry_candidate(
+            &second,
+            (
+                "lease:grant-2-authorized-retry",
+                b"intent:grant-2-authorized-retry",
+            ),
+            |_| {},
         );
-        authorized_retry.grant_id = second.grant_id;
-        authorized_retry.grant_version = second.grant_version;
-        authorized_retry.retry_of_intent_digest = Some(second.intent_digest);
-        seal_spec(&mut authorized_retry);
         let proof = authority
             .issue(authorized_retry.clone())
-            .expect("exact grant-2 reconciliation authorizes a fresh retry")
+            .expect("exact failed reconciliation authorizes a fresh retry")
             .proof;
+        authorized_request.lease_proof = proof;
         authority
-            .reserve(&request(&authorized_retry, proof), NOW + 3)
-            .expect("fresh grant-2 retry reserves after exact reconciliation");
+            .reserve(&authorized_request, NOW + 3)
+            .expect("fresh grant-2 retry reserves after exact failed reconciliation");
         assert_ne!(first.grant_id, authorized_retry.grant_id);
     }
 
@@ -2941,16 +2542,27 @@ mod tests {
         let mut retry = spec("lease:retry", b"intent:shared");
         retry.decision_digest = Digest::of(b"new-decision");
         seal_spec(&mut retry);
-        let retry_proof = authority.issue(retry.clone()).expect("retry").proof;
-        let retry_request = request(&retry, retry_proof);
         assert_eq!(
-            authority.reserve(&retry_request, NOW + 1),
-            Err(DenialCode::LeaseReconciliationRequired)
+            authority.issue(retry),
+            Err(DenialCode::LeaseReconciliationRequired),
+            "an exact-effect durable hold takes precedence over the general binding collision"
+        );
+        let relabelled = spec("lease:relabelled", b"intent:relabelled");
+        assert_eq!(relabelled.effect_digest, first.effect_digest);
+        let relabelled_proof = authority
+            .issue(relabelled.clone())
+            .expect("preissued relabelled lease")
+            .proof;
+        let relabelled_request = request(&relabelled, relabelled_proof);
+        assert_eq!(
+            authority.reserve(&relabelled_request, NOW + 1),
+            Err(DenialCode::LeaseReconciliationRequired),
+            "fresh intent and lease identifiers cannot bypass an exact-effect hold"
         );
         let reconciliation = reconciler
             .issue(
                 &receipt,
-                DispatchOutcome::Completed,
+                DispatchOutcome::Failed,
                 Digest::of(b"operator terminal evidence"),
                 *b"operator-proof01",
                 NOW + 2,
@@ -2961,25 +2573,151 @@ mod tests {
             .expect("explicit reconciliation");
         assert_eq!(
             authority
-                .reconciliation_receipt(&retry.grant_id, retry.grant_version, retry.intent_digest,)
+                .reconciliation_receipt(&first.grant_id, first.grant_version, first.intent_digest,)
                 .expect("recorded reconciliation"),
             Some(reconciliation.reconciliation_id)
         );
-        assert_eq!(
-            authority.reserve(&retry_request, NOW + 2),
-            Err(DenialCode::LeaseReplay)
-        );
-        let mut explicit_retry = spec("lease:retry-alias", b"intent:retry-alias");
-        explicit_retry.retry_of_intent_digest = Some(retry.intent_digest);
-        seal_spec(&mut explicit_retry);
+        let (explicit_retry, mut retry_request) =
+            retry_candidate(&first, ("lease:retry-alias", b"intent:retry-alias"), |_| {});
         let proof = authority
             .issue(explicit_retry.clone())
             .expect("append-only retry alias")
             .proof;
-        assert!(
-            authority
-                .reserve(&request(&explicit_retry, proof), NOW + 2)
-                .is_ok()
+        retry_request.lease_proof = proof;
+        assert!(authority.reserve(&retry_request, NOW + 2).is_ok());
+    }
+
+    #[test]
+    fn failed_resolution_authorizes_only_one_exact_retry_and_recovery_preserves_consumption() {
+        let (authority, reconciler) = authority_with_reconciliation(budget());
+        let parent = spec("lease:retry-parent", b"intent:retry-parent");
+        let receipt = authenticated_unknown_receipt(&authority, &parent);
+        let failed = reconciler
+            .issue(
+                &receipt,
+                DispatchOutcome::Failed,
+                Digest::of(b"failed parent terminal evidence"),
+                *b"retry-proof-0001",
+                NOW + 2,
+            )
+            .expect("failed parent reconciliation");
+        authority
+            .reconcile(&receipt, &failed)
+            .expect("store failed parent resolution");
+
+        let (cross_effect, mut cross_effect_request) = retry_candidate(
+            &parent,
+            ("lease:retry-cross-effect", b"intent:retry-cross-effect"),
+            |request| request.payload = b"PONG".to_vec(),
+        );
+        cross_effect_request.lease_proof = authority
+            .issue(cross_effect)
+            .expect("admit pending cross-effect candidate")
+            .proof;
+        assert_eq!(
+            authority.reserve(&cross_effect_request, NOW + 3),
+            Err(DenialCode::RetryAliasInvalid)
+        );
+
+        let (cross_tenant, mut cross_tenant_request) = retry_candidate(
+            &parent,
+            ("lease:retry-cross-tenant", b"intent:retry-cross-tenant"),
+            |request| request.tenant_id = Some("tenant:other".to_owned()),
+        );
+        cross_tenant_request.lease_proof = authority
+            .issue(cross_tenant)
+            .expect("admit pending cross-tenant candidate")
+            .proof;
+        assert_eq!(
+            authority.reserve(&cross_tenant_request, NOW + 3),
+            Err(DenialCode::RetryAliasInvalid)
+        );
+
+        let (cross_target, mut cross_target_request) = retry_candidate(
+            &parent,
+            ("lease:retry-cross-target", b"intent:retry-cross-target"),
+            |request| {
+                request.target_id = "target:other-loopback".to_owned();
+                request.hostname = "other.localhost".to_owned();
+                request.target = "127.0.0.1:8081".parse().expect("alternate address");
+            },
+        );
+        cross_target_request.lease_proof = authority
+            .issue(cross_target)
+            .expect("admit pending cross-target candidate")
+            .proof;
+        assert_eq!(
+            authority.reserve(&cross_target_request, NOW + 3),
+            Err(DenialCode::RetryAliasInvalid)
+        );
+
+        let (first, mut first_request) = retry_candidate(
+            &parent,
+            ("lease:retry-exact-a", b"intent:retry-exact-a"),
+            |request| {
+                request.action_id = "action:retry-exact-a".to_owned();
+                request.correlation_id = "correlation:retry-exact-a".to_owned();
+                request.request_issued_at_millis = NOW;
+                request.request_expires_at_millis = NOW + 4_000;
+            },
+        );
+        first_request.lease_proof = authority
+            .issue(first)
+            .expect("admit first exact pending retry")
+            .proof;
+        let (second, mut second_request) = retry_candidate(
+            &parent,
+            ("lease:retry-exact-b", b"intent:retry-exact-b"),
+            |request| {
+                request.action_id = "action:retry-exact-b".to_owned();
+                request.correlation_id = "correlation:retry-exact-b".to_owned();
+                request.request_issued_at_millis = NOW + 1;
+                request.request_expires_at_millis = NOW + 4_001;
+            },
+        );
+        second_request.lease_proof = authority
+            .issue(second)
+            .expect("admit second exact pending retry")
+            .proof;
+
+        let first_approval = authority
+            .reserve(&first_request, NOW + 3)
+            .expect("first exact retry atomically consumes authorization");
+        authority
+            .abandon(&first_approval)
+            .expect("release exact retry reservation");
+        assert_eq!(
+            authority.reserve(&second_request, NOW + 3),
+            Err(DenialCode::RetryAliasInvalid),
+            "a failed parent authorizes at most one exact retry"
+        );
+
+        let checkpoint = authority
+            .checkpoint()
+            .expect("checkpoint consumed retry parent");
+        let restored = LeaseAuthority::new_with_reconciliation_verifier(
+            "lease-key:test".to_owned(),
+            lease_key(),
+            "gateway:boot:retry-restored".to_owned(),
+            Digest::of(b"retry restored challenge"),
+            "reconciliation-key:test".to_owned(),
+            reconciliation_key(),
+        )
+        .expect("fresh retry restore authority");
+        restored
+            .restore_checkpoint(&checkpoint, checkpoint.checkpoint_id())
+            .expect("restore consumed retry authorization");
+        let (mut after_restart, _) = retry_candidate(
+            &parent,
+            ("lease:retry-after-restart", b"intent:retry-after-restart"),
+            |_| {},
+        );
+        after_restart.gateway_boot_id = "gateway:boot:retry-restored".to_owned();
+        seal_spec(&mut after_restart);
+        assert_eq!(
+            restored.issue(after_restart),
+            Err(DenialCode::RetryAliasInvalid),
+            "retry consumption survives recovery"
         );
     }
 
@@ -3046,12 +2784,22 @@ mod tests {
         );
         let reconciliation = reconciler
             .issue_control_plane_hold(
-                (&active.grant_id, active.grant_version),
-                active.intent_digest,
-                DispatchOutcome::Failed,
-                Digest::of(b"revocation terminal evidence"),
-                *b"revoke-proof-001",
-                NOW + 2,
+                ControlPlaneReconciliationHold {
+                    grant_id: active.grant_id.clone(),
+                    grant_version: active.grant_version,
+                    intent_digest: active.intent_digest,
+                    effect_digest: active.effect_digest,
+                    hold_binding_digest: active.hold_binding_digest(
+                        "lease-key:test",
+                        Digest::of(b"gateway challenge:test"),
+                    ),
+                },
+                ReconciliationTerminal {
+                    outcome: DispatchOutcome::Failed,
+                    evidence_digest: Digest::of(b"revocation terminal evidence"),
+                    nonce: *b"revoke-proof-001",
+                    resolved_at_millis: NOW + 2,
+                },
             )
             .expect("revocation reconciliation proof");
         assert_eq!(
@@ -3189,24 +2937,75 @@ mod tests {
         let mut retry = spec("lease:crash-retry", b"intent:crash-active");
         retry.gateway_boot_id = "gateway:boot:restored".to_owned();
         seal_spec(&mut retry);
-        let retry_proof = restored.issue(retry.clone()).expect("new boot lease").proof;
         assert_eq!(
-            restored.reserve(&request(&retry, retry_proof), NOW + 1),
-            Err(DenialCode::LeaseReconciliationRequired)
+            restored.issue(retry),
+            Err(DenialCode::LeaseReconciliationRequired),
+            "a recovered exact-effect hold preserves reconciliation precedence"
         );
         let reconciler = ReconciliationAuthority::new(
             "reconciliation-key:test".to_owned(),
             reconciliation_key(),
         )
         .expect("reconciliation signer");
+        let wrong_effect = reconciler
+            .issue_control_plane_hold(
+                ControlPlaneReconciliationHold {
+                    grant_id: active.grant_id.clone(),
+                    grant_version: active.grant_version,
+                    intent_digest: active.intent_digest,
+                    effect_digest: Digest::of(b"wrong crash effect"),
+                    hold_binding_digest: active
+                        .hold_binding_digest("lease-key:test", Digest::of(b"source challenge")),
+                },
+                ReconciliationTerminal {
+                    outcome: DispatchOutcome::Failed,
+                    evidence_digest: Digest::of(b"wrong-effect terminal evidence"),
+                    nonce: *b"wrong-effect-001",
+                    resolved_at_millis: NOW + 2,
+                },
+            )
+            .expect("authenticated wrong-effect proof");
+        assert_eq!(
+            restored.reconcile_control_plane_hold(&wrong_effect),
+            Err(DenialCode::LeaseReconciliationRequired)
+        );
+        let wrong_binding = reconciler
+            .issue_control_plane_hold(
+                ControlPlaneReconciliationHold {
+                    grant_id: active.grant_id.clone(),
+                    grant_version: active.grant_version,
+                    intent_digest: active.intent_digest,
+                    effect_digest: active.effect_digest,
+                    hold_binding_digest: Digest::of(b"wrong exact crash hold binding"),
+                },
+                ReconciliationTerminal {
+                    outcome: DispatchOutcome::Failed,
+                    evidence_digest: Digest::of(b"wrong-binding terminal evidence"),
+                    nonce: *b"wrong-binding001",
+                    resolved_at_millis: NOW + 2,
+                },
+            )
+            .expect("authenticated wrong-binding proof");
+        assert_eq!(
+            restored.reconcile_control_plane_hold(&wrong_binding),
+            Err(DenialCode::LeaseReconciliationRequired)
+        );
         let reconciliation = reconciler
             .issue_control_plane_hold(
-                (&active.grant_id, active.grant_version),
-                active.intent_digest,
-                DispatchOutcome::Failed,
-                Digest::of(b"crash terminal evidence"),
-                *b"crash-proof-0001",
-                NOW + 2,
+                ControlPlaneReconciliationHold {
+                    grant_id: active.grant_id.clone(),
+                    grant_version: active.grant_version,
+                    intent_digest: active.intent_digest,
+                    effect_digest: active.effect_digest,
+                    hold_binding_digest: active
+                        .hold_binding_digest("lease-key:test", Digest::of(b"source challenge")),
+                },
+                ReconciliationTerminal {
+                    outcome: DispatchOutcome::Failed,
+                    evidence_digest: Digest::of(b"crash terminal evidence"),
+                    nonce: *b"crash-proof-0001",
+                    resolved_at_millis: NOW + 2,
+                },
             )
             .expect("crash reconciliation proof");
         restored
@@ -3231,6 +3030,91 @@ mod tests {
         assert_eq!(
             restored.issue(replayed_available),
             Err(DenialCode::LeaseReplay)
+        );
+    }
+
+    #[test]
+    fn completed_intent_cannot_be_reissued_with_fresh_coordinates_after_restore() {
+        // Given: a completed intent under a grant that still has action budget.
+        let mut limits = budget();
+        limits.total_actions = 2;
+        let source = authority_for_boot(
+            limits,
+            "gateway:boot:retired-source",
+            b"retired source challenge",
+        );
+        let mut completed = spec("lease:retired-original", b"intent:retired-terminal");
+        completed.gateway_boot_id = "gateway:boot:retired-source".to_owned();
+        seal_spec(&mut completed);
+        let proof = source
+            .issue(completed.clone())
+            .expect("issue original intent")
+            .proof;
+        let approval = source
+            .reserve(&request(&completed, proof), NOW)
+            .expect("reserve original intent");
+        source
+            .finalize(&approval, completion(DispatchOutcome::Completed))
+            .expect("acknowledge completed intent");
+        assert_eq!(
+            source
+                .usage(&completed.grant_id, completed.grant_version)
+                .expect("completed usage")
+                .dispatched_actions,
+            1
+        );
+        let checkpoint = source.checkpoint().expect("checkpoint completed intent");
+        let restored = LeaseAuthority::new(
+            "lease-key:test".to_owned(),
+            lease_key(),
+            "gateway:boot:retired-restored".to_owned(),
+            Digest::of(b"retired restored challenge"),
+        )
+        .expect("fresh restore authority");
+        restored
+            .restore_checkpoint(&checkpoint, checkpoint.checkpoint_id())
+            .expect("restore completed intent");
+
+        // When: the new boot issues the same semantic intent with fresh coordinates.
+        let mut replay = spec("lease:retired-replay", b"intent:retired-terminal");
+        replay.gateway_boot_id = "gateway:boot:retired-restored".to_owned();
+        seal_spec(&mut replay);
+        assert_ne!(replay.lease_id, completed.lease_id);
+        assert_ne!(replay.dispatch_nonce, completed.dispatch_nonce);
+
+        // Then: semantic retirement, rather than exhausted budget, rejects it.
+        assert_eq!(
+            restored.issue(replay),
+            Err(DenialCode::LeaseBindingMismatch)
+        );
+        let mut distinct = spec("lease:retired-distinct", b"intent:retired-distinct");
+        distinct.gateway_boot_id = "gateway:boot:retired-restored".to_owned();
+        seal_spec(&mut distinct);
+        let distinct_proof = restored
+            .issue(distinct.clone())
+            .expect("remaining budget admits a distinct intent")
+            .proof;
+        assert!(
+            restored
+                .reserve(&request(&distinct, distinct_proof), NOW + 1)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn recovery_rejects_v6_format_rollback() {
+        let source = authority_for_boot(
+            budget(),
+            "gateway:boot:rollback-source",
+            b"rollback source challenge",
+        );
+        let checkpoint = source.checkpoint().expect("current checkpoint");
+        let mut rollback = checkpoint.as_bytes().to_vec();
+        rollback[4] = 6;
+
+        assert_eq!(
+            LeaseRecoveryCheckpoint::from_bytes(rollback),
+            Err(DenialCode::RecoveryCheckpointInvalid)
         );
     }
 

@@ -112,7 +112,7 @@ def make_repository(root: Path, *, dependency: str | None = None) -> None:
     )
     write(
         root / "build-policy.toml",
-        """schema_version = 1
+        """schema_version = 2
 python_version = "3.12.3"
 python_runtime_verification = "version_only_unverified"
 rust_version = "1.96.1"
@@ -144,8 +144,18 @@ provenance = "tools/build_metadata_hook.py"
     workflow.parent.mkdir(parents=True, exist_ok=True)
     workflow.write_bytes(canonical_ci_workflow("1.96.1"))
     (root / "tools").mkdir(parents=True)
+    shutil.copyfile(source_root / "tools/__init__.py", root / "tools/__init__.py")
     shutil.copyfile(
         source_root / "tools/build_metadata_hook.py", root / "tools/build_metadata_hook.py"
+    )
+    shutil.copyfile(source_root / "tools/cargo_sbom.py", root / "tools/cargo_sbom.py")
+    shutil.copyfile(
+        source_root / "tools/cargo_vendor_graph.py",
+        root / "tools/cargo_vendor_graph.py",
+    )
+    shutil.copyfile(
+        source_root / "tools/cargo_vendor_policy.py",
+        root / "tools/cargo_vendor_policy.py",
     )
     dependencies = f'  "{dependency}",\n' if dependency else ""
     write(

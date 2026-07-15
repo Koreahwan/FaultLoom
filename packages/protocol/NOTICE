@@ -3,6 +3,11 @@ Copyright 2026 FaultLoom contributors
 
 This product is licensed under the Apache License, Version 2.0.
 
+The Gateway includes checksum-bound, vendored Rust dependencies. Their package,
+version, SPDX expression, and retained license-file locations are listed in
+docs/THIRD_PARTY_LICENSES.md. Those components remain under their respective
+upstream licenses; their license texts are retained within vendor/<crate-version>/.
+
 FaultLoom was designed with reference to the Terminator project. No legacy Git
 history is grafted into this repository. Any subsequently migrated source must
 retain file-level provenance and the following legacy notice:

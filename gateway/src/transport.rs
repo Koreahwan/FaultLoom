@@ -1,123 +1,29 @@
 use std::io::{ErrorKind, Read, Write};
-use std::net::{Shutdown, TcpStream};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::net::TcpStream;
+use std::time::{Duration, Instant};
 
-use crate::ipc::{DenialCode, DispatchOutcome};
 use crate::policy::CompiledAction;
+use crate::transport_outcome::{after_cancellation, after_send_failure, completed, failed};
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+mod cancellation;
+
+use cancellation::ConnectFailure;
+pub(crate) use cancellation::DispatchCancellation;
+
+pub(crate) use crate::transport_outcome::{
+    CancellationDisposition, DispatchLimits, TransportObservation,
+};
+
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_RESPONSE_BYTES: usize = 65_536;
 
-#[derive(Debug)]
-pub(crate) struct TransportObservation {
-    pub(crate) outcome: DispatchOutcome,
-    pub(crate) bytes_sent: u64,
-    pub(crate) response: Vec<u8>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct DispatchCancellation {
-    state: Arc<Mutex<CancellationState>>,
-}
-
-#[derive(Debug)]
-struct CancellationState {
-    cancelled: bool,
-    stream: Option<TcpStream>,
-}
-
-impl DispatchCancellation {
-    pub(crate) fn new() -> Self {
-        Self {
-            state: Arc::new(Mutex::new(CancellationState {
-                cancelled: false,
-                stream: None,
-            })),
-        }
-    }
-
-    pub(crate) fn cancel(&self) -> Result<bool, DenialCode> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.cancelled = true;
-        let Some(stream) = state.stream.as_ref() else {
-            return Ok(false);
-        };
-        stream
-            .shutdown(Shutdown::Both)
-            .map_err(|_| DenialCode::LeaseAccountingUnavailable)?;
-        state.stream = None;
-        Ok(true)
-    }
-
-    pub(crate) fn is_cancelled(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .cancelled
-    }
-
-    fn connect(&self, target: &std::net::SocketAddr) -> Result<TcpStream, ()> {
-        // One lock makes connect/register atomic against completed cancellation.
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.cancelled {
-            return Err(());
-        }
-        let stream = TcpStream::connect_timeout(target, CONNECT_TIMEOUT).map_err(|_| ())?;
-        if stream.set_read_timeout(Some(IO_TIMEOUT)).is_err()
-            || stream.set_write_timeout(Some(IO_TIMEOUT)).is_err()
-        {
-            let _ = stream.shutdown(Shutdown::Both);
-            return Err(());
-        }
-        let cancellation_stream = stream.try_clone().map_err(|_| {
-            let _ = stream.shutdown(Shutdown::Both);
-        })?;
-        state.stream = Some(cancellation_stream);
-        Ok(stream)
-    }
-
-    fn detach(&self) {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .stream = None;
-    }
-}
-
-impl PartialEq for DispatchCancellation {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.state, &other.state)
-    }
-}
-
-impl Eq for DispatchCancellation {}
-
 pub(crate) trait TargetTransport {
-    fn dispatch(&self, action: &CompiledAction) -> TransportObservation;
-
     fn dispatch_cancellable(
         &self,
         action: &CompiledAction,
         cancellation: &DispatchCancellation,
-    ) -> TransportObservation {
-        if cancellation.is_cancelled() {
-            return failed(Vec::new(), 0);
-        }
-        let observation = self.dispatch(action);
-        if cancellation.is_cancelled() {
-            after_cancellation(observation.response, observation.bytes_sent)
-        } else {
-            observation
-        }
-    }
+        limits: DispatchLimits,
+    ) -> TransportObservation;
 }
 
 pub(crate) struct TcpTargetTransport;
@@ -129,23 +35,30 @@ impl TcpTargetTransport {
 }
 
 impl TargetTransport for TcpTargetTransport {
-    fn dispatch(&self, action: &CompiledAction) -> TransportObservation {
-        self.dispatch_cancellable(action, &DispatchCancellation::new())
-    }
-
     fn dispatch_cancellable(
         &self,
         action: &CompiledAction,
         cancellation: &DispatchCancellation,
+        limits: DispatchLimits,
     ) -> TransportObservation {
-        let mut stream = match cancellation.connect(&action.target) {
-            Ok(stream) => stream,
-            Err(_) => return failed(Vec::new(), 0),
+        let Some(connect_timeout) = limits.deadline.checked_duration_since(Instant::now()) else {
+            return failed(Vec::new(), 0);
         };
-        let observation = dispatch_stream(&mut stream, action, cancellation);
+        if connect_timeout.is_zero() || limits.maximum_response_bytes == 0 {
+            return failed(Vec::new(), 0);
+        }
+        let deadline = limits.deadline;
+        let mut stream = match cancellation.connect(&action.target, connect_timeout) {
+            Ok(stream) => stream,
+            Err(ConnectFailure::Cancelled(disposition)) => {
+                return after_cancellation(Vec::new(), 0, disposition);
+            }
+            Err(ConnectFailure::Failed) => return limit_reached(cancellation, Vec::new(), 0),
+        };
+        let observation = dispatch_stream(&mut stream, action, cancellation, deadline, limits);
         cancellation.detach();
-        if cancellation.is_cancelled() {
-            after_cancellation(observation.response, observation.bytes_sent)
+        if let Some(disposition) = cancellation.disposition() {
+            after_cancellation(observation.response, observation.bytes_sent, disposition)
         } else {
             observation
         }
@@ -156,169 +69,98 @@ fn dispatch_stream(
     stream: &mut TcpStream,
     action: &CompiledAction,
     cancellation: &DispatchCancellation,
+    deadline: Instant,
+    limits: DispatchLimits,
 ) -> TransportObservation {
     let mut bytes_sent = 0usize;
     while bytes_sent < action.bytes.len() {
-        if cancellation.is_cancelled() {
-            return after_send_failure(Vec::new(), bytes_sent);
+        if configure_timeout(stream, deadline, true).is_err() {
+            return limit_reached(cancellation, Vec::new(), bytes_sent as u64);
         }
-        match stream.write(&action.bytes[bytes_sent..]) {
+        let permit = match cancellation.begin_io() {
+            Ok(permit) => permit,
+            Err(disposition) => {
+                return after_cancellation(Vec::new(), bytes_sent as u64, disposition);
+            }
+        };
+        let write_result = stream.write(&action.bytes[bytes_sent..]);
+        drop(permit);
+        match write_result {
             Ok(0) => return after_send_failure(Vec::new(), bytes_sent),
             Ok(count) => bytes_sent += count,
             Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) if timeout_reached(&error, deadline) => {
+                return limit_reached(cancellation, Vec::new(), bytes_sent as u64);
+            }
             Err(_) => return after_send_failure(Vec::new(), bytes_sent),
         }
     }
-    if stream.shutdown(Shutdown::Write).is_err() {
-        return after_send_failure(Vec::new(), bytes_sent);
-    }
-
     let mut response = Vec::new();
     let mut buffer = [0u8; 4096];
     loop {
-        if cancellation.is_cancelled() {
-            return after_send_failure(response, bytes_sent);
+        if response.len() >= limits.maximum_response_bytes {
+            return limit_reached(cancellation, response, bytes_sent as u64);
         }
-        match stream.read(&mut buffer) {
-            Ok(0) => {
-                return TransportObservation {
-                    outcome: DispatchOutcome::Completed,
-                    bytes_sent: bytes_sent as u64,
-                    response,
-                };
+        if configure_timeout(stream, deadline, false).is_err() {
+            return limit_reached(cancellation, response, bytes_sent as u64);
+        }
+        let permit = match cancellation.begin_io() {
+            Ok(permit) => permit,
+            Err(disposition) => {
+                return after_cancellation(response, bytes_sent as u64, disposition);
             }
+        };
+        let remaining_bytes = limits.maximum_response_bytes - response.len();
+        let read_limit = buffer.len().min(remaining_bytes);
+        let read_result = stream.read(&mut buffer[..read_limit]);
+        drop(permit);
+        match read_result {
+            Ok(0) => return completed(response, bytes_sent),
             Ok(count) => {
-                if response.len().saturating_add(count) > MAX_RESPONSE_BYTES {
-                    return after_send_failure(response, bytes_sent);
-                }
                 response.extend_from_slice(&buffer[..count]);
+                if response.len() >= MAX_RESPONSE_BYTES {
+                    return limit_reached(cancellation, response, bytes_sent as u64);
+                }
             }
             Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) if timeout_reached(&error, deadline) => {
+                return limit_reached(cancellation, response, bytes_sent as u64);
+            }
             Err(_) => return after_send_failure(response, bytes_sent),
         }
     }
 }
 
-fn failed(response: Vec<u8>, bytes_sent: usize) -> TransportObservation {
-    TransportObservation {
-        outcome: DispatchOutcome::Failed,
-        bytes_sent: bytes_sent as u64,
-        response,
+fn configure_timeout(stream: &TcpStream, deadline: Instant, write: bool) -> Result<(), ()> {
+    let remaining = deadline.checked_duration_since(Instant::now()).ok_or(())?;
+    if remaining.is_zero() {
+        return Err(());
     }
-}
-
-fn after_send_failure(response: Vec<u8>, bytes_sent: usize) -> TransportObservation {
-    if bytes_sent == 0 {
-        failed(response, bytes_sent)
+    let timeout = remaining.min(IO_TIMEOUT);
+    let result = if write {
+        stream.set_write_timeout(Some(timeout))
     } else {
-        TransportObservation {
-            outcome: DispatchOutcome::UnknownOutcome,
-            bytes_sent: bytes_sent as u64,
-            response,
-        }
-    }
+        stream.set_read_timeout(Some(timeout))
+    };
+    result.map_err(|_| ())
 }
 
-fn after_cancellation(response: Vec<u8>, bytes_sent: u64) -> TransportObservation {
-    TransportObservation {
-        outcome: if bytes_sent == 0 {
-            DispatchOutcome::Failed
-        } else {
-            DispatchOutcome::UnknownOutcome
-        },
-        bytes_sent,
-        response,
-    }
+fn timeout_reached(error: &std::io::Error, deadline: Instant) -> bool {
+    Instant::now() >= deadline
+        || matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock)
+}
+
+fn limit_reached(
+    cancellation: &DispatchCancellation,
+    response: Vec<u8>,
+    bytes_sent: u64,
+) -> TransportObservation {
+    let disposition = cancellation
+        .cancel()
+        .unwrap_or(CancellationDisposition::TargetOutcomeUnknown);
+    after_cancellation(response, bytes_sent, disposition)
 }
 
 #[cfg(test)]
-mod cancellation_tests {
-    use std::io::Read;
-    use std::net::TcpListener;
-    use std::sync::mpsc;
-    use std::thread;
-
-    use super::*;
-    use crate::Digest;
-    use crate::ipc::{ActionKind, EgressPlane};
-
-    fn action(target: std::net::SocketAddr) -> CompiledAction {
-        CompiledAction {
-            intent_digest: Digest::of(b"transport cancellation intent"),
-            action_kind: ActionKind::SemanticHttpV1,
-            target,
-            egress_plane: EgressPlane::TargetGateway,
-            semantic_action_digest: Digest::of(b"transport cancellation semantics"),
-            resolution_digest: Digest::of(b"transport cancellation resolution"),
-            request_binding_digest: Digest::of(b"transport cancellation binding"),
-            bytes: b"PING".to_vec(),
-        }
-    }
-
-    #[test]
-    fn cancellation_before_dispatch_never_opens_a_target_socket() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("owned listener");
-        listener
-            .set_nonblocking(true)
-            .expect("nonblocking listener");
-        let cancellation = DispatchCancellation::new();
-        assert_eq!(
-            cancellation.cancel(),
-            Ok(false),
-            "no stream existed before cancellation"
-        );
-
-        let observation = TcpTargetTransport::new().dispatch_cancellable(
-            &action(listener.local_addr().expect("listener address")),
-            &cancellation,
-        );
-        assert_eq!(observation.outcome, DispatchOutcome::Failed);
-        assert_eq!(observation.bytes_sent, 0);
-        assert_eq!(
-            listener
-                .accept()
-                .expect_err("cancelled dispatch cannot connect")
-                .kind(),
-            ErrorKind::WouldBlock
-        );
-    }
-
-    #[test]
-    fn cancellation_physically_interrupts_an_in_flight_stream_exactly_once() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("owned listener");
-        let target = listener.local_addr().expect("listener address");
-        let (request_read_tx, request_read_rx) = mpsc::sync_channel(0);
-        let (release_tx, release_rx) = mpsc::sync_channel(0);
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("transport connection");
-            let mut request = [0_u8; 4];
-            stream.read_exact(&mut request).expect("request bytes");
-            assert_eq!(&request, b"PING");
-            request_read_tx.send(()).expect("request-read signal");
-            release_rx.recv().expect("release server connection");
-            drop(stream);
-        });
-
-        let cancellation = DispatchCancellation::new();
-        let worker_cancellation = cancellation.clone();
-        let worker = thread::spawn(move || {
-            TcpTargetTransport::new().dispatch_cancellable(&action(target), &worker_cancellation)
-        });
-        request_read_rx.recv().expect("target observed request");
-        assert_eq!(
-            cancellation.cancel(),
-            Ok(true),
-            "cancellation must shut down the registered live stream"
-        );
-        assert_eq!(
-            cancellation.cancel(),
-            Ok(false),
-            "repeated cancellation cannot report a second physical interruption"
-        );
-        let observation = worker.join().expect("transport worker");
-        assert_eq!(observation.outcome, DispatchOutcome::UnknownOutcome);
-        assert_eq!(observation.bytes_sent, 4);
-        release_tx.send(()).expect("release server");
-        server.join().expect("server worker");
-    }
-}
+#[path = "transport_tests.rs"]
+mod cancellation_tests;

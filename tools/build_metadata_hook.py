@@ -11,6 +11,11 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from tools.cargo_sbom import CargoSbomError, parse_cargo_context, sbom_fragments
+
 
 class HookError(RuntimeError):
     """The supplied build context is incomplete or malformed."""
@@ -31,6 +36,7 @@ def _load_context(path: Path) -> dict[str, Any]:
         raise HookError(f"cannot read build context: {exc}") from exc
     required = {
         "builder",
+        "cargo_vendor",
         "ci_policy",
         "components",
         "dependency_graph",
@@ -42,7 +48,7 @@ def _load_context(path: Path) -> dict[str, Any]:
         "subjects",
         "toolchains",
     }
-    if value.get("schema_version") != 2 or not required <= value.keys():
+    if value.get("schema_version") != 3 or not required <= value.keys():
         raise HookError("unsupported or incomplete build context")
     if not isinstance(value["subjects"], list) or not value["subjects"]:
         raise HookError("build context must contain at least one subject")
@@ -76,6 +82,12 @@ def _load_context(path: Path) -> dict[str, Any]:
     native_artifacts = value["native_artifacts"]
     if not isinstance(native_artifacts, list):
         raise HookError("build context native_artifacts must be a list")
+    try:
+        cargo_graph = parse_cargo_context(value["cargo_vendor"])
+    except CargoSbomError as exc:
+        raise HookError(str(exc)) from exc
+    if cargo_graph is not None and not native_artifacts:
+        raise HookError("Cargo vendor graph requires a native artifact")
     expected_rust_verification = (
         "rustc_cargo_closure_digests_and_locked_offline_build_verified"
         if native_artifacts
@@ -199,6 +211,13 @@ def make_sbom(context: dict[str, Any]) -> dict[str, Any]:
     dependency_edges = []
     internal_purls = {component["purl"] for component in context["components"]}
     root_dependencies = set(internal_purls)
+    cargo_graph = parse_cargo_context(context["cargo_vendor"])
+    cargo_direct: list[str] = []
+    if cargo_graph is not None:
+        cargo_components, cargo_edges = sbom_fragments(cargo_graph)
+        components.extend(cargo_components)
+        dependency_edges.extend(cargo_edges)
+        cargo_direct = list(cargo_graph.direct_dependencies)
     for component in context["components"]:
         components.append(
             {
@@ -280,7 +299,7 @@ def make_sbom(context: dict[str, Any]) -> dict[str, Any]:
                 ],
             }
         )
-        dependency_edges.append({"ref": native["purl"], "dependsOn": []})
+        dependency_edges.append({"ref": native["purl"], "dependsOn": cargo_direct})
     dependency_edges.append({"ref": root_ref, "dependsOn": sorted(root_dependencies)})
     return {
         "bomFormat": "CycloneDX",
@@ -317,6 +336,14 @@ def make_sbom(context: dict[str, Any]) -> dict[str, Any]:
                 {
                     "name": "faultloom:hostEnvironmentVerification",
                     "value": context["toolchains"]["host_environment_verification"],
+                },
+                {
+                    "name": "faultloom:cargoVendorVerification",
+                    "value": (
+                        "not_used"
+                        if context["cargo_vendor"] is None
+                        else context["cargo_vendor"]["verification"]
+                    ),
                 },
             ],
             "component": {
@@ -356,6 +383,23 @@ def make_provenance(context: dict[str, Any]) -> dict[str, Any]:
                 },
             }
         )
+    cargo_graph = parse_cargo_context(context["cargo_vendor"])
+    if cargo_graph is not None:
+        for package in cargo_graph.packages:
+            resolved_dependencies.append(
+                {
+                    "uri": package.purl,
+                    "digest": {"sha256": package.checksum},
+                    "annotations": {
+                        "faultloom:licenseExpression": package.license,
+                        "faultloom:retainedLicenseFiles": list(package.license_files),
+                        "faultloom:rustVersionVerification": package.rust_version_verification,
+                        "faultloom:declaredRustVersion": package.rust_version,
+                        "faultloom:vendoredBuildScript": package.build_script,
+                        "faultloom:dependencies": list(package.dependencies),
+                    },
+                }
+            )
     for native in context["native_artifacts"]:
         resolved_dependencies.extend(
             [
