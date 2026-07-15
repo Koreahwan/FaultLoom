@@ -19,7 +19,8 @@ fn installed_supervisor_dispatches_only_the_bootstrap_bound_loopback_target() {
     let bootstrap = bootstrap(listener.local_addr().expect("listener address"), now);
     let authority = issuer(&bootstrap);
     let mut gateway = ProcessHarness::spawn(&bootstrap);
-    let (envelope, receipt) = authority.issue(1, false, now, now + 60_000, 0x50);
+    let epoch_now = now_millis();
+    let (envelope, receipt) = authority.issue(1, false, epoch_now, epoch_now + 60_000, 0x50);
     assert!(matches!(
         gateway.round_trip(
             SupervisorCommand::AdmitEpoch {
