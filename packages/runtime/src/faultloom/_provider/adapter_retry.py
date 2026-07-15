@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import hmac
 
-from faultloom_protocol import sha256_digest
-
 from .adapter_helpers import _decode_ed25519_signature, _logical_request_digest
 from .adapter_policy import _ProviderAdapterPolicy
 from .common import (
@@ -14,6 +12,7 @@ from .common import (
     ProxyEffectDisposition,
     ProxyOutcome,
     RetryDisposition,
+    provider_sha256_digest as sha256_digest,
 )
 from .intent import ProviderCallIntent, failover_provenance_attestation_bytes
 from .metadata import ProviderModelProfile

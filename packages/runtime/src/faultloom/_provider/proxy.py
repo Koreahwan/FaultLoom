@@ -6,8 +6,6 @@ from typing import Literal, Protocol, Self
 from faultloom_protocol import (
     Ed25519PublicKeyRecord,
     SecretRef,
-    canonical_json_bytes,
-    sha256_digest,
 )
 from faultloom_protocol.base import (
     AwareDatetime,
@@ -25,6 +23,8 @@ from .common import (
     Signed64NonNegative,
     Signed64Positive,
     _RuntimeModel,
+    provider_canonical_json_bytes as canonical_json_bytes,
+    provider_sha256_digest as sha256_digest,
 )
 from .metadata import ProviderObservedMetadata
 

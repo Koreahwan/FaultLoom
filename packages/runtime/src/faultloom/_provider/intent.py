@@ -2,11 +2,16 @@ from __future__ import annotations
 
 from typing import Literal, Self
 
-from faultloom_protocol import SecretRef, canonical_json_bytes
+from faultloom_protocol import SecretRef
 from faultloom_protocol.base import AwareDatetime, Identifier, NonEmptyStr, Sha256Digest
 from pydantic import Field, model_validator
 
-from .common import Signed64NonNegative, Signed64Positive, _RuntimeModel
+from .common import (
+    Signed64NonNegative,
+    Signed64Positive,
+    _RuntimeModel,
+    provider_canonical_json_bytes as canonical_json_bytes,
+)
 from .metadata import ProviderToolSpec
 
 class GenerationConfig(_RuntimeModel):

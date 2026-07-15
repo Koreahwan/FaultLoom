@@ -12,10 +12,10 @@ from faultloom.provider import (
     ProviderPlane,
     ProviderProxyResult,
     ProxyOutcome,
+    provider_canonical_json_bytes as canonical_json_bytes,
 )
 from faultloom_protocol import (
     Ed25519PublicKeyRecord,
-    canonical_json_bytes,
     load_public_key,
 )
 

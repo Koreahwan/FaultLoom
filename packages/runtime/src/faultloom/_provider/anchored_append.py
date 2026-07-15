@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 
 from faultloom.state import ArtifactRef, EventRecord, ProviderJournalEntry
-from faultloom_protocol import canonical_json_bytes
 
 from .anchored_base import (
     _MAX_PROVIDER_RECEIPT_BYTES,
@@ -11,7 +10,10 @@ from .anchored_base import (
     _PROVIDER_RECEIPT_MEDIA_TYPE,
 )
 from .anchored_receipts import _AnchoredJournalReceipts
-from .common import ProviderReceiptError
+from .common import (
+    ProviderReceiptError,
+    provider_canonical_json_bytes as canonical_json_bytes,
+)
 from .receipt import ProviderCallReceipt
 
 

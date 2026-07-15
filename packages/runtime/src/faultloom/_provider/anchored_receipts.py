@@ -4,7 +4,6 @@ import hashlib
 import hmac
 
 from faultloom.state import AnchorCheckpoint, EventRecord, ProviderJournalEntry
-from faultloom_protocol import canonical_json_bytes
 
 from .anchored_base import (
     _MAX_PROVIDER_RECEIPT_BYTES,
@@ -14,7 +13,10 @@ from .anchored_base import (
     _PROVIDER_RECEIPT_METADATA_MEDIA_TYPE,
 )
 from .anchored_events import _AnchoredJournalEvents
-from .common import ProviderReceiptError
+from .common import (
+    ProviderReceiptError,
+    provider_canonical_json_bytes as canonical_json_bytes,
+)
 from .receipt import ProviderCallReceipt
 
 

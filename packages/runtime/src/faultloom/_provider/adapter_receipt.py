@@ -2,12 +2,11 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from faultloom_protocol import sha256_digest
 from faultloom_protocol.base import MAX_INT64
 
 from .adapter_helpers import _ceil_cost
 from .adapter_retry import _ProviderAdapterRetry
-from .common import SCHEMA_VERSION
+from .common import SCHEMA_VERSION, provider_sha256_digest as sha256_digest
 from .intent import ProviderCallIntent
 from .metadata import ProviderModelProfile
 from .proxy import ProviderProxyRequest, ProviderProxyResult

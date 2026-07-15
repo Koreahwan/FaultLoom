@@ -4,6 +4,7 @@ import re
 from enum import Enum
 from typing import Annotated, Literal
 
+from faultloom.egress_wire import WireValue
 from faultloom_protocol import ProtocolModel
 from faultloom_protocol.base import MAX_INT64
 from pydantic import Field
@@ -46,6 +47,22 @@ class ProviderPlaneError(ProviderAdapterError):
 
 class _RuntimeModel(ProtocolModel):
     schema_version: Literal["0.1.0"] = SCHEMA_VERSION
+
+
+def provider_canonical_json_bytes(value: WireValue) -> bytes:
+    from .wire_catalog import PROVIDER_WIRE
+
+    return PROVIDER_WIRE.canonical_json_bytes(value)
+
+
+def provider_canonical_json(value: WireValue) -> str:
+    return provider_canonical_json_bytes(value).decode("utf-8")
+
+
+def provider_sha256_digest(value: WireValue) -> str:
+    from .wire_catalog import PROVIDER_WIRE
+
+    return PROVIDER_WIRE.digest(value)
 
 
 class ProviderPlane(str, Enum):

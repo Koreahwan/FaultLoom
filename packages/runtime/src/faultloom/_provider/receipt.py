@@ -3,7 +3,6 @@ from __future__ import annotations
 import hmac
 from typing import Self
 
-from faultloom_protocol import sha256_digest
 from faultloom_protocol.base import AwareDatetime, Identifier, Sha256Digest, ShortStr
 from pydantic import model_validator
 
@@ -15,6 +14,7 @@ from .common import (
     Signed64NonNegative,
     Signed64Positive,
     _RuntimeModel,
+    provider_sha256_digest as sha256_digest,
 )
 from .proxy import ProviderProxyRequest, ProviderProxyResult, _dispatch_reservation_digest
 

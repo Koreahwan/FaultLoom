@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hmac
 
-from faultloom_protocol import canonical_json_bytes, sha256_digest
-
-from .common import ProviderReceiptError
+from .common import (
+    ProviderReceiptError,
+    provider_canonical_json_bytes as canonical_json_bytes,
+    provider_sha256_digest as sha256_digest,
+)
 from .memory_base import _MemoryJournalBase
 from .receipt import ProviderCallReceipt, _provider_journal_binding_digest
 

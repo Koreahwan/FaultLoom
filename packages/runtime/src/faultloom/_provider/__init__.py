@@ -16,6 +16,9 @@ from .common import (
     ProxyEffectDisposition,
     ProxyOutcome,
     RetryDisposition,
+    provider_canonical_json,
+    provider_canonical_json_bytes,
+    provider_sha256_digest,
 )
 from .intent import (
     FailoverProvenance,
@@ -41,6 +44,7 @@ from .proxy import (
     provider_proxy_result_attestation_bytes,
 )
 from .receipt import ProviderCallReceipt
+from .wire_catalog import PROVIDER_WIRE as _PROVIDER_WIRE
 
 __all__ = [
     "AnchoredProviderReceiptJournal",
@@ -77,5 +81,8 @@ __all__ = [
     "RetryDisposition",
     "failover_provenance_attestation_bytes",
     "provider_proxy_result_attestation_bytes",
+    "provider_canonical_json",
+    "provider_canonical_json_bytes",
+    "provider_sha256_digest",
     "provider_tool_schema_digest",
 ]

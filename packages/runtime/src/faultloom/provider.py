@@ -34,7 +34,10 @@ from ._provider import (
     ProxyOutcome,
     RetryDisposition,
     failover_provenance_attestation_bytes,
+    provider_canonical_json,
+    provider_canonical_json_bytes,
     provider_proxy_result_attestation_bytes,
+    provider_sha256_digest,
     provider_tool_schema_digest,
 )
 
@@ -72,6 +75,9 @@ __all__ = [
     "ProxyOutcome",
     "RetryDisposition",
     "failover_provenance_attestation_bytes",
+    "provider_canonical_json",
+    "provider_canonical_json_bytes",
     "provider_proxy_result_attestation_bytes",
+    "provider_sha256_digest",
     "provider_tool_schema_digest",
 ]

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-from faultloom_protocol import sha256_digest
-
 from .adapter_helpers import _logical_request_digest, _trusted_monotonic, _trusted_now
 from .adapter_state import _ProviderAdapterState
-from .common import ProviderAdapterError, ProviderPolicyError, ProviderRetryError
+from .common import (
+    ProviderAdapterError,
+    ProviderPolicyError,
+    ProviderRetryError,
+    provider_sha256_digest as sha256_digest,
+)
 from .intent import ProviderCallIntent
 from .metadata import ProviderModelProfile, provider_tool_schema_digest
 from .proxy import ProviderProxyRequest, ProviderProxyResult, _dispatch_reservation_digest

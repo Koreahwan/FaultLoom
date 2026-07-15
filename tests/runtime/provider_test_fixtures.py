@@ -30,10 +30,12 @@ from faultloom.provider import (
     ProxyEffectDisposition,
     ProxyOutcome,
     RetryDisposition,
+    provider_canonical_json as canonical_json,
+    provider_sha256_digest as sha256_digest,
     provider_tool_schema_digest,
 )
 from faultloom.state import AnchorCheckpoint
-from faultloom_protocol import AuthoritySigner, canonical_json, sha256_digest
+from faultloom_protocol import AuthoritySigner
 from pydantic import ValidationError
 
 from tests.runtime.provider_test_models import (

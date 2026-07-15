@@ -13,9 +13,9 @@ from faultloom.provider import (
     ProxyEffectDisposition,
     ProxyOutcome,
     failover_provenance_attestation_bytes,
+    provider_sha256_digest as sha256_digest,
     provider_proxy_result_attestation_bytes,
 )
-from faultloom_protocol import sha256_digest
 
 from tests.runtime.provider_test_models import (
     FAILOVER_SIGNER,

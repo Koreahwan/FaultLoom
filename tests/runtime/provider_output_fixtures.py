@@ -9,9 +9,10 @@ from faultloom.provider import (
     ProviderCallReceipt,
     ProviderModelProfile,
     ProviderProxyRequest,
+    provider_sha256_digest as sha256_digest,
 )
 from faultloom.state import StateStore
-from faultloom_protocol import Ed25519PublicKeyRecord, sha256_digest
+from faultloom_protocol import Ed25519PublicKeyRecord
 
 from tests.runtime.provider_test_fixtures import (
     FakeProxy,

@@ -4,10 +4,14 @@ import base64
 from datetime import datetime, timezone
 from typing import Callable, Iterable
 
-from faultloom_protocol import sha256_digest
 from faultloom_protocol.base import MAX_INT64
 
-from .common import ProviderAdapterError, ProviderPlaneError, SCHEMA_VERSION
+from .common import (
+    ProviderAdapterError,
+    ProviderPlaneError,
+    SCHEMA_VERSION,
+    provider_sha256_digest as sha256_digest,
+)
 from .intent import ProviderCallIntent
 from .metadata import ProviderModelProfile, provider_tool_schema_digest
 
