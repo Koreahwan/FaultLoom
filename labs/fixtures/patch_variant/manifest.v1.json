@@ -1,0 +1,80 @@
+{
+  "schema_version": "0.1.0",
+  "lab_id": "lab.patch-variant",
+  "lab_version": "0.1.0",
+  "component_name": "faultloom-demo-component",
+  "cases": [
+    {
+      "case_id": "fixture.vulnerable",
+      "deployment": "vulnerable",
+      "component_present": true,
+      "path_exposed": true,
+      "auth_satisfied": true,
+      "config_satisfied": true,
+      "feature_satisfied": true,
+      "patch_state": "absent",
+      "backport_signal": false,
+      "expected_conclusion": "reachable"
+    },
+    {
+      "case_id": "fixture.patched",
+      "deployment": "patched",
+      "component_present": true,
+      "path_exposed": true,
+      "auth_satisfied": true,
+      "config_satisfied": true,
+      "feature_satisfied": true,
+      "patch_state": "present",
+      "backport_signal": false,
+      "expected_conclusion": "not_reachable"
+    },
+    {
+      "case_id": "fixture.backported",
+      "deployment": "backported",
+      "component_present": true,
+      "path_exposed": true,
+      "auth_satisfied": true,
+      "config_satisfied": true,
+      "feature_satisfied": true,
+      "patch_state": "backported",
+      "backport_signal": true,
+      "expected_conclusion": "not_reachable"
+    },
+    {
+      "case_id": "fixture.ambiguous",
+      "deployment": "ambiguous",
+      "component_present": true,
+      "path_exposed": true,
+      "auth_satisfied": true,
+      "config_satisfied": null,
+      "feature_satisfied": true,
+      "patch_state": "unknown",
+      "backport_signal": true,
+      "expected_conclusion": "ambiguous"
+    },
+    {
+      "case_id": "fixture.advisory-only",
+      "deployment": "advisory_only",
+      "component_present": false,
+      "path_exposed": false,
+      "auth_satisfied": null,
+      "config_satisfied": null,
+      "feature_satisfied": null,
+      "patch_state": "unknown",
+      "backport_signal": false,
+      "expected_conclusion": "not_reachable"
+    },
+    {
+      "case_id": "fixture.incomplete-fix",
+      "deployment": "incomplete_fix",
+      "component_present": true,
+      "path_exposed": true,
+      "auth_satisfied": true,
+      "config_satisfied": true,
+      "feature_satisfied": true,
+      "patch_state": "absent",
+      "backport_signal": false,
+      "expected_conclusion": "reachable"
+    }
+  ]
+}
