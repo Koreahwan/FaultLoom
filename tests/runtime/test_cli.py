@@ -786,8 +786,6 @@ def test_live_mode_is_explicitly_unavailable_after_authority_validation(
         ["scope", "draft", "--template", "lab"],
         ["scope", "approve", "draft.json", "--out", "grant.json"],
         ["scope", "revoke", "grant.1"],
-        ["verify", "candidate.1"],
-        ["report", "finding.1", "--format", "md"],
         ["pack", "list"],
         ["pack", "doctor", "pack.web"],
         ["pack", "test", "pack.web"],
@@ -801,3 +799,20 @@ def test_declared_command_surface_fails_closed_until_integrated(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "declared but unavailable" in captured.err
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ["verify", "candidate.1"],
+        ["report", "finding.1", "--format", "md"],
+    ),
+    ids=("verify", "report"),
+)
+def test_verification_command_surface_accepts_documented_syntax_and_fails_closed(
+    arguments: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(arguments) == cli.EXIT_AUTHORITY
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "verification data is unavailable" in captured.err

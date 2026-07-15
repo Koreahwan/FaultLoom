@@ -59,17 +59,17 @@ class VerificationCliError(RuntimeError):
 
 
 def _add_result_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--result", type=Path, required=True)
-    parser.add_argument("--trusted-key", type=Path, required=True)
-    parser.add_argument("--run-id", required=True)
-    parser.add_argument("--run-manifest-digest", required=True)
-    parser.add_argument("--authority-digest", required=True)
-    parser.add_argument("--engagement-id", required=True)
-    parser.add_argument("--source-actor", required=True)
-    parser.add_argument("--verifier-actor", required=True)
-    parser.add_argument("--verifier-authority-digest", required=True)
-    parser.add_argument("--verifier-authority", type=Path, required=True)
-    parser.add_argument("--verifier-authority-key", type=Path, required=True)
+    parser.add_argument("--result", type=Path)
+    parser.add_argument("--trusted-key", type=Path)
+    parser.add_argument("--run-id")
+    parser.add_argument("--run-manifest-digest")
+    parser.add_argument("--authority-digest")
+    parser.add_argument("--engagement-id")
+    parser.add_argument("--source-actor")
+    parser.add_argument("--verifier-actor")
+    parser.add_argument("--verifier-authority-digest")
+    parser.add_argument("--verifier-authority", type=Path)
+    parser.add_argument("--verifier-authority-key", type=Path)
     parser.add_argument("--minimum-result-version", type=int, default=1)
 
 
@@ -91,6 +91,28 @@ def _load_verified_result(
     arguments: argparse.Namespace,
     dependencies: VerificationCliDependencies,
 ) -> VerifiedResultArtifact:
+    missing = tuple(
+        option
+        for option, attribute in (
+            ("--result", "result"),
+            ("--trusted-key", "trusted_key"),
+            ("--run-id", "run_id"),
+            ("--run-manifest-digest", "run_manifest_digest"),
+            ("--authority-digest", "authority_digest"),
+            ("--engagement-id", "engagement_id"),
+            ("--source-actor", "source_actor"),
+            ("--verifier-actor", "verifier_actor"),
+            ("--verifier-authority-digest", "verifier_authority_digest"),
+            ("--verifier-authority", "verifier_authority"),
+            ("--verifier-authority-key", "verifier_authority_key"),
+        )
+        if getattr(arguments, attribute) is None
+    )
+    if missing:
+        raise VerificationCliError(
+            reason="verification data is unavailable; missing configuration: "
+            + ", ".join(missing)
+        )
     result_content, key_content = dependencies.capture_protocol_pair(
         arguments.result,
         arguments.trusted_key,
