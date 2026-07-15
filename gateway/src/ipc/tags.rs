@@ -1,5 +1,5 @@
 pub(super) const MAGIC: &[u8; 4] = b"FLGW";
-pub(super) const VERSION: u8 = 4;
+pub(super) const VERSION: u8 = 5;
 pub(super) const REQUEST_MESSAGE: u8 = 1;
 pub(super) const RESPONSE_MESSAGE: u8 = 2;
 pub const MAX_FRAME_BYTES: usize = 65_536;

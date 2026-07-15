@@ -2,6 +2,7 @@ use super::response::GatewayResponse;
 use super::tags::{DenialCode, MAX_FRAME_BYTES, RESPONSE_MESSAGE};
 use super::validation::valid_identifier;
 use super::wire::Encoder;
+use crate::semantic_http::validate_semantic_http_artifact;
 
 pub fn encode_response(response: &GatewayResponse) -> Result<Vec<u8>, DenialCode> {
     let mut output = Encoder::new(RESPONSE_MESSAGE);
@@ -16,10 +17,19 @@ pub fn encode_response(response: &GatewayResponse) -> Result<Vec<u8>, DenialCode
             output.digest(denied.request_digest);
             output.byte(denied.reason as u8);
         }
-        GatewayResponse::Receipt { action_id, receipt } => {
+        GatewayResponse::Receipt {
+            action_id,
+            receipt,
+            semantic_http,
+        } => {
             if !valid_identifier(action_id)
                 || action_id != &receipt.action_id
                 || !receipt.validate()
+                || semantic_http.as_ref().is_some_and(|artifact| {
+                    !validate_semantic_http_artifact(artifact)
+                        || Some(artifact.raw_response_digest) != receipt.response_digest
+                        || artifact.raw_response_length != receipt.bytes_received
+                })
             {
                 return Err(DenialCode::InvalidRequest);
             }
@@ -71,6 +81,22 @@ pub fn encode_response(response: &GatewayResponse) -> Result<Vec<u8>, DenialCode
             output.u64(receipt.bytes_sent);
             output.u64(receipt.bytes_received);
             output.byte(u8::from(receipt.reconciliation_required));
+            output.byte(u8::from(semantic_http.is_some()));
+            if let Some(artifact) = semantic_http {
+                output.u16(artifact.status_code);
+                output.u16(
+                    u16::try_from(artifact.headers.len())
+                        .map_err(|_| DenialCode::InvalidRequest)?,
+                );
+                for header in &artifact.headers {
+                    output.string(&header.name)?;
+                    output.short_bytes(&header.value)?;
+                }
+                output.long_bytes(&artifact.body)?;
+                output.digest(artifact.body_digest);
+                output.digest(artifact.raw_response_digest);
+                output.u64(artifact.raw_response_length);
+            }
         }
     }
     if output.bytes.len() > MAX_FRAME_BYTES {

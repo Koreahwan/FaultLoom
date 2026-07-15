@@ -39,6 +39,7 @@ fn acknowledged_signed_unknown_response_tombstone_allows_zero_prepared_reconcili
         SupervisorResponse::Gateway(Box::new(GatewayResponse::Receipt {
             action_id: receipt.action_id.clone(),
             receipt: receipt.clone(),
+            semantic_http: None,
         }))
         .to_bytes()
         .expect("encode signed unknown response");

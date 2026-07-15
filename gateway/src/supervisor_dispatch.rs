@@ -1,7 +1,7 @@
 use crate::Digest;
 use crate::ipc::{
-    ActionKind, DenialCode, DeniedResponse, DispatchRequest, EgressPlane, FlowKind,
-    GatewayResponse, RequiredFeature, encode_request,
+    ActionKind, DenialCode, DeniedResponse, DispatchRequest, EgressPlane, GatewayResponse,
+    RequiredFeature, encode_request,
 };
 use crate::supervisor_durable::ReservedResponseSlot;
 use crate::supervisor_protocol::{SupervisorDispatch, SupervisorResponse};
@@ -104,6 +104,8 @@ impl SupervisorRuntime {
         if intent.target_id != self.selection.target_id() {
             return Err(DenialCode::ScopeTargetDenied);
         }
+        let flow_kind = intent.flow_kind;
+        let parent_action_id = intent.parent_action_id.clone();
         let mut request = DispatchRequest {
             action_id: intent.action_id,
             correlation_id: intent.correlation_id,
@@ -121,8 +123,8 @@ impl SupervisorRuntime {
             action_kind: ActionKind::SemanticHttpV1,
             action_class: intent.action_class,
             egress_plane: EgressPlane::TargetGateway,
-            flow_kind: FlowKind::TopLevel,
-            parent_action_id: None,
+            flow_kind,
+            parent_action_id,
             required_features: vec![RequiredFeature::GatewayDispatchV1],
             hostname: self.selection.hostname().to_owned(),
             protocol: self.selection.protocol().to_owned(),

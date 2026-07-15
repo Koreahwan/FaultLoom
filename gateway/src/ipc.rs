@@ -14,6 +14,7 @@ mod tests;
 mod validation;
 mod wire;
 
+pub use crate::semantic_http::{SemanticHttpHeader, SemanticHttpResponseArtifact};
 pub use framing::{read_frame, write_frame};
 pub use receipt::DispatchReceipt;
 pub use request::DispatchRequest;

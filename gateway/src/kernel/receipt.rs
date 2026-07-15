@@ -5,6 +5,7 @@ use crate::ipc::{
 use crate::policy::{
     ActionCompiler, LeaseApproval, LeaseVerifier, PreEgressBarrier, ScopeVerifier,
 };
+use crate::semantic_http::{SemanticHttpResponseArtifact, parse_semantic_http_response};
 use crate::transport::{TargetTransport, TransportObservation};
 
 use super::{Clock, Gateway};
@@ -50,7 +51,7 @@ pub(super) fn make_receipt(
     compiled_bytes: &[u8],
     observation: TransportObservation,
     timing: (u64, u64),
-) -> DispatchReceipt {
+) -> (DispatchReceipt, Option<SemanticHttpResponseArtifact>) {
     let (dispatched_at_millis, completed_at_millis) = timing;
     let request_digest = Digest::of(compiled_bytes);
     let response_digest = match observation.outcome {
@@ -62,6 +63,9 @@ pub(super) fn make_receipt(
     };
     let bytes_received = u64::try_from(observation.response.len()).unwrap_or(u64::MAX);
     let reconciliation_required = observation.outcome == DispatchOutcome::UnknownOutcome;
+    let semantic_http = (observation.outcome == DispatchOutcome::Completed)
+        .then(|| parse_semantic_http_response(&observation.response))
+        .flatten();
     let mut receipt = DispatchReceipt {
         receipt_id: Digest::ZERO,
         receipt_authentication_tag: Digest::ZERO,
@@ -105,5 +109,5 @@ pub(super) fn make_receipt(
         reconciliation_required,
     };
     receipt.receipt_id = receipt.canonical_id();
-    receipt
+    (receipt, semantic_http)
 }

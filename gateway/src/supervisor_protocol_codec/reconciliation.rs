@@ -25,6 +25,7 @@ pub(super) fn encode_supervisor_reconciliation(
             let gateway = GatewayResponse::Receipt {
                 action_id: unknown_receipt.action_id.clone(),
                 receipt: (**unknown_receipt).clone(),
+                semantic_http: None,
             };
             encoder.byte(DISPATCH_RECEIPT_RECONCILIATION);
             encoder.bytes(&encode_gateway_response(&gateway)?)?;

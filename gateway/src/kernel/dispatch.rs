@@ -8,6 +8,7 @@ use crate::policy::{
     ActionCompiler, LeaseCompletion, LeaseVerifier, PreEgressBarrier, PreEgressBarrierError,
     ScopeVerifier,
 };
+use crate::semantic_http::MAX_SEMANTIC_HTTP_RESPONSE_BYTES;
 use crate::transport::{DispatchLimits, TargetTransport};
 
 use super::receipt::{denied, make_receipt};
@@ -180,7 +181,7 @@ where
                 .unwrap_or(dispatch_started),
             maximum_response_bytes: usize::try_from(lease.reservation.response_bytes)
                 .unwrap_or(usize::MAX)
-                .min(65_536),
+                .min(MAX_SEMANTIC_HTTP_RESPONSE_BYTES),
         };
         match self
             .barrier
@@ -215,7 +216,7 @@ where
         }) {
             observation.outcome = DispatchOutcome::UnknownOutcome;
         }
-        let mut receipt = make_receipt(
+        let (mut receipt, semantic_http) = make_receipt(
             &request,
             request_frame_digest,
             &scope,
@@ -232,6 +233,7 @@ where
         Ok(GatewayResponse::Receipt {
             action_id: request.action_id,
             receipt,
+            semantic_http,
         })
     }
 }

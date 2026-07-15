@@ -1,4 +1,4 @@
-use faultloom_gateway::ipc::DispatchOutcome;
+use faultloom_gateway::ipc::{DispatchOutcome, FlowKind};
 use faultloom_gateway::lease::{ControlPlaneReconciliationHold, ReconciliationTerminal};
 use faultloom_gateway::supervisor_protocol::{
     ControlEgressDisposition, SupervisorCommand, SupervisorControlReceipt,
@@ -37,6 +37,9 @@ fn commands_round_trip_canonically() {
             },
         )
         .expect("issue control-plane reconciliation");
+    let mut child = dispatch("child-codec", 7, "target:owned-loopback", 0x45);
+    child.flow_kind = FlowKind::BrowserSubresource;
+    child.parent_action_id = Some("action:codec".to_owned());
     let commands = [
         SupervisorCommand::AdmitEpoch {
             canonical_envelope: b"canonical-epoch".to_vec(),
@@ -48,6 +51,7 @@ fn commands_round_trip_canonically() {
             "target:owned-loopback",
             0x44,
         ))),
+        SupervisorCommand::Dispatch(Box::new(child)),
         SupervisorCommand::ReconcileExpiry,
         SupervisorCommand::RecoverPendingResponse {
             original_request_id: faultloom_gateway::Digest::of(b"original request"),
