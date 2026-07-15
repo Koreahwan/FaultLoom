@@ -882,9 +882,11 @@ def _receipt(
         "evaluated_at": evaluated_at,
         "reconciliation_required": reconciliation_required,
     }
-    return EgressReceipt(
-        receipt_digest=sha256_digest(payload),
-        **payload,
+    return EgressReceipt.model_validate(
+        {
+            **payload,
+            "receipt_digest": sha256_digest(payload),
+        }
     )
 
 
