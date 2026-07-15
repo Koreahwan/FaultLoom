@@ -25,6 +25,11 @@ from faultloom_protocol.signing import SignatureVerificationError
 from . import __version__
 from .adapter_cli import configure_adapter_parser
 from .resume_cli import ResumeCliError, ResumeOperation, configure_resume_parser
+from .verification_cli import (
+    VerificationCliDependencies,
+    VerificationCliError,
+    configure_verification_parsers,
+)
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -703,12 +708,16 @@ def build_parser() -> argparse.ArgumentParser:
         reject_duplicate_keys=_reject_duplicate_keys,
     )
     verify = commands.add_parser("verify", help="verify a finding candidate")
-    verify.add_argument("candidate_id")
-    _set_unavailable(verify, "verify")
     report = commands.add_parser("report", help="render a verified finding")
-    report.add_argument("finding_id")
-    report.add_argument("--format", choices=("md", "json"), required=True)
-    _set_unavailable(report, "report")
+    configure_verification_parsers(
+        verify,
+        report,
+        VerificationCliDependencies(
+            capture_protocol_pair=_capture_protocol_file_pair,
+            parse_protocol_file=_parse_protocol_file,
+            now=_utc_now,
+        ),
+    )
 
     adapter = commands.add_parser("adapter", help="inspect adapter registry")
     configure_adapter_parser(adapter)
@@ -738,6 +747,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"faultloom: error: {exc}", file=sys.stderr)
         return exc.exit_code
     except ResumeCliError as exc:
+        print(f"faultloom: error: {exc}", file=sys.stderr)
+        return EXIT_AUTHORITY
+    except VerificationCliError as exc:
         print(f"faultloom: error: {exc}", file=sys.stderr)
         return EXIT_AUTHORITY
 
