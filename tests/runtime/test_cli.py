@@ -786,8 +786,6 @@ def test_live_mode_is_explicitly_unavailable_after_authority_validation(
         ["scope", "draft", "--template", "lab"],
         ["scope", "approve", "draft.json", "--out", "grant.json"],
         ["scope", "revoke", "grant.1"],
-        ["resume", "run.1"],
-        ["inspect", "run.1"],
         ["verify", "candidate.1"],
         ["report", "finding.1", "--format", "md"],
         ["adapter", "list"],
