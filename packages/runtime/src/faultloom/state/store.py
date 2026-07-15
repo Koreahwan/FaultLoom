@@ -176,7 +176,7 @@ class StateStore:
                     self.engagement_id,
                     key,
                     transaction_lock=self._lock,
-                    commit_callback=self._commit_anchor,
+                    commit_callback=self._synchronize_anchor,
                     path_validator=self._revalidate_roots,
                     migration_anchor=checkpoint,
                     migration_minimum_anchor=self._minimum_anchor,
