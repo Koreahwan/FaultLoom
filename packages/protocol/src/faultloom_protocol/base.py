@@ -124,6 +124,8 @@ def _trusted_protocol_type(value_type: type[object]) -> bool:
         return False
     if module_name not in {
         "faultloom_protocol.base",
+        "faultloom_protocol.evaluation_manifest",
+        "faultloom_protocol.evaluation_results",
         "faultloom_protocol.models",
     }:
         return False

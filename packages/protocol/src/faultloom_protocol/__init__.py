@@ -15,6 +15,8 @@ from .compatibility import (
     require_protocol_compatible,
 )
 from .gateway_receipt import GatewayEpochReceiptIssuer
+from .evaluation import *  # noqa: F403
+from .evaluation import __all__ as _EVALUATION_PUBLIC_EXPORTS
 from .models import *  # noqa: F403
 from .models import REQUIRED_MODEL_TYPES, WIRE_MODEL_TYPES, schema_catalog
 from .signing import (
@@ -89,5 +91,6 @@ __all__ = [
     "verify_engagement_bundle",
     "verify_run_result_bundle",
     "signing_bytes",
+    *_EVALUATION_PUBLIC_EXPORTS,
     *[model.__name__ for model in REQUIRED_MODEL_TYPES],
 ]

@@ -26,6 +26,7 @@ from .base import (
 from .canonical import sha256_digest
 from .compatibility import SemVer, require_protocol_compatible
 from .enum_integrity import _install_protocol_enum_catalog
+from .evaluation import EVALUATION_ENUM_TYPES, EVALUATION_MODEL_TYPES
 
 Port = Annotated[int, Field(ge=1, le=65535)]
 PositiveInt = Annotated[int, Field(ge=1, le=MAX_INT64)]
@@ -1486,6 +1487,7 @@ _install_protocol_enum_catalog(
         EvidenceCapability,
         TelemetryPolicy,
         OperationKind,
+        *EVALUATION_ENUM_TYPES,
     )
 )
 
@@ -1569,5 +1571,9 @@ def schema_catalog() -> dict[str, dict[str, object]]:
 
     return {
         model.__name__: model.model_json_schema()
-        for model in (*REQUIRED_MODEL_TYPES, *WIRE_MODEL_TYPES)
+        for model in (
+            *REQUIRED_MODEL_TYPES,
+            *WIRE_MODEL_TYPES,
+            *EVALUATION_MODEL_TYPES,
+        )
     }
