@@ -4,6 +4,7 @@ import base64
 import json
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone, tzinfo
+from enum import Enum
 
 import pytest
 from pydantic import ValidationError
@@ -760,6 +761,41 @@ def test_line_ranges_reference_full_output_and_continue_without_loss() -> None:
     assert (final.start, final.end, final.total_units) == (2, 3, 3)
     assert final.next_cursor is None
     assert (first.value + final.value).encode() == body
+
+
+def test_retrieval_unit_rejects_counterfeit_enum_without_hooks() -> None:
+    calls = {"eq": 0, "hash": 0, "str": 0}
+
+    class CounterfeitUnit(str, Enum):
+        LINES = "lines"
+
+        def __eq__(self, other: object) -> bool:
+            calls["eq"] += 1
+            raise AssertionError("counterfeit equality hook executed")
+
+        def __hash__(self) -> int:
+            calls["hash"] += 1
+            raise AssertionError("counterfeit hash hook executed")
+
+        def __str__(self) -> str:
+            calls["str"] += 1
+            raise AssertionError("counterfeit string hook executed")
+
+    calls.update({name: 0 for name in calls})
+    backend = MemoryBackend()
+    record = backend.add(b"one\n")
+    retriever = BoundedRetriever(backend, cursor_key=b"exact-unit-key" + b"x" * 32)
+
+    with pytest.raises(RetrievalRangeError, match="RetrievalUnit"):
+        retriever.read_range(
+            engagement_id="engagement.1",
+            content_id=record.content_id,
+            unit=CounterfeitUnit.LINES,  # type: ignore[arg-type]
+            start=0,
+            count=1,
+        )
+
+    assert calls == {"eq": 0, "hash": 0, "str": 0}
 
 
 def test_byte_ranges_preserve_arbitrary_original_bytes() -> None:

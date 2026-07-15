@@ -17,7 +17,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Literal, Protocol, Self
+from typing import Final, Literal, Protocol, Self
 
 from pydantic import (
     BaseModel,
@@ -177,6 +177,12 @@ class ScopeTrustAnchor(_RuntimeModel):
 class RetrievalUnit(str, Enum):
     BYTES = "bytes"
     LINES = "lines"
+
+
+_RETRIEVAL_UNIT_WIRE_VALUES: Final[tuple[tuple[RetrievalUnit, str], ...]] = (
+    (RetrievalUnit.BYTES, "bytes"),
+    (RetrievalUnit.LINES, "lines"),
+)
 
 
 class RetrievedView(_RuntimeModel):
@@ -1121,12 +1127,15 @@ def _context_document(
                 )
             ],
             "bounded_views": [
-                view.model_dump(mode="python")
+                {
+                    **view.model_dump(mode="python"),
+                    "unit": _retrieval_unit_wire_value(view.unit),
+                }
                 for view in sorted(
                     state.retrieved_views,
                     key=lambda item: (
                         item.content_id,
-                        item.unit.value,
+                        _retrieval_unit_wire_value(item.unit),
                         item.start,
                         item.end,
                     ),
@@ -1305,7 +1314,7 @@ def _range_id(
 
 
 def _view_binding_document(values: Mapping[str, object]) -> dict[str, object]:
-    return {
+    document = {
         key: values[key]
         for key in (
             "engagement_digest",
@@ -1325,6 +1334,23 @@ def _view_binding_document(values: Mapping[str, object]) -> dict[str, object]:
             "next_cursor_id",
         )
     }
+    document["unit"] = _retrieval_unit_wire_value(values["unit"])
+    return document
+
+
+def _retrieval_unit_wire_value(value: object) -> str:
+    if type(value) is RetrievalUnit:
+        for member, wire_value in _RETRIEVAL_UNIT_WIRE_VALUES:
+            if value is member:
+                backing_value = object.__getattribute__(member, "_value_")
+                if (
+                    type(backing_value) is str
+                    and backing_value == wire_value
+                    and str.__str__(member) == wire_value
+                ):
+                    return wire_value
+                break
+    raise RetrievalRangeError("retrieved view unit is not an exact registered member")
 
 
 def _view_binding_tag_from_values(key: bytes, values: Mapping[str, object]) -> str:
