@@ -63,6 +63,7 @@ fn dispatch_receipt_response_round_trip_is_canonical() {
     let response = GatewayResponse::Receipt {
         action_id: "action:1".to_owned(),
         receipt,
+        semantic_http: None,
     };
     let encoded = encode_response(&response).expect("encode response");
     assert_eq!(decode_response(&encoded), Ok(response.clone()));
@@ -83,13 +84,18 @@ fn dispatch_receipt_response_round_trip_is_canonical() {
     let GatewayResponse::Receipt {
         action_id,
         mut receipt,
+        ..
     } = response
     else {
         unreachable!("fixture response is a receipt")
     };
     receipt.request_binding_digest = Digest::of(b"substituted request binding");
     assert_eq!(
-        encode_response(&GatewayResponse::Receipt { action_id, receipt }),
+        encode_response(&GatewayResponse::Receipt {
+            action_id,
+            receipt,
+            semantic_http: None,
+        }),
         Err(DenialCode::InvalidRequest)
     );
 }

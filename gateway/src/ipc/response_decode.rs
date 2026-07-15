@@ -4,6 +4,9 @@ use super::response::{DecodeError, DeniedResponse, GatewayResponse};
 use super::tags::{ActionKind, DenialCode, DispatchOutcome, EgressPlane, RESPONSE_MESSAGE};
 use super::validation::valid_identifier;
 use super::wire::Decoder;
+use crate::semantic_http::{
+    SemanticHttpHeader, SemanticHttpResponseArtifact, validate_semantic_http_artifact,
+};
 
 pub fn decode_response(bytes: &[u8]) -> Result<GatewayResponse, DecodeError> {
     let mut input = Decoder::new(bytes, RESPONSE_MESSAGE)?;
@@ -113,6 +116,34 @@ pub fn decode_response(bytes: &[u8]) -> Result<GatewayResponse, DecodeError> {
                     });
                 }
             };
+            let semantic_http = match input.byte()? {
+                0 => None,
+                1 => {
+                    let status_code = input.u16()?;
+                    let header_count = input.u16()?;
+                    let mut headers = Vec::with_capacity(usize::from(header_count));
+                    for _ in 0..header_count {
+                        headers.push(SemanticHttpHeader {
+                            name: input.string()?,
+                            value: input.short_bytes()?.to_vec(),
+                        });
+                    }
+                    Some(SemanticHttpResponseArtifact {
+                        status_code,
+                        headers,
+                        body: input.long_bytes()?.to_vec(),
+                        body_digest: input.digest()?,
+                        raw_response_digest: input.digest()?,
+                        raw_response_length: input.u64()?,
+                    })
+                }
+                _ => {
+                    return Err(DecodeError {
+                        action_id: Some(action_id),
+                        reason: DenialCode::MalformedFrame,
+                    });
+                }
+            };
             let receipt = DispatchReceipt {
                 receipt_id,
                 receipt_authentication_tag,
@@ -158,13 +189,22 @@ pub fn decode_response(bytes: &[u8]) -> Result<GatewayResponse, DecodeError> {
             if !valid_identifier(&action_id)
                 || action_id != receipt.action_id
                 || !receipt.validate()
+                || semantic_http.as_ref().is_some_and(|artifact| {
+                    !validate_semantic_http_artifact(artifact)
+                        || Some(artifact.raw_response_digest) != receipt.response_digest
+                        || artifact.raw_response_length != receipt.bytes_received
+                })
             {
                 return Err(DecodeError {
                     action_id: Some(action_id),
                     reason: DenialCode::MalformedFrame,
                 });
             }
-            GatewayResponse::Receipt { action_id, receipt }
+            GatewayResponse::Receipt {
+                action_id,
+                receipt,
+                semantic_http,
+            }
         }
         _ => {
             return Err(DecodeError {

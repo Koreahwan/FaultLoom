@@ -3,7 +3,7 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use faultloom_gateway::Digest;
-use faultloom_gateway::ipc::ActionClass;
+use faultloom_gateway::ipc::{ActionClass, FlowKind};
 use faultloom_gateway::supervisor_protocol::SupervisorDispatch;
 
 use crate::bootstrap_fixture::TestBootstrap;
@@ -40,6 +40,8 @@ pub fn dispatch(label: &str, epoch: u64, target_id: &str, seed: u8) -> Superviso
         target_id: target_id.to_owned(),
         scope_epoch: epoch,
         action_class: ActionClass::Observe,
+        flow_kind: FlowKind::TopLevel,
+        parent_action_id: None,
         method: "POST".to_owned(),
         path: "/probe".to_owned(),
         intent_digest: Digest::of(intent_material),

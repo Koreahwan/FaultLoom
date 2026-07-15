@@ -4,6 +4,7 @@ use super::binding::push_binding_string;
 use super::receipt::DispatchReceipt;
 use super::tags::DenialCode;
 use super::validation::valid_identifier;
+use crate::semantic_http::SemanticHttpResponseArtifact;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeniedResponse {
@@ -48,6 +49,7 @@ pub enum GatewayResponse {
     Receipt {
         action_id: String,
         receipt: DispatchReceipt,
+        semantic_http: Option<SemanticHttpResponseArtifact>,
     },
 }
 

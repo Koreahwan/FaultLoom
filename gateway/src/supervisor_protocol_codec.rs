@@ -8,7 +8,7 @@ use crate::ipc::DenialCode;
 use super::supervisor_protocol::{SupervisorCommand, SupervisorResponse};
 
 const MAGIC: &[u8; 4] = b"FLSC";
-const VERSION: u8 = 4;
+const VERSION: u8 = 5;
 
 pub(super) fn encode_command(command: &SupervisorCommand) -> Result<Vec<u8>, DenialCode> {
     command::encode_command(command)

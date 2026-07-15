@@ -148,6 +148,7 @@ fn acknowledged_dispatch_response(
     let encoded = SupervisorResponse::Gateway(Box::new(GatewayResponse::Receipt {
         action_id: receipt.action_id.clone(),
         receipt: receipt.clone(),
+        semantic_http: None,
     }))
     .to_bytes()?;
     let response_digest = Digest::of(&encoded);

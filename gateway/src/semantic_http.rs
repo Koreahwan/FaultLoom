@@ -3,6 +3,175 @@ use crate::ipc::{ActionKind, DenialCode, DispatchRequest, EgressPlane, valid_ide
 use crate::policy::{ActionCompiler, CompiledAction, CompilerLeaseBinding, target_effect_digest};
 
 const HMAC_BLOCK_BYTES: usize = 64;
+pub(crate) const MAX_SEMANTIC_HTTP_RESPONSE_BYTES: usize = 32_768;
+const MAX_SEMANTIC_HTTP_HEADERS: usize = 128;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SemanticHttpHeader {
+    pub name: String,
+    pub value: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SemanticHttpResponseArtifact {
+    pub status_code: u16,
+    pub headers: Vec<SemanticHttpHeader>,
+    pub body: Vec<u8>,
+    pub body_digest: Digest,
+    pub raw_response_digest: Digest,
+    pub raw_response_length: u64,
+}
+
+pub(crate) fn parse_semantic_http_response(
+    response: &[u8],
+) -> Option<SemanticHttpResponseArtifact> {
+    if response.is_empty() || response.len() > MAX_SEMANTIC_HTTP_RESPONSE_BYTES {
+        return None;
+    }
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")?;
+    let head = &response[..header_end];
+    let body = &response[header_end + 4..];
+    let lines = head.split(|byte| *byte == b'\n').collect::<Vec<_>>();
+    let status_line = canonical_header_line(lines.first()?, lines.len() == 1)?;
+    let status_code = parse_status_line(status_line)?;
+    let mut headers = Vec::new();
+    let mut content_length = None;
+    for (index, raw_line) in lines.iter().enumerate().skip(1) {
+        if headers.len() >= MAX_SEMANTIC_HTTP_HEADERS {
+            return None;
+        }
+        let line = canonical_header_line(raw_line, index + 1 == lines.len())?;
+        let separator = line.iter().position(|byte| *byte == b':')?;
+        let (raw_name, raw_value) = line.split_at(separator);
+        if raw_name.is_empty() || !raw_name.iter().copied().all(valid_header_name_byte) {
+            return None;
+        }
+        let name = raw_name
+            .iter()
+            .map(u8::to_ascii_lowercase)
+            .collect::<Vec<_>>();
+        let name = String::from_utf8(name).ok()?;
+        let value = trim_optional_whitespace(&raw_value[1..]);
+        if !value
+            .iter()
+            .all(|byte| *byte == b'\t' || (0x20..=0x7e).contains(byte))
+        {
+            return None;
+        }
+        if name == "transfer-encoding" {
+            return None;
+        }
+        if name == "content-length" {
+            if content_length.is_some() || value.is_empty() {
+                return None;
+            }
+            let text = std::str::from_utf8(value).ok()?;
+            if !text.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            content_length = text.parse::<usize>().ok();
+            if content_length.is_none() {
+                return None;
+            }
+        }
+        headers.push(SemanticHttpHeader {
+            name,
+            value: value.to_vec(),
+        });
+    }
+    if content_length.is_some_and(|length| length != body.len()) {
+        return None;
+    }
+    Some(SemanticHttpResponseArtifact {
+        status_code,
+        headers,
+        body: body.to_vec(),
+        body_digest: Digest::of(body),
+        raw_response_digest: Digest::of(response),
+        raw_response_length: u64::try_from(response.len()).ok()?,
+    })
+}
+
+pub(crate) fn validate_semantic_http_artifact(artifact: &SemanticHttpResponseArtifact) -> bool {
+    (100..=599).contains(&artifact.status_code)
+        && artifact.headers.len() <= MAX_SEMANTIC_HTTP_HEADERS
+        && artifact.headers.iter().all(|header| {
+            !header.name.is_empty()
+                && header.name == header.name.to_ascii_lowercase()
+                && header.name.bytes().all(valid_header_name_byte)
+                && header
+                    .value
+                    .iter()
+                    .all(|byte| *byte == b'\t' || (0x20..=0x7e).contains(byte))
+        })
+        && artifact.body.len() <= MAX_SEMANTIC_HTTP_RESPONSE_BYTES
+        && artifact.body_digest == Digest::of(&artifact.body)
+        && artifact.raw_response_digest != Digest::ZERO
+        && artifact.raw_response_length > 0
+        && artifact.raw_response_length <= MAX_SEMANTIC_HTTP_RESPONSE_BYTES as u64
+}
+
+fn canonical_header_line(line: &[u8], is_last: bool) -> Option<&[u8]> {
+    let line = if is_last {
+        line
+    } else {
+        line.strip_suffix(b"\r")?
+    };
+    (!line.contains(&b'\r')).then_some(line)
+}
+
+fn parse_status_line(line: &[u8]) -> Option<u16> {
+    let line = std::str::from_utf8(line).ok()?;
+    let mut parts = line.splitn(3, ' ');
+    if parts.next()? != "HTTP/1.1" {
+        return None;
+    }
+    let status = parts.next()?;
+    if status.len() != 3 || !status.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let status = status.parse::<u16>().ok()?;
+    (100..=599).contains(&status).then_some(status)
+}
+
+fn valid_header_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn trim_optional_whitespace(mut value: &[u8]) -> &[u8] {
+    while value
+        .first()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        value = &value[1..];
+    }
+    while value
+        .last()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
 
 #[derive(Clone)]
 pub(crate) struct SemanticHttpCompiler {
@@ -98,7 +267,6 @@ fn compile_http(request: &DispatchRequest) -> Result<Vec<u8>, DenialCode> {
             .hostname
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b':'))
-        || request.payload.is_empty()
     {
         return Err(DenialCode::CompilerDenied);
     }

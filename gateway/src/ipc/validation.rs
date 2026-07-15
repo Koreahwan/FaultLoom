@@ -41,7 +41,6 @@ impl DispatchRequest {
                 > MAX_DISPATCH_TTL_MILLIS
             || self.retry_of_intent_digest == Some(Digest::ZERO)
             || self.retry_of_intent_digest == Some(self.intent_digest)
-            || self.payload.is_empty()
             || self.payload.len() > MAX_PAYLOAD_BYTES
             || self.scope_proof.is_empty()
             || self.scope_proof.len() > MAX_PROOF_BYTES

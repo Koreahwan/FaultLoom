@@ -139,6 +139,7 @@ fn acknowledged_cancelled_unknown(
     let response = SupervisorResponse::Gateway(Box::new(GatewayResponse::Receipt {
         action_id: receipt.action_id.clone(),
         receipt: receipt.clone(),
+        semantic_http: None,
     }))
     .to_bytes()
     .expect("encode cancelled unknown response");

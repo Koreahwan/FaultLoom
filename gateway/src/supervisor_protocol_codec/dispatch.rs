@@ -1,4 +1,4 @@
-use crate::ipc::{ActionClass, DenialCode};
+use crate::ipc::{ActionClass, DenialCode, FlowKind};
 
 use super::super::supervisor_protocol::SupervisorDispatch;
 use super::super::supervisor_wire::{Decoder, Encoder};
@@ -18,6 +18,8 @@ pub(super) fn encode_dispatch(
     encoder.string(&dispatch.target_id)?;
     encoder.u64(dispatch.scope_epoch);
     encoder.byte(dispatch.action_class as u8);
+    encoder.byte(dispatch.flow_kind as u8);
+    encoder.optional_string(dispatch.parent_action_id.as_deref())?;
     encoder.string(&dispatch.method)?;
     encoder.string(&dispatch.path)?;
     encoder.digest(dispatch.intent_digest);
@@ -45,6 +47,16 @@ pub(super) fn decode_dispatch(decoder: &mut Decoder<'_>) -> Result<SupervisorDis
         3 => ActionClass::StateChange,
         _ => return Err(DenialCode::UnsupportedActionClass),
     };
+    let flow_kind = match decoder.byte()? {
+        1 => FlowKind::TopLevel,
+        3 => FlowKind::Redirect,
+        4 => FlowKind::BrowserSubresource,
+        5 => FlowKind::BrowserIframe,
+        6 => FlowKind::ServiceWorker,
+        8 => FlowKind::Download,
+        _ => return Err(DenialCode::InvalidChildFlow),
+    };
+    let parent_action_id = decoder.optional_string()?;
     Ok(SupervisorDispatch {
         action_id,
         correlation_id,
@@ -52,6 +64,8 @@ pub(super) fn decode_dispatch(decoder: &mut Decoder<'_>) -> Result<SupervisorDis
         target_id,
         scope_epoch,
         action_class,
+        flow_kind,
+        parent_action_id,
         method: decoder.string()?,
         path: decoder.string()?,
         intent_digest: decoder.digest()?,

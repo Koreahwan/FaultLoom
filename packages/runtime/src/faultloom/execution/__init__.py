@@ -1,0 +1,91 @@
+"""Gateway-only semantic HTTP and multi-identity browser execution."""
+
+from .browser import BrowserExecutionCoordinator
+from .browser_contracts import (
+    BrowserContractError,
+    BrowserIdentityContext,
+    UnsupportedBrowserTransport,
+)
+from .contracts import (
+    SEMANTIC_HTTP_ACTION_KIND,
+    BrowserChildCandidate,
+    BrowserChildKind,
+    EndpointScheme,
+    ExecutionIdentity,
+    GatewayDeniedResult,
+    GatewayDispatchCommand,
+    GatewayDispatchResult,
+    GatewayResult,
+    SemanticBodyRef,
+    SemanticEndpoint,
+    SemanticHeader,
+    SemanticHttpObservation,
+    SemanticHttpRequest,
+    SemanticQueryParameter,
+    SemanticResponseHeader,
+    SemanticValue,
+    semantic_payload_digest,
+)
+from .http import SemanticHttpExecutor
+from .http_validation import (
+    DispatchReplayError,
+    DispatchUncertainError,
+    ExecutionContractError,
+    GatewayChannelError,
+    LocalDispatchState,
+    ReconciliationStateError,
+)
+from .gateway import (
+    ExecutionFlowKind,
+    GatewayDispatchFrame,
+    GatewayResponseEnvelope,
+    bind_gateway_response,
+    canonical_dispatch_receipt_id,
+    gateway_dispatch_frame,
+    gateway_frame_digest,
+)
+from .gateway_client import (
+    AuthenticatedGatewayClient,
+    GatewayChannelConfig,
+)
+
+__all__ = [
+    "SEMANTIC_HTTP_ACTION_KIND",
+    "BrowserChildCandidate",
+    "BrowserChildKind",
+    "BrowserContractError",
+    "BrowserExecutionCoordinator",
+    "BrowserIdentityContext",
+    "AuthenticatedGatewayClient",
+    "DispatchReplayError",
+    "DispatchUncertainError",
+    "EndpointScheme",
+    "ExecutionFlowKind",
+    "ExecutionContractError",
+    "ExecutionIdentity",
+    "GatewayDeniedResult",
+    "GatewayChannelConfig",
+    "GatewayChannelError",
+    "GatewayDispatchCommand",
+    "GatewayDispatchFrame",
+    "GatewayDispatchResult",
+    "GatewayResponseEnvelope",
+    "GatewayResult",
+    "LocalDispatchState",
+    "ReconciliationStateError",
+    "SemanticBodyRef",
+    "SemanticEndpoint",
+    "SemanticHeader",
+    "SemanticHttpExecutor",
+    "SemanticHttpObservation",
+    "SemanticHttpRequest",
+    "SemanticQueryParameter",
+    "SemanticResponseHeader",
+    "SemanticValue",
+    "UnsupportedBrowserTransport",
+    "bind_gateway_response",
+    "canonical_dispatch_receipt_id",
+    "gateway_dispatch_frame",
+    "gateway_frame_digest",
+    "semantic_payload_digest",
+]

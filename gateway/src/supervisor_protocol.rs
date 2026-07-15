@@ -1,5 +1,5 @@
 use crate::Digest;
-use crate::ipc::{ActionClass, DenialCode, DispatchReceipt, GatewayResponse};
+use crate::ipc::{ActionClass, DenialCode, DispatchReceipt, FlowKind, GatewayResponse};
 use crate::lease::ReconciliationReceipt;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -10,6 +10,8 @@ pub struct SupervisorDispatch {
     pub target_id: String,
     pub scope_epoch: u64,
     pub action_class: ActionClass,
+    pub flow_kind: FlowKind,
+    pub parent_action_id: Option<String>,
     pub method: String,
     pub path: String,
     pub intent_digest: Digest,

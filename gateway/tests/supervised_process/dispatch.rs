@@ -2,6 +2,7 @@ use std::io::Write;
 use std::net::TcpListener;
 use std::thread;
 
+use faultloom_gateway::Digest;
 use faultloom_gateway::ipc::{DenialCode, DeniedResponse, DispatchOutcome, GatewayResponse};
 use faultloom_gateway::supervisor_protocol::{
     ControlEgressDisposition, SupervisorCommand, SupervisorControlReceipt, SupervisorResponse,
@@ -61,11 +62,24 @@ fn installed_supervisor_dispatches_only_the_bootstrap_bound_loopback_target() {
     let SupervisorResponse::Gateway(successful) = successful else {
         panic!("installed supervised dispatch did not return a gateway response")
     };
-    let GatewayResponse::Receipt { receipt, .. } = *successful else {
+    let GatewayResponse::Receipt {
+        receipt,
+        semantic_http: Some(semantic_http),
+        ..
+    } = *successful
+    else {
         panic!("installed supervised dispatch did not return a receipt")
     };
     assert_eq!(receipt.outcome, DispatchOutcome::Completed);
     assert!(!receipt.reconciliation_required);
+    assert_eq!(semantic_http.status_code, 200);
+    assert_eq!(semantic_http.body, b"OK");
+    assert_eq!(semantic_http.body_digest, Digest::of(b"OK"));
+    assert_eq!(
+        semantic_http.raw_response_digest,
+        receipt.response_digest.expect("completed response digest")
+    );
+    assert_eq!(semantic_http.raw_response_length, receipt.bytes_received);
     assert!(request.starts_with(b"POST /probe HTTP/1.1\r\nHost: 127.0.0.1\r\n"));
     assert!(request.ends_with(b"probe-success"));
     assert!(matches!(
