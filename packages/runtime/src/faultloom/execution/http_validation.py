@@ -99,16 +99,24 @@ def _validate_gateway_result(
 
     observation = result.observation
     if observation is None:
-        if receipt.response_digest is not None or receipt.bytes_received:
-            raise ExecutionContractError("Gateway response bytes require an observation reference")
+        if receipt.outcome is DispatchOutcome.COMPLETED:
+            raise ExecutionContractError("Gateway response bytes require semantic observation")
     else:
         response_ref = observation.response_ref
-        if receipt.response_digest != response_ref.cas_digest:
-            raise ExecutionContractError("response observation digest differs from the receipt")
-        if response_ref.run_id != command.intent.run_id:
-            raise ExecutionContractError("response observation belongs to another run")
-        if response_ref.byte_length != receipt.bytes_received:
-            raise ExecutionContractError("response observation length differs from the receipt")
+        if response_ref is not None:
+            if receipt.response_digest != response_ref.cas_digest:
+                raise ExecutionContractError("response observation digest differs from the receipt")
+            if response_ref.run_id != command.intent.run_id:
+                raise ExecutionContractError("response observation belongs to another run")
+            if response_ref.byte_length != receipt.bytes_received:
+                raise ExecutionContractError("response observation length differs from the receipt")
+        if observation.raw_response_digest is not None:
+            if receipt.response_digest != observation.raw_response_digest:
+                raise ExecutionContractError("semantic response digest differs from the receipt")
+            if observation.raw_response_length != receipt.bytes_received:
+                raise ExecutionContractError("semantic response length differs from the receipt")
+            if observation.status_code != receipt.response_status:
+                raise ExecutionContractError("semantic response status differs from the receipt")
         for child in observation.child_candidates:
             if child.parent_action_id != command.intent.action_id:
                 raise ExecutionContractError("browser child belongs to another parent action")

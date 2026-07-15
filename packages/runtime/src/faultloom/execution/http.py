@@ -7,20 +7,11 @@ from datetime import datetime, timezone
 from threading import Lock
 from typing import Protocol, Self, assert_never
 
-from faultloom_protocol import sha256_digest
-
 from .contracts import (
     GatewayDispatchCommand,
     GatewayResult,
 )
-from .gateway import (
-    GatewayCancellationReceipt,
-    GatewayCancellationRequest,
-    GatewayDispatchFrame,
-    GatewayResponseEnvelope,
-    gateway_cancellation_is_authentic,
-    gateway_dispatch_frame,
-)
+from .gateway import GatewayDispatchFrame, GatewayResponseEnvelope, gateway_dispatch_frame
 from .gateway_client import AuthenticatedGatewayClient
 from .http_validation import (
     DispatchReplayError,
@@ -36,11 +27,6 @@ class GatewayPort(Protocol):
     """The sole target-egress dependency available to the runtime executor."""
 
     def dispatch(self, frame: GatewayDispatchFrame) -> GatewayResponseEnvelope: ...
-
-    def cancel_context(
-        self,
-        request: GatewayCancellationRequest,
-    ) -> GatewayCancellationReceipt: ...
 
     def reconcile(self, frame: GatewayDispatchFrame) -> GatewayResponseEnvelope | None: ...
 
@@ -61,7 +47,7 @@ class SemanticHttpExecutor:
     ) -> None:
         if type(gateway) is not AuthenticatedGatewayClient:
             raise ExecutionContractError(
-                "production execution requires the authenticated pipe Gateway client"
+                "production execution requires the authenticated supervised Gateway client"
             )
         self._initialize(gateway, gateway.channel_key, now)
 
@@ -166,20 +152,6 @@ class SemanticHttpExecutor:
         state = validate_gateway_envelope(frame, envelope, self._channel_key)
         self._set_state(action_id, state)
         return envelope.result
-
-    def cancel_context(
-        self,
-        request: GatewayCancellationRequest,
-    ) -> GatewayCancellationReceipt:
-        try:
-            receipt = self._gateway.cancel_context(request)
-        except Exception as exc:
-            raise DispatchUncertainError("Gateway cancellation channel failed") from exc
-        if receipt.request_digest != sha256_digest(request):
-            raise ExecutionContractError("Gateway cancellation request binding mismatch")
-        if not gateway_cancellation_is_authentic(receipt, self._channel_key):
-            raise ExecutionContractError("Gateway cancellation authentication failed")
-        return receipt
 
     def state_for(self, action_id: str) -> LocalDispatchState | None:
         with self._lock:

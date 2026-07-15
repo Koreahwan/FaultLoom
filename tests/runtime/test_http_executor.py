@@ -27,7 +27,6 @@ from faultloom_protocol import SCHEMA_VERSION
 
 from .execution_helpers import (
     CHANNEL_KEY,
-    D1,
     NOW,
     RecordingGateway,
     command,
@@ -43,7 +42,7 @@ def test_production_executor_rejects_an_in_process_gateway_port() -> None:
     gateway = RecordingGateway(completed_result)
     untrusted = _UntrustedGatewayClient.__new__(_UntrustedGatewayClient)
 
-    with pytest.raises(ExecutionContractError, match="authenticated pipe"):
+    with pytest.raises(ExecutionContractError, match="authenticated supervised"):
         SemanticHttpExecutor(untrusted, now=lambda: NOW)
 
     assert gateway.calls == []
@@ -88,23 +87,13 @@ def test_expired_or_future_lease_is_rejected_before_gateway_call() -> None:
     assert gateway.calls == []
 
 
-def test_zero_byte_lease_is_rejected_before_gateway_call() -> None:
+def test_zero_byte_lease_cannot_be_constructed() -> None:
     approved = command()
-    lease_values = approved.lease.model_dump(mode="python")
     reservation_values = approved.lease.reservation.model_dump(mode="python")
     reservation_values["request_bytes"] = 0
-    lease_values["reservation"] = m.BudgetReservation.model_validate(reservation_values)
-    command_values = approved.model_dump(mode="python")
-    command_values["lease"] = m.ActionLease.model_validate(lease_values)
-    zero_byte = type(approved).model_validate(command_values)
-    gateway = RecordingGateway(completed_result)
-    executor = SemanticHttpExecutor._for_test(
-        gateway, channel_key=CHANNEL_KEY, now=lambda: NOW
-    )
 
-    with pytest.raises(ExecutionContractError, match="non-zero byte reservations"):
-        executor.execute(zero_byte)
-    assert gateway.calls == []
+    with pytest.raises(ValueError, match="request_bytes"):
+        m.BudgetReservation.model_validate(reservation_values)
 
 
 def test_gateway_denial_is_bound_and_never_automatically_retried() -> None:
@@ -197,21 +186,17 @@ def test_receipt_dispatched_outside_lease_window_is_rejected() -> None:
 
 def test_unknown_outcome_requires_reconciliation_and_never_retries() -> None:
     approved = command()
-    provisional_receipt = m.DispatchReceipt(
-        schema_version=SCHEMA_VERSION,
+    receipt_values = completed_result(approved).receipt.model_dump(mode="python")
+    receipt_values.update(
         receipt_id="receipt.unknown",
-        lease_id=approved.lease.lease_id,
-        intent_digest=approved.intent_digest,
-        decision_digest=approved.decision_digest,
-        scope_epoch=approved.lease.scope_epoch,
-        request_digest=D1,
+        response_digest=None,
         outcome=m.DispatchOutcome.UNKNOWN_OUTCOME,
-        dispatched_at=NOW,
-        bytes_sent=64,
+        completed_at=None,
+        response_status=None,
         bytes_received=0,
         reconciliation_required=True,
     )
-    receipt_values = provisional_receipt.model_dump(mode="python")
+    provisional_receipt = m.DispatchReceipt.model_validate(receipt_values)
     receipt_values["receipt_id"] = canonical_dispatch_receipt_id(provisional_receipt)
     receipt = m.DispatchReceipt.model_validate(receipt_values)
     result = GatewayDispatchResult(

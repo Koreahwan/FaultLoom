@@ -6,15 +6,12 @@ from faultloom.execution import (
     BrowserChildKind,
     BrowserContractError,
     BrowserExecutionCoordinator,
-    CancellationReason,
     ExecutionFlowKind,
     GatewayDispatchCommand,
     GatewayResult,
     SemanticHttpExecutor,
     UnsupportedBrowserTransport,
 )
-from faultloom_protocol import sha256_digest
-
 from .browser_execution_helpers import browser_context, http_candidate, websocket_candidate
 from .execution_helpers import (
     CHANNEL_KEY,
@@ -222,7 +219,7 @@ def test_reused_child_candidate_is_poisoned_before_execution() -> None:
     assert browser.pending_candidate_ids("browser.owner") == ()
 
 
-def test_closing_context_cancels_pending_children_and_prevents_further_actions() -> None:
+def test_closing_context_discards_pending_children_and_prevents_further_actions() -> None:
     candidate = http_candidate(BrowserChildKind.SUBRESOURCE, suffix="script")
     gateway = RecordingGateway(
         lambda dispatch_command: completed_result(dispatch_command, child_candidates=(candidate,))
@@ -236,7 +233,7 @@ def test_closing_context_cancels_pending_children_and_prevents_further_actions()
     browser.register_context(context)
     browser.navigate("browser.owner", command(identity=context.identity))
 
-    receipt = browser.close_context("browser.owner")
+    browser.close_context("browser.owner")
 
     child_command = command(
         action_id="action.child",
@@ -248,5 +245,3 @@ def test_closing_context_cancels_pending_children_and_prevents_further_actions()
     with pytest.raises(BrowserContractError, match="not active"):
         browser.execute_child("browser.owner", candidate.candidate_id, child_command)
     assert len(gateway.calls) == 1
-    assert receipt.request_digest == sha256_digest(gateway.cancel_calls[0])
-    assert gateway.cancel_calls[0].reason is CancellationReason.CONTEXT_CLOSED

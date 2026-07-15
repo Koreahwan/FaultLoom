@@ -7,6 +7,7 @@ wire bytes, and resolving secret references remain Gateway responsibilities.
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import re
 from enum import Enum
@@ -23,9 +24,10 @@ from faultloom_protocol import (
     PolicyDecision,
     ProtocolModel,
     SecretRef,
-    sha256_digest,
 )
 from faultloom_protocol.base import Identifier, NonEmptyStr, Sha256Digest, ShortStr
+
+from .wire import execution_sha256_digest
 
 SEMANTIC_HTTP_ACTION_KIND = "http.semantic"
 
@@ -265,7 +267,7 @@ class GatewayDispatchCommand(ExecutionModel):
 
     @model_validator(mode="after")
     def _bindings_are_exact(self) -> Self:
-        intent_digest = sha256_digest(self.intent)
+        intent_digest = execution_sha256_digest(self.intent)
         payload_digest = semantic_payload_digest(self.request, self.identity)
         if self.intent.action_kind != SEMANTIC_HTTP_ACTION_KIND:
             raise ValueError("action kind is not the admitted semantic HTTP family")
@@ -313,17 +315,17 @@ class GatewayDispatchCommand(ExecutionModel):
 
     @property
     def intent_digest(self) -> str:
-        return sha256_digest(self.intent)
+        return execution_sha256_digest(self.intent)
 
     @property
     def decision_digest(self) -> str:
-        return sha256_digest(self.decision)
+        return execution_sha256_digest(self.decision)
 
 
 def semantic_payload_digest(request: SemanticHttpRequest, identity: ExecutionIdentity) -> str:
     """Bind compiler input and the opaque session handle into one intent digest."""
 
-    return sha256_digest({"identity": identity, "request": request})
+    return execution_sha256_digest({"identity": identity, "request": request})
 
 
 class BrowserChildKind(str, Enum):
@@ -359,15 +361,40 @@ class BrowserChildCandidate(ExecutionModel):
         return self
 
 
+class SemanticResponseHeader(ExecutionModel):
+    name: Annotated[str, Field(min_length=1, max_length=256)]
+    value: bytes
+
+
 class SemanticHttpObservation(ExecutionModel):
-    response_ref: ObservationRef
+    response_ref: ObservationRef | None = None
+    status_code: Annotated[int, Field(ge=100, le=599)] | None = None
+    headers: tuple[SemanticResponseHeader, ...] = ()
+    body: bytes | None = None
+    body_digest: Sha256Digest | None = None
+    raw_response_digest: Sha256Digest | None = None
+    raw_response_length: Annotated[int, Field(ge=0, le=2**63 - 1)] | None = None
     child_candidates: tuple[BrowserChildCandidate, ...] = ()
 
     @model_validator(mode="after")
-    def _candidate_ids_are_unique(self) -> Self:
+    def _observation_is_bound(self) -> Self:
         ids = [candidate.candidate_id for candidate in self.child_candidates]
         if len(ids) != len(set(ids)):
             raise ValueError("browser child candidate IDs must be unique")
+        semantic_values = (
+            self.status_code,
+            self.body,
+            self.body_digest,
+            self.raw_response_digest,
+            self.raw_response_length,
+        )
+        if any(value is not None for value in semantic_values):
+            if any(value is None for value in semantic_values):
+                raise ValueError("semantic HTTP observation fields are all-or-none")
+            if self.body is None or self.body_digest != (
+                f"sha256:{hashlib.sha256(self.body).hexdigest()}"
+            ):
+                raise ValueError("semantic HTTP body digest mismatch")
         return self
 
 

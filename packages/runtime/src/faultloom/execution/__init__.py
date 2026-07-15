@@ -22,10 +22,11 @@ from .contracts import (
     SemanticHttpObservation,
     SemanticHttpRequest,
     SemanticQueryParameter,
+    SemanticResponseHeader,
     SemanticValue,
     semantic_payload_digest,
 )
-from .http import GatewayPort, SemanticHttpExecutor
+from .http import SemanticHttpExecutor
 from .http_validation import (
     DispatchReplayError,
     DispatchUncertainError,
@@ -35,20 +36,18 @@ from .http_validation import (
     ReconciliationStateError,
 )
 from .gateway import (
-    CancellationReason,
     ExecutionFlowKind,
-    GatewayCancellationReceipt,
-    GatewayCancellationRequest,
     GatewayDispatchFrame,
     GatewayResponseEnvelope,
-    bind_gateway_cancellation,
     bind_gateway_response,
     canonical_dispatch_receipt_id,
     gateway_dispatch_frame,
     gateway_frame_digest,
 )
-from .gateway_client import AuthenticatedGatewayClient
-from .gateway_pipe import GatewayPipeChannels, GatewayPipeFds
+from .gateway_client import (
+    AuthenticatedGatewayClient,
+    GatewayChannelConfig,
+)
 
 __all__ = [
     "SEMANTIC_HTTP_ACTION_KIND",
@@ -58,7 +57,6 @@ __all__ = [
     "BrowserExecutionCoordinator",
     "BrowserIdentityContext",
     "AuthenticatedGatewayClient",
-    "CancellationReason",
     "DispatchReplayError",
     "DispatchUncertainError",
     "EndpointScheme",
@@ -66,15 +64,11 @@ __all__ = [
     "ExecutionContractError",
     "ExecutionIdentity",
     "GatewayDeniedResult",
-    "GatewayCancellationReceipt",
-    "GatewayCancellationRequest",
+    "GatewayChannelConfig",
     "GatewayChannelError",
     "GatewayDispatchCommand",
     "GatewayDispatchFrame",
     "GatewayDispatchResult",
-    "GatewayPort",
-    "GatewayPipeFds",
-    "GatewayPipeChannels",
     "GatewayResponseEnvelope",
     "GatewayResult",
     "LocalDispatchState",
@@ -86,9 +80,9 @@ __all__ = [
     "SemanticHttpObservation",
     "SemanticHttpRequest",
     "SemanticQueryParameter",
+    "SemanticResponseHeader",
     "SemanticValue",
     "UnsupportedBrowserTransport",
-    "bind_gateway_cancellation",
     "bind_gateway_response",
     "canonical_dispatch_receipt_id",
     "gateway_dispatch_frame",

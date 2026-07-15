@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal, Self, assert_never
+from typing import Self, assert_never
 
 from pydantic import model_validator
 
@@ -23,8 +23,6 @@ class BrowserIdentityContext(ExecutionModel):
     browser_context_id: Identifier
     storage_partition_id: Identifier
     identity: ExecutionIdentity
-    automation_driver: Literal["playwright"] = "playwright"
-    browser_engine: Literal["chromium"] = "chromium"
 
     @model_validator(mode="after")
     def _authenticated_and_consistent(self) -> Self:

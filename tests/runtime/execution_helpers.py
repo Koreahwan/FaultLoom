@@ -8,9 +8,6 @@ from faultloom.execution import (
     BrowserChildCandidate,
     EndpointScheme,
     ExecutionIdentity,
-    GatewayCancellationReceipt,
-    GatewayCancellationRequest,
-    GatewayDeniedResult,
     GatewayDispatchCommand,
     GatewayDispatchFrame,
     GatewayDispatchResult,
@@ -19,7 +16,6 @@ from faultloom.execution import (
     SemanticEndpoint,
     SemanticHttpObservation,
     SemanticHttpRequest,
-    bind_gateway_cancellation,
     bind_gateway_response,
     canonical_dispatch_receipt_id,
     gateway_frame_digest,
@@ -40,9 +36,9 @@ def semantic_request(
 ) -> SemanticHttpRequest:
     endpoint = SemanticEndpoint(
         schema_version=SCHEMA_VERSION,
-        scheme=EndpointScheme.HTTPS,
+        scheme=EndpointScheme.HTTP,
         hostname=hostname,
-        port=443,
+        port=80,
         path=path,
     )
     return SemanticHttpRequest(
@@ -123,17 +119,6 @@ def command(
         response_bytes=8192,
         duration_seconds=10,
     )
-    lease = m.ActionLease(
-        schema_version=SCHEMA_VERSION,
-        lease_id=lease_id,
-        intent_digest=sha256_digest(intent),
-        grant_id="grant.1",
-        grant_version=3,
-        scope_epoch=7,
-        issued_at=lease_issued_at,
-        expires_at=lease_expires_at or NOW + timedelta(minutes=1),
-        reservation=reservation,
-    )
     decision = m.PolicyDecision(
         schema_version=SCHEMA_VERSION,
         decision_id=f"decision.{action_id}",
@@ -145,6 +130,34 @@ def command(
         reason_codes=("explicit.allow",),
         evaluated_at=NOW,
         lease_id=lease_id,
+    )
+    lease = m.ActionLease(
+        schema_version=SCHEMA_VERSION,
+        lease_id=lease_id,
+        lease_key_id="lease-key.1",
+        action_id=action_id,
+        correlation_id=f"correlation.{action_id}",
+        intent_digest=sha256_digest(intent),
+        decision_digest=sha256_digest(decision),
+        grant_id="grant.1",
+        grant_version=3,
+        scope_epoch=7,
+        authority_key_id="ed25519:sha256:" + "33" * 32,
+        scope_epoch_binding_digest="sha256:" + "44" * 32,
+        gateway_boot_id="gateway-boot.1",
+        boot_challenge_digest="sha256:" + "55" * 32,
+        target_id=intent.target_id,
+        identity_id=identity.identity_id,
+        tenant_id=identity.tenant_id,
+        action_kind=intent.action_kind,
+        semantic_action_digest=intent.payload_digest,
+        request_binding_digest="sha256:" + "66" * 32,
+        resolution_digest="sha256:" + "77" * 32,
+        egress_plane=m.EgressPlane.TARGET_GATEWAY,
+        dispatch_nonce="0123456789abcdef0123456789abcdef",
+        issued_at=lease_issued_at,
+        expires_at=lease_expires_at or NOW + timedelta(minutes=1),
+        reservation=reservation,
     )
     return GatewayDispatchCommand(
         schema_version=SCHEMA_VERSION,
@@ -166,10 +179,33 @@ def completed_result(
     provisional_receipt = m.DispatchReceipt(
         schema_version=SCHEMA_VERSION,
         receipt_id="receipt.pending",
+        receipt_authentication_tag="sha256:" + "88" * 32,
+        action_id=command.intent.action_id,
+        correlation_id=command.lease.correlation_id,
         lease_id=command.lease.lease_id,
+        lease_key_id=command.lease.lease_key_id,
+        grant_id=command.lease.grant_id,
+        grant_version=command.lease.grant_version,
+        authority_key_id=command.lease.authority_key_id,
+        scope_epoch_binding_digest=command.lease.scope_epoch_binding_digest,
+        gateway_boot_id=command.lease.gateway_boot_id,
+        boot_challenge_digest=command.lease.boot_challenge_digest,
         intent_digest=command.intent_digest,
         decision_digest=command.decision_digest,
         scope_epoch=command.lease.scope_epoch,
+        target_id=command.intent.target_id,
+        identity_id=command.lease.identity_id,
+        tenant_id=command.lease.tenant_id,
+        action_kind=command.intent.action_kind,
+        semantic_action_digest=command.lease.semantic_action_digest,
+        request_binding_digest=command.lease.request_binding_digest,
+        request_frame_digest="sha256:" + "99" * 32,
+        resolution_digest=command.lease.resolution_digest,
+        egress_plane=command.lease.egress_plane,
+        dispatch_nonce=command.lease.dispatch_nonce,
+        lease_issued_at=command.lease.issued_at,
+        lease_expires_at=command.lease.expires_at,
+        reservation=command.lease.reservation,
         request_digest=D1,
         response_digest=D2,
         outcome=m.DispatchOutcome.COMPLETED,
@@ -211,32 +247,13 @@ class RecordingGateway:
         reconciler: Callable[[GatewayDispatchCommand], GatewayResult | None] | None = None,
     ) -> None:
         self.calls: list[GatewayDispatchFrame] = []
-        self.cancel_calls: list[GatewayCancellationRequest] = []
         self.reconcile_calls: list[GatewayDispatchFrame] = []
         self._handler = handler
         self._reconciler = reconciler
-        self._cancelled_generations: set[tuple[str, int]] = set()
 
     def dispatch(self, frame: GatewayDispatchFrame) -> GatewayResponseEnvelope:
-        owner = (frame.command.identity.context_id, frame.context_generation)
-        if owner in self._cancelled_generations:
-            denied = GatewayDeniedResult(
-                schema_version=SCHEMA_VERSION,
-                action_id=frame.command.intent.action_id,
-                request_digest=gateway_frame_digest(frame),
-                reason_code="scope.revoked",
-            )
-            return bind_gateway_response(frame, denied, CHANNEL_KEY)
         self.calls.append(frame)
         return bind_gateway_response(frame, self._handler(frame.command), CHANNEL_KEY)
-
-    def cancel_context(
-        self,
-        request: GatewayCancellationRequest,
-    ) -> GatewayCancellationReceipt:
-        self.cancel_calls.append(request)
-        self._cancelled_generations.add((request.context_id, request.context_generation))
-        return bind_gateway_cancellation(request, (), CHANNEL_KEY)
 
     def reconcile(self, frame: GatewayDispatchFrame) -> GatewayResponseEnvelope | None:
         self.reconcile_calls.append(frame)

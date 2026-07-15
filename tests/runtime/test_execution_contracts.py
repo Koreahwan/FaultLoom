@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 from pydantic import ValidationError
 
@@ -7,12 +9,14 @@ from faultloom.execution import (
     EndpointScheme,
     SemanticEndpoint,
     SemanticHeader,
+    SemanticHttpObservation,
     SemanticHttpRequest,
     SemanticQueryParameter,
     SemanticValue,
     semantic_payload_digest,
 )
-from faultloom_protocol import SCHEMA_VERSION, SecretRef, canonical_json
+from faultloom.execution.wire import execution_canonical_json_bytes
+from faultloom_protocol import SCHEMA_VERSION, SecretRef
 
 from .execution_helpers import command, execution_identity, semantic_request
 
@@ -39,8 +43,9 @@ def test_sensitive_headers_require_opaque_secret_references(name: str) -> None:
     with pytest.raises(ValidationError, match="secret_ref"):
         SemanticHeader(schema_version=SCHEMA_VERSION, name=name, value=literal("raw"))
     header = SemanticHeader(schema_version=SCHEMA_VERSION, name=name, value=secret(name))
-    assert "raw" not in canonical_json(header)
-    assert "secret://" in canonical_json(header)
+    encoded = execution_canonical_json_bytes(header)
+    assert b"raw" not in encoded
+    assert b"secret://" in encoded
 
 
 @pytest.mark.parametrize(
@@ -107,3 +112,21 @@ def test_semantic_http_refuses_websocket_schemes() -> None:
             endpoint=endpoint,
             method="GET",
         )
+
+
+def test_semantic_response_body_digest_is_bound_before_local_authentication() -> None:
+    body = b"OK"
+    observation = SemanticHttpObservation(
+        schema_version=SCHEMA_VERSION,
+        status_code=200,
+        body=body,
+        body_digest=f"sha256:{hashlib.sha256(body).hexdigest()}",
+        raw_response_digest="sha256:" + "11" * 32,
+        raw_response_length=40,
+    )
+
+    assert b"$faultloom_bytes_hex" in execution_canonical_json_bytes(observation)
+    values = observation.model_dump(mode="python")
+    values["body_digest"] = "sha256:" + "22" * 32
+    with pytest.raises(ValidationError, match="body digest"):
+        SemanticHttpObservation.model_validate(values)
