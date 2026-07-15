@@ -1,5 +1,18 @@
 """Public out-of-process extension SDK."""
 
+from .admission import (
+    AdapterAdmissionError,
+    AdapterAdmissionRegistry,
+    AdapterNotFoundError,
+)
+from .admission_models import (
+    AdapterAdmissionReceipt,
+    AdapterAdmissionSnapshot,
+    AdapterAdmissionState,
+    AdmissionGate,
+    AdmissionOutcome,
+)
+
 from .reference import (
     ReferenceProcessClient,
     ReferenceProcessError,
@@ -34,6 +47,14 @@ __version__ = "0.1.0"
 
 __all__ = [
     "__version__",
+    "AdapterAdmissionError",
+    "AdapterAdmissionReceipt",
+    "AdapterAdmissionRegistry",
+    "AdapterAdmissionSnapshot",
+    "AdapterAdmissionState",
+    "AdapterNotFoundError",
+    "AdmissionGate",
+    "AdmissionOutcome",
     "AuthorityBindingError",
     "CompileActionRequest",
     "CompileActionResponse",

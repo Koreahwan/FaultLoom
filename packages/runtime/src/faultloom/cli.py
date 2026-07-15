@@ -23,6 +23,7 @@ from faultloom_protocol import (
 from faultloom_protocol.signing import SignatureVerificationError
 
 from . import __version__
+from .adapter_cli import configure_adapter_parser
 from .resume_cli import ResumeCliError, ResumeOperation, configure_resume_parser
 
 EXIT_OK = 0
@@ -709,15 +710,16 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--format", choices=("md", "json"), required=True)
     _set_unavailable(report, "report")
 
-    for group_name in ("adapter", "pack"):
-        group = commands.add_parser(group_name, help=f"inspect {group_name} registry")
-        group_commands = group.add_subparsers(dest=f"{group_name}_command", required=True)
-        group_list = group_commands.add_parser("list")
-        _set_unavailable(group_list, f"{group_name} list")
-        for operation in ("doctor", "test"):
-            child = group_commands.add_parser(operation)
-            child.add_argument(f"{group_name}_id")
-            _set_unavailable(child, f"{group_name} {operation}")
+    adapter = commands.add_parser("adapter", help="inspect adapter registry")
+    configure_adapter_parser(adapter)
+    pack = commands.add_parser("pack", help="inspect pack registry")
+    pack_commands = pack.add_subparsers(dest="pack_command", required=True)
+    pack_list = pack_commands.add_parser("list")
+    _set_unavailable(pack_list, "pack list")
+    for operation in ("doctor", "test"):
+        child = pack_commands.add_parser(operation)
+        child.add_argument("pack_id")
+        _set_unavailable(child, f"pack {operation}")
 
     evaluation = commands.add_parser("eval", help="run a sealed evaluation manifest")
     evaluation_commands = evaluation.add_subparsers(dest="eval_command", required=True)
