@@ -27,6 +27,10 @@ from .evaluation_enums import (
 PositiveInt = Annotated[int, Field(ge=1, le=MAX_INT64)]
 NonNegativeInt = Annotated[int, Field(ge=0, le=MAX_INT64)]
 ContextLoadBps = Annotated[int, Field(ge=0, le=MAX_INT64)]
+ContextResetCount = Annotated[
+    Literal[0, 1, 3, 10],
+    Field(json_schema_extra={"maximum": MAX_INT64}),
+]
 StableVersion = Annotated[str, Field(pattern=r"^[0-9]+\.[0-9]+\.[0-9]+$")]
 SourceCommit = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
 
@@ -48,7 +52,7 @@ class EvaluationCaseDescriptor(ProtocolModel):
     taxonomy: EvaluationTaxonomy
     pack_ids: tuple[Identifier, ...]
     adapter_ids: tuple[Identifier, ...] = ()
-    context_reset_count: Literal[0, 1, 3, 10]
+    context_reset_count: ContextResetCount
     workload_context_bps: ContextLoadBps
     fixture_visibility: Literal["public_loopback", "private_holdout"]
 
