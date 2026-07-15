@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools==81.0.0", "wheel==0.42.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "faultloom"
+version = "0.1.0"
+description = "Fail-closed command line and research runtime for FaultLoom"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+dependencies = [
+  "cryptography==41.0.7",
+  "faultloom-protocol==0.1.0",
+  "faultloom-sdk==0.1.0",
+]
+
+[project.scripts]
+faultloom = "faultloom.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

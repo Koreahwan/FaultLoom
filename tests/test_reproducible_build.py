@@ -6,6 +6,7 @@ import io
 import json
 import os
 import shutil
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -13,6 +14,7 @@ import unittest
 import zipfile
 import zlib
 from pathlib import Path
+from unittest import mock
 
 from tools.check_public_tree import scan
 from tools.reproducible_build import (
@@ -433,8 +435,93 @@ class ReproducibleBuildTests(unittest.TestCase):
             root = base / "source"
             root.mkdir()
             make_repository(root)
-            manifest = build_reproducibly(root, base / "output", EPOCH)
-            self.assertEqual(set(manifest), {path.name for path in (base / "output").iterdir()})
+            output = base / "output"
+            manifest = build_reproducibly(root, output, EPOCH)
+            self.assertEqual(set(manifest), {path.name for path in output.iterdir()})
+            self.assertEqual(
+                {path.name: 0o644 for path in output.iterdir()},
+                {
+                    path.name: stat.S_IMODE(path.stat().st_mode)
+                    for path in output.iterdir()
+                },
+            )
+
+    def test_build_once_rejects_chmod_that_leaves_wrong_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            root = base / "source"
+            root.mkdir()
+            make_repository(root)
+            output = base / "output"
+            original_chmod = Path.chmod
+
+            def leave_wrong_mode(
+                path: Path, mode: int, *, follow_symlinks: bool = True
+            ) -> None:
+                applied_mode = 0o600 if path.parent == output else mode
+                original_chmod(
+                    path, applied_mode, follow_symlinks=follow_symlinks
+                )
+
+            with mock.patch.object(Path, "chmod", new=leave_wrong_mode):
+                with self.assertRaisesRegex(
+                    BuildPolicyError,
+                    r"artifact mode mismatch .* expected 0644, found 0600",
+                ):
+                    build_once(root, output, EPOCH)
+
+    def test_metadata_hook_rejects_chmod_that_leaves_wrong_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            root = base / "source"
+            root.mkdir()
+            make_repository(root)
+            output = base / "output"
+            original_chmod = Path.chmod
+
+            def leave_wrong_mode(
+                path: Path, mode: int, *, follow_symlinks: bool = True
+            ) -> None:
+                is_sbom = (
+                    path.parent == output
+                    and path.name == "faultloom-core.sbom.cdx.json"
+                )
+                applied_mode = 0o600 if is_sbom else mode
+                original_chmod(
+                    path, applied_mode, follow_symlinks=follow_symlinks
+                )
+
+            with mock.patch.object(Path, "chmod", new=leave_wrong_mode):
+                with self.assertRaisesRegex(
+                    BuildPolicyError,
+                    r"artifact mode mismatch for faultloom-core\.sbom\.cdx\.json: "
+                    r"expected 0644, found 0600",
+                ):
+                    build_once(root, output, EPOCH)
+
+    def test_reproducible_driver_rejects_wrong_final_destination_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            root = base / "source"
+            root.mkdir()
+            make_repository(root)
+            output = base / "output"
+            original_chmod = Path.chmod
+
+            def leave_wrong_mode(
+                path: Path, mode: int, *, follow_symlinks: bool = True
+            ) -> None:
+                applied_mode = 0o600 if path.parent == output else mode
+                original_chmod(
+                    path, applied_mode, follow_symlinks=follow_symlinks
+                )
+
+            with mock.patch.object(Path, "chmod", new=leave_wrong_mode):
+                with self.assertRaisesRegex(
+                    BuildPolicyError,
+                    r"artifact mode mismatch .* expected 0644, found 0600",
+                ):
+                    build_reproducibly(root, output, EPOCH)
 
     def test_external_dependency_requires_matching_hashed_lock(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1177,9 +1264,35 @@ dependencies = []
                 metadata = wheel.read(metadata_name).decode("utf-8")
             self.assertIn("Description-Content-Type: text/x-rst\n", metadata)
 
-    def test_unsupported_entry_points_and_conflicting_license_fail_closed(self) -> None:
+    def test_console_scripts_are_deterministic_and_other_entry_points_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            make_repository(root)
+            project = root / "packages/demo/pyproject.toml"
+            write(
+                project,
+                project.read_text(encoding="utf-8")
+                + '\n[project.scripts]\nfaultloom-demo = "faultloom_demo:main"\n',
+            )
+            write(
+                root / "packages/demo/src/faultloom_demo/__init__.py",
+                "def main() -> int:\n    return 0\n",
+            )
+            commit_all(root, "Declare a deterministic console script")
+            output = root / "output"
+            build_once(root, output, EPOCH)
+            with zipfile.ZipFile(next(output.glob("*.whl"))) as wheel:
+                entry_points_name = next(
+                    name
+                    for name in wheel.namelist()
+                    if name.endswith(".dist-info/entry_points.txt")
+                )
+                self.assertEqual(
+                    wheel.read(entry_points_name),
+                    b"[console_scripts]\nfaultloom-demo = faultloom_demo:main\n",
+                )
+
         additions = (
-            ('\n[project.scripts]\nfaultloom-demo = "faultloom_demo:main"\n', "unsupported"),
             (
                 '\n[project.entry-points."faultloom.plugins"]\n'
                 'demo = "faultloom_demo:plugin"\n',
@@ -1196,6 +1309,69 @@ dependencies = []
                     commit_all(root, "Declare unsupported entry-point metadata")
                     with self.assertRaisesRegex(BuildPolicyError, error):
                         discover_projects(root, load_policy(root))
+
+        malformed_scripts = (
+            ('"bad script" = "faultloom_demo:main"', "invalid project script name"),
+            ('faultloom-demo = "faultloom_demo:main()"', "invalid project script target"),
+            ('faultloom-demo = ["faultloom_demo:main"]', "invalid project script target"),
+        )
+        for declaration, error in malformed_scripts:
+            with self.subTest(declaration=declaration):
+                with tempfile.TemporaryDirectory() as raw:
+                    root = Path(raw)
+                    make_repository(root)
+                    project = root / "packages/demo/pyproject.toml"
+                    write(
+                        project,
+                        project.read_text(encoding="utf-8")
+                        + f"\n[project.scripts]\n{declaration}\n",
+                    )
+                    commit_all(root, "Declare an invalid console script")
+                    with self.assertRaisesRegex(BuildPolicyError, error):
+                        discover_projects(root, load_policy(root))
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            make_repository(root)
+            project = root / "packages/demo/pyproject.toml"
+            write(
+                project,
+                project.read_text(encoding="utf-8")
+                + '\n[project.scripts]\nfaultloom-demo = "os:system"\n',
+            )
+            commit_all(root, "Target a module outside the wheel")
+            with self.assertRaisesRegex(BuildPolicyError, "outside its wheel"):
+                build_once(root, root / "output", EPOCH)
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            make_repository(root)
+            demo_project = root / "packages/demo/pyproject.toml"
+            write(
+                demo_project,
+                demo_project.read_text(encoding="utf-8")
+                + '\n[project.scripts]\nFaultLoom-Demo = "faultloom_demo:main"\n',
+            )
+            second_project = root / "packages/second/pyproject.toml"
+            write(
+                second_project,
+                demo_project.read_text(encoding="utf-8").replace(
+                    'name = "faultloom-demo"', 'name = "faultloom-second"'
+                ).replace(
+                    'FaultLoom-Demo = "faultloom_demo:main"',
+                    'faultloom-demo = "faultloom_second:main"',
+                ),
+            )
+            write(root / "packages/second/README.md", "# Second\n")
+            write(root / "packages/second/LICENSE", "project license\n")
+            write(root / "packages/second/NOTICE", "project notice\n")
+            write(
+                root / "packages/second/src/faultloom_second/__init__.py",
+                "def main() -> int:\n    return 0\n",
+            )
+            commit_all(root, "Collide console script names across projects")
+            with self.assertRaisesRegex(BuildPolicyError, "unique across projects"):
+                discover_projects(root, load_policy(root))
 
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
