@@ -16,6 +16,7 @@ from .canonical import canonical_json
 from .cas import ArtifactRef, EncryptedCAS, EngagementKey
 from .filesystem import DirectoryBinding, open_private_directory
 from .ledger import EventLedger, EventRecord
+from .provider_journal import ProviderJournalEntry, ProviderJournalRecord
 from .types import ChainIntegrityError, CrossEngagementError, StorageError, require_identifier
 
 
@@ -176,6 +177,8 @@ class StateStore:
                     transaction_lock=self._lock,
                     commit_callback=self._synchronize_anchor,
                     path_validator=self._revalidate_roots,
+                    migration_anchor=checkpoint,
+                    migration_minimum_anchor=self._minimum_anchor,
                 )
                 self._synchronize_anchor()
         except Exception:
@@ -213,6 +216,12 @@ class StateStore:
         if self._closed or self.ledger is None or self.cas is None or self.anchor is None:
             raise StorageError("state store is closed")
         return self.ledger, self.cas, self.anchor
+
+    @property
+    def minimum_anchor(self) -> AnchorCheckpoint | None:
+        """The caller-retained freshness floor bound at construction."""
+
+        return self._minimum_anchor
 
     def _revalidate_roots(self) -> None:
         self._state_binding.revalidate()
@@ -332,6 +341,78 @@ class StateStore:
     def checkpoint(self) -> AnchorCheckpoint:
         with self._lock:
             return self._synchronize_anchor()
+
+    def _require_exact_provider_store(self) -> None:
+        if type(self) is not StateStore:
+            raise StorageError("provider journal requires the exact StateStore")
+
+    def reserve_provider_receipt(
+        self, entry: ProviderJournalEntry
+    ) -> ProviderJournalRecord:
+        """Atomically reserve a provider attempt and durably anchor the receipt."""
+
+        self._require_exact_provider_store()
+        with self._lock:
+            ledger, _, _ = self._components()
+            return ledger.reserve_provider_receipt(
+                entry,
+                state_store=self,
+                minimum_anchor=self._minimum_anchor,
+            )
+
+    def finalize_provider_receipt(
+        self,
+        reservation_receipt_digest: str,
+        entry: ProviderJournalEntry,
+    ) -> ProviderJournalRecord:
+        """CAS a terminal provider receipt onto its exact reservation."""
+
+        self._require_exact_provider_store()
+        with self._lock:
+            ledger, _, _ = self._components()
+            return ledger.finalize_provider_receipt(
+                reservation_receipt_digest,
+                entry,
+                state_store=self,
+                minimum_anchor=self._minimum_anchor,
+            )
+
+    def provider_receipt_by_digest(
+        self, receipt_digest: str
+    ) -> ProviderJournalRecord | None:
+        self._require_exact_provider_store()
+        with self._lock:
+            ledger, _, _ = self._components()
+            return ledger.provider_receipt_by_digest(
+                receipt_digest,
+                state_store=self,
+                minimum_anchor=self._minimum_anchor,
+            )
+
+    def provider_receipt_by_attempt(
+        self, call_id: str, attempt: int
+    ) -> ProviderJournalRecord | None:
+        self._require_exact_provider_store()
+        with self._lock:
+            ledger, _, _ = self._components()
+            return ledger.provider_receipt_by_attempt(
+                call_id,
+                attempt,
+                state_store=self,
+                minimum_anchor=self._minimum_anchor,
+            )
+
+    def provider_receipt_by_attempt_id(
+        self, attempt_id: str
+    ) -> ProviderJournalRecord | None:
+        self._require_exact_provider_store()
+        with self._lock:
+            ledger, _, _ = self._components()
+            return ledger.provider_receipt_by_attempt_id(
+                attempt_id,
+                state_store=self,
+                minimum_anchor=self._minimum_anchor,
+            )
 
     def append_observation(
         self,
