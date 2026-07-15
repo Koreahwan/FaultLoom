@@ -1,0 +1,44 @@
+{
+  "schema_version": "0.1.0",
+  "lab_id": "faultloom.public.semantic-http-baseline",
+  "lab_version": "0.1.0",
+  "fixture_id": "fixture.semantic-http.authorization",
+  "fixture_version": "1.0.0",
+  "target_id": "target.loopback",
+  "bind_host": "127.0.0.1",
+  "state_id": "state.semantic-http.canary",
+  "descriptor": {
+    "namespace": "faultloom.lab.web.semantic_http",
+    "descriptor_version": "1.0.0",
+    "descriptor_type": "authorization_baseline",
+    "descriptor_ref": "fixtures/semantic_http_baseline/manifest.v1.json"
+  },
+  "variants": [
+    {
+      "variant_id": "variant.semantic-http.vulnerable",
+      "mode": "vulnerable",
+      "actor_tenant_id": "tenant.beta",
+      "request_method": "GET",
+      "request_path": "/v1/tenants/tenant.beta/resources/canary",
+      "oracle": {
+        "oracle_id": "oracle.cross-tenant-read.positive",
+        "polarity": "positive",
+        "effect_kind": "cross_tenant_read",
+        "expected_status": 200
+      }
+    },
+    {
+      "variant_id": "variant.semantic-http.denied",
+      "mode": "denied",
+      "actor_tenant_id": "tenant.beta",
+      "request_method": "GET",
+      "request_path": "/v1/tenants/tenant.beta/resources/canary",
+      "oracle": {
+        "oracle_id": "oracle.cross-tenant-read.negative",
+        "polarity": "negative",
+        "effect_kind": "cross_tenant_read_denied",
+        "expected_status": 403
+      }
+    }
+  ]
+}
