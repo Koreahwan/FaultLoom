@@ -6,7 +6,8 @@ import datetime as dt
 import hashlib
 import os
 import secrets
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -174,7 +175,7 @@ class StateStore:
                     self.engagement_id,
                     key,
                     transaction_lock=self._lock,
-                    commit_callback=self._synchronize_anchor,
+                    commit_callback=self._commit_anchor,
                     path_validator=self._revalidate_roots,
                 )
                 self._synchronize_anchor()
@@ -329,9 +330,23 @@ class StateStore:
                 ledger, anchor_store, snapshot
             )
 
+    def _commit_anchor(self) -> None:
+        self._synchronize_anchor()
+
     def checkpoint(self) -> AnchorCheckpoint:
         with self._lock:
             return self._synchronize_anchor()
+
+    @contextmanager
+    def serialized(self) -> Iterator[StateStore]:
+        """Hold the engagement lock across a multi-step state transition."""
+
+        with self._lock:
+            self._synchronize_anchor()
+            try:
+                yield self
+            finally:
+                self._synchronize_anchor()
 
     def append_observation(
         self,
