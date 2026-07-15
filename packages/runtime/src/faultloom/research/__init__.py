@@ -12,11 +12,18 @@ from .models import (
     WriterConflictError,
 )
 from .runtime import PersistentResearcher
+from .specialist import (
+    ProposalMergeReceipt,
+    ProposalMergeRequest,
+    SpecialistMergeError,
+)
 
 __all__ = [
     "PersistentResearcher",
     "ProposalActorRole",
     "ProposalConflictError",
+    "ProposalMergeReceipt",
+    "ProposalMergeRequest",
     "ResearchBinding",
     "ResearchError",
     "ResearchIntegrityError",
@@ -25,5 +32,6 @@ __all__ = [
     "ResearchPassError",
     "ResearchProposal",
     "ResearchSequenceError",
+    "SpecialistMergeError",
     "WriterConflictError",
 ]

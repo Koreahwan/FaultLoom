@@ -28,6 +28,8 @@ from .research import (
     PersistentResearcher,
     ProposalActorRole,
     ProposalConflictError,
+    ProposalMergeReceipt,
+    ProposalMergeRequest,
     ResearchBinding,
     ResearchError,
     ResearchIntegrityError,
@@ -36,6 +38,7 @@ from .research import (
     ResearchPassError,
     ResearchProposal,
     ResearchSequenceError,
+    SpecialistMergeError,
     WriterConflictError,
 )
 
@@ -64,6 +67,8 @@ __all__ = [
     "PersistentResearcher",
     "ProposalActorRole",
     "ProposalConflictError",
+    "ProposalMergeReceipt",
+    "ProposalMergeRequest",
     "ResearchBinding",
     "ResearchContextRecords",
     "ResearchError",
@@ -73,6 +78,7 @@ __all__ = [
     "ResearchPassError",
     "ResearchProposal",
     "ResearchSequenceError",
+    "SpecialistMergeError",
     "WriterConflictError",
     "__version__",
 ]

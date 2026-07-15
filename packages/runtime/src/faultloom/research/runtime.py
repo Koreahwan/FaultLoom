@@ -19,16 +19,29 @@ from faultloom_protocol import (
 
 from .journal import ResearchJournal
 from .models import ResearchBinding, ResearchJournalState, ResearchPass, ResearchProposal
+from .specialist import (
+    ProposalMergeReceipt,
+    ProposalMergeRequest,
+    SpecialistProposalMerger,
+)
 
 
 class PersistentResearcher:
     def __init__(
         self,
+        store: StateStore,
         journal: ResearchJournal,
         hypotheses: HypothesisJournal,
+        binding: ResearchBinding,
     ) -> None:
         self._journal = journal
         self._hypotheses = hypotheses
+        self._specialist = SpecialistProposalMerger(
+            store,
+            journal,
+            hypotheses,
+            binding,
+        )
 
     @classmethod
     def open(
@@ -40,8 +53,10 @@ class PersistentResearcher:
         journal = ResearchJournal(store, exact)
         journal.bind()
         return cls(
+            store,
             journal,
             HypothesisJournal(store, exact.run_id, exact.researcher_id),
+            exact,
         )
 
     @property
@@ -56,6 +71,12 @@ class PersistentResearcher:
 
     def submit_proposal(self, proposal: ResearchProposal) -> ResearchProposal:
         return self._journal.append_proposal(proposal)
+
+    def merge_specialist_proposal(
+        self,
+        request: ProposalMergeRequest,
+    ) -> ProposalMergeReceipt:
+        return self._specialist.merge(request)
 
     def recent_deltas(self, *, limit: int = 50) -> tuple[ResearchDelta, ...]:
         return self._journal.recent_deltas(limit=limit)

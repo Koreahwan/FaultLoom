@@ -123,6 +123,20 @@ class ResearchJournal:
             )
         return exact
 
+    def proposal(self, proposal_id: str) -> ResearchProposal:
+        replay = replay_research(self._store, self._binding.run_id)
+        proposal = next(
+            (item for item in replay.proposals if item.proposal_id == proposal_id),
+            None,
+        )
+        if proposal is None:
+            raise ProposalConflictError("specialist proposal is not in the durable inbox")
+        return proposal
+
+    def delta(self, delta_id: str) -> ResearchDelta | None:
+        replay = replay_research(self._store, self._binding.run_id)
+        return next((item for item in replay.deltas if item.delta_id == delta_id), None)
+
     def recent_deltas(self, *, limit: int = 50) -> tuple[ResearchDelta, ...]:
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ResearchPassError("research delta limit must be between 1 and 100")
