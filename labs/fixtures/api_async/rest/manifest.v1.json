@@ -1,0 +1,15 @@
+{
+  "schema_version": "0.1.0",
+  "lab_id": "lab.api_async.rest",
+  "lab_version": "0.1.0",
+  "fixture_id": "fixture.api_async.rest.authorization",
+  "fixture_version": "0.1.0",
+  "namespace": "faultloom.lab.api_async.rest.v1",
+  "surface_kind": "rest",
+  "target_id": "target.loopback.api_async",
+  "bind_host": "127.0.0.1",
+  "variants": [
+    {"variant_id":"variant.rest.positive","polarity":"positive","identity_context_id":"identity.outsider","tenant_id":"tenant.beta","expected_authorized":true,"expected_effect":"effect.cross_tenant_read"},
+    {"variant_id":"variant.rest.negative","polarity":"negative","identity_context_id":"identity.outsider","tenant_id":"tenant.beta","expected_authorized":false,"expected_effect":"effect.denied"}
+  ]
+}

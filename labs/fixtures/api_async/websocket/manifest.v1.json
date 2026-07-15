@@ -1,0 +1,15 @@
+{
+  "schema_version": "0.1.0",
+  "lab_id": "lab.api_async.websocket",
+  "lab_version": "0.1.0",
+  "fixture_id": "fixture.api_async.websocket.channel_isolation",
+  "fixture_version": "0.1.0",
+  "namespace": "faultloom.lab.api_async.websocket.v1",
+  "surface_kind": "websocket",
+  "target_id": "target.loopback.api_async",
+  "bind_host": "127.0.0.1",
+  "variants": [
+    {"variant_id":"variant.websocket.positive","polarity":"positive","identity_context_id":"identity.member","tenant_id":"tenant.beta","expected_authorized":true,"expected_effect":"effect.cross_tenant_message"},
+    {"variant_id":"variant.websocket.negative","polarity":"negative","identity_context_id":"identity.member","tenant_id":"tenant.beta","expected_authorized":false,"expected_effect":"effect.denied"}
+  ]
+}

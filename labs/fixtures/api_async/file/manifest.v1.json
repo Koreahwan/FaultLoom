@@ -1,0 +1,15 @@
+{
+  "schema_version": "0.1.0",
+  "lab_id": "lab.api_async.file",
+  "lab_version": "0.1.0",
+  "fixture_id": "fixture.api_async.file.tenant_binding",
+  "fixture_version": "0.1.0",
+  "namespace": "faultloom.lab.api_async.file.v1",
+  "surface_kind": "file",
+  "target_id": "target.loopback.api_async",
+  "bind_host": "127.0.0.1",
+  "variants": [
+    {"variant_id":"variant.file.positive","polarity":"positive","identity_context_id":"identity.member","tenant_id":"tenant.beta","expected_authorized":true,"expected_effect":"effect.foreign_file_download"},
+    {"variant_id":"variant.file.negative","polarity":"negative","identity_context_id":"identity.member","tenant_id":"tenant.beta","expected_authorized":false,"expected_effect":"effect.denied"}
+  ]
+}

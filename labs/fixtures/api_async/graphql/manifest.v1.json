@@ -1,0 +1,15 @@
+{
+  "schema_version": "0.1.0",
+  "lab_id": "lab.api_async.graphql",
+  "lab_version": "0.1.0",
+  "fixture_id": "fixture.api_async.graphql.resolver_authorization",
+  "fixture_version": "0.1.0",
+  "namespace": "faultloom.lab.api_async.graphql.v1",
+  "surface_kind": "graphql",
+  "target_id": "target.loopback.api_async",
+  "bind_host": "127.0.0.1",
+  "variants": [
+    {"variant_id":"variant.graphql.positive","polarity":"positive","identity_context_id":"identity.member","tenant_id":"tenant.beta","expected_authorized":true,"expected_effect":"effect.unauthorized_field"},
+    {"variant_id":"variant.graphql.negative","polarity":"negative","identity_context_id":"identity.member","tenant_id":"tenant.beta","expected_authorized":false,"expected_effect":"effect.denied"}
+  ]
+}
