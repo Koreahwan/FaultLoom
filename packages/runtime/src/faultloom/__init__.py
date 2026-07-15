@@ -14,6 +14,30 @@ from .state import (
     StateStore,
     StorageError,
 )
+from .hypothesis import (
+    HypothesisConflictError,
+    HypothesisCursor,
+    HypothesisCursorError,
+    HypothesisGraphState,
+    HypothesisPage,
+    HypothesisSeed,
+    NegativeResultSeed,
+    ResearchContextRecords,
+)
+from .research import (
+    PersistentResearcher,
+    ProposalActorRole,
+    ProposalConflictError,
+    ResearchBinding,
+    ResearchError,
+    ResearchIntegrityError,
+    ResearchJournalState,
+    ResearchPass,
+    ResearchPassError,
+    ResearchProposal,
+    ResearchSequenceError,
+    WriterConflictError,
+)
 
 __version__ = "0.1.0"
 
@@ -30,5 +54,25 @@ __all__ = [
     "RetrievalPage",
     "StateStore",
     "StorageError",
+    "HypothesisConflictError",
+    "HypothesisCursor",
+    "HypothesisCursorError",
+    "HypothesisGraphState",
+    "HypothesisPage",
+    "HypothesisSeed",
+    "NegativeResultSeed",
+    "PersistentResearcher",
+    "ProposalActorRole",
+    "ProposalConflictError",
+    "ResearchBinding",
+    "ResearchContextRecords",
+    "ResearchError",
+    "ResearchIntegrityError",
+    "ResearchJournalState",
+    "ResearchPass",
+    "ResearchPassError",
+    "ResearchProposal",
+    "ResearchSequenceError",
+    "WriterConflictError",
     "__version__",
 ]
