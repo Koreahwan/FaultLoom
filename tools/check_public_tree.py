@@ -7,11 +7,13 @@ import argparse
 import ast
 import json
 import re
+import tomllib
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 
 REQUIRED_POLICY_FILES = {"LICENSE", "NOTICE", "SECURITY.md", "ETHICAL_USE.md"}
+PRIVATE_ROOTS = {"eval", "legacy", "ops"}
 PRIVATE_NAMES = {
     ".env",
     "labels.private.json",
@@ -22,6 +24,17 @@ PRIVATE_NAMES = {
 GENERATED_PARTS = {".pytest_cache", "__pycache__", "target", "dist", "build"}
 IGNORED_PARTS = {".git", *GENERATED_PARTS}
 RULE_FIXTURE_PATHS = {"tools/check_public_tree.py", "tests/test_public_tree_gate.py"}
+CONFIG_SUFFIXES = {
+    ".cfg",
+    ".conf",
+    ".ini",
+    ".json",
+    ".jsonl",
+    ".toml",
+    ".yaml",
+    ".yml",
+}
+PUBLIC_EMAIL_DOMAINS = {"example.com", "example.net", "example.org"}
 ABSOLUTE_PATH_PATTERNS = (
     re.compile(r"/mnt/[a-z]/users/", re.IGNORECASE),
     re.compile(r"[a-z]:\\\\users\\\\", re.IGNORECASE),
@@ -43,6 +56,26 @@ DIRECT_NETWORK_IMPORTS = {
     "socket",
     "urllib.request",
     "websockets",
+}
+SECRET_PATTERNS = (
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"-----BEGIN (?:EC |OPENSSH |RSA )?PRIVATE KEY-----"),
+)
+SECRET_ASSIGNMENT = re.compile(
+    r"(?im)^[ \t]*[\"']?(?:api[_-]?key|access[_-]?token|auth[_-]?token|"
+    r"client[_-]?secret|password|secret)[\"']?[ \t]*[:=][ \t]*[\"']?"
+    r"(?P<value>[^\s\"'#]+)"
+)
+EMAIL = re.compile(r"(?i)\b[A-Z0-9._%+-]+@(?P<domain>[A-Z0-9.-]+\.[A-Z]{2,})\b")
+PHONE = re.compile(r"(?<!\d)(?:\+\d{1,3}[ .-]?)?\d{3}[ .-]\d{3}[ .-]\d{4}(?!\d)")
+PLACEHOLDER_VALUES = {
+    "<redacted>",
+    "changeme",
+    "example",
+    "placeholder",
+    "redacted",
+    "test",
 }
 
 
@@ -78,15 +111,85 @@ def _python_imports(path: Path) -> set[str]:
     return imports
 
 
+def _is_public_email(domain: str) -> bool:
+    lowered = domain.lower()
+    return lowered in PUBLIC_EMAIL_DOMAINS or lowered.endswith(
+        (".example", ".invalid", ".test")
+    )
+
+
+def _legal_violations(root: Path) -> list[Violation]:
+    violations: list[Violation] = []
+    license_path = root / "LICENSE"
+    notice_path = root / "NOTICE"
+    if license_path.is_file():
+        text = license_path.read_text(encoding="utf-8", errors="replace")
+        if "Apache License" not in text or "Version 2.0" not in text:
+            violations.append(
+                Violation("LICENSE", "invalid_license", "Apache-2.0 text required")
+            )
+    if notice_path.is_file():
+        text = notice_path.read_text(encoding="utf-8", errors="replace")
+        if "MIT License" not in text or "Terminator Project Contributors" not in text:
+            violations.append(
+                Violation(
+                    "NOTICE",
+                    "legacy_notice_missing",
+                    "Terminator MIT notice required",
+                )
+            )
+
+    packages = root / "packages"
+    if packages.is_dir():
+        for manifest in sorted(packages.glob("*/pyproject.toml")):
+            relative = manifest.relative_to(root).as_posix()
+            try:
+                project = tomllib.loads(manifest.read_text(encoding="utf-8"))["project"]
+            except (KeyError, OSError, tomllib.TOMLDecodeError, UnicodeError):
+                violations.append(
+                    Violation(
+                        relative,
+                        "invalid_package_metadata",
+                        "unreadable project metadata",
+                    )
+                )
+                continue
+            license_files = project.get("license-files", [])
+            if project.get("license") != "Apache-2.0" or not {
+                "LICENSE",
+                "NOTICE",
+            } <= set(license_files):
+                violations.append(
+                    Violation(
+                        relative,
+                        "invalid_package_license",
+                        "Apache-2.0 with LICENSE and NOTICE required",
+                    )
+                )
+            for name in ("LICENSE", "NOTICE"):
+                if not (manifest.parent / name).is_file():
+                    violations.append(
+                        Violation(
+                            f"{manifest.parent.relative_to(root).as_posix()}/{name}",
+                            "missing_package_notice",
+                            "package legal file required",
+                        )
+                    )
+    return violations
+
+
 def _scan(root: Path, *, ignored_parts: set[str]) -> list[Violation]:
     root = root.resolve()
     violations: list[Violation] = []
     missing = REQUIRED_POLICY_FILES - {path.name for path in root.iterdir() if path.is_file()}
     for name in sorted(missing):
         violations.append(Violation(name, "missing_policy_file", "required public policy file"))
+    violations.extend(_legal_violations(root))
 
     for path, relative in _iter_files(root, ignored_parts=ignored_parts):
         display = relative.as_posix()
+        if relative.parts and relative.parts[0].lower() in PRIVATE_ROOTS:
+            violations.append(Violation(display, "private_root", relative.parts[0]))
         if path.is_symlink():
             violations.append(Violation(display, "symlink_forbidden", "public repositories are self-contained"))
             continue
@@ -114,6 +217,37 @@ def _scan(root: Path, *, ignored_parts: set[str]) -> list[Violation]:
                         violations.append(
                             Violation(display, "sibling_dependency", pattern.pattern)
                         )
+                if any(pattern.search(text) for pattern in SECRET_PATTERNS):
+                    violations.append(
+                        Violation(
+                            display,
+                            "secret_material",
+                            "high-confidence credential pattern",
+                        )
+                    )
+                if path.suffix.lower() in CONFIG_SUFFIXES:
+                    for match in SECRET_ASSIGNMENT.finditer(text):
+                        value = match.group("value").lower()
+                        if value not in PLACEHOLDER_VALUES and not value.startswith(
+                            ("${", "env:")
+                        ):
+                            violations.append(
+                                Violation(
+                                    display,
+                                    "secret_assignment",
+                                    "non-placeholder credential value",
+                                )
+                            )
+                            break
+                if any(
+                    not _is_public_email(match.group("domain"))
+                    for match in EMAIL.finditer(text)
+                ):
+                    violations.append(
+                        Violation(display, "pii_email", "non-public email address")
+                    )
+                if PHONE.search(text):
+                    violations.append(Violation(display, "pii_phone", "phone-like personal data"))
 
         pack_or_sdk = (
             display.startswith("packs/")
