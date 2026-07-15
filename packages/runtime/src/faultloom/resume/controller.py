@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hmac
 
-from faultloom_protocol import ModelIdentity, RunManifest, canonical_json_bytes, sha256_digest
+from faultloom_protocol import ModelIdentity, RunManifest, sha256_digest
 
 from ..context import ContextState
 from ..state import AnchorCheckpoint, StateStore
@@ -31,6 +31,7 @@ from .models import (
     ResumeTrustError,
     ResumeTrustPolicy,
 )
+from .wire import canonical_model_bytes, model_digest
 
 
 class CheckpointController:
@@ -86,8 +87,8 @@ class CheckpointController:
                 )
                 if existing.reconciliation_id == exact.reconciliation_id:
                     if same_predecessor and hmac.compare_digest(
-                        canonical_json_bytes(existing),
-                        canonical_json_bytes(exact),
+                        canonical_model_bytes(existing, ActionReconciliation),
+                        canonical_model_bytes(exact, ActionReconciliation),
                     ):
                         return existing
                     raise CheckpointConflictError(
@@ -138,8 +139,8 @@ class CheckpointController:
         )
         if envelope.context_state.engagement_id != self._store.engagement_id:
             raise ResumeTrustError("checkpoint belongs to another engagement")
-        canonical = canonical_json_bytes(envelope)
-        checkpoint_digest = sha256_digest(envelope)
+        canonical = canonical_model_bytes(envelope, CheckpointEnvelope)
+        checkpoint_digest = model_digest(envelope, CheckpointEnvelope)
 
         with self._store.serialized():
             snapshot = self._journal.snapshot()

@@ -24,6 +24,7 @@ from .models import (
     ResumeTrustError,
     UnresolvedActionState,
 )
+from .wire import canonical_model_bytes, model_digest
 
 
 CHECKPOINT_ACTOR_STREAM = "control.resume"
@@ -281,12 +282,15 @@ class CheckpointJournal:
             envelope = CheckpointEnvelope.model_validate_json(canonical)
         except (ValidationError, ValueError) as exc:
             raise CheckpointIntegrityError("checkpoint artifact is invalid") from exc
-        if canonical_json_bytes(envelope) != canonical:
+        if canonical_model_bytes(envelope, CheckpointEnvelope) != canonical:
             raise CheckpointIntegrityError("checkpoint artifact is not canonical")
         expected_metadata = canonical_json(
             {
                 "schema_version": 1,
-                "values": _metadata_values(envelope, sha256_digest(envelope)),
+                "values": _metadata_values(
+                    envelope,
+                    model_digest(envelope, CheckpointEnvelope),
+                ),
             }
         ).encode("utf-8")
         if metadata_bytes != expected_metadata:
@@ -298,7 +302,7 @@ class CheckpointJournal:
         return CheckpointRecord(
             event_sequence=event.seq,
             event_hash=event.event_hash,
-            checkpoint_digest=sha256_digest(envelope),
+            checkpoint_digest=model_digest(envelope, CheckpointEnvelope),
             canonical_bytes=canonical,
             envelope=envelope,
         )
@@ -507,8 +511,8 @@ def reconciliation_matches_predecessor(
 ) -> bool:
     expected = _predecessor_binding(predecessor)
     return durable.event_sequence > predecessor.event_sequence and hmac.compare_digest(
-        canonical_json_bytes(durable.predecessor),
-        canonical_json_bytes(expected),
+        canonical_model_bytes(durable.predecessor, _ReconciliationPredecessor),
+        canonical_model_bytes(expected, _ReconciliationPredecessor),
     )
 
 
@@ -538,8 +542,8 @@ def validate_durable_reconciliations(
         validate_reconciliation_predecessor(durable, predecessor)
         validate_reconciliation_stage(predecessor, reconciliation)
         if not hmac.compare_digest(
-            canonical_json_bytes(durable.reconciliation),
-            canonical_json_bytes(reconciliation),
+            canonical_model_bytes(durable.reconciliation, ActionReconciliation),
+            canonical_model_bytes(reconciliation, ActionReconciliation),
         ):
             raise CheckpointConflictError(
                 "checkpoint reconciliation differs from prior durable evidence"
