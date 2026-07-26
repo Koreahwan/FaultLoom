@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import io
 import json
-import subprocess
+import os
 import sys
 import tarfile
 import time
 from pathlib import Path
 
 import pytest
-
 from faultloom import model_utility_runtime_wrapper as wrapper
 
 
@@ -51,9 +50,8 @@ def test_archive_rejects_unsafe_and_unexpected_paths(
     tmp_path: Path, hostile: tarfile.TarInfo
 ) -> None:
     archive_path = _archive(tmp_path / "hostile.tar.gz", _required() + [hostile])
-    with tarfile.open(archive_path, "r:gz") as archive:
-        with pytest.raises(wrapper.WrapperError):
-            wrapper._validated_members(archive)
+    with tarfile.open(archive_path, "r:gz") as archive, pytest.raises(wrapper.WrapperError):
+        wrapper._validated_members(archive)
 
 
 def test_archive_rejects_duplicates_devices_hardlinks_and_unsafe_symlinks(
@@ -70,9 +68,10 @@ def test_archive_rejects_duplicates_devices_hardlinks_and_unsafe_symlinks(
     symlink.linkname = "../escape"
     for index, hostile in enumerate((duplicate, device, hardlink, symlink)):
         archive_path = _archive(tmp_path / f"hostile-{index}.tar.gz", _required() + [hostile])
-        with tarfile.open(archive_path, "r:gz") as archive:
-            with pytest.raises(wrapper.WrapperError):
-                wrapper._validated_members(archive)
+        with tarfile.open(archive_path, "r:gz") as archive, pytest.raises(
+            wrapper.WrapperError
+        ):
+            wrapper._validated_members(archive)
 
 
 def test_llama_argv_is_cpu_only_offline_deterministic_and_single_turn(
@@ -108,14 +107,34 @@ def test_bounded_child_rejects_stdout_flood_without_leaking_value(
     assert secret not in str(error.value)
 
 
-def _inner_grandchild_script(pid_file: Path, action: str) -> tuple[str, ...]:
-    script = (
-        "import pathlib,subprocess,sys,time;"
-        "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],"
-        "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);"
-        f"pathlib.Path({str(pid_file)!r}).write_text(str(child.pid));"
-        + action
-    )
+def _inner_setsid_double_fork_script(pid_file: Path, action: str) -> tuple[str, ...]:
+    script = f"""
+import os
+import pathlib
+import signal
+import sys
+import time
+
+first = os.fork()
+if first == 0:
+    os.setsid()
+    second = os.fork()
+    if second == 0:
+        descriptor = os.open(os.devnull, os.O_RDWR)
+        for target in (0, 1, 2):
+            os.dup2(descriptor, target)
+        os.close(descriptor)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))
+        time.sleep(60)
+        os._exit(0)
+    os._exit(0)
+os.waitpid(first, 0)
+deadline = time.monotonic() + 2
+while not pathlib.Path({str(pid_file)!r}).exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+{action}
+"""
     return (sys.executable, "-c", script)
 
 
@@ -128,32 +147,53 @@ def _assert_inner_pid_gone(pid_file: Path) -> None:
     assert not Path(f"/proc/{pid}").exists()
 
 
-def test_inner_timeout_kills_grandchild_process_group(
+def test_inner_timeout_reaps_setsid_double_fork_without_signaling_caller(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pid_file = tmp_path / "inner-timeout.pid"
+    caller_group = os.getpgrp()
     monkeypatch.setattr(wrapper, "_CHILD_TIMEOUT_SECONDS", 0.25)
     with pytest.raises(wrapper.WrapperError, match="timed out"):
-        wrapper._run_bounded(_inner_grandchild_script(pid_file, "time.sleep(60)"))
+        wrapper._run_bounded(_inner_setsid_double_fork_script(pid_file, "time.sleep(60)"))
     _assert_inner_pid_gone(pid_file)
+    assert os.getpgrp() == caller_group
 
 
-def test_inner_stdout_limit_kills_grandchild_process_group(
+def test_inner_stdout_limit_reaps_setsid_double_fork(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pid_file = tmp_path / "inner-stdout.pid"
     monkeypatch.setattr(wrapper, "_MAX_CHILD_STDOUT_BYTES", 1024)
     action = "sys.stdout.write('x'*100000);sys.stdout.flush();time.sleep(60)"
     with pytest.raises(wrapper.WrapperError, match="stdout exceeded"):
-        wrapper._run_bounded(_inner_grandchild_script(pid_file, action))
+        wrapper._run_bounded(_inner_setsid_double_fork_script(pid_file, action))
     _assert_inner_pid_gone(pid_file)
 
 
-def test_inner_nonzero_leader_kills_grandchild_process_group(tmp_path: Path) -> None:
+def test_inner_nonzero_leader_reaps_setsid_double_fork(tmp_path: Path) -> None:
     pid_file = tmp_path / "inner-nonzero.pid"
     with pytest.raises(wrapper.WrapperError, match="nonzero"):
-        wrapper._run_bounded(_inner_grandchild_script(pid_file, "sys.exit(7)"))
+        wrapper._run_bounded(_inner_setsid_double_fork_script(pid_file, "sys.exit(7)"))
     _assert_inner_pid_gone(pid_file)
+
+
+def test_inner_cleanup_failure_surfaces_stable_wrapper_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(wrapper, "_set_subreaper", lambda: None)
+    monkeypatch.setattr(wrapper, "_cleanup_descendants", lambda: False)
+    with pytest.raises(wrapper.WrapperError, match="child process cleanup failed"):
+        wrapper._run_bounded((sys.executable, "-c", "pass"))
+
+
+def test_inner_cleanup_eperm_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(wrapper, "_process_record", lambda _pid: (0, 7))
+
+    def permission_denied(_pid: int, _signal: int) -> None:
+        raise PermissionError
+
+    monkeypatch.setattr(os, "kill", permission_denied)
+    assert wrapper._signal_identity(123, 7, 15) is False
 
 
 def test_decision_parser_requires_one_exact_bounded_object() -> None:

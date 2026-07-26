@@ -8,16 +8,15 @@ from enum import StrEnum
 from typing import Annotated, ClassVar, Literal, Self
 
 from faultloom_protocol.base import Identifier, NonEmptyStr, Sha256Digest
-from pydantic import BaseModel, ConfigDict, Field, model_validator
-
 from faultloom_sdk import ModelUtilityArm, UtilityDecision
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 MODEL_SNAPSHOT_TOKEN = "{MODEL_SNAPSHOT}"
 FAULTLOOM_UTILITY_V1_SANDBOX_DIGEST = (
     "sha256:52231e1caf55bcbc667b269f49c63599a6f7db4767ae6a039580d0ff853db712"
 )
 FAULTLOOM_UTILITY_V1_RUNTIME_DIGEST = (
-    "sha256:8a7d140f449c2ec0ca2eceddcbd7951309ce338611a580b8fba9d3caa1a96e00"
+    "sha256:22bfc603fbfc1b6c599027cfc538475df64c5bf66a818c608bcae88aae95c2de"
 )
 FAULTLOOM_UTILITY_V1_MODEL_DIGEST = (
     "sha256:48ab3034d0dd401fbc721eb1df3217902fee7dab9078992d66431f09b7750201"

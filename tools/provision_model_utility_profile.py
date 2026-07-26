@@ -10,14 +10,14 @@ import os
 import shutil
 import stat
 import sys
-import tempfile
 import tarfile
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 _PROFILE_ROOT = Path("/opt/faultloom/model-utility-v1")
 _BWRAP_DIGEST = "52231e1caf55bcbc667b269f49c63599a6f7db4767ae6a039580d0ff853db712"
-_WRAPPER_DIGEST = "8a7d140f449c2ec0ca2eceddcbd7951309ce338611a580b8fba9d3caa1a96e00"
+_WRAPPER_DIGEST = "22bfc603fbfc1b6c599027cfc538475df64c5bf66a818c608bcae88aae95c2de"
 _MODEL_DIGEST = "48ab3034d0dd401fbc721eb1df3217902fee7dab9078992d66431f09b7750201"
 _BUNDLE_DIGEST = "afe1ae0b706c4a0830b218a9249037b7a6cc723f81deb78825662128b25453e6"
 _MODEL_SIZE = 386_404_992

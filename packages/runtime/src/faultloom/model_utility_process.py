@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import os
 import selectors
-import signal
 import subprocess
+import sys
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import IO, Literal
 
 
@@ -36,57 +37,36 @@ class BoundedProcessResult:
     stdout: bytes
 
 
-def _capture_owned_process_group(process: subprocess.Popen[bytes]) -> int | None:
-    """Capture only the new session group created for this exact child."""
+def _supervisor_argv(launch: BoundedProcessLaunch) -> tuple[str, ...]:
+    supervisor = Path(__file__).with_name("model_utility_process_supervisor.py")
+    descriptors = ",".join(str(value) for value in launch.pass_fds)
+    return (
+        sys.executable,
+        "-I",
+        str(supervisor),
+        "--pass-fds",
+        descriptors,
+        "--",
+        *launch.argv,
+    )
 
-    try:
-        process_group = os.getpgid(process.pid)
-    except ProcessLookupError:
-        return None
-    if process_group != process.pid or process_group == os.getpgrp():
-        return None
-    return process_group
 
-
-def _terminate_owned_process_group(
-    process: subprocess.Popen[bytes], process_group: int | None
-) -> None:
-    """Terminate descendants without ever signaling the caller's group."""
-
-    if process_group is not None and process_group == process.pid:
+def _finish_supervisor(process: subprocess.Popen[bytes]) -> bool:
+    if process.poll() is None:
         try:
-            os.killpg(process_group, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+            process.terminate()
         except OSError:
-            pass
-        deadline = time.monotonic() + 0.1
-        while time.monotonic() < deadline:
-            try:
-                os.killpg(process_group, 0)
-            except ProcessLookupError:
-                break
-            except OSError:
-                break
-            time.sleep(0.01)
-        else:
-            try:
-                os.killpg(process_group, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            except OSError:
-                pass
-    try:
-        _ = process.wait(timeout=1.0)
-    except subprocess.TimeoutExpired:
+            return False
         try:
-            process.kill()
-        except OSError:
-            pass
-        try:
-            _ = process.wait(timeout=1.0)
+            _ = process.wait(timeout=3.0)
         except subprocess.TimeoutExpired:
-            pass
+            try:
+                process.kill()
+                _ = process.wait(timeout=1.0)
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+            return False
+    return process.returncode is not None and process.returncode >= 0 and process.returncode != 125
 
 
 def _close_stream(
@@ -161,7 +141,7 @@ def _exchange_bytes(
 
 def run_bounded_process(launch: BoundedProcessLaunch) -> BoundedProcessResult:
     process = subprocess.Popen(
-        launch.argv,
+        _supervisor_argv(launch),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -172,7 +152,6 @@ def run_bounded_process(launch: BoundedProcessLaunch) -> BoundedProcessResult:
         start_new_session=True,
         shell=launch.shell,
     )
-    process_group = _capture_owned_process_group(process)
     deadline = time.monotonic() + launch.timeout_seconds
     try:
         stdout = _exchange_bytes(process, launch, deadline)
@@ -182,10 +161,12 @@ def run_bounded_process(launch: BoundedProcessLaunch) -> BoundedProcessResult:
         returncode = process.wait(timeout=remaining)
         return BoundedProcessResult(returncode=returncode, stdout=stdout)
     finally:
-        _terminate_owned_process_group(process, process_group)
+        cleanup_ok = _finish_supervisor(process)
         for stream in (process.stdin, process.stdout, process.stderr):
             if stream is not None:
                 stream.close()
+        if not cleanup_ok:
+            raise BoundedProcessError("child process cleanup failed")
 
 
 __all__ = [

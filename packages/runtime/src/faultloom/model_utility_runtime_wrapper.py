@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import os
@@ -27,6 +28,8 @@ _MAX_CHILD_STDOUT_BYTES = 64 * 1024
 _MAX_CHILD_STDERR_BYTES = 64 * 1024
 _MAX_OUTPUT_CHARS = 4096
 _CHILD_TIMEOUT_SECONDS = 180
+_PR_SET_CHILD_SUBREAPER = 36
+_MAX_PROCESSES = 4096
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _DECISIONS = frozenset(("positive", "negative", "inconclusive"))
@@ -203,6 +206,7 @@ def _extract_bundle(bundle: Path, destination: Path) -> Path:
 
 
 def _run_bounded(argv: tuple[str, ...], stdin: bytes = b"") -> bytes:
+    _set_subreaper()
     process = subprocess.Popen(
         argv,
         stdin=subprocess.PIPE,
@@ -212,7 +216,6 @@ def _run_bounded(argv: tuple[str, ...], stdin: bytes = b"") -> bytes:
         close_fds=True,
         start_new_session=True,
     )
-    process_group = _capture_owned_process_group(process)
     try:
         if process.stdin is None or process.stdout is None or process.stderr is None:
             raise WrapperError("child pipes are unavailable")
@@ -252,53 +255,120 @@ def _run_bounded(argv: tuple[str, ...], stdin: bytes = b"") -> bytes:
             raise WrapperError("child returned nonzero status")
         return bytes(output)
     finally:
-        _terminate_owned_process_group(process, process_group)
+        cleanup_ok = _cleanup_descendants()
         for stream in (process.stdin, process.stdout, process.stderr):
             if stream is not None:
                 stream.close()
+        if not cleanup_ok:
+            raise WrapperError("child process cleanup failed")
 
 
-def _capture_owned_process_group(process: subprocess.Popen[bytes]) -> int | None:
+def _set_subreaper() -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.argtypes = (ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong)
+    prctl.restype = ctypes.c_int
+    if prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+        raise WrapperError("child subreaper is unavailable")
+
+
+def _process_record(pid: int) -> tuple[int, int] | None:
     try:
-        process_group = os.getpgid(process.pid)
+        raw = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise WrapperError("child process identity is unavailable") from error
+    end = raw.rfind(")")
+    fields = raw[end + 2 :].split() if end >= 0 else []
+    if len(fields) < 20:
+        raise WrapperError("child process identity is invalid")
+    try:
+        return int(fields[1]), int(fields[19])
+    except ValueError as error:
+        raise WrapperError("child process identity is invalid") from error
+
+
+def _descendants() -> dict[int, int]:
+    try:
+        pids = [int(entry.name) for entry in Path("/proc").iterdir() if entry.name.isdigit()]
+    except OSError as error:
+        raise WrapperError("child process inventory is unavailable") from error
+    if len(pids) > _MAX_PROCESSES:
+        raise WrapperError("child process inventory exceeds its limit")
+    records: dict[int, tuple[int, int]] = {}
+    for pid in pids:
+        record = _process_record(pid)
+        if record is not None:
+            records[pid] = record
+    parents = {os.getpid()}
+    descendants: dict[int, int] = {}
+    while True:
+        found = {
+            pid: start_time
+            for pid, (parent, start_time) in records.items()
+            if parent in parents and pid not in descendants
+        }
+        if not found:
+            return descendants
+        descendants.update(found)
+        parents = set(found)
+
+
+def _signal_identity(pid: int, start_time: int, sent_signal: int) -> bool:
+    current = _process_record(pid)
+    if current is None or current[1] != start_time:
+        return True
+    try:
+        os.kill(pid, sent_signal)
     except ProcessLookupError:
-        return None
-    if process_group != process.pid or process_group == os.getpgrp():
-        return None
-    return process_group
+        return True
+    except OSError:
+        return False
+    return True
 
 
-def _terminate_owned_process_group(
-    process: subprocess.Popen[bytes], process_group: int | None
-) -> None:
-    if process_group is not None and process_group == process.pid:
+def _reap_exited() -> tuple[bool, bool]:
+    """Return (operation_succeeded, no_children_remain)."""
+    while True:
         try:
-            os.killpg(process_group, signal.SIGTERM)
-        except (ProcessLookupError, OSError):
-            pass
-        deadline = time.monotonic() + 0.1
-        while time.monotonic() < deadline:
+            waited, _status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return True, True
+        except OSError:
+            return False, False
+        if waited == 0:
+            return True, False
+
+
+def _cleanup_descendants() -> bool:
+    for sent_signal, duration in ((signal.SIGTERM, 0.2), (signal.SIGKILL, 1.5)):
+        deadline = time.monotonic() + duration
+        while True:
             try:
-                os.killpg(process_group, 0)
-            except (ProcessLookupError, OSError):
+                descendants = _descendants()
+                signaled = all(
+                    _signal_identity(pid, start_time, sent_signal)
+                    for pid, start_time in descendants.items()
+                )
+            except WrapperError:
+                return False
+            if descendants and not signaled:
+                return False
+            reaped, no_children = _reap_exited()
+            if not reaped:
+                return False
+            if not descendants and no_children:
+                return True
+            if time.monotonic() >= deadline:
                 break
             time.sleep(0.01)
-        else:
-            try:
-                os.killpg(process_group, signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                pass
     try:
-        process.wait(timeout=1.0)
-    except subprocess.TimeoutExpired:
-        try:
-            process.kill()
-        except OSError:
-            pass
-        try:
-            process.wait(timeout=1.0)
-        except subprocess.TimeoutExpired:
-            pass
+        descendants = _descendants()
+    except WrapperError:
+        return False
+    reaped, no_children = _reap_exited()
+    return not descendants and reaped and no_children
 
 
 def _llama_argv(runtime_root: Path, prompt_file: Path) -> tuple[str, ...]:
