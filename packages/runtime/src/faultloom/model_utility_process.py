@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import selectors
+import signal
 import subprocess
 import time
 from collections.abc import Mapping
@@ -33,6 +34,59 @@ class BoundedProcessLaunch:
 class BoundedProcessResult:
     returncode: int
     stdout: bytes
+
+
+def _capture_owned_process_group(process: subprocess.Popen[bytes]) -> int | None:
+    """Capture only the new session group created for this exact child."""
+
+    try:
+        process_group = os.getpgid(process.pid)
+    except ProcessLookupError:
+        return None
+    if process_group != process.pid or process_group == os.getpgrp():
+        return None
+    return process_group
+
+
+def _terminate_owned_process_group(
+    process: subprocess.Popen[bytes], process_group: int | None
+) -> None:
+    """Terminate descendants without ever signaling the caller's group."""
+
+    if process_group is not None and process_group == process.pid:
+        try:
+            os.killpg(process_group, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            pass
+        deadline = time.monotonic() + 0.1
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(process_group, 0)
+            except ProcessLookupError:
+                break
+            except OSError:
+                break
+            time.sleep(0.01)
+        else:
+            try:
+                os.killpg(process_group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                pass
+    try:
+        _ = process.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            _ = process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def _close_stream(
@@ -118,6 +172,7 @@ def run_bounded_process(launch: BoundedProcessLaunch) -> BoundedProcessResult:
         start_new_session=True,
         shell=launch.shell,
     )
+    process_group = _capture_owned_process_group(process)
     deadline = time.monotonic() + launch.timeout_seconds
     try:
         stdout = _exchange_bytes(process, launch, deadline)
@@ -127,9 +182,7 @@ def run_bounded_process(launch: BoundedProcessLaunch) -> BoundedProcessResult:
         returncode = process.wait(timeout=remaining)
         return BoundedProcessResult(returncode=returncode, stdout=stdout)
     finally:
-        if process.poll() is None:
-            process.kill()
-        _ = process.wait()
+        _terminate_owned_process_group(process, process_group)
         for stream in (process.stdin, process.stdout, process.stderr):
             if stream is not None:
                 stream.close()

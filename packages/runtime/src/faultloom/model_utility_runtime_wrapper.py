@@ -8,6 +8,7 @@ import json
 import os
 import re
 import selectors
+import signal
 import subprocess
 import sys
 import tarfile
@@ -211,6 +212,7 @@ def _run_bounded(argv: tuple[str, ...], stdin: bytes = b"") -> bytes:
         close_fds=True,
         start_new_session=True,
     )
+    process_group = _capture_owned_process_group(process)
     try:
         if process.stdin is None or process.stdout is None or process.stderr is None:
             raise WrapperError("child pipes are unavailable")
@@ -250,12 +252,53 @@ def _run_bounded(argv: tuple[str, ...], stdin: bytes = b"") -> bytes:
             raise WrapperError("child returned nonzero status")
         return bytes(output)
     finally:
-        if process.poll() is None:
-            process.kill()
-        process.wait()
+        _terminate_owned_process_group(process, process_group)
         for stream in (process.stdin, process.stdout, process.stderr):
             if stream is not None:
                 stream.close()
+
+
+def _capture_owned_process_group(process: subprocess.Popen[bytes]) -> int | None:
+    try:
+        process_group = os.getpgid(process.pid)
+    except ProcessLookupError:
+        return None
+    if process_group != process.pid or process_group == os.getpgrp():
+        return None
+    return process_group
+
+
+def _terminate_owned_process_group(
+    process: subprocess.Popen[bytes], process_group: int | None
+) -> None:
+    if process_group is not None and process_group == process.pid:
+        try:
+            os.killpg(process_group, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            pass
+        deadline = time.monotonic() + 0.1
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(process_group, 0)
+            except (ProcessLookupError, OSError):
+                break
+            time.sleep(0.01)
+        else:
+            try:
+                os.killpg(process_group, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+    try:
+        process.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def _llama_argv(runtime_root: Path, prompt_file: Path) -> tuple[str, ...]:

@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 import tarfile
+import time
 from pathlib import Path
 
 import pytest
@@ -105,6 +106,54 @@ def test_bounded_child_rejects_stdout_flood_without_leaking_value(
     with pytest.raises(wrapper.WrapperError, match="stdout exceeded") as error:
         wrapper._run_bounded(argv)
     assert secret not in str(error.value)
+
+
+def _inner_grandchild_script(pid_file: Path, action: str) -> tuple[str, ...]:
+    script = (
+        "import pathlib,subprocess,sys,time;"
+        "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],"
+        "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(child.pid));"
+        + action
+    )
+    return (sys.executable, "-c", script)
+
+
+def _assert_inner_pid_gone(pid_file: Path) -> None:
+    assert pid_file.is_file()
+    pid = int(pid_file.read_text())
+    deadline = time.monotonic() + 2.0
+    while Path(f"/proc/{pid}").exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert not Path(f"/proc/{pid}").exists()
+
+
+def test_inner_timeout_kills_grandchild_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid_file = tmp_path / "inner-timeout.pid"
+    monkeypatch.setattr(wrapper, "_CHILD_TIMEOUT_SECONDS", 0.25)
+    with pytest.raises(wrapper.WrapperError, match="timed out"):
+        wrapper._run_bounded(_inner_grandchild_script(pid_file, "time.sleep(60)"))
+    _assert_inner_pid_gone(pid_file)
+
+
+def test_inner_stdout_limit_kills_grandchild_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid_file = tmp_path / "inner-stdout.pid"
+    monkeypatch.setattr(wrapper, "_MAX_CHILD_STDOUT_BYTES", 1024)
+    action = "sys.stdout.write('x'*100000);sys.stdout.flush();time.sleep(60)"
+    with pytest.raises(wrapper.WrapperError, match="stdout exceeded"):
+        wrapper._run_bounded(_inner_grandchild_script(pid_file, action))
+    _assert_inner_pid_gone(pid_file)
+
+
+def test_inner_nonzero_leader_kills_grandchild_process_group(tmp_path: Path) -> None:
+    pid_file = tmp_path / "inner-nonzero.pid"
+    with pytest.raises(wrapper.WrapperError, match="nonzero"):
+        wrapper._run_bounded(_inner_grandchild_script(pid_file, "sys.exit(7)"))
+    _assert_inner_pid_gone(pid_file)
 
 
 def test_decision_parser_requires_one_exact_bounded_object() -> None:
