@@ -19,6 +19,7 @@ dependencies = [
 
 [project.scripts]
 faultloom = "faultloom.cli:main"
+faultloom-model-producer-attestor = "faultloom.model_utility_attestor:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
