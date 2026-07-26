@@ -20,3 +20,20 @@ after the minimum proof of another user's data and do not retain it. An operator
 must review any scope draft and sign the resulting authority grant. A model,
 scanner, browser, proxy, or plugin cannot expand that grant.
 
+## Preserved legacy disclaimer
+
+The legacy Terminator distribution carried the following disclaimer. It is
+preserved as ethical-use policy and does not modify the Apache-2.0 license:
+
+This software is designed exclusively for authorized security research, CTF
+challenges, and bug bounty programs with explicit safe harbor policies.
+
+Users are solely responsible for:
+
+- Obtaining proper authorization before testing any system;
+- Complying with all applicable laws and regulations;
+- Following responsible disclosure practices; and
+- Using only benign, non-destructive payloads.
+
+Unauthorized access to computer systems is illegal. The authors and
+contributors assume no liability for misuse of this software.

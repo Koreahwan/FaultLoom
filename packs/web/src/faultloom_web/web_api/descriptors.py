@@ -6,6 +6,13 @@ from typing import Final
 from faultloom_protocol import ActionIntent, sha256_digest
 
 from ._base import WebApiIntegrationError
+from .ids import (
+    ACTION_COMPILER_ID,
+    EVALUATOR_ID,
+    HYPOTHESIS_PROVIDER_ID,
+    OBSERVATION_NORMALIZER_ID,
+    VERIFIER_ID,
+)
 from .inputs import ActionBoundaryRecord
 from .results import (
     NormalizedWebObservation,
@@ -16,12 +23,6 @@ from .results import (
     WebApiRunResult,
     WebApiVerification,
 )
-
-ACTION_COMPILER_ID: Final = "web.api.action_compiler"
-OBSERVATION_NORMALIZER_ID: Final = "web.api.observation_normalizer"
-HYPOTHESIS_PROVIDER_ID: Final = "web.api.bridge_hypothesis_provider"
-VERIFIER_ID: Final = "web.api.clean_chain_verifier"
-EVALUATOR_ID: Final = "web.api.integration_evaluator"
 
 _ACTION_PACKS: Final = frozenset(
     {"pack.web.identity_workflow", "pack.web.api_async"}

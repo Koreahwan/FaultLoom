@@ -32,6 +32,13 @@ class BrowserChildOperation:
     generation: int
 
 
+@dataclass(frozen=True, slots=True)
+class BrowserCancellation:
+    context: BrowserIdentityContext
+    generation: int
+    action_ids: tuple[str, ...]
+
+
 class BrowserLifecycle:
     def __init__(self) -> None:
         self._lock = Lock()
@@ -119,7 +126,7 @@ class BrowserLifecycle:
                 generation=generation,
             )
 
-    def begin_cancellation(self, context_id: str) -> BrowserOperation:
+    def begin_cancellation(self, context_id: str) -> BrowserCancellation:
         with self._condition:
             context = self._contexts.pop(context_id, None)
             if context is None:
@@ -131,9 +138,21 @@ class BrowserLifecycle:
                 if candidate.browser_context_id == context_id:
                     del self._pending[candidate_id]
                     self._consumed.add(candidate_id)
-            return BrowserOperation(context=context, generation=generation)
+            owner = (context_id, generation)
+            action_ids = tuple(
+                sorted(
+                    action_id
+                    for action_id, current_owner in self._in_flight.items()
+                    if current_owner == owner
+                )
+            )
+            return BrowserCancellation(
+                context=context,
+                generation=generation,
+                action_ids=action_ids,
+            )
 
-    def wait_for_cancellation(self, operation: BrowserOperation) -> None:
+    def wait_for_cancellation(self, operation: BrowserCancellation) -> None:
         owner = (operation.context.browser_context_id, operation.generation)
         with self._condition:
             self._condition.wait_for(
@@ -155,6 +174,13 @@ class BrowserLifecycle:
                 candidates = observation.child_candidates
             case unreachable:
                 assert_never(unreachable)
+        self.admit_discovered(operation, candidates)
+
+    def admit_discovered(
+        self,
+        operation: BrowserOperation,
+        candidates: tuple[BrowserChildCandidate, ...],
+    ) -> None:
         with self._condition:
             context_id = operation.context.browser_context_id
             active = self._contexts.get(context_id)

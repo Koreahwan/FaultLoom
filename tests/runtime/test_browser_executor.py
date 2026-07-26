@@ -3,9 +3,11 @@ from __future__ import annotations
 import pytest
 
 from faultloom.execution import (
+    BrowserChildCandidate,
     BrowserChildKind,
     BrowserContractError,
     BrowserExecutionCoordinator,
+    BrowserIdentityContext,
     ExecutionFlowKind,
     GatewayDispatchCommand,
     GatewayResult,
@@ -22,6 +24,51 @@ from .execution_helpers import (
     execution_identity,
     semantic_request,
 )
+
+
+class RecordingBrowserDriver:
+    def __init__(
+        self,
+        navigate_candidates: tuple[BrowserChildCandidate, ...] = (),
+    ) -> None:
+        self.events: list[tuple[str, str]] = []
+        self._navigate_candidates = navigate_candidates
+
+    def register_context(self, context: BrowserIdentityContext) -> None:
+        self.events.append(("register", context.browser_context_id))
+
+    def close_context(self, context_id: str) -> None:
+        self.events.append(("close", context_id))
+
+    def interrupt_context(self, context_id: str) -> None:
+        self.events.append(("interrupt", context_id))
+
+    def navigate(
+        self,
+        context: BrowserIdentityContext,
+        command: GatewayDispatchCommand,
+        result: GatewayResult,
+    ) -> tuple[BrowserChildCandidate, ...]:
+        del result
+        self.events.append(("navigate", command.intent.action_id))
+        return self._navigate_candidates
+
+    def fulfill_child(
+        self,
+        candidate: BrowserChildCandidate,
+        command: GatewayDispatchCommand,
+        result: GatewayResult,
+    ) -> tuple[BrowserChildCandidate, ...]:
+        del command, result
+        self.events.append(("fulfill", candidate.candidate_id))
+        return ()
+
+    def abort_child(self, candidate_id: str) -> None:
+        self.events.append(("abort", candidate_id))
+
+    def navigation_ready(self, context_id: str) -> bool:
+        del context_id
+        return True
 
 
 def test_identity_contexts_cannot_share_session_or_storage_partition() -> None:
@@ -51,6 +98,64 @@ def test_identity_contexts_cannot_share_session_or_storage_partition() -> None:
     )
     with pytest.raises(BrowserContractError, match="storage partition"):
         browser.register_context(shared_partition)
+
+
+def test_coordinator_drives_registered_browser_only_after_gateway_completion() -> None:
+    approved = command()
+    expected = completed_result(approved)
+    gateway = RecordingGateway(lambda _: expected)
+    driver = RecordingBrowserDriver()
+    browser = BrowserExecutionCoordinator(
+        SemanticHttpExecutor._for_test(
+            gateway, channel_key=CHANNEL_KEY, now=lambda: NOW
+        ),
+        browser_driver=driver,
+    )
+    context = browser_context()
+
+    browser.register_context(context)
+    result = browser.navigate(context.browser_context_id, approved)
+    browser.close_context(context.browser_context_id)
+
+    assert result == expected
+    assert driver.events == [
+        ("register", "browser.owner"),
+        ("navigate", "action.nav"),
+        ("close", "browser.owner"),
+    ]
+
+
+def test_discovered_route_needs_a_fresh_gateway_action_before_fulfillment() -> None:
+    candidate = http_candidate(BrowserChildKind.SUBRESOURCE, suffix="asset")
+    driver = RecordingBrowserDriver((candidate,))
+    gateway = RecordingGateway(completed_result)
+    browser = BrowserExecutionCoordinator(
+        SemanticHttpExecutor._for_test(
+            gateway, channel_key=CHANNEL_KEY, now=lambda: NOW
+        ),
+        browser_driver=driver,
+    )
+    context = browser_context()
+    browser.register_context(context)
+    browser.navigate(context.browser_context_id, command(identity=context.identity))
+    child = command(
+        action_id="action.asset",
+        lease_id="lease.asset",
+        request=candidate.request,
+        identity=context.identity,
+        parent_action_ids=(candidate.parent_action_id,),
+    )
+
+    browser.execute_child(context.browser_context_id, candidate.candidate_id, child)
+
+    assert [frame.command.intent.action_id for frame in gateway.calls] == [
+        "action.nav",
+        "action.asset",
+    ]
+    assert driver.events[-1] == ("fulfill", candidate.candidate_id)
+    with pytest.raises(BrowserContractError, match="already consumed"):
+        browser.execute_child(context.browser_context_id, candidate.candidate_id, child)
+    assert driver.events.count(("fulfill", candidate.candidate_id)) == 1
 
 
 def test_navigation_rejects_cross_identity_session_before_gateway() -> None:

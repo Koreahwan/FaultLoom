@@ -236,7 +236,7 @@ def test_receipt_cannot_exceed_reserved_request_or_response_bytes() -> None:
     assert executor.state_for(approved.intent.action_id) is LocalDispatchState.UNKNOWN
 
 
-def test_execution_modules_have_no_target_network_or_browser_client_imports() -> None:
+def test_gateway_http_core_has_no_target_network_or_browser_client_imports() -> None:
     root = Path(__file__).parents[2] / "packages" / "runtime" / "src" / "faultloom" / "execution"
     forbidden_roots = {
         "aiohttp",
@@ -249,7 +249,16 @@ def test_execution_modules_have_no_target_network_or_browser_client_imports() ->
         "websockets",
     }
     imported: set[str] = set()
-    for source_path in root.glob("*.py"):
+    core_modules = (
+        "contracts.py",
+        "gateway.py",
+        "gateway_client.py",
+        "gateway_launcher.py",
+        "http.py",
+        "http_validation.py",
+        "wire.py",
+    )
+    for source_path in (root / name for name in core_modules):
         tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):

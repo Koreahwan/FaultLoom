@@ -138,8 +138,8 @@ provenance = "tools/build_metadata_hook.py"
         root / "requirements-release.graph.json",
         '{\n  "packages": {},\n  "schema_version": 1\n}\n',
     )
-    write(root / "LICENSE", "synthetic Apache-2.0 license fixture\n")
-    write(root / "NOTICE", "synthetic notice fixture\n")
+    shutil.copyfile(source_root / "LICENSE", root / "LICENSE")
+    shutil.copyfile(source_root / "NOTICE", root / "NOTICE")
     write(root / "SECURITY.md", "synthetic security policy fixture\n")
     write(root / "ETHICAL_USE.md", "synthetic ethical-use policy fixture\n")
     workflow = root / ".github/workflows/ci.yml"

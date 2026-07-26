@@ -1,16 +1,24 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from faultloom_protocol import PackManifest
 from faultloom_sdk import ManifestRegistry
 
 
+WEB3_PACK_SOURCE = Path(__file__).parents[2] / "packs" / "web3" / "src"
+sys.path.insert(0, str(WEB3_PACK_SOURCE))
+
+from faultloom_web3 import web3_pack_manifest
+
+
 FIXTURE = Path(__file__).parent / "fixtures" / "future_web3_pack_manifest.json"
 
 
-def test_future_web3_pack_uses_public_abi_without_web3_implementation() -> None:
+def test_web3_pack_uses_the_predeclared_public_abi() -> None:
     manifest = PackManifest.model_validate_json(FIXTURE.read_text(encoding="utf-8"))
+    assert web3_pack_manifest() == manifest
     registry = ManifestRegistry(
         known_capability_descriptors=manifest.capability_descriptors,
         known_action_compilers=manifest.action_compilers,
@@ -24,4 +32,3 @@ def test_future_web3_pack_uses_public_abi_without_web3_implementation() -> None:
     registry.install_pack(manifest)
 
     assert registry.packs == (manifest,)
-    assert not (Path(__file__).parents[2] / "packs" / "web3").exists()

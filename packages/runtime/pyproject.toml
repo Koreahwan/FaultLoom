@@ -14,6 +14,7 @@ dependencies = [
   "cryptography==41.0.7",
   "faultloom-protocol==0.1.0",
   "faultloom-sdk==0.1.0",
+  "playwright==1.58.0",
 ]
 
 [project.scripts]
@@ -21,3 +22,6 @@ faultloom = "faultloom.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+faultloom = ["py.typed"]

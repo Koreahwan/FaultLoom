@@ -21,7 +21,17 @@ PRIVATE_NAMES = {
     "customer.json",
     "submission-outbox",
 }
-GENERATED_PARTS = {".pytest_cache", "__pycache__", "target", "dist", "build"}
+GENERATED_PARTS = {
+    ".omo",
+    ".pytest_cache",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "nul",
+    "out",
+    "target",
+}
 IGNORED_PARTS = {".git", *GENERATED_PARTS}
 RULE_FIXTURE_PATHS = {"tools/check_public_tree.py", "tests/test_public_tree_gate.py"}
 CONFIG_SUFFIXES = {

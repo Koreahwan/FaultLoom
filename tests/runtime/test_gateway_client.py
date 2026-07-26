@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import subprocess
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -52,6 +54,44 @@ def test_production_client_requires_a_pinned_supervised_process() -> None:
             config,
             expected_binary_digest="sha256:" + "11" * 32,
         )
+
+
+def test_production_client_interrupt_terminates_its_exact_gateway_process() -> None:
+    executable = "/usr/bin/python3"
+    process = subprocess.Popen(
+        (
+            executable,
+            "-c",
+            "import sys; sys.stdin.buffer.read()",
+            "--supervised-stdio",
+        ),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    config = GatewayChannelConfig(
+        key_id="channel-key.1",
+        key=bytes(range(1, 33)),
+        boot_id="gateway-boot.1",
+        nonce=bytes(range(16)),
+        issued_at_millis=1_000,
+        expires_at_millis=31_000,
+    )
+    client = AuthenticatedGatewayClient(
+        process,
+        config,
+        expected_binary_digest=(
+            "sha256:" + hashlib.sha256(Path(executable).read_bytes()).hexdigest()
+        ),
+    )
+    try:
+        client.interrupt()
+        assert process.poll() is not None
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=1)
+        client.close()
 
 
 def test_dispatch_codec_preserves_child_flow_and_parent_binding() -> None:

@@ -7,9 +7,12 @@ pythonpath = [
   "packages/runtime/src",
   "packs/web/src",
   "packs/llm/src",
+  "packs/advanced_web/src",
+  "packs/cloud/src",
+  "packs/mobile/src",
+  "packs/web3/src",
 ]
 
 [tool.ruff]
 target-version = "py312"
 line-length = 100
-

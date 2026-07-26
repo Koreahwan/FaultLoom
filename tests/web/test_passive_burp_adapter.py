@@ -32,9 +32,11 @@ from faultloom_web.burp import (
 class _SecretSink:
     def __init__(self) -> None:
         self.count = 0
+        self.registrations: list[tuple[str, str]] = []
 
     def register(self, *, purpose: str, value: str) -> SecretRef:
         self.count += 1
+        self.registrations.append((purpose, value))
         return SecretRef(
             schema_version="0.1.0",
             uri=f"secret://burp/item-{self.count}",
@@ -168,13 +170,104 @@ def test_history_is_scope_filtered_and_secrets_are_replaced_with_refs() -> None:
         )
 
 
-def test_candidate_only_adapter_cannot_be_promoted_to_verification_evidence() -> None:
+@pytest.mark.parametrize(
+    "header_name", ("X-API-Key", "x_auth_token", "Proxy-Authorization", "X-Session-Key")
+)
+def test_sensitive_header_aliases_are_scrubbed_without_overmatching(header_name: str) -> None:
+    raw_value = f"secret-for-{header_name}"
+    item = BurpHistoryItem(
+        item_id="history-header-alias",
+        transport=HistoryTransport.HTTP,
+        host="lab.test",
+        path="/approved/object",
+        headers=(
+            BurpHeader(name=header_name, value=raw_value),
+            BurpHeader(name="X-Monkey-ID", value="useful-nonsecret"),
+        ),
+    )
+    sink = _SecretSink()
+
+    result = _adapter().scrub_history(
+        _request(BurpTool.READ_HTTP_HISTORY),
+        (item,),
+        observed_server=expected_server_snapshot(),
+        secrets=sink,
+    )[0]
+
+    assert result.headers == (
+        BurpHeader(name=header_name, value="<secret-ref>"),
+        BurpHeader(name="X-Monkey-ID", value="useful-nonsecret"),
+    )
+    assert type(result.secret_refs[0]) is SecretRef
+    assert sink.registrations == [(f"burp.header.{header_name}", raw_value)]
+    assert raw_value not in result.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    ("wire_name", "canonical_name"),
+    (("api_key", "api_key"), ("API%5FKEY", "api_key"), ("X%2DAPI%2DKEY", "x_api_key")),
+)
+def test_query_credentials_are_scrubbed_without_rewriting_nonsecret_query(
+    wire_name: str,
+    canonical_name: str,
+) -> None:
+    wire_secret = "S3cr%65t%2BToken"
+    decoded_secret = "S3cret+Token"
+    useful_prefix = "/approved/object?view=Full%2FDetail+Mode&"
+    useful_suffix = "&cursor=a%2Fb+z&monkey=banana"
+    item = BurpHistoryItem(
+        item_id="history-query-secret",
+        transport=HistoryTransport.HTTP,
+        host="lab.test",
+        path=f"{useful_prefix}{wire_name}={wire_secret}{useful_suffix}",
+    )
+    sink = _SecretSink()
+
+    result = _adapter().scrub_history(
+        _request(BurpTool.READ_HTTP_HISTORY),
+        (item,),
+        observed_server=expected_server_snapshot(),
+        secrets=sink,
+    )[0]
+
+    assert result.path == f"{useful_prefix}{wire_name}=<secret-ref>{useful_suffix}"
+    assert type(result.secret_refs[0]) is SecretRef
+    assert sink.registrations == [(f"burp.query.{canonical_name}", decoded_secret)]
+    serialized = result.model_dump_json()
+    assert wire_secret not in serialized
+    assert decoded_secret not in serialized
+
+
+def test_history_scrub_fails_closed_before_secret_processing_on_schema_drift() -> None:
+    expected = expected_server_snapshot()
+    drifted_tool = expected.tools[0].model_copy(update={"input_schema_digest": "0" * 64})
+    drifted = expected.model_copy(update={"tools": (drifted_tool, *expected.tools[1:])})
+    item = BurpHistoryItem(
+        item_id="history-schema-drift",
+        transport=HistoryTransport.HTTP,
+        host="lab.test",
+        path="/approved/object?api_key=must-not-be-processed",
+    )
+    sink = _SecretSink()
+
+    with pytest.raises(BurpPolicyError, match="adapter_disabled"):
+        _adapter().scrub_history(
+            _request(BurpTool.READ_HTTP_HISTORY),
+            (item,),
+            observed_server=drifted,
+            secrets=sink,
+        )
+
+    assert sink.registrations == []
+
+
+def test_candidate_only_adapter_cannot_be_promoted_by_caller_declared_metrics() -> None:
     manifest = passive_burp_adapter_manifest()
     registry = ManifestRegistry(known_adapter_capabilities=manifest.capabilities)
     registry.install_adapter(manifest)
     admission = AdapterAdmissionRegistry(registry)
     digest = sha256_digest(manifest)
-    for gate in (AdmissionGate.CONTRACT, AdmissionGate.FIDELITY, AdmissionGate.MODEL_UTILITY):
+    for gate in (AdmissionGate.CONTRACT, AdmissionGate.FIDELITY):
         admission.record(
             AdapterAdmissionReceipt(
                 adapter_id=manifest.adapter_id,
@@ -182,10 +275,20 @@ def test_candidate_only_adapter_cannot_be_promoted_to_verification_evidence() ->
                 gate=gate,
                 outcome=AdmissionOutcome.PASSED,
                 artifact_digest=manifest.output_schema_digest,
-                unique_verified_positives=2 if gate is AdmissionGate.MODEL_UTILITY else 0,
             )
         )
-    with pytest.raises(AdapterAdmissionError, match="candidate-only"):
+    with pytest.raises(ValidationError, match="Extra inputs"):
+        AdapterAdmissionReceipt.model_validate(
+            {
+                "adapter_id": manifest.adapter_id,
+                "manifest_digest": digest,
+                "gate": AdmissionGate.MODEL_UTILITY,
+                "outcome": AdmissionOutcome.PASSED,
+                "artifact_digest": manifest.output_schema_digest,
+                "unique_verified_positives": 2,
+            }
+        )
+    with pytest.raises(AdapterAdmissionError, match="every admission gate"):
         admission.require_evidence_source(
             manifest.adapter_id,
             independent_non_tool_evidence=True,

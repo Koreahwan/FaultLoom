@@ -9,7 +9,7 @@ use super::codec::{nonce, now_millis};
 use super::fixture::{reconciliation_authority, unknown_receipt};
 
 #[test]
-fn reconciliation_codec_v4_preserves_exact_hold_binding_and_rejects_tamper() {
+fn reconciliation_codec_v5_preserves_exact_hold_binding_and_rejects_tamper() {
     // Given: an unknown receipt and proof bound to the same nonzero hold.
     let unknown = unknown_receipt("hold-binding", 0x75);
     let hold_binding_digest = unknown.hold_binding_digest;
@@ -29,12 +29,13 @@ fn reconciliation_codec_v4_preserves_exact_hold_binding_and_rejects_tamper() {
         }));
 
     // When: the exact reconciliation command is encoded.
-    let encoded = command.to_bytes().expect("encode v4 reconciliation");
+    let encoded = command.to_bytes().expect("encode v5 reconciliation");
 
-    // Then: v4 carries both bindings canonically and rejects proof tampering.
-    assert_eq!(encoded.get(4), Some(&4));
+    // Then: v5 carries both bindings canonically and rejects version rollback
+    // and proof tampering.
+    assert_eq!(encoded.get(4), Some(&5));
     let mut stale_version = encoded.clone();
-    stale_version[4] = 3;
+    stale_version[4] = 4;
     assert_eq!(
         SupervisorCommand::from_bytes(&stale_version),
         Err(DenialCode::MalformedFrame)

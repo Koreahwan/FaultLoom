@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
@@ -16,6 +17,7 @@ from faultloom.execution import (
     SemanticEndpoint,
     SemanticHttpObservation,
     SemanticHttpRequest,
+    SemanticResponseHeader,
     bind_gateway_response,
     canonical_dispatch_receipt_id,
     gateway_frame_digest,
@@ -147,10 +149,10 @@ def command(
         gateway_boot_id="gateway-boot.1",
         boot_challenge_digest="sha256:" + "55" * 32,
         target_id=intent.target_id,
-        identity_id=identity.identity_id,
+        identity_id=_required(identity.identity_id),
         tenant_id=identity.tenant_id,
         action_kind=intent.action_kind,
-        semantic_action_digest=intent.payload_digest,
+        semantic_action_digest=_required(intent.payload_digest),
         request_binding_digest="sha256:" + "66" * 32,
         resolution_digest="sha256:" + "77" * 32,
         egress_plane=m.EgressPlane.TARGET_GATEWAY,
@@ -175,7 +177,14 @@ def completed_result(
     child_candidates: tuple[BrowserChildCandidate, ...] = (),
     bytes_sent: int = 128,
     bytes_received: int = 256,
+    body: bytes | None = None,
+    headers: tuple[SemanticResponseHeader, ...] = (),
+    status_code: int = 200,
 ) -> GatewayDispatchResult:
+    response_digest = D2
+    if body is not None:
+        bytes_received = len(body)
+        response_digest = f"sha256:{hashlib.sha256(body).hexdigest()}"
     provisional_receipt = m.DispatchReceipt(
         schema_version=SCHEMA_VERSION,
         receipt_id="receipt.pending",
@@ -207,11 +216,11 @@ def completed_result(
         lease_expires_at=command.lease.expires_at,
         reservation=command.lease.reservation,
         request_digest=D1,
-        response_digest=D2,
+        response_digest=response_digest,
         outcome=m.DispatchOutcome.COMPLETED,
         dispatched_at=NOW,
         completed_at=NOW + timedelta(seconds=1),
-        response_status=200,
+        response_status=status_code,
         bytes_sent=bytes_sent,
         bytes_received=bytes_received,
     )
@@ -222,7 +231,7 @@ def completed_result(
         schema_version=SCHEMA_VERSION,
         observation_id=f"observation.{command.intent.action_id}",
         run_id=command.intent.run_id,
-        cas_digest=D2,
+        cas_digest=response_digest,
         media_type="application/http",
         byte_length=bytes_received,
         created_at=NOW + timedelta(seconds=1),
@@ -230,6 +239,14 @@ def completed_result(
     observation = SemanticHttpObservation(
         schema_version=SCHEMA_VERSION,
         response_ref=response_ref,
+        status_code=status_code if body is not None else None,
+        headers=headers,
+        body=body,
+        body_digest=(
+            f"sha256:{hashlib.sha256(body).hexdigest()}" if body is not None else None
+        ),
+        raw_response_digest=response_digest if body is not None else None,
+        raw_response_length=bytes_received if body is not None else None,
         child_candidates=child_candidates,
     )
     return GatewayDispatchResult(
@@ -263,3 +280,12 @@ class RecordingGateway:
         if result is None:
             return None
         return bind_gateway_response(frame, result, CHANNEL_KEY)
+
+    def interrupt(self) -> None:
+        return
+
+
+def _required[T](value: T | None) -> T:
+    if value is None:
+        raise AssertionError("test fixture requires a concrete value")
+    return value

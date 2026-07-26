@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from urllib.parse import unquote_plus
 
 from faultloom_protocol import SecretRef
 
@@ -20,11 +22,46 @@ from .models import (
     SecretRegistrar,
 )
 
-_SENSITIVE_HEADERS = frozenset({"authorization", "cookie", "set-cookie"})
+_SENSITIVE_NAMES = frozenset(
+    {
+        "access_token",
+        "api_key",
+        "auth_token",
+        "authorization",
+        "bearer",
+        "client_secret",
+        "cookie",
+        "credential",
+        "id_token",
+        "password",
+        "passwd",
+        "private_key",
+        "proxy_authorization",
+        "refresh_token",
+        "secret",
+        "session",
+        "session_cookie",
+        "session_id",
+        "set_cookie",
+        "token",
+        "x_api_key",
+        "x_auth_token",
+        "x_session_key",
+    }
+)
+_SENSITIVE_COMPACT_NAMES = frozenset(name.replace("_", "") for name in _SENSITIVE_NAMES)
 _HISTORY_TOOLS = {
     BurpTool.READ_HTTP_HISTORY: HistoryTransport.HTTP,
     BurpTool.READ_WEBSOCKET_HISTORY: HistoryTransport.WEBSOCKET,
 }
+
+
+def _sensitive_name(value: str) -> str | None:
+    with_word_boundaries = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", value)
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", with_word_boundaries).strip("_").casefold()
+    if normalized in _SENSITIVE_NAMES or normalized.replace("_", "") in _SENSITIVE_COMPACT_NAMES:
+        return normalized
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,14 +134,19 @@ class PassiveBurpPolicyAdapter:
         item: BurpHistoryItem,
         secrets: SecretRegistrar,
     ) -> ScrubbedHistoryItem:
+        path, query_refs = self._scrub_path_query(item.path, secrets)
         headers: list[BurpHeader] = []
         credentials: list[ScrubbedSecret] = []
-        refs: list[SecretRef] = []
+        refs = list(query_refs)
         for header in item.headers:
-            if header.name.casefold() not in _SENSITIVE_HEADERS:
+            if _sensitive_name(header.name) is None:
                 headers.append(header)
                 continue
-            ref = self._register_secret(secrets, purpose=f"burp.header.{header.name}", value=header.value)
+            ref = self._register_secret(
+                secrets,
+                purpose=f"burp.header.{header.name}",
+                value=header.value,
+            )
             headers.append(BurpHeader(name=header.name, value="<secret-ref>"))
             refs.append(ref)
         for credential in item.credentials:
@@ -119,18 +161,46 @@ class PassiveBurpPolicyAdapter:
             item_id=item.item_id,
             transport=item.transport,
             host=item.host,
-            path=item.path,
+            path=path,
             headers=tuple(headers),
             credentials=tuple(credentials),
             secret_refs=tuple(refs),
         )
+
+    def _scrub_path_query(
+        self,
+        path: str,
+        secrets: SecretRegistrar,
+    ) -> tuple[str, tuple[SecretRef, ...]]:
+        path_only, separator, query = path.partition("?")
+        if not separator:
+            return path, ()
+        fields: list[str] = []
+        refs: list[SecretRef] = []
+        for field in query.split("&"):
+            wire_name, equals, wire_value = field.partition("=")
+            canonical_name = _sensitive_name(unquote_plus(wire_name))
+            if canonical_name is None or not equals or not wire_value:
+                fields.append(field)
+                continue
+            ref = self._register_secret(
+                secrets,
+                purpose=f"burp.query.{canonical_name}",
+                value=unquote_plus(wire_value),
+            )
+            fields.append(f"{wire_name}=<secret-ref>")
+            refs.append(ref)
+        return f"{path_only}?{'&'.join(fields)}", tuple(refs)
 
     @staticmethod
     def _register_secret(secrets: SecretRegistrar, *, purpose: str, value: str) -> SecretRef:
         try:
             ref = secrets.register(purpose=purpose, value=value)
         except Exception as exc:
-            raise BurpPolicyError("secret_scrub_failed", "secret registration failed closed") from exc
+            raise BurpPolicyError(
+                "secret_scrub_failed",
+                "secret registration failed closed",
+            ) from exc
         if type(ref) is not SecretRef or value in ref.uri or value in ref.purpose:
             raise BurpPolicyError("secret_scrub_failed", "registrar returned an unsafe reference")
         return ref

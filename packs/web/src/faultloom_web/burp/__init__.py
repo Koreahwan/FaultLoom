@@ -1,3 +1,11 @@
+from .active import (
+    ActiveBurpRequestPreparer,
+    BurpGatewayPreview,
+    BurpSelectedBudget,
+    BurpSelectedIdentity,
+    BurpSelectedRequest,
+    PreparedBurpGatewayDispatch,
+)
 from .manifest import expected_server_snapshot, passive_burp_adapter_manifest
 from .models import (
     BurpHeader,
@@ -18,10 +26,15 @@ from .models import (
 from .policy import BurpPolicyError, PassiveBurpPolicyAdapter
 
 __all__ = [
+    "ActiveBurpRequestPreparer",
     "BurpHeader",
+    "BurpGatewayPreview",
     "BurpHistoryItem",
     "BurpPolicyError",
     "BurpScope",
+    "BurpSelectedBudget",
+    "BurpSelectedIdentity",
+    "BurpSelectedRequest",
     "BurpServerSnapshot",
     "BurpTool",
     "BurpToolRequest",
@@ -31,6 +44,7 @@ __all__ = [
     "HttpVersion",
     "LoopbackEndpoint",
     "PassiveBurpPolicyAdapter",
+    "PreparedBurpGatewayDispatch",
     "ScrubbedHistoryItem",
     "SecretRegistrar",
     "ToolDescriptor",

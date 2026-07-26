@@ -1,9 +1,13 @@
 # FaultLoom runtime
 
 This package provides the public `faultloom` command-line surface and the
-durable research runtime. The v0.1 CLI starts fail closed: its loopback smoke
-path validates a signed authority grant without opening a socket, and live
-dispatch remains unavailable until the Gateway execution path is integrated.
+durable research runtime. The v0.1 CLI starts fail closed: its default run path
+validates a signed authority grant without opening a socket. On POSIX,
+`run --live` permits exactly one Gateway-only dispatch only when a separate
+controller supplies an existing private launch bundle, signed FLBS bootstrap,
+authenticated journal descriptors, channel configuration, and a preapproved
+command. The runtime does not mint authority or install the Gateway trust
+root. The personal Windows executable remains manual-only.
 
 Trusted authority keys are local public-key records. Pass one to `faultloom
 run` with `--trusted-key`, or set `FAULTLOOM_TRUSTED_AUTHORITY_KEY` to its

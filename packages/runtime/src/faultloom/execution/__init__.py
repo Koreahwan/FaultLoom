@@ -1,6 +1,11 @@
 """Gateway-only semantic HTTP and multi-identity browser execution."""
 
 from .browser import BrowserExecutionCoordinator
+from .browser_driver import ChromiumBrowserDriver, ChromiumLaunchConfig
+from .browser_runtime_manifest import (
+    ChromiumRuntimeAsset,
+    PINNED_CHROMIUM_RUNTIME_ASSETS,
+)
 from .browser_contracts import (
     BrowserContractError,
     BrowserIdentityContext,
@@ -48,6 +53,17 @@ from .gateway_client import (
     AuthenticatedGatewayClient,
     GatewayChannelConfig,
 )
+from .gateway_launcher import (
+    GatewayLaunchBundle,
+    GatewayLaunchError,
+    GatewayLauncher,
+)
+from .gateway_provisioner import (
+    GatewayProvisionedHandoff,
+    GatewayProvisioningError,
+    GatewayProvisioningMaterial,
+    provision_gateway_handoff,
+)
 
 __all__ = [
     "SEMANTIC_HTTP_ACTION_KIND",
@@ -56,7 +72,11 @@ __all__ = [
     "BrowserContractError",
     "BrowserExecutionCoordinator",
     "BrowserIdentityContext",
+    "ChromiumBrowserDriver",
+    "ChromiumLaunchConfig",
+    "ChromiumRuntimeAsset",
     "AuthenticatedGatewayClient",
+    "PINNED_CHROMIUM_RUNTIME_ASSETS",
     "DispatchReplayError",
     "DispatchUncertainError",
     "EndpointScheme",
@@ -64,6 +84,12 @@ __all__ = [
     "ExecutionContractError",
     "ExecutionIdentity",
     "GatewayDeniedResult",
+    "GatewayLaunchBundle",
+    "GatewayLaunchError",
+    "GatewayLauncher",
+    "GatewayProvisionedHandoff",
+    "GatewayProvisioningError",
+    "GatewayProvisioningMaterial",
     "GatewayChannelConfig",
     "GatewayChannelError",
     "GatewayDispatchCommand",
@@ -87,5 +113,6 @@ __all__ = [
     "canonical_dispatch_receipt_id",
     "gateway_dispatch_frame",
     "gateway_frame_digest",
+    "provision_gateway_handoff",
     "semantic_payload_digest",
 ]

@@ -123,17 +123,52 @@ def _run_arguments(authority_path: Path, key_path: Path) -> list[str]:
     ]
 
 
-def test_doctor_json_is_offline_and_machine_readable(capsys: pytest.CaptureFixture[str]) -> None:
+def test_doctor_json_reports_posix_controller_provisioned_live_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(cli.os, "name", "posix")
     assert cli.main(["doctor", "--json"]) == cli.EXIT_OK
     result = json.loads(capsys.readouterr().out)
     assert result == {
         "component": "faultloom",
-        "live_dispatch_enabled": False,
-        "network_access": "none",
+        "live_dispatch_enabled": True,
+        "live_dispatch_mode": "controller_provisioned_single_dispatch",
+        "network_access": "gateway_only",
         "ok": True,
         "protocol_version": "0.1.0",
         "runtime_version": "0.1.0",
     }
+
+
+def test_doctor_json_keeps_windows_personal_runtime_manual_only(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(cli.os, "name", "nt")
+
+    assert cli.main(["doctor", "--json"]) == cli.EXIT_OK
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["live_dispatch_enabled"] is False
+    assert result["live_dispatch_mode"] == "manual_only"
+    assert result["network_access"] == "none"
+
+
+def test_windows_personal_build_includes_registered_candidate_packs() -> None:
+    script = (ROOT / "tools" / "build_personal_windows_cli.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    for package, source_path in (
+        ("faultloom_advanced_web", "packs\\advanced_web\\src"),
+        ("faultloom_cloud", "packs\\cloud\\src"),
+        ("faultloom_mobile", "packs\\mobile\\src"),
+        ("faultloom_web3", "packs\\web3\\src"),
+    ):
+        assert f"'{source_path}'" in script
+        assert f"'--hidden-import', '{package}'" in script
+        assert f"'--hidden-import', '{package}.manifest'" in script
 
 
 def test_signed_loopback_run_is_validation_only(
@@ -196,6 +231,332 @@ def test_actual_module_loopback_smoke_opens_no_socket(tmp_path: Path) -> None:
     assert process.returncode == cli.EXIT_OK
     assert process.stderr == ""
     assert json.loads(process.stdout)["dispatch_performed"] is False
+
+
+def test_single_operator_key_scope_and_pack_workflow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    key_root = tmp_path / "authority"
+    draft_path = tmp_path / "scope-draft.json"
+    grant_path = tmp_path / "authority-grant.json"
+
+    assert cli.main(["key", "init", "--out-dir", str(key_root)]) == cli.EXIT_OK
+    key_result = json.loads(capsys.readouterr().out)
+    private_key = Path(key_result["private_key"])
+    public_key = Path(key_result["public_key"])
+    assert private_key.stat().st_mode & 0o777 == 0o600
+    assert len(private_key.read_text(encoding="ascii").strip()) == 64
+    assert public_key.is_file()
+
+    assert cli.main(
+        [
+            "scope",
+            "draft",
+            "--template",
+            "bounty",
+            "--target-id",
+            "target.example",
+            "--hostname",
+            "example.com",
+            "--pack",
+            "web",
+            "--out",
+            str(draft_path),
+        ]
+    ) == cli.EXIT_OK
+    assert json.loads(capsys.readouterr().out)["draft"] == str(draft_path)
+
+    assert cli.main(
+        [
+            "scope",
+            "approve",
+            str(draft_path),
+            "--private-key",
+            str(private_key),
+            "--out",
+            str(grant_path),
+        ]
+    ) == cli.EXIT_OK
+    assert json.loads(capsys.readouterr().out)["authority"] == str(grant_path)
+
+    workspace = tmp_path / "engagement"
+    assert cli.main(
+        _run_arguments(grant_path, public_key)[:-4]
+        + [
+            "--target",
+            "target.example",
+            "--pack",
+            "web",
+            "--workspace",
+            str(workspace),
+        ]
+    ) == cli.EXIT_OK
+    run_result = json.loads(capsys.readouterr().out)
+    assert run_result["authority_verified"] is True
+    assert run_result["mode"] == "manual_authorized"
+    assert run_result["target_id"] == "target.example"
+    assert Path(run_result["workspace"]) == workspace
+    assert (workspace / "run.json").is_file()
+
+    assert cli.main(["pack", "list"]) == cli.EXIT_OK
+    listed = json.loads(capsys.readouterr().out)
+    assert [item["pack_id"] for item in listed["packs"]] == [
+        "pack.advanced_web",
+        "pack.cloud.iam_oauth",
+        "pack.llm.agent",
+        "pack.mobile",
+        "pack.web",
+        "pack.web3.future-fixture",
+    ]
+    assert cli.main(["pack", "doctor", "pack.web"]) == cli.EXIT_OK
+    web_doctor = json.loads(capsys.readouterr().out)
+    assert web_doctor["ok"] is True
+    assert web_doctor["live_dispatch_supported"] is True
+
+
+@pytest.mark.parametrize(
+    ("pack_alias", "pack_id"),
+    (
+        ("advanced-web", "pack.advanced_web"),
+        ("cloud", "pack.cloud.iam_oauth"),
+        ("mobile", "pack.mobile"),
+        ("web3", "pack.web3.future-fixture"),
+    ),
+)
+def test_candidate_pack_aliases_create_signed_manual_workspaces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    pack_alias: str,
+    pack_id: str,
+) -> None:
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    key_root = tmp_path / "authority"
+    draft_path = tmp_path / "scope-draft.json"
+    grant_path = tmp_path / "authority-grant.json"
+    workspace = tmp_path / "workspace"
+
+    assert cli.main(["key", "init", "--out-dir", str(key_root)]) == cli.EXIT_OK
+    key_result = json.loads(capsys.readouterr().out)
+
+    assert cli.main(
+        [
+            "scope",
+            "draft",
+            "--template",
+            "lab",
+            "--target-id",
+            "target.example",
+            "--hostname",
+            "example.com",
+            "--pack",
+            pack_alias,
+            "--out",
+            str(draft_path),
+        ]
+    ) == cli.EXIT_OK
+    assert json.loads(capsys.readouterr().out)["pack_id"] == pack_id
+
+    assert cli.main(
+        [
+            "scope",
+            "approve",
+            str(draft_path),
+            "--private-key",
+            key_result["private_key"],
+            "--out",
+            str(grant_path),
+        ]
+    ) == cli.EXIT_OK
+    capsys.readouterr()
+
+    assert cli.main(
+        [
+            "run",
+            "--authority",
+            str(grant_path),
+            "--trusted-key",
+            key_result["public_key"],
+            "--target",
+            "target.example",
+            "--pack",
+            pack_alias,
+            "--workspace",
+            str(workspace),
+        ]
+    ) == cli.EXIT_OK
+    result = json.loads(capsys.readouterr().out)
+    assert result["dispatch_performed"] is False
+    assert result["pack_id"] == pack_id
+    assert json.loads((workspace / "run.json").read_text(encoding="utf-8"))["pack_id"] == pack_id
+
+    assert cli.main(["pack", "doctor", pack_id]) == cli.EXIT_OK
+    pack_doctor = json.loads(capsys.readouterr().out)
+    assert pack_doctor["pack_id"] == pack_id
+    assert pack_doctor["live_dispatch_supported"] is False
+
+
+@pytest.mark.parametrize(
+    ("pack_alias", "pack_id"),
+    (
+        ("advanced-web", "pack.advanced_web"),
+        ("cloud", "pack.cloud.iam_oauth"),
+        ("mobile", "pack.mobile"),
+        ("web3", "pack.web3.future-fixture"),
+    ),
+)
+def test_candidate_pack_aliases_reject_live_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    pack_alias: str,
+    pack_id: str,
+) -> None:
+    authority_path, key_path = _authority_files(tmp_path, pack_ids=(pack_id,))
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    arguments = _run_arguments(authority_path, key_path)
+    arguments[arguments.index("--pack") + 1] = pack_alias
+
+    assert cli.main([*arguments, "--live"]) == cli.EXIT_UNAVAILABLE
+    assert f"manual-only pack {pack_id!r}" in capsys.readouterr().err
+
+
+def test_external_authorized_run_creates_manual_workspace_without_socket(
+    tmp_path: Path,
+) -> None:
+    now = datetime.now(UTC) - timedelta(minutes=1)
+    authority_path, key_path = _authority_files(
+        tmp_path / "grant",
+        hostnames=("example.com",),
+        now=now,
+    )
+    workspace = tmp_path / "customer-run"
+
+    process = _run_module(
+        _run_arguments(authority_path, key_path)
+        + ["--workspace", str(workspace)],
+        reject_sockets=True,
+    )
+
+    assert process.returncode == cli.EXIT_OK
+    assert process.stderr == ""
+    result = json.loads(process.stdout)
+    assert result == {
+        "authority_verified": True,
+        "dispatch_performed": False,
+        "grant_id": result["grant_id"],
+        "mode": "manual_authorized",
+        "network_access": "none",
+        "pack_id": "pack.web",
+        "run_id": result["run_id"],
+        "target_id": "target.lab",
+        "workspace": str(workspace),
+    }
+    manifest = json.loads((workspace / "run.json").read_text(encoding="utf-8"))
+    assert manifest["run_id"] == result["run_id"]
+    assert manifest["dispatch_performed"] is False
+    assert manifest["target"]["hostnames"] == ["example.com"]
+    assert len(manifest["authority_sha256"]) == 64
+    assert len(manifest["trusted_key_sha256"]) == 64
+    assert (workspace / "authority.json").read_bytes() == authority_path.read_bytes()
+    assert (workspace / "trusted-key.json").read_bytes() == key_path.read_bytes()
+    assert (workspace / "README.md").is_file()
+    for relative in (
+        "evidence/raw",
+        "evidence/normalized",
+        "findings",
+        "reports",
+    ):
+        assert (workspace / relative).is_dir()
+
+
+def test_manual_evidence_add_streams_file_and_records_digest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    authority_path, key_path = _authority_files(
+        tmp_path / "grant",
+        hostnames=("example.com",),
+    )
+    workspace = tmp_path / "customer-run"
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    assert cli.main(
+        _run_arguments(authority_path, key_path)
+        + ["--workspace", str(workspace)]
+    ) == cli.EXIT_OK
+    capsys.readouterr()
+    source = tmp_path / "burp-export.json"
+    source.write_bytes(b'{"request":"GET / HTTP/1.1","status":200}\n')
+
+    assert cli.main(
+        [
+            "evidence",
+            "add",
+            "--workspace",
+            str(workspace),
+            "--file",
+            str(source),
+            "--kind",
+            "burp",
+            "--title",
+            "Landing page response",
+        ]
+    ) == cli.EXIT_OK
+
+    result = json.loads(capsys.readouterr().out)
+    stored = Path(result["stored_file"])
+    record_path = Path(result["record"])
+    assert stored.parent == workspace / "evidence" / "raw"
+    assert stored.read_bytes() == source.read_bytes()
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    assert record["kind"] == "burp"
+    assert record["title"] == "Landing page response"
+    assert record["size_bytes"] == len(source.read_bytes())
+    assert record["sha256"] == result["sha256"]
+    assert len(record["sha256"]) == 64
+    assert record["run_id"].startswith("run.")
+
+    steps = tmp_path / "steps.txt"
+    steps.write_text(
+        "1. Send the recorded request.\n2. Observe the unauthorized response.\n",
+        encoding="utf-8",
+    )
+    assert cli.main(
+        [
+            "finding",
+            "new",
+            "--workspace",
+            str(workspace),
+            "--title",
+            "Unauthenticated data exposure",
+            "--severity",
+            "high",
+            "--summary",
+            "A public request returned private account data.",
+            "--impact",
+            "An unauthenticated party can read another account.",
+            "--steps-file",
+            str(steps),
+            "--remediation",
+            "Enforce object-level authorization before serialization.",
+            "--evidence",
+            result["evidence_id"],
+        ]
+    ) == cli.EXIT_OK
+    finding_result = json.loads(capsys.readouterr().out)
+    finding_path = Path(finding_result["finding"])
+    report = finding_path.read_text(encoding="utf-8")
+    assert "DRAFT — NOT INDEPENDENTLY VERIFIED" in report
+    assert "# Unauthenticated data exposure" in report
+    assert "Severity: **High**" in report
+    assert "Send the recorded request" in report
+    assert result["evidence_id"] in report
+    assert record["sha256"] in report
+    assert "example.com" in report
 
 
 @pytest.mark.parametrize(
@@ -767,7 +1128,7 @@ def test_unsigned_target_pack_url_and_non_loopback_are_denied(
     assert cli.main(_run_arguments(external_authority, external_key)) == cli.EXIT_AUTHORITY
 
 
-def test_live_mode_is_explicitly_unavailable_after_authority_validation(
+def test_live_mode_requires_controller_provisioning_after_authority_validation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -776,19 +1137,143 @@ def test_live_mode_is_explicitly_unavailable_after_authority_validation(
     monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
     arguments = _run_arguments(authority_path, key_path) + ["--live"]
     assert cli.main(arguments) == cli.EXIT_UNAVAILABLE
-    assert "live dispatch is unavailable" in capsys.readouterr().err
+    assert "controller-provisioned --gateway-bundle" in capsys.readouterr().err
+
+
+def test_gateway_provisioning_inputs_are_rejected_without_live_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    authority_path, key_path = _authority_files(tmp_path)
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+
+    assert cli.main(
+        _run_arguments(authority_path, key_path)
+        + ["--gateway-bundle", str(tmp_path / "bundle.json")]
+    ) == cli.EXIT_USAGE
+
+    assert "require --live" in capsys.readouterr().err
+
+
+def test_live_mode_dispatches_one_preapproved_command_through_launcher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import faultloom.execution as execution
+    from faultloom.execution import EndpointScheme, SemanticEndpoint, SemanticHttpRequest
+    from faultloom_protocol import SCHEMA_VERSION
+    from tests.runtime.execution_helpers import command, completed_result
+
+    grant = sample_models()["AuthorityGrant"]
+    target = grant.targets[0].model_copy(
+        update={
+            "target_id": "target.loopback",
+            "hostnames": ("localhost",),
+            "ports": (80,),
+            "protocols": ("http",),
+            "paths": ("/api/*",),
+        }
+    )
+    grant = grant.model_copy(
+        update={
+            "issued_at": NOW,
+            "not_before": NOW,
+            "expires_at": NOW + timedelta(hours=1),
+            "targets": (target,),
+            "execution_windows": (
+                grant.execution_windows[0].model_copy(
+                    update={"starts_at": NOW, "ends_at": NOW + timedelta(hours=1)}
+                ),
+            ),
+            "budget": grant.budget.model_copy(update={"max_request_bytes": 8192}),
+        }
+    )
+    signer = AuthoritySigner.from_private_bytes(bytes(range(32)))
+    envelope = sign_authority_grant(grant, signer, signed_at=NOW)
+    authority_path = tmp_path / "authority.json"
+    key_path = tmp_path / "authority-public-key.json"
+    authority_path.write_text(envelope.model_dump_json(), encoding="utf-8")
+    key_path.write_text(signer.public_key_record.model_dump_json(), encoding="utf-8")
+    approved = command(
+        request=SemanticHttpRequest(
+            schema_version=SCHEMA_VERSION,
+            endpoint=SemanticEndpoint(
+                schema_version=SCHEMA_VERSION,
+                scheme=EndpointScheme.HTTP,
+                hostname="localhost",
+                port=80,
+                path="/api/probe",
+            ),
+            method="GET",
+        )
+    )
+    approved = approved.model_copy(
+        update={
+            "lease": approved.lease.model_copy(
+                update={"authority_key_id": signer.key_id}
+            )
+        }
+    )
+    dispatch_path = tmp_path / "dispatch.json"
+    dispatch_path.write_text(approved.model_dump_json(), encoding="utf-8")
+    bundle_path = tmp_path / "bundle.json"
+    bundle_path.write_text("{}", encoding="utf-8")
+    observed: list[object] = []
+
+    class ProvisionedBundle:
+        @classmethod
+        def load(cls, path: Path) -> object:
+            observed.append(path)
+            return object()
+
+    class RecordingLauncher:
+        def __init__(self, bundle: object) -> None:
+            observed.append(bundle)
+
+        def __enter__(self) -> "RecordingLauncher":
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            observed.append("closed")
+
+        def dispatch(self, supplied: object) -> object:
+            observed.append(supplied)
+            return completed_result(approved)
+
+    monkeypatch.setattr(execution, "GatewayLaunchBundle", ProvisionedBundle)
+    monkeypatch.setattr(execution, "GatewayLauncher", RecordingLauncher)
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    arguments = [
+        "run",
+        "--authority",
+        str(authority_path),
+        "--trusted-key",
+        str(key_path),
+        "--target",
+        "target.loopback",
+        "--pack",
+        "web",
+        "--live",
+        "--gateway-bundle",
+        str(bundle_path),
+        "--dispatch-command",
+        str(dispatch_path),
+    ]
+
+    assert cli.main(arguments) == cli.EXIT_OK
+    result = json.loads(capsys.readouterr().out)
+    assert result["dispatch_performed"] is True
+    assert result["network_access"] == "gateway_only"
+    assert observed[0] == bundle_path
+    assert observed[-1] == "closed"
 
 
 @pytest.mark.parametrize(
     "arguments",
     (
-        ["key", "init"],
-        ["scope", "draft", "--template", "lab"],
-        ["scope", "approve", "draft.json", "--out", "grant.json"],
         ["scope", "revoke", "grant.1"],
-        ["pack", "list"],
-        ["pack", "doctor", "pack.web"],
-        ["pack", "test", "pack.web"],
         ["eval", "run", "manifest.json"],
     ),
 )

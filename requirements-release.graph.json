@@ -7,6 +7,11 @@
     "cryptography==41.0.7": [
       "cffi==2.1.0"
     ],
+    "greenlet==3.2.4": [],
+    "playwright==1.58.0": [
+      "greenlet==3.2.4",
+      "pyee==13.0.1"
+    ],
     "pycparser==3.0": [],
     "pydantic==2.12.5": [
       "annotated-types==0.7.0",
@@ -15,6 +20,9 @@
       "typing-inspection==0.4.2"
     ],
     "pydantic-core==2.41.5": [
+      "typing-extensions==4.16.0"
+    ],
+    "pyee==13.0.1": [
       "typing-extensions==4.16.0"
     ],
     "typing-extensions==4.16.0": [],

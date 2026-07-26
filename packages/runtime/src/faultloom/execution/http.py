@@ -30,6 +30,8 @@ class GatewayPort(Protocol):
 
     def reconcile(self, frame: GatewayDispatchFrame) -> GatewayResponseEnvelope | None: ...
 
+    def interrupt(self) -> None: ...
+
 
 class SemanticHttpExecutor:
     """Validate one approved semantic request and hand it only to the Gateway.
@@ -135,6 +137,9 @@ class SemanticHttpExecutor:
                     assert_never(unreachable)
         self._set_state(action_id, state)
         return envelope.result
+
+    def interrupt(self) -> None:
+        self._gateway.interrupt()
 
     def reconcile(self, action_id: str) -> GatewayResult | None:
         with self._lock:

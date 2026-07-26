@@ -1,6 +1,6 @@
 from faultloom_protocol import PackManifest, SCHEMA_VERSION
 
-from .descriptors import (
+from .ids import (
     ACTION_COMPILER_ID,
     EVALUATOR_ID,
     HYPOTHESIS_PROVIDER_ID,

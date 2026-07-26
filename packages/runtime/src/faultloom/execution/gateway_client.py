@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
-from typing import BinaryIO, assert_never
+from typing import BinaryIO, assert_never, cast
 
 from faultloom_protocol import (
     BudgetReservation,
@@ -152,15 +152,24 @@ class AuthenticatedGatewayClient:
         if process.poll() is not None:
             raise ExecutionContractError("Gateway process is not running")
         args = process.args
-        if type(args) not in (tuple, list) or not args or "--supervised-stdio" not in args:
+        if type(args) not in (tuple, list):
             raise ExecutionContractError("Gateway process is not in supervised stdio mode")
-        executable = args[0]
+        text_args = cast(tuple[object, ...] | list[object], args)
+        if not text_args or "--supervised-stdio" not in text_args:
+            raise ExecutionContractError("Gateway process is not in supervised stdio mode")
+        executable = text_args[0]
         if type(executable) is not str:
             raise ExecutionContractError("Gateway executable path is not canonical text")
         digest = f"sha256:{hashlib.sha256(Path(executable).read_bytes()).hexdigest()}"
         if not hmac.compare_digest(digest, expected_binary_digest):
             raise ExecutionContractError("Gateway executable digest differs from the pinned RC")
-        self._initialize(process.stdout, process.stdin, channel, now_millis)
+        self._process = process
+        self._initialize(
+            cast(BinaryIO, process.stdout),
+            cast(BinaryIO, process.stdin),
+            channel,
+            now_millis,
+        )
 
     def _initialize(
         self,
@@ -204,6 +213,22 @@ class AuthenticatedGatewayClient:
         raise GatewayChannelError(
             "unknown outcomes require the T18 signed reconciliation control plane"
         )
+
+    def interrupt(self) -> None:
+        process = self._process
+        if process.poll() is not None:
+            return
+        try:
+            process.terminate()
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired as exc:
+                raise GatewayChannelError("Gateway process did not terminate") from exc
+        except OSError as exc:
+            raise GatewayChannelError("Gateway process interrupt failed") from exc
 
     def close(self) -> None:
         self._writer.close()

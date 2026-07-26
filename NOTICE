@@ -13,6 +13,7 @@ history is grafted into this repository. Any subsequently migrated source must
 retain file-level provenance and the following legacy notice:
 
   MIT License
+
   Copyright (c) 2026 Terminator Project Contributors
 
   Permission is hereby granted, free of charge, to any person obtaining a copy

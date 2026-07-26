@@ -3,28 +3,46 @@
 from __future__ import annotations
 
 import argparse
+from fnmatch import fnmatchcase
+import hashlib
 import ipaddress
 import json
 import os
+import secrets
 import stat
 import sys
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TypeVar
 
 from faultloom_protocol import (
     PROTOCOL_VERSION,
+    SCHEMA_VERSION,
+    ActionBudget,
+    ActionClass,
+    ActionPolicy,
+    AuthorityGrant,
+    AuthoritySigner,
+    CallbackPolicy,
     Ed25519PublicKeyRecord,
+    ExplicitDeny,
+    ProviderPolicy,
     ProtocolModel,
+    RetentionPolicy,
+    ScopeContractDraft,
     SignedAuthorityGrant,
+    StateChangePolicy,
+    TargetAsset,
+    TimeWindow,
+    sha256_digest,
+    sign_authority_grant,
     verify_authority_grant,
 )
 from faultloom_protocol.signing import SignatureVerificationError
 
 from . import __version__
 from .adapter_cli import configure_adapter_parser
-from .resume_cli import ResumeCliError, ResumeOperation, configure_resume_parser
 from .verification_cli import (
     VerificationCliDependencies,
     VerificationCliError,
@@ -38,8 +56,17 @@ EXIT_AUTHORITY = 4
 MAX_PROTOCOL_FILE_BYTES = 1024 * 1024
 MAX_PROTOCOL_JSON_DEPTH = 128
 PROTOCOL_READ_CHUNK_BYTES = 64 * 1024
+EVIDENCE_COPY_CHUNK_BYTES = 1024 * 1024
 TRUSTED_KEY_ENV = "FAULTLOOM_TRUSTED_AUTHORITY_KEY"
-PACK_IDS = {"web": "pack.web", "llm": "pack.llm"}
+PACK_IDS = {
+    "web": "pack.web",
+    "llm": "pack.llm.agent",
+    "advanced-web": "pack.advanced_web",
+    "cloud": "pack.cloud.iam_oauth",
+    "mobile": "pack.mobile",
+    "web3": "pack.web3.future-fixture",
+}
+LIVE_PACK_IDS = frozenset({"pack.web"})
 
 ModelT = TypeVar("ModelT", bound=ProtocolModel)
 
@@ -53,6 +80,9 @@ _FILE_STAT_FIELDS = (
     "st_size",
     "st_mtime_ns",
     "st_ctime_ns",
+)
+_WINDOWS_FILE_STAT_FIELDS = tuple(
+    field for field in _FILE_STAT_FIELDS if field != "st_ctime_ns"
 )
 _DIRECTORY_STAT_FIELDS = ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid")
 
@@ -97,6 +127,13 @@ def _positive_int(value: str) -> int:
         raise argparse.ArgumentTypeError("must be a positive integer") from exc
     if parsed < 1:
         raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _port(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed > 65535:
+        raise argparse.ArgumentTypeError("must be a TCP port between 1 and 65535")
     return parsed
 
 
@@ -381,6 +418,16 @@ def _capture_protocol_file_pair(
     *,
     private_second: bool = False,
 ) -> tuple[bytes, bytes]:
+    if os.name == "nt":
+        key_snapshot = _snapshot_windows_protocol_file(key_path)
+        authority_snapshot = _snapshot_windows_protocol_file(authority_path)
+        authority_content = _read_windows_protocol_file(
+            authority_path,
+            authority_snapshot,
+        )
+        key_content = _read_windows_protocol_file(key_path, key_snapshot)
+        return authority_content, key_content
+
     key_snapshot = _snapshot_protocol_file_path(key_path)
     if private_second:
         mode = stat.S_IMODE(key_snapshot.leaf_stat.st_mode)
@@ -408,6 +455,70 @@ def _capture_protocol_file_pair(
             _close_bound_protocol_file(authority)
     finally:
         _close_bound_protocol_file(key)
+
+
+def _snapshot_windows_protocol_file(path: Path) -> os.stat_result:
+    try:
+        metadata = path.lstat()
+        _require_regular_single_link(path, metadata)
+        if metadata.st_size > MAX_PROTOCOL_FILE_BYTES:
+            raise _protocol_file_error(
+                path,
+                f"input exceeds {MAX_PROTOCOL_FILE_BYTES} bytes",
+            )
+        return metadata
+    except CliError:
+        raise
+    except OSError as exc:
+        raise _protocol_file_error(path, str(exc)) from exc
+
+
+def _read_windows_protocol_file(
+    path: Path,
+    expected: os.stat_result,
+) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        with path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if not _stat_matches(expected, opened, _WINDOWS_FILE_STAT_FIELDS):
+                raise _protocol_file_error(path, "input changed before opening")
+            while total <= MAX_PROTOCOL_FILE_BYTES:
+                requested = min(
+                    PROTOCOL_READ_CHUNK_BYTES,
+                    MAX_PROTOCOL_FILE_BYTES + 1 - total,
+                )
+                chunk = stream.read(requested)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+            current = os.fstat(stream.fileno())
+        final = path.lstat()
+    except CliError:
+        raise
+    except OSError as exc:
+        raise _protocol_file_error(path, str(exc)) from exc
+    if total > MAX_PROTOCOL_FILE_BYTES:
+        raise _protocol_file_error(
+            path,
+            f"input exceeds {MAX_PROTOCOL_FILE_BYTES} bytes",
+        )
+    if (
+        total != expected.st_size
+        or not _stat_matches(expected, current, _WINDOWS_FILE_STAT_FIELDS)
+        or not _stat_matches(expected, final, _WINDOWS_FILE_STAT_FIELDS)
+    ):
+        raise _protocol_file_error(path, "input changed while reading")
+    return b"".join(chunks)
+
+
+def _capture_public_protocol_file_pair(
+    first_path: Path,
+    second_path: Path,
+) -> tuple[bytes, bytes]:
+    return _capture_protocol_file_pair(first_path, second_path)
 
 
 def _validate_json_depth(text: str) -> None:
@@ -554,11 +665,292 @@ def _emit_json(value: object) -> None:
     print(json.dumps(value, sort_keys=True, separators=(",", ":")))
 
 
+def _write_new_file(path: Path, content: bytes, *, mode: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        descriptor = os.open(path, flags, mode)
+    except OSError as exc:
+        raise CliError(f"cannot create {path}: {exc}", exit_code=EXIT_USAGE) from exc
+    try:
+        offset = 0
+        while offset < len(content):
+            offset += os.write(descriptor, content[offset:])
+        os.fsync(descriptor)
+    except OSError as exc:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise CliError(f"cannot write {path}: {exc}", exit_code=EXIT_USAGE) from exc
+    finally:
+        os.close(descriptor)
+    try:
+        os.chmod(path, mode)
+    except OSError as exc:
+        raise CliError(f"cannot set permissions on {path}: {exc}", exit_code=EXIT_USAGE) from exc
+
+
+def _write_protocol_model(path: Path, model: ProtocolModel, *, mode: int = 0o600) -> None:
+    _write_new_file(
+        path,
+        (model.model_dump_json(indent=2) + "\n").encode("utf-8"),
+        mode=mode,
+    )
+
+
+def _key_init(arguments: argparse.Namespace) -> int:
+    root: Path = arguments.out_dir
+    try:
+        root.mkdir(parents=True, exist_ok=False, mode=0o700)
+    except OSError as exc:
+        raise CliError(
+            f"cannot create new authority directory {root}: {exc}",
+            exit_code=EXIT_USAGE,
+        ) from exc
+    seed = secrets.token_bytes(32)
+    signer = AuthoritySigner.from_private_bytes(seed)
+    private_path = root / "authority-private.key"
+    public_path = root / "authority-public-key.json"
+    _write_new_file(private_path, seed.hex().encode("ascii") + b"\n", mode=0o600)
+    _write_protocol_model(public_path, signer.public_key_record, mode=0o644)
+    _emit_json(
+        {
+            "key_id": signer.key_id,
+            "private_key": str(private_path),
+            "public_key": str(public_path),
+        }
+    )
+    return EXIT_OK
+
+
+def _scope_draft(arguments: argparse.Namespace) -> int:
+    now = _utc_now()
+    ends_at = now + timedelta(hours=arguments.duration_hours)
+    methods = tuple(arguments.method or ("GET", "HEAD", "OPTIONS"))
+    paths = tuple(arguments.path or ("/*",))
+    hostnames = tuple(arguments.hostname or ())
+    cidrs = tuple(arguments.cidr or ())
+    pack_id = PACK_IDS[arguments.pack]
+    try:
+        target = TargetAsset(
+            schema_version=SCHEMA_VERSION,
+            target_id=arguments.target_id,
+            hostnames=hostnames,
+            cidrs=cidrs,
+            ports=tuple(arguments.port or (443,)),
+            protocols=("https",),
+            paths=paths,
+            methods=methods,
+        )
+        policy = ActionPolicy(
+            schema_version=SCHEMA_VERSION,
+            allowed_classes=(ActionClass.OBSERVE, ActionClass.SAFE_PROBE),
+            allowed_families=("http.semantic", "browser.observe"),
+            allowed_methods=methods,
+            allowed_path_patterns=paths,
+            denied=(
+                ExplicitDeny(
+                    schema_version=SCHEMA_VERSION,
+                    deny_id="deny.external-message",
+                    target_id=arguments.target_id,
+                    action_families=("external_message",),
+                    reason="External messages are not approved by the default template.",
+                ),
+            ),
+        )
+        draft = ScopeContractDraft(
+            schema_version=SCHEMA_VERSION,
+            draft_id=f"draft.{arguments.target_id}",
+            revision=1,
+            title=arguments.title,
+            created_at=now,
+            created_by=arguments.operator,
+            targets=(target,),
+            adapter_ids=("adapter.http",),
+            action_policy=policy,
+            identities=("identity.operator",),
+            execution_windows=(
+                TimeWindow(schema_version=SCHEMA_VERSION, starts_at=now, ends_at=ends_at),
+            ),
+            budget=ActionBudget(
+                schema_version=SCHEMA_VERSION,
+                total_actions=500,
+                rate_per_minute=30,
+                max_concurrency=2,
+                max_request_bytes=1024 * 1024,
+                max_response_bytes=10 * 1024 * 1024,
+                max_duration_seconds=120,
+            ),
+            callback_policy=CallbackPolicy(
+                schema_version=SCHEMA_VERSION,
+                maximum_ttl_seconds=300,
+            ),
+            provider_policy=ProviderPolicy(
+                schema_version=SCHEMA_VERSION,
+                allowed_providers=("provider.manual",),
+                allowed_model_snapshots=("operator-selected",),
+                data_policy_id="policy.operator-controlled",
+            ),
+            retention_policy=RetentionPolicy(
+                schema_version=SCHEMA_VERSION,
+                policy_id="retention.30-days",
+                retain_until=now + timedelta(days=30),
+                delete_after_seconds=30 * 24 * 60 * 60,
+            ),
+            state_change_policy=StateChangePolicy(schema_version=SCHEMA_VERSION),
+            emergency_contact_ref="contact.operator-stop",
+            notes=(f"faultloom.pack:{pack_id}", f"faultloom.template:{arguments.template}"),
+        )
+    except ValueError as exc:
+        raise CliError(f"invalid scope draft: {exc}", exit_code=EXIT_USAGE) from exc
+    _write_protocol_model(arguments.out, draft)
+    _emit_json({"draft": str(arguments.out), "pack_id": pack_id, "target_id": target.target_id})
+    return EXIT_OK
+
+
+def _private_signer(path: Path, content: bytes) -> AuthoritySigner:
+    try:
+        text = content.decode("ascii")
+        if text.endswith("\r\n"):
+            text = text[:-2]
+        elif text.endswith("\n"):
+            text = text[:-1]
+        if len(text) != 64 or any(character not in "0123456789abcdef" for character in text):
+            raise ValueError("expected one lowercase 64-character hex seed")
+        return AuthoritySigner.from_private_bytes(bytes.fromhex(text))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise CliError(f"invalid private key file {path}: {exc}", exit_code=EXIT_AUTHORITY) from exc
+
+
+def _scope_approve(arguments: argparse.Namespace) -> int:
+    draft_content, private_content = _capture_protocol_file_pair(
+        arguments.draft,
+        arguments.private_key,
+        private_second=True,
+    )
+    draft = _parse_protocol_file(arguments.draft, draft_content, ScopeContractDraft)
+    signer = _private_signer(arguments.private_key, private_content)
+    now = _utc_now()
+    pack_notes = tuple(
+        note.removeprefix("faultloom.pack:")
+        for note in draft.notes
+        if note.startswith("faultloom.pack:")
+    )
+    pack_ids = pack_notes or ("pack.web",)
+    grant_id = arguments.grant_id or f"grant.{draft.draft_id.removeprefix('draft.')}"
+    try:
+        grant = AuthorityGrant(
+            schema_version=SCHEMA_VERSION,
+            grant_id=grant_id,
+            grant_version=1,
+            draft_digest=sha256_digest(draft),
+            issued_at=now,
+            not_before=now,
+            expires_at=max(window.ends_at for window in draft.execution_windows),
+            issued_to=arguments.issued_to,
+            approved_by=arguments.approved_by,
+            targets=draft.targets,
+            pack_ids=pack_ids,
+            adapter_ids=draft.adapter_ids,
+            action_policy=draft.action_policy,
+            identities=draft.identities,
+            roles=("role.operator",),
+            tenants=draft.tenants,
+            execution_windows=draft.execution_windows,
+            budget=draft.budget,
+            callback_policy=draft.callback_policy,
+            provider_policy=draft.provider_policy,
+            retention_policy=draft.retention_policy,
+            state_change_policy=draft.state_change_policy,
+            emergency_contact_ref=draft.emergency_contact_ref,
+        )
+        envelope = sign_authority_grant(grant, signer, signed_at=now)
+    except ValueError as exc:
+        raise CliError(f"cannot approve scope draft: {exc}", exit_code=EXIT_USAGE) from exc
+    _write_protocol_model(arguments.out, envelope)
+    _emit_json(
+        {
+            "authority": str(arguments.out),
+            "grant_id": grant.grant_id,
+            "key_id": signer.key_id,
+        }
+    )
+    return EXIT_OK
+
+
+def _pack_manifest(pack_id: str) -> ProtocolModel:
+    normalized = PACK_IDS.get(pack_id, pack_id)
+    if normalized == "pack.web":
+        from faultloom_web.web_api.manifest import web_api_manifest
+
+        return web_api_manifest()
+    if normalized == "pack.llm.agent":
+        from faultloom_llm.manifest import llm_agent_manifest
+
+        return llm_agent_manifest()
+    if normalized == "pack.advanced_web":
+        from faultloom_advanced_web.manifest import advanced_web_manifest
+
+        return advanced_web_manifest()
+    if normalized == "pack.cloud.iam_oauth":
+        from faultloom_cloud.manifest import cloud_iam_oauth_manifest
+
+        return cloud_iam_oauth_manifest()
+    if normalized == "pack.mobile":
+        from faultloom_mobile.manifest import mobile_manifest
+
+        return mobile_manifest()
+    if normalized == "pack.web3.future-fixture":
+        from faultloom_web3.manifest import web3_pack_manifest
+
+        return web3_pack_manifest()
+    raise CliError(f"unknown pack {pack_id!r}", exit_code=EXIT_USAGE)
+
+
+def _pack_list(_: argparse.Namespace) -> int:
+    manifests = [_pack_manifest(pack_id) for pack_id in sorted(PACK_IDS.values())]
+    _emit_json(
+        {
+            "packs": [
+                {
+                    "live_dispatch_supported": manifest.pack_id in LIVE_PACK_IDS,
+                    "pack_id": manifest.pack_id,
+                    "pack_version": manifest.pack_version,
+                }
+                for manifest in manifests
+            ]
+        }
+    )
+    return EXIT_OK
+
+
+def _pack_check(arguments: argparse.Namespace) -> int:
+    manifest = _pack_manifest(arguments.pack_id)
+    _emit_json(
+        {
+            "capability_count": len(manifest.capability_descriptors),
+            "live_dispatch_supported": manifest.pack_id in LIVE_PACK_IDS,
+            "ok": True,
+            "pack_id": manifest.pack_id,
+            "pack_version": manifest.pack_version,
+            "protocol_range": manifest.protocol_range,
+        }
+    )
+    return EXIT_OK
+
+
 def _doctor(arguments: argparse.Namespace) -> int:
+    live_supported = os.name == "posix"
+    live_mode = "controller_provisioned_single_dispatch" if live_supported else "manual_only"
+    network_access = "gateway_only" if live_supported else "none"
     result = {
         "component": "faultloom",
-        "live_dispatch_enabled": False,
-        "network_access": "none",
+        "live_dispatch_enabled": live_supported,
+        "live_dispatch_mode": live_mode,
+        "network_access": network_access,
         "ok": True,
         "protocol_version": PROTOCOL_VERSION,
         "runtime_version": __version__,
@@ -568,8 +960,525 @@ def _doctor(arguments: argparse.Namespace) -> int:
     else:
         print("FaultLoom doctor: ok")
         print(f"runtime={__version__} protocol={PROTOCOL_VERSION}")
-        print("live_dispatch=disabled network_access=none")
+        state = "enabled" if live_supported else "disabled"
+        print(f"live_dispatch={state} mode={live_mode} network_access={network_access}")
     return EXIT_OK
+
+
+def _create_manual_workspace(
+    workspace: Path,
+    *,
+    authority_content: bytes,
+    key_content: bytes,
+    grant: AuthorityGrant,
+    target: TargetAsset,
+    pack_id: str,
+    now: datetime,
+) -> dict[str, object]:
+    try:
+        workspace.mkdir(parents=True, exist_ok=False, mode=0o700)
+        os.chmod(workspace, 0o700)
+        for relative in (
+            "evidence/raw",
+            "evidence/normalized",
+            "findings",
+            "reports",
+        ):
+            (workspace / relative).mkdir(parents=True, mode=0o700)
+    except OSError as exc:
+        raise CliError(
+            f"cannot create new run workspace {workspace}: {exc}",
+            exit_code=EXIT_USAGE,
+        ) from exc
+
+    run_id = f"run.{now:%Y%m%dT%H%M%SZ}.{secrets.token_hex(4)}"
+    manifest: dict[str, object] = {
+        "schema": "faultloom.manual-run.v1",
+        "run_id": run_id,
+        "created_at": now.isoformat().replace("+00:00", "Z"),
+        "mode": "manual_authorized",
+        "dispatch_performed": False,
+        "network_access": "none",
+        "grant_id": grant.grant_id,
+        "grant_version": grant.grant_version,
+        "authority_sha256": hashlib.sha256(authority_content).hexdigest(),
+        "trusted_key_sha256": hashlib.sha256(key_content).hexdigest(),
+        "target": target.model_dump(mode="json"),
+        "pack_id": pack_id,
+        "action_policy": grant.action_policy.model_dump(mode="json"),
+        "budget": grant.budget.model_dump(mode="json"),
+        "execution_windows": [
+            window.model_dump(mode="json") for window in grant.execution_windows
+        ],
+    }
+    target_summary = json.dumps(
+        target.model_dump(mode="json"),
+        indent=2,
+        sort_keys=True,
+    )
+    methods = ", ".join(grant.action_policy.allowed_methods)
+    paths = ", ".join(grant.action_policy.allowed_path_patterns)
+    readme = f"""# FaultLoom authorized manual run
+
+- Run: `{run_id}`
+- Grant: `{grant.grant_id}`
+- Pack: `{pack_id}`
+
+This workspace authorizes manual research only within the signed scope below.
+FaultLoom did not open a network socket or dispatch an action when creating it.
+
+## Working rules
+
+- Use only the listed target, ports, methods, and paths.
+- Allowed HTTP methods: {methods}
+- Allowed path patterns: {paths}
+- Keep request/response exports and screenshots in `evidence/raw/`.
+- Put cleaned evidence in `evidence/normalized/` and draft findings in `findings/`.
+- Do not perform destructive changes, high-load testing, payments, or external messages.
+- Do not store passwords, session cookies, API keys, or private signing keys here.
+- Stop when the signed execution window or program authorization expires.
+
+## Signed target
+
+```json
+{target_summary}
+```
+"""
+    _write_new_file(workspace / "authority.json", authority_content, mode=0o600)
+    _write_new_file(workspace / "trusted-key.json", key_content, mode=0o600)
+    _write_new_file(
+        workspace / "README.md",
+        readme.encode("utf-8"),
+        mode=0o600,
+    )
+    _write_new_file(
+        workspace / "run.json",
+        (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+        mode=0o600,
+    )
+    return manifest
+
+
+def _load_manual_workspace(workspace: Path) -> dict[str, object]:
+    manifest_path = workspace / "run.json"
+    try:
+        metadata = manifest_path.stat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("run.json is not a regular file")
+        if metadata.st_size > MAX_PROTOCOL_FILE_BYTES:
+            raise ValueError("run.json is too large")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise CliError(
+            f"invalid manual run workspace {workspace}: {exc}",
+            exit_code=EXIT_USAGE,
+        ) from exc
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema") != "faultloom.manual-run.v1"
+        or not isinstance(manifest.get("run_id"), str)
+    ):
+        raise CliError(
+            f"invalid manual run workspace {workspace}: unsupported run.json",
+            exit_code=EXIT_USAGE,
+        )
+    return manifest
+
+
+def _evidence_add(arguments: argparse.Namespace) -> int:
+    manifest = _load_manual_workspace(arguments.workspace)
+    source: Path = arguments.file
+    try:
+        source_metadata = source.stat()
+    except OSError as exc:
+        raise CliError(f"cannot read evidence file {source}: {exc}", exit_code=EXIT_USAGE) from exc
+    if not stat.S_ISREG(source_metadata.st_mode):
+        raise CliError(
+            f"evidence source is not a regular file: {source}",
+            exit_code=EXIT_USAGE,
+        )
+
+    now = _utc_now()
+    evidence_id = f"evidence.{now:%Y%m%dT%H%M%SZ}.{secrets.token_hex(4)}"
+    suffix = source.suffix.lower()
+    if not (
+        1 < len(suffix) <= 10
+        and suffix.startswith(".")
+        and suffix[1:].isalnum()
+        and suffix.isascii()
+    ):
+        suffix = ".bin"
+    destination = (
+        arguments.workspace / "evidence" / "raw" / f"{evidence_id}.data{suffix}"
+    )
+    record_path = arguments.workspace / "evidence" / "raw" / f"{evidence_id}.json"
+    digest = hashlib.sha256()
+    size_bytes = 0
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        descriptor = os.open(destination, flags, 0o600)
+        try:
+            with source.open("rb") as stream:
+                while chunk := stream.read(EVIDENCE_COPY_CHUNK_BYTES):
+                    digest.update(chunk)
+                    size_bytes += len(chunk)
+                    offset = 0
+                    while offset < len(chunk):
+                        offset += os.write(descriptor, chunk[offset:])
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError as exc:
+        try:
+            destination.unlink()
+        except OSError:
+            pass
+        raise CliError(f"cannot store evidence file {source}: {exc}", exit_code=EXIT_USAGE) from exc
+
+    record = {
+        "schema": "faultloom.manual-evidence.v1",
+        "evidence_id": evidence_id,
+        "run_id": manifest["run_id"],
+        "created_at": now.isoformat().replace("+00:00", "Z"),
+        "kind": arguments.kind,
+        "title": arguments.title or source.name,
+        "original_name": source.name,
+        "stored_file": destination.name,
+        "size_bytes": size_bytes,
+        "sha256": digest.hexdigest(),
+    }
+    _write_new_file(
+        record_path,
+        (json.dumps(record, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+        mode=0o600,
+    )
+    _emit_json(
+        {
+            "evidence_id": evidence_id,
+            "record": str(record_path),
+            "sha256": record["sha256"],
+            "stored_file": str(destination),
+        }
+    )
+    return EXIT_OK
+
+
+def _read_small_text(path: Path, *, label: str) -> str:
+    try:
+        metadata = path.stat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("not a regular file")
+        if metadata.st_size > MAX_PROTOCOL_FILE_BYTES:
+            raise ValueError(f"exceeds {MAX_PROTOCOL_FILE_BYTES} bytes")
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise CliError(f"invalid {label} file {path}: {exc}", exit_code=EXIT_USAGE) from exc
+
+
+def _workspace_evidence(
+    workspace: Path,
+    *,
+    run_id: str,
+    selected_ids: tuple[str, ...],
+) -> list[dict[str, object]]:
+    records: dict[str, dict[str, object]] = {}
+    raw_directory = workspace / "evidence" / "raw"
+    try:
+        record_paths = sorted(raw_directory.glob("evidence.*.json"))
+    except OSError as exc:
+        raise CliError(f"cannot list workspace evidence: {exc}", exit_code=EXIT_USAGE) from exc
+    for record_path in record_paths:
+        try:
+            metadata = record_path.stat()
+            if metadata.st_size > MAX_PROTOCOL_FILE_BYTES:
+                continue
+            value = json.loads(record_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(value, dict)
+            and value.get("schema") == "faultloom.manual-evidence.v1"
+            and value.get("run_id") == run_id
+            and isinstance(value.get("evidence_id"), str)
+        ):
+            records[str(value["evidence_id"])] = value
+    wanted = selected_ids or tuple(sorted(records))
+    missing = [evidence_id for evidence_id in wanted if evidence_id not in records]
+    if missing:
+        raise CliError(
+            "unknown evidence id(s) for this workspace: " + ", ".join(missing),
+            exit_code=EXIT_USAGE,
+        )
+    return [records[evidence_id] for evidence_id in wanted]
+
+
+def _finding_new(arguments: argparse.Namespace) -> int:
+    manifest = _load_manual_workspace(arguments.workspace)
+    run_id = str(manifest["run_id"])
+    evidence = _workspace_evidence(
+        arguments.workspace,
+        run_id=run_id,
+        selected_ids=tuple(arguments.evidence or ()),
+    )
+    now = _utc_now()
+    finding_id = f"finding.{now:%Y%m%dT%H%M%SZ}.{secrets.token_hex(4)}"
+    steps = (
+        _read_small_text(arguments.steps_file, label="reproduction steps").strip()
+        if arguments.steps_file is not None
+        else "[Add exact, repeatable steps here.]"
+    )
+    target = manifest.get("target")
+    target_text = json.dumps(target, indent=2, sort_keys=True)
+    evidence_lines = [
+        "- `{evidence_id}` — {kind} — SHA-256 `{sha256}` — `{stored_file}`".format(
+            evidence_id=item.get("evidence_id", "unknown"),
+            kind=item.get("kind", "other"),
+            sha256=item.get("sha256", "unknown"),
+            stored_file=item.get("stored_file", "unknown"),
+        )
+        for item in evidence
+    ]
+    if not evidence_lines:
+        evidence_lines.append("- [Add evidence with `faultloom evidence add`.]")
+    summary = arguments.summary or "[Describe the vulnerability and affected component.]"
+    impact = arguments.impact or "[Describe realistic security and business impact.]"
+    remediation = arguments.remediation or "[Describe the smallest effective fix.]"
+    markdown = f"""# {arguments.title}
+
+> DRAFT — NOT INDEPENDENTLY VERIFIED
+
+- Severity: **{arguments.severity.title()}**
+- Finding ID: `{finding_id}`
+- Run ID: `{run_id}`
+- Signed grant: `{manifest.get('grant_id', 'unknown')}`
+
+## Summary
+
+{summary}
+
+## Impact
+
+{impact}
+
+## Steps to reproduce
+
+{steps}
+
+## Evidence
+
+{chr(10).join(evidence_lines)}
+
+## Remediation
+
+{remediation}
+
+## Authorized target
+
+```json
+{target_text}
+```
+
+## Scope statement
+
+Testing was performed manually under the signed FaultLoom grant stored with this run.
+This draft does not claim independent verification or automatic exploit execution.
+"""
+    record = {
+        "schema": "faultloom.manual-finding.v1",
+        "finding_id": finding_id,
+        "run_id": run_id,
+        "created_at": now.isoformat().replace("+00:00", "Z"),
+        "status": "draft_unverified",
+        "title": arguments.title,
+        "severity": arguments.severity,
+        "summary": summary,
+        "impact": impact,
+        "steps_to_reproduce": steps,
+        "remediation": remediation,
+        "evidence_ids": [item["evidence_id"] for item in evidence],
+    }
+    markdown_path = arguments.workspace / "findings" / f"{finding_id}.md"
+    record_path = arguments.workspace / "findings" / f"{finding_id}.json"
+    _write_new_file(markdown_path, markdown.encode("utf-8"), mode=0o600)
+    _write_new_file(
+        record_path,
+        (json.dumps(record, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+        mode=0o600,
+    )
+    _emit_json(
+        {
+            "finding": str(markdown_path),
+            "finding_id": finding_id,
+            "record": str(record_path),
+            "status": "draft_unverified",
+        }
+    )
+    return EXIT_OK
+
+
+def _capture_single_protocol_file(path: Path) -> bytes:
+    if os.name == "nt":
+        snapshot = _snapshot_windows_protocol_file(path)
+        return _read_windows_protocol_file(path, snapshot)
+    snapshot = _snapshot_protocol_file_path(path)
+    bound = _open_bound_protocol_file(snapshot)
+    try:
+        content = _read_bound_protocol_file(bound)
+        _reconcile_bound_protocol_file(bound)
+        return content
+    finally:
+        _close_bound_protocol_file(bound)
+
+
+def _path_matches(pattern: str, path: str) -> bool:
+    return path.startswith(pattern[:-1]) if pattern.endswith("*") else path == pattern
+
+
+def _validate_live_command(
+    command: object,
+    *,
+    grant: AuthorityGrant,
+    target: TargetAsset,
+    pack_id: str,
+    authority_key_id: str,
+    now: datetime,
+) -> None:
+    from .execution import GatewayDispatchCommand
+
+    if type(command) is not GatewayDispatchCommand:
+        raise CliError("live dispatch command has an invalid exact type", exit_code=EXIT_AUTHORITY)
+    intent = command.intent
+    request = command.request
+    lease = command.lease
+    policy = grant.action_policy
+    endpoint = request.endpoint
+    if (
+        command.decision.grant_id != grant.grant_id
+        or command.decision.grant_version != grant.grant_version
+        or lease.grant_id != grant.grant_id
+        or lease.grant_version != grant.grant_version
+        or lease.authority_key_id != authority_key_id
+    ):
+        raise CliError(
+            "live command is not bound to the verified authority grant",
+            exit_code=EXIT_AUTHORITY,
+        )
+    if intent.target_id != target.target_id or lease.target_id != target.target_id:
+        raise CliError(
+            "live command is not bound to the selected signed target",
+            exit_code=EXIT_AUTHORITY,
+        )
+    if intent.pack_id != pack_id:
+        raise CliError(
+            "live command pack differs from the selected signed pack",
+            exit_code=EXIT_AUTHORITY,
+        )
+    if (
+        intent.action_class not in policy.allowed_classes
+        or intent.action_kind not in policy.allowed_families
+        or (policy.allowed_methods and request.method not in policy.allowed_methods)
+        or (
+            policy.allowed_path_patterns
+            and not any(
+                _path_matches(pattern, endpoint.path)
+                for pattern in policy.allowed_path_patterns
+            )
+        )
+    ):
+        raise CliError(
+            "live command action is outside the signed action policy",
+            exit_code=EXIT_AUTHORITY,
+        )
+    if any(
+        (deny.target_id is None or deny.target_id == target.target_id)
+        and (not deny.action_families or intent.action_kind in deny.action_families)
+        and (not deny.methods or request.method in deny.methods)
+        and (deny.path_pattern is None or _path_matches(deny.path_pattern, endpoint.path))
+        and (
+            deny.host_pattern is None
+            or any(fnmatchcase(host, deny.host_pattern) for host in target.hostnames)
+        )
+        for deny in policy.denied
+    ):
+        raise CliError("live command matches an explicit signed deny", exit_code=EXIT_AUTHORITY)
+    host_allowed = endpoint.hostname in target.hostnames
+    if not host_allowed:
+        try:
+            address = ipaddress.ip_address(endpoint.hostname)
+            host_allowed = any(address in ipaddress.ip_network(cidr) for cidr in target.cidrs)
+        except ValueError:
+            host_allowed = False
+    if (
+        not host_allowed
+        or (target.ports and endpoint.port not in target.ports)
+        or (target.protocols and endpoint.scheme.value not in target.protocols)
+        or (target.methods and request.method not in target.methods)
+        or (
+            target.paths
+            and not any(_path_matches(pattern, endpoint.path) for pattern in target.paths)
+        )
+    ):
+        raise CliError(
+            "live command endpoint is outside the selected signed target",
+            exit_code=EXIT_AUTHORITY,
+        )
+    if command.identity.identity_id not in grant.identities:
+        raise CliError(
+            "live command identity is outside the signed grant",
+            exit_code=EXIT_AUTHORITY,
+        )
+    if grant.tenants and command.identity.tenant_id not in grant.tenants:
+        raise CliError("live command tenant is outside the signed grant", exit_code=EXIT_AUTHORITY)
+    reservation = lease.reservation
+    budget = grant.budget
+    if (
+        reservation.request_bytes > budget.max_request_bytes
+        or reservation.response_bytes > budget.max_response_bytes
+        or reservation.duration_seconds > budget.max_duration_seconds
+    ):
+        raise CliError(
+            "live command reservation exceeds the signed budget",
+            exit_code=EXIT_AUTHORITY,
+        )
+    active_window_ends = [
+        window.ends_at
+        for window in grant.execution_windows
+        if window.starts_at <= now < window.ends_at
+    ]
+    if (
+        lease.issued_at > now
+        or now >= lease.expires_at
+        or lease.expires_at > grant.expires_at
+        or not active_window_ends
+        or lease.expires_at > max(active_window_ends)
+    ):
+        raise CliError(
+            "live command lease is outside the signed execution window",
+            exit_code=EXIT_AUTHORITY,
+        )
+
+
+def _validate_external_live_workspace(
+    workspace: Path | None,
+    bundle: Path,
+    command: Path,
+) -> None:
+    if workspace is None:
+        raise CliError("external live dispatch requires --workspace", exit_code=EXIT_AUTHORITY)
+    try:
+        metadata = workspace.stat()
+        root = workspace.resolve(strict=True)
+        bundle.resolve(strict=True).relative_to(root)
+        command.resolve(strict=True).relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise CliError(
+            "external live bundle and command must be inside an existing workspace",
+            exit_code=EXIT_AUTHORITY,
+        ) from exc
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise CliError("external live workspace is not a directory", exit_code=EXIT_AUTHORITY)
 
 
 def _run(arguments: argparse.Namespace) -> int:
@@ -618,16 +1527,112 @@ def _run(arguments: argparse.Namespace) -> int:
             "current time is outside every signed execution window",
             exit_code=EXIT_AUTHORITY,
         )
-    if arguments.live:
+    target = targets[0]
+    if not _target_is_loopback(target) and arguments.workspace is None:
         raise CliError(
-            "live dispatch is unavailable until the Gateway executor is integrated",
-            exit_code=EXIT_UNAVAILABLE,
-        )
-    if not _target_is_loopback(targets[0]):
-        raise CliError(
-            "the v0.1 CLI smoke path accepts loopback targets only",
+            "external targets require --workspace for an authorized run",
             exit_code=EXIT_AUTHORITY,
         )
+    if not arguments.live and (
+        arguments.gateway_bundle is not None or arguments.dispatch_command is not None
+    ):
+        raise CliError(
+            "--gateway-bundle and --dispatch-command require --live",
+            exit_code=EXIT_USAGE,
+        )
+
+    if arguments.live:
+        if pack_id not in LIVE_PACK_IDS:
+            raise CliError(
+                f"live Gateway dispatch is unavailable for manual-only pack {pack_id!r}",
+                exit_code=EXIT_UNAVAILABLE,
+            )
+        if arguments.gateway_bundle is None or arguments.dispatch_command is None:
+            raise CliError(
+                "live dispatch requires a controller-provisioned --gateway-bundle "
+                "and --dispatch-command",
+                exit_code=EXIT_UNAVAILABLE,
+            )
+        from .execution import (
+            GatewayDeniedResult,
+            GatewayDispatchCommand,
+            GatewayLaunchBundle,
+            GatewayLaunchError,
+            GatewayLauncher,
+        )
+        from .execution.http_validation import ExecutionContractError
+
+        command_content = _capture_single_protocol_file(arguments.dispatch_command)
+        command = _parse_protocol_file(
+            arguments.dispatch_command,
+            command_content,
+            GatewayDispatchCommand,
+        )
+        _validate_live_command(
+            command,
+            grant=grant,
+            target=target,
+            pack_id=pack_id,
+            authority_key_id=public_key.key_id,
+            now=now,
+        )
+        if not _target_is_loopback(target):
+            _validate_external_live_workspace(
+                arguments.workspace,
+                arguments.gateway_bundle,
+                arguments.dispatch_command,
+            )
+        try:
+            bundle = GatewayLaunchBundle.load(arguments.gateway_bundle)
+            with GatewayLauncher(bundle) as launcher:
+                result = launcher.dispatch(command)
+        except (GatewayLaunchError, ExecutionContractError, OSError, ValueError) as exc:
+            raise CliError(f"live Gateway dispatch failed: {exc}", exit_code=EXIT_UNAVAILABLE) from exc
+        if isinstance(result, GatewayDeniedResult):
+            raise CliError(
+                f"Gateway denied live action {result.action_id}: {result.reason_code}",
+                exit_code=EXIT_AUTHORITY,
+            )
+        _emit_json(
+            {
+                "authority_verified": True,
+                "dispatch_performed": True,
+                "grant_id": grant.grant_id,
+                "mode": "live_gateway",
+                "network_access": "gateway_only",
+                "outcome": result.receipt.outcome.value,
+                "pack_id": pack_id,
+                "receipt_id": result.receipt.receipt_id,
+                "target_id": target.target_id,
+                "workspace": str(arguments.workspace) if arguments.workspace is not None else None,
+            }
+        )
+        return EXIT_OK
+
+    if arguments.workspace is not None:
+        manifest = _create_manual_workspace(
+            arguments.workspace,
+            authority_content=authority_content,
+            key_content=key_content,
+            grant=grant,
+            target=target,
+            pack_id=pack_id,
+            now=now,
+        )
+        _emit_json(
+            {
+                "authority_verified": True,
+                "dispatch_performed": False,
+                "grant_id": grant.grant_id,
+                "mode": "manual_authorized",
+                "network_access": "none",
+                "pack_id": pack_id,
+                "run_id": manifest["run_id"],
+                "target_id": target.target_id,
+                "workspace": str(arguments.workspace),
+            }
+        )
+        return EXIT_OK
 
     _emit_json(
         {
@@ -637,7 +1642,7 @@ def _run(arguments: argparse.Namespace) -> int:
             "mode": "loopback_smoke",
             "network_access": "none",
             "pack_id": pack_id,
-            "target_id": targets[0].target_id,
+            "target_id": target.target_id,
         }
     )
     return EXIT_OK
@@ -655,6 +1660,36 @@ def _set_unavailable(parser: argparse.ArgumentParser, command_path: str) -> None
     parser.set_defaults(handler=_unavailable, command_path=command_path)
 
 
+def _configure_resume_command(
+    parser: argparse.ArgumentParser,
+    *,
+    operation_name: str,
+) -> None:
+    if os.name == "nt":
+        _set_unavailable(parser, operation_name)
+        return
+
+    from .resume_cli import ResumeCliError, ResumeOperation, configure_resume_parser
+
+    operation = ResumeOperation(operation_name)
+    configure_resume_parser(
+        parser,
+        operation=operation,
+        capture_protocol_pair=_capture_protocol_file_pair,
+        validate_json_depth=_validate_json_depth,
+        reject_duplicate_keys=_reject_duplicate_keys,
+    )
+    configured_handler = parser.get_default("handler")
+
+    def handle(arguments: argparse.Namespace) -> int:
+        try:
+            return int(configured_handler(arguments))
+        except ResumeCliError as exc:
+            raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+
+    parser.set_defaults(handler=handle)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="faultloom")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -667,17 +1702,34 @@ def build_parser() -> argparse.ArgumentParser:
     key = commands.add_parser("key", help="manage local signing keys")
     key_commands = key.add_subparsers(dest="key_command", required=True)
     key_init = key_commands.add_parser("init", help="initialize a local authority key")
-    _set_unavailable(key_init, "key init")
+    key_init.add_argument("--out-dir", type=Path, default=Path(".faultloom/authority"))
+    key_init.set_defaults(handler=_key_init)
 
     scope = commands.add_parser("scope", help="manage signed scope contracts")
     scope_commands = scope.add_subparsers(dest="scope_command", required=True)
     scope_draft = scope_commands.add_parser("draft", help="create a scope draft")
     scope_draft.add_argument("--template", choices=("lab", "bounty", "consulting"), required=True)
-    _set_unavailable(scope_draft, "scope draft")
+    scope_draft.add_argument("--target-id", required=True)
+    target_location = scope_draft.add_mutually_exclusive_group(required=True)
+    target_location.add_argument("--hostname", action="append")
+    target_location.add_argument("--cidr", action="append")
+    scope_draft.add_argument("--port", action="append", type=_port)
+    scope_draft.add_argument("--method", action="append")
+    scope_draft.add_argument("--path", action="append")
+    scope_draft.add_argument("--pack", choices=tuple(PACK_IDS), default="web")
+    scope_draft.add_argument("--duration-hours", type=_positive_int, default=8)
+    scope_draft.add_argument("--title", default="FaultLoom authorized engagement")
+    scope_draft.add_argument("--operator", default="operator.local")
+    scope_draft.add_argument("--out", type=Path, required=True)
+    scope_draft.set_defaults(handler=_scope_draft)
     scope_approve = scope_commands.add_parser("approve", help="approve a scope draft")
     scope_approve.add_argument("draft", type=Path)
+    scope_approve.add_argument("--private-key", type=Path, required=True)
     scope_approve.add_argument("--out", type=Path, required=True)
-    _set_unavailable(scope_approve, "scope approve")
+    scope_approve.add_argument("--grant-id")
+    scope_approve.add_argument("--issued-to", default="researcher.local")
+    scope_approve.add_argument("--approved-by", default="operator.local")
+    scope_approve.set_defaults(handler=_scope_approve)
     scope_revoke = scope_commands.add_parser("revoke", help="revoke an authority grant")
     scope_revoke.add_argument("grant_id")
     _set_unavailable(scope_revoke, "scope revoke")
@@ -688,32 +1740,57 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--minimum-grant-version", type=_positive_int, default=1)
     run.add_argument("--target", required=True, help="signed target-id; URLs are not accepted")
     run.add_argument("--pack", choices=tuple(PACK_IDS), required=True)
+    run.add_argument(
+        "--workspace",
+        type=Path,
+        help="create a new offline workspace for an authorized manual run",
+    )
     run.add_argument("--live", action="store_true")
+    run.add_argument("--gateway-bundle", type=Path)
+    run.add_argument("--dispatch-command", type=Path)
     run.set_defaults(handler=_run)
 
+    evidence = commands.add_parser("evidence", help="manage manual run evidence")
+    evidence_commands = evidence.add_subparsers(dest="evidence_command", required=True)
+    evidence_add = evidence_commands.add_parser("add", help="add a file to a run workspace")
+    evidence_add.add_argument("--workspace", type=Path, required=True)
+    evidence_add.add_argument("--file", type=Path, required=True)
+    evidence_add.add_argument(
+        "--kind",
+        choices=("burp", "http", "screenshot", "note", "other"),
+        required=True,
+    )
+    evidence_add.add_argument("--title")
+    evidence_add.set_defaults(handler=_evidence_add)
+
+    finding = commands.add_parser("finding", help="prepare manual finding drafts")
+    finding_commands = finding.add_subparsers(dest="finding_command", required=True)
+    finding_new = finding_commands.add_parser("new", help="create a report-ready draft")
+    finding_new.add_argument("--workspace", type=Path, required=True)
+    finding_new.add_argument("--title", required=True)
+    finding_new.add_argument(
+        "--severity",
+        choices=("informational", "low", "medium", "high", "critical"),
+        required=True,
+    )
+    finding_new.add_argument("--summary")
+    finding_new.add_argument("--impact")
+    finding_new.add_argument("--steps-file", type=Path)
+    finding_new.add_argument("--remediation")
+    finding_new.add_argument("--evidence", action="append")
+    finding_new.set_defaults(handler=_finding_new)
+
     resume = commands.add_parser("resume", help="resume a durable run")
-    configure_resume_parser(
-        resume,
-        operation=ResumeOperation.RESUME,
-        capture_protocol_pair=_capture_protocol_file_pair,
-        validate_json_depth=_validate_json_depth,
-        reject_duplicate_keys=_reject_duplicate_keys,
-    )
+    _configure_resume_command(resume, operation_name="resume")
     inspect = commands.add_parser("inspect", help="inspect durable run state")
-    configure_resume_parser(
-        inspect,
-        operation=ResumeOperation.INSPECT,
-        capture_protocol_pair=_capture_protocol_file_pair,
-        validate_json_depth=_validate_json_depth,
-        reject_duplicate_keys=_reject_duplicate_keys,
-    )
+    _configure_resume_command(inspect, operation_name="inspect")
     verify = commands.add_parser("verify", help="verify a finding candidate")
     report = commands.add_parser("report", help="render a verified finding")
     configure_verification_parsers(
         verify,
         report,
         VerificationCliDependencies(
-            capture_protocol_pair=_capture_protocol_file_pair,
+            capture_protocol_pair=_capture_public_protocol_file_pair,
             parse_protocol_file=_parse_protocol_file,
             now=_utc_now,
         ),
@@ -724,11 +1801,11 @@ def build_parser() -> argparse.ArgumentParser:
     pack = commands.add_parser("pack", help="inspect pack registry")
     pack_commands = pack.add_subparsers(dest="pack_command", required=True)
     pack_list = pack_commands.add_parser("list")
-    _set_unavailable(pack_list, "pack list")
+    pack_list.set_defaults(handler=_pack_list)
     for operation in ("doctor", "test"):
         child = pack_commands.add_parser(operation)
         child.add_argument("pack_id")
-        _set_unavailable(child, f"pack {operation}")
+        child.set_defaults(handler=_pack_check)
 
     evaluation = commands.add_parser("eval", help="run a sealed evaluation manifest")
     evaluation_commands = evaluation.add_subparsers(dest="eval_command", required=True)
@@ -746,9 +1823,6 @@ def main(argv: list[str] | None = None) -> int:
     except CliError as exc:
         print(f"faultloom: error: {exc}", file=sys.stderr)
         return exc.exit_code
-    except ResumeCliError as exc:
-        print(f"faultloom: error: {exc}", file=sys.stderr)
-        return EXIT_AUTHORITY
     except VerificationCliError as exc:
         print(f"faultloom: error: {exc}", file=sys.stderr)
         return EXIT_AUTHORITY

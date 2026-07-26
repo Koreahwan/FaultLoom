@@ -6,6 +6,10 @@ import argparse
 import json
 import sys
 from collections.abc import Mapping
+from pathlib import Path
+from typing import ClassVar
+
+from pydantic import BaseModel, ConfigDict
 
 from faultloom_sdk import (
     AdapterAdmissionError,
@@ -24,6 +28,18 @@ EXIT_UNAVAILABLE = 3
 
 class AdapterCliError(RuntimeError):
     """An expected offline adapter command failure."""
+
+
+class _AdapterArguments(BaseModel):
+    model_config: ClassVar[ConfigDict] = ConfigDict(
+        extra="ignore", frozen=True, strict=True
+    )
+
+    adapter_id: str
+
+
+class _UtilityArguments(_AdapterArguments):
+    config: Path
 
 
 def _registry() -> AdapterAdmissionRegistry:
@@ -58,8 +74,9 @@ def _list_adapters(_arguments: argparse.Namespace) -> int:
 
 
 def _doctor_adapter(arguments: argparse.Namespace) -> int:
+    parsed = _AdapterArguments.model_validate(vars(arguments))
     try:
-        snapshot = _registry().doctor(arguments.adapter_id)
+        snapshot = _registry().doctor(parsed.adapter_id)
     except AdapterAdmissionError as exc:
         return _fail(str(exc))
     manifest = snapshot.manifest
@@ -81,9 +98,10 @@ def _doctor_adapter(arguments: argparse.Namespace) -> int:
 
 
 def _test_adapter(arguments: argparse.Namespace) -> int:
+    parsed = _AdapterArguments.model_validate(vars(arguments))
     registry = _registry()
     try:
-        manifest = registry.prepare_test(arguments.adapter_id)
+        manifest = registry.prepare_test(parsed.adapter_id)
         if manifest.adapter_id != "adapter.reference":
             raise AdapterCliError("adapter has no fixed offline test harness")
         response = ReferenceProcessClient(
@@ -99,7 +117,7 @@ def _test_adapter(arguments: argparse.Namespace) -> int:
             outcome=AdmissionOutcome.PASSED,
             artifact_digest=manifest.input_schema_digest,
         )
-        registry.record(contract)
+        _ = registry.record(contract)
         fidelity = AdapterAdmissionReceipt(
             adapter_id=manifest.adapter_id,
             manifest_digest=digest,
@@ -121,7 +139,39 @@ def _test_adapter(arguments: argparse.Namespace) -> int:
             "state": snapshot.state.value,
         }
     )
-    return EXIT_OK
+    return EXIT_UNAVAILABLE
+
+
+def _utility_test_adapter(arguments: argparse.Namespace) -> int:
+    parsed = _UtilityArguments.model_validate(vars(arguments))
+    try:
+        from .model_utility_cli import ModelUtilityCliError, prepare_local_model_config
+    except ImportError:
+        return _fail("model utility is unavailable on this platform")
+    try:
+        _ = _registry().prepare_test(parsed.adapter_id)
+        _ = prepare_local_model_config(parsed.config)
+    except AdapterAdmissionError as exc:
+        return _fail(str(exc))
+    except ModelUtilityCliError as exc:
+        _emit(
+            {
+                "adapter_id": parsed.adapter_id,
+                "model_utility": "not_run",
+                "reason": exc.reason,
+                "state": "pending_model_utility",
+            }
+        )
+        return EXIT_UNAVAILABLE
+    _emit(
+        {
+            "adapter_id": parsed.adapter_id,
+            "model_utility": "not_run",
+            "reason": "evaluation_input_unavailable",
+            "state": "pending_model_utility",
+        }
+    )
+    return EXIT_UNAVAILABLE
 
 
 def _fail(message: str) -> int:
@@ -135,5 +185,9 @@ def configure_adapter_parser(parser: argparse.ArgumentParser) -> None:
     list_command.set_defaults(handler=_list_adapters)
     for operation, handler in (("doctor", _doctor_adapter), ("test", _test_adapter)):
         command = commands.add_parser(operation)
-        command.add_argument("adapter_id")
+        _ = command.add_argument("adapter_id")
         command.set_defaults(handler=handler)
+    utility_test = commands.add_parser("utility-test")
+    _ = utility_test.add_argument("adapter_id")
+    _ = utility_test.add_argument("--config", type=Path, required=True)
+    utility_test.set_defaults(handler=_utility_test_adapter)

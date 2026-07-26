@@ -58,10 +58,11 @@ def test_symlink_is_rejected_without_following(tmp_path: Path) -> None:
 
 def test_untracked_generated_output_is_ignored(tmp_path: Path) -> None:
     make_policies(tmp_path)
-    (tmp_path / "dist").mkdir()
-    (tmp_path / "dist" / "customer.json").write_text("generated\n", encoding="utf-8")
-    (tmp_path / "target").mkdir()
-    (tmp_path / "target" / ".env").write_text("generated\n", encoding="utf-8")
+    for directory in (".omo", ".venv", "dist", "out", "target"):
+        generated = tmp_path / directory
+        generated.mkdir()
+        (generated / "customer.json").write_text("generated\n", encoding="utf-8")
+    (tmp_path / "nul").write_text("generated\n", encoding="utf-8")
     assert scan(tmp_path) == []
 
 
