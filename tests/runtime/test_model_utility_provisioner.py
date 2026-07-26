@@ -13,6 +13,14 @@ def _digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def test_provisioner_pins_checked_in_runtime_wrapper() -> None:
+    wrapper = (
+        Path(__file__).parents[2]
+        / "packages/runtime/src/faultloom/model_utility_runtime_wrapper.py"
+    )
+    assert provisioner._WRAPPER_DIGEST == _digest(wrapper.read_bytes())
+
+
 def _write_json(path: Path, value: object) -> Path:
     path.write_text(json.dumps(value), encoding="utf-8")
     return path

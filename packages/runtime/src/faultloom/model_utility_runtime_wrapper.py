@@ -32,6 +32,11 @@ _PR_SET_CHILD_SUBREAPER = 36
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _DECISIONS = frozenset(("positive", "negative", "inconclusive"))
+_DECISION_SCHEMA = (
+    '{"type":"object","additionalProperties":false,"required":["decision","output"],'
+    '"properties":{"decision":{"enum":["positive","negative","inconclusive"]},'
+    '"output":{"type":"string"}}}'
+)
 _REQUEST_KEYS = frozenset(
     (
         "request_id",
@@ -453,6 +458,8 @@ def _llama_argv(runtime_root: Path, prompt_file: Path) -> tuple[str, ...]:
         "--conversation",
         "--single-turn",
         "--simple-io",
+        "--json-schema",
+        _DECISION_SCHEMA,
         "--log-disable",
     )
 
@@ -483,13 +490,16 @@ def _parse_decision(raw: bytes, prompt: str) -> tuple[str, str]:
         text = raw.decode()
     except UnicodeDecodeError:
         return "inconclusive", ""
-    if "Error:" in text or "Failed to" in text:
-        raise WrapperError("model runtime reported an error")
     prompt_marker = "> " + prompt + "\n"
     exit_marker = "\n\n\nExiting...\n"
     if text.count(prompt_marker) != 1 or not text.endswith(exit_marker):
+        if "Error:" in text or "Failed to" in text:
+            raise WrapperError("model runtime reported an error")
         raise WrapperError("model generation markers are invalid")
-    generated = text.split(prompt_marker, 1)[1][: -len(exit_marker)]
+    preamble, generated = text.split(prompt_marker, 1)
+    if "Error:" in preamble or "Failed to" in preamble:
+        raise WrapperError("model runtime reported an error")
+    generated = generated[: -len(exit_marker)]
     decoder = json.JSONDecoder()
     matches: list[tuple[str, str]] = []
     for offset, character in enumerate(generated):
