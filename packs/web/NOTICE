@@ -1,0 +1,35 @@
+FaultLoom
+Copyright 2026 FaultLoom contributors
+
+This product is licensed under the Apache License, Version 2.0.
+
+The Gateway includes checksum-bound, vendored Rust dependencies. Their package,
+version, SPDX expression, and retained license-file locations are listed in
+docs/THIRD_PARTY_LICENSES.md. Those components remain under their respective
+upstream licenses; their license texts are retained within vendor/<crate-version>/.
+
+FaultLoom was designed with reference to the Terminator project. No legacy Git
+history is grafted into this repository. Any subsequently migrated source must
+retain file-level provenance and the following legacy notice:
+
+  MIT License
+
+  Copyright (c) 2026 Terminator Project Contributors
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools==81.0.0", "wheel==0.42.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "faultloom-web"
+version = "0.1.0"
+description = "Isolated Web/API execution pack for FaultLoom"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+dependencies = [
+  "faultloom==0.1.0",
+  "faultloom-protocol==0.1.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+faultloom_web = ["py.typed"]
