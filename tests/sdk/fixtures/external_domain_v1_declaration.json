@@ -1,0 +1,58 @@
+{
+  "abi_version": "1.0.0",
+  "adapter_bindings": [
+    {
+      "manifest": {
+        "action_classes": ["observe"],
+        "adapter_id": "adapter.external.cloud",
+        "adapter_version": "1.0.0",
+        "budget": {
+          "max_bytes": 65536,
+          "max_concurrency": 1,
+          "rate_per_minute": 10,
+          "schema_version": "0.1.0",
+          "timeout_seconds": 5
+        },
+        "capabilities": ["cloud.read_only_api"],
+        "evidence_capability": "candidate_only",
+        "image_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "input_schema_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "license_class": "external_user_managed",
+        "network_mode": "gateway_only",
+        "output_schema_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "schema_version": "0.1.0",
+        "telemetry_policy": "local_receipts_only",
+        "update_policy": "pinned_no_runtime_updates",
+        "upstream_commit": null,
+        "upstream_version": "1.2.3"
+      },
+      "manifest_digest": "sha256:2fe7c3faa94327a59719ddd34693027c7582298ff177c915ad4918d466ae005f",
+      "schema_version": "0.1.0"
+    }
+  ],
+  "cleanup_contract": "receipt_required",
+  "declared_actions": ["cloud.iam.read"],
+  "declared_capabilities": ["cloud.iam.observe", "cloud.read_only_api"],
+  "domain_id": "domain.external.cloud",
+  "egress_contract": "gateway_only",
+  "evidence_contract": "digest_references_only",
+  "pack_manifest": {
+    "action_compilers": ["cloud.iam.read"],
+    "capability_descriptors": ["cloud.iam.observe"],
+    "evaluation_descriptors": ["cloud.iam.fixture"],
+    "hypothesis_providers": ["cloud.iam.hypothesis"],
+    "observation_normalizers": ["cloud.iam.observation"],
+    "pack_id": "pack.external.cloud",
+    "pack_version": "1.0.0",
+    "process_isolation": "required",
+    "protocol_range": ">=0.1.0,<0.2.0",
+    "required_adapter_capabilities": ["cloud.read_only_api"],
+    "required_gateway_features": ["dispatch.leases"],
+    "schema_namespace": "external.cloud.v1",
+    "schema_version": "0.1.0",
+    "verifier_descriptors": ["cloud.iam.verifier"]
+  },
+  "pack_manifest_digest": "sha256:716fde67fb6e7f58269268e144b39b28d07ccc13cef10bee201001308baaecf0",
+  "schema_namespace": "external.cloud.v1",
+  "schema_version": "0.1.0"
+}

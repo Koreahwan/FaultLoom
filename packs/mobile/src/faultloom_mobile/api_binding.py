@@ -39,9 +39,13 @@ class MobileApiBindingEvidence:
     case_id: CaseId
     app_link_scheme: str
     app_link_application_id: str
+    api_binding_id: str
+    app_link_uri: str
+    api_bound_link_uri: str
     declared_api_audience: str
     observed_api_audience: str
     audience_matches: bool
+    link_matches: bool
     classification: Literal["diagnostic_candidate", "matched_negative_control"]
     candidate_only: Literal[True] = True
 
@@ -91,11 +95,19 @@ def normalize_mobile_api_binding(
         raise ValueError("app-link deep_link must be an absolute URI")
     application_id = _required_string(app_link_payload, "application_id", "app-link")
     declared_audience = _required_string(app_link_payload, "api_audience", "app-link")
+    api_binding_id = _required_string(binding_payload, "api_id", "api-binding")
+    bound_link = _required_string(binding_payload, "bound_deep_link", "api-binding")
+    parsed_bound_link = urlparse(bound_link)
+    if not parsed_bound_link.scheme or not parsed_bound_link.netloc:
+        raise ValueError("api-binding bound_deep_link must be an absolute URI")
     observed_audience = _required_string(binding_payload, "api_audience", "api-binding")
     audience_matches = declared_audience == observed_audience
+    link_matches = deep_link == bound_link
     classification: Literal["diagnostic_candidate", "matched_negative_control"]
     classification = (
-        "matched_negative_control" if audience_matches else "diagnostic_candidate"
+        "matched_negative_control"
+        if audience_matches and link_matches
+        else "diagnostic_candidate"
     )
     return MobileApiBindingEvidence(
         normalized_observation=NormalizedObservation(
@@ -108,9 +120,13 @@ def normalize_mobile_api_binding(
         case_id=case_id,
         app_link_scheme=parsed_link.scheme,
         app_link_application_id=application_id,
+        api_binding_id=api_binding_id,
+        app_link_uri=deep_link,
+        api_bound_link_uri=bound_link,
         declared_api_audience=declared_audience,
         observed_api_audience=observed_audience,
         audience_matches=audience_matches,
+        link_matches=link_matches,
         classification=classification,
     )
 

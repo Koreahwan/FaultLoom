@@ -2,12 +2,26 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Lock, Thread
 from typing import Literal, final
 from urllib.parse import urlparse
 from urllib.request import urlopen
+
+from faultloom_mobile import (
+    G46_PINNED_MANIFEST,
+    G46AdmissionToken,
+    G46PreparedGatewayCommand,
+    G46SyntheticIdentities,
+    G46VerifierReceipt,
+    MobileApiBindingRun,
+    assert_g46_no_secrets,
+    observe_mobile_api_binding,
+    prepare_g46_gateway_command,
+    verify_g46_fixture,
+)
 
 CaseId = Literal["mismatch", "negative"]
 EvidenceKind = Literal["app-link", "api-binding"]
@@ -17,6 +31,169 @@ EvidenceKind = Literal["app-link", "api-binding"]
 class MobileApiBindingFixtureResponse:
     url: str
     body: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class G46FixtureState:
+    phase: Literal["ready", "completed"] = "ready"
+    runs: int = 0
+    simulated_io_count: Literal[0] = 0
+
+
+@dataclass(frozen=True, slots=True)
+class G46FixtureRun:
+    observation: MobileApiBindingRun
+    command: G46PreparedGatewayCommand | None
+    receipt: G46VerifierReceipt
+
+
+@final
+class OwnedG46MobileApiFixture:
+    """Fully simulated G46 source with a signed, bounded, inert command seam."""
+
+    endpoint = "fixture://owned-g46-mobile-api"
+    initial_state = G46FixtureState()
+
+    def __init__(
+        self,
+        admission_token: G46AdmissionToken,
+        authority_public_key: bytes,
+        now_epoch_seconds: int,
+    ) -> None:
+        if type(admission_token) is not G46AdmissionToken:
+            raise TypeError("G46 fixture requires a G46 admission envelope")
+        self.admission_token = admission_token
+        self.authority_public_key = bytes(authority_public_key)
+        self.now_epoch_seconds = now_epoch_seconds
+        self.identities = G46SyntheticIdentities(
+            device_id=admission_token.device_id,
+            application_id=admission_token.application_id,
+            api_id=admission_token.api_id,
+        )
+        self.admission_token.assert_verified(
+            G46_PINNED_MANIFEST,
+            self.identities,
+            self.authority_public_key,
+            now_epoch_seconds,
+        )
+        self.state = self.initial_state
+
+    def __enter__(self) -> "OwnedG46MobileApiFixture":
+        if self.state != self.initial_state:
+            raise RuntimeError("G46 fixture must start from its declared initial state")
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.cleanup()
+
+    def run(self, case_id: CaseId) -> G46FixtureRun:
+        if self.state != self.initial_state:
+            raise RuntimeError("reset or cleanup is required before another G46 fixture run")
+        observation = observe_mobile_api_binding(_G46SuppliedJsonSource(), case_id)
+        command = (
+            prepare_g46_gateway_command(
+                observation,
+                G46_PINNED_MANIFEST,
+                self.admission_token,
+                self.authority_public_key,
+                self.now_epoch_seconds,
+            )
+            if observation.evidence.classification == "diagnostic_candidate"
+            else None
+        )
+        receipt = verify_g46_fixture(
+            observation,
+            G46_PINNED_MANIFEST,
+            self.admission_token,
+            command,
+            self.authority_public_key,
+            self.now_epoch_seconds,
+        )
+        self.state = replace(self.state, phase="completed", runs=1)
+        self.assert_no_secrets()
+        return G46FixtureRun(observation=observation, command=command, receipt=receipt)
+
+    def reset(self) -> None:
+        self.state = self.initial_state
+
+    def cleanup(self) -> None:
+        self.reset()
+
+    def assert_no_secrets(self) -> None:
+        assert_g46_no_secrets(
+            (
+                G46_PINNED_MANIFEST,
+                self.admission_token,
+                self.identities,
+                _G46_ROUTES,
+            )
+        )
+
+    def assert_fully_simulated(self) -> None:
+        if self.endpoint != "fixture://owned-g46-mobile-api":
+            raise AssertionError("G46 fixture must not identify an external API endpoint")
+        if self.state.simulated_io_count != 0:
+            raise AssertionError("G46 fixture must not perform device or API I/O")
+
+
+@final
+class _G46SuppliedJsonSource:
+    """Return pre-supplied JSON only; this type performs no I/O."""
+
+    def read(
+        self, case_id: CaseId, evidence: EvidenceKind
+    ) -> MobileApiBindingFixtureResponse:
+        try:
+            body = _G46_ROUTES[(case_id, evidence)]
+        except KeyError as exc:
+            raise ValueError("G46 supplied JSON case is not declared") from exc
+        return MobileApiBindingFixtureResponse(
+            url=f"fixture://owned-g46-mobile-api/{case_id}/{evidence}", body=body
+        )
+
+
+_G46_ROUTES = {
+    ("mismatch", "app-link"): json.dumps(
+        {
+            "application_id": "synthetic.g46.application.mobile",
+            "deep_link": "fixture://owned-g46-mobile-api/callback",
+            "api_audience": "synthetic.g46.audience.public",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode(),
+    ("mismatch", "api-binding"): json.dumps(
+        {
+            "api_id": "synthetic.g46.api.binding",
+            "binding_id": "synthetic.g46.binding.mismatch",
+            "bound_deep_link": "fixture://owned-g46-mobile-api/callback",
+            "api_audience": "audience-b",
+            "token_material_present": False,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode(),
+    ("negative", "app-link"): json.dumps(
+        {
+            "application_id": "synthetic.g46.application.mobile",
+            "deep_link": "fixture://owned-g46-mobile-api/callback",
+            "api_audience": "synthetic.g46.audience.public",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode(),
+    ("negative", "api-binding"): json.dumps(
+        {
+            "api_id": "synthetic.g46.api.binding",
+            "binding_id": "synthetic.g46.binding.negative",
+            "bound_deep_link": "fixture://owned-g46-mobile-api/callback",
+            "api_audience": "synthetic.g46.audience.public",
+            "token_material_present": False,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode(),
+}
 
 
 @final
@@ -108,6 +285,8 @@ class LoopbackMobileApiBindingFixture:
             ),
             "/mismatch/api-binding": (
                 b'{"binding_id":"fixture-binding-42",'
+                b'"api_id":"fixture.api.binding",'
+                b'"bound_deep_link":"fixture://authorized/callback",'
                 b'"api_audience":"mobile.client.private"}'
             ),
             "/negative/app-link": (
@@ -117,6 +296,8 @@ class LoopbackMobileApiBindingFixture:
             ),
             "/negative/api-binding": (
                 b'{"binding_id":"fixture-binding-43",'
+                b'"api_id":"fixture.api.binding",'
+                b'"bound_deep_link":"fixture://authorized/callback",'
                 b'"api_audience":"mobile.client.public"}'
             ),
         }

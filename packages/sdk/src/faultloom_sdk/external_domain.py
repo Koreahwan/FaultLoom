@@ -12,14 +12,18 @@ version is explicitly admitted.  Unknown versions therefore fail closed.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import datetime
 from typing import final
 
-from faultloom_protocol import ProtocolModel, sha256_digest
+from faultloom_protocol import ProtocolModel, sha256_digest, verify_authority_grant
 from faultloom_protocol.models import (
     AdapterManifest,
     AuthorityGrant,
+    Ed25519PublicKeyRecord,
     PackManifest,
     SchemaNamespace,
+    SignedAuthorityGrant,
 )
 from faultloom_protocol.base import Identifier, Sha256Digest, ShortStr
 
@@ -31,6 +35,40 @@ EXTERNAL_DOMAIN_ABI_VERSION = "1.0.0"
 
 class ExternalDomainAdmissionError(ValueError):
     """An external-domain declaration is not admissible without broadening trust."""
+
+
+def canonical_external_domain_manifest_digest(
+    declaration: ExternalDomainDeclaration,
+) -> Sha256Digest:
+    """Return the canonical declaration digest used by admission receipts.
+
+    The declaration is data only.  This helper deliberately does not load a
+    pack or contact a signer; signed authority is verified separately by
+    :meth:`ExternalDomainRegistry.admit_signed`.
+    """
+
+    if type(declaration) is not ExternalDomainDeclaration:
+        raise ExternalDomainAdmissionError(
+            "declaration must be an exact ExternalDomainDeclaration"
+        )
+    clean = ExternalDomainDeclaration.model_validate(
+        declaration.model_dump(mode="python")
+    )
+    return sha256_digest(clean.model_dump(mode="python"))
+
+
+def require_external_domain_abi_compatible(abi_version: str) -> None:
+    """Fail closed unless a declaration uses the sole stable v1 vocabulary.
+
+    The v1 model forbids unknown fields, so accepting a newer patch or minor
+    string without a corresponding model would falsely claim compatibility.
+    New declaration versions require a new explicit admission path.
+    """
+
+    if abi_version != EXTERNAL_DOMAIN_ABI_VERSION:
+        raise ExternalDomainAdmissionError(
+            f"unsupported external-domain ABI: {abi_version}"
+        )
 
 
 class ExternalAdapterBinding(ProtocolModel):
@@ -62,7 +100,7 @@ class ExternalDomainDeclaration(ProtocolModel):
 
 
 class ExternalDomainAdmission(ProtocolModel):
-    """Data receipt proving admission checks, not execution or authority issuance."""
+    """Candidate admission only; this is not proof of a verified signature."""
 
     abi_version: ShortStr
     domain_id: Identifier
@@ -71,6 +109,154 @@ class ExternalDomainAdmission(ProtocolModel):
     pack_manifest_digest: Sha256Digest
     adapter_manifest_digests: tuple[Sha256Digest, ...]
     authority_grant_digest: Sha256Digest
+
+
+@dataclass(frozen=True, init=False, slots=True)
+@final
+class VerifiedExternalDomainAdmission:
+    """Admission data paired with the original signed-authority envelope.
+
+    This object is a transport container, not a trust boundary.  Python
+    module-private names can be imported by an untrusted caller, so consumers
+    must verify the stored envelope again against *their* pinned public key
+    before treating the admission as signed.
+    """
+
+    __admission: ExternalDomainAdmission
+    __pinned_verifier_key_id: str
+    __signed_authority_grant_digest: str
+    __signed_grant_envelope_digest: str
+    __signed_grant: SignedAuthorityGrant
+
+    def __init__(self) -> None:
+        raise TypeError(
+            "verified external-domain admissions are only created by admit_signed"
+        )
+
+    @property
+    def admission(self) -> ExternalDomainAdmission:
+        return self.__admission
+
+    @property
+    def pinned_verifier_key_id(self) -> str:
+        return self.__pinned_verifier_key_id
+
+    @property
+    def signed_authority_grant_digest(self) -> str:
+        return self.__signed_authority_grant_digest
+
+    @property
+    def signed_grant_envelope_digest(self) -> str:
+        return self.__signed_grant_envelope_digest
+
+    def conformance_parts(
+        self,
+        *,
+        trusted_public_key: Ed25519PublicKeyRecord,
+        minimum_grant_version: int = 1,
+        now: datetime | None = None,
+    ) -> tuple[ExternalDomainAdmission, str, str, str]:
+        """Revalidate the exact signed envelope before emitting a receipt.
+
+        The trust root belongs to the receipt consumer, rather than to this
+        object or the registry that originally produced it.  That keeps a
+        private helper or a forged in-memory capability from substituting a
+        bare digest for an authority signature.
+        """
+
+        admission = getattr(self, "_VerifiedExternalDomainAdmission__admission", None)
+        signed_grant = getattr(
+            self, "_VerifiedExternalDomainAdmission__signed_grant", None
+        )
+        pinned_verifier_key_id = getattr(
+            self, "_VerifiedExternalDomainAdmission__pinned_verifier_key_id", None
+        )
+        signed_authority_grant_digest = getattr(
+            self,
+            "_VerifiedExternalDomainAdmission__signed_authority_grant_digest",
+            None,
+        )
+        signed_grant_envelope_digest = getattr(
+            self,
+            "_VerifiedExternalDomainAdmission__signed_grant_envelope_digest",
+            None,
+        )
+        if (
+            type(self) is not VerifiedExternalDomainAdmission
+            or type(admission) is not ExternalDomainAdmission
+            or type(signed_grant) is not SignedAuthorityGrant
+            or not isinstance(pinned_verifier_key_id, str)
+            or not isinstance(signed_authority_grant_digest, str)
+            or not isinstance(signed_grant_envelope_digest, str)
+        ):
+            raise ExternalDomainAdmissionError(
+                "conformance receipt requires a verified signed admission proof"
+            )
+        if type(trusted_public_key) is not Ed25519PublicKeyRecord:
+            raise ExternalDomainAdmissionError(
+                "conformance receipt requires an exact pinned Ed25519 public key"
+            )
+        if pinned_verifier_key_id != trusted_public_key.key_id:
+            raise ExternalDomainAdmissionError(
+                "conformance receipt trusted key differs from admission pin"
+            )
+        grant = verify_authority_grant(
+            signed_grant,
+            trusted_public_key,
+            now=now,
+            minimum_version=minimum_grant_version,
+        )
+        signed_grant_digest = sha256_digest(grant)
+        signed_envelope_digest = sha256_digest(signed_grant)
+        if (
+            admission.authority_grant_digest != signed_grant_digest
+            or signed_authority_grant_digest != signed_grant_digest
+            or signed_grant_envelope_digest != signed_envelope_digest
+        ):
+            raise ExternalDomainAdmissionError(
+                "verified grant digest does not match admission authority binding"
+            )
+        return (
+            admission,
+            pinned_verifier_key_id,
+            signed_grant_digest,
+            signed_envelope_digest,
+        )
+
+
+def _verified_external_domain_admission(
+    *,
+    admission: ExternalDomainAdmission,
+    pinned_verifier_key_id: str,
+    signed_grant: SignedAuthorityGrant,
+) -> VerifiedExternalDomainAdmission:
+    if type(admission) is not ExternalDomainAdmission:
+        raise TypeError("admission must be an exact ExternalDomainAdmission")
+    if type(signed_grant) is not SignedAuthorityGrant:
+        raise TypeError("signed grant must be an exact SignedAuthorityGrant")
+    result = object.__new__(VerifiedExternalDomainAdmission)
+    object.__setattr__(result, "_VerifiedExternalDomainAdmission__admission", admission)
+    object.__setattr__(
+        result,
+        "_VerifiedExternalDomainAdmission__pinned_verifier_key_id",
+        pinned_verifier_key_id,
+    )
+    object.__setattr__(
+        result,
+        "_VerifiedExternalDomainAdmission__signed_authority_grant_digest",
+        sha256_digest(signed_grant.payload),
+    )
+    object.__setattr__(
+        result,
+        "_VerifiedExternalDomainAdmission__signed_grant_envelope_digest",
+        sha256_digest(signed_grant),
+    )
+    object.__setattr__(
+        result,
+        "_VerifiedExternalDomainAdmission__signed_grant",
+        signed_grant,
+    )
+    return result
 
 
 def _unknown(values: Iterable[str], admitted: frozenset[str]) -> tuple[str, ...]:
@@ -132,10 +318,7 @@ class ExternalDomainRegistry:
         clean = ExternalDomainDeclaration.model_validate(
             declaration.model_dump(mode="python")
         )
-        if clean.abi_version != EXTERNAL_DOMAIN_ABI_VERSION:
-            raise ExternalDomainAdmissionError(
-                f"unsupported external-domain ABI: {clean.abi_version}"
-            )
+        require_external_domain_abi_compatible(clean.abi_version)
         if clean.schema_namespace != clean.pack_manifest.schema_namespace:
             raise ExternalDomainAdmissionError(
                 "declaration namespace differs from pack manifest namespace"
@@ -255,8 +438,7 @@ class ExternalDomainRegistry:
         except ManifestRegistryError as exc:
             raise ExternalDomainAdmissionError(str(exc)) from exc
 
-        declaration_document = clean.model_dump(mode="python")
-        declaration_digest = sha256_digest(declaration_document)
+        declaration_digest = canonical_external_domain_manifest_digest(clean)
         existing_domain = self._namespaces.get(clean.schema_namespace)
         if existing_domain is not None and existing_domain != clean.domain_id:
             raise ExternalDomainAdmissionError(
@@ -293,3 +475,39 @@ class ExternalDomainRegistry:
             for adapter, digest in zip(adapters, adapter_digests, strict=True)
         )
         return receipt
+
+    def admit_signed(
+        self,
+        declaration: ExternalDomainDeclaration,
+        *,
+        signed_grant: SignedAuthorityGrant,
+        trusted_public_key: Ed25519PublicKeyRecord,
+        minimum_grant_version: int = 1,
+        now: datetime | None = None,
+        requested_capabilities: Iterable[str] = (),
+        requested_actions: Iterable[str] = (),
+    ) -> VerifiedExternalDomainAdmission:
+        """Return proof of verified authority admission and reject rollback.
+
+        This is the untrusted-boundary entry point.  The protocol verifier
+        authenticates the canonical grant digest and enforces the supplied
+        monotonic version floor before the ordinary data-only admission path.
+        """
+
+        grant = verify_authority_grant(
+            signed_grant,
+            trusted_public_key,
+            now=now,
+            minimum_version=minimum_grant_version,
+        )
+        admission = self.admit(
+            declaration,
+            grant=grant,
+            requested_capabilities=requested_capabilities,
+            requested_actions=requested_actions,
+        )
+        return _verified_external_domain_admission(
+            admission=admission,
+            pinned_verifier_key_id=trusted_public_key.key_id,
+            signed_grant=signed_grant,
+        )

@@ -19,6 +19,15 @@ from .external_domain import (
     ExternalDomainAdmissionError,
     ExternalDomainDeclaration,
     ExternalDomainRegistry,
+    VerifiedExternalDomainAdmission,
+    canonical_external_domain_manifest_digest,
+    require_external_domain_abi_compatible,
+)
+from .external_domain_conformance import (
+    EXTERNAL_DOMAIN_CONFORMANCE_VERSION,
+    ExternalDomainConformanceReceipt,
+    build_external_domain_conformance_receipt,
+    canonical_external_domain_conformance_receipt,
 )
 
 from .reference import (
@@ -93,11 +102,14 @@ __all__ = [
     "DescribeResponse",
     "DescriptorRoleConflictError",
     "EXTERNAL_DOMAIN_ABI_VERSION",
+    "EXTERNAL_DOMAIN_CONFORMANCE_VERSION",
     "ExternalAdapterBinding",
     "ExternalDomainAdmission",
     "ExternalDomainAdmissionError",
     "ExternalDomainDeclaration",
+    "ExternalDomainConformanceReceipt",
     "ExternalDomainRegistry",
+    "VerifiedExternalDomainAdmission",
     "ManifestConflictError",
     "ManifestRegistry",
     "ManifestRegistryError",
@@ -124,12 +136,16 @@ __all__ = [
     "UnknownDescriptorError",
     "UtilityDecision",
     "derive_model_utility_metrics",
+    "build_external_domain_conformance_receipt",
+    "canonical_external_domain_manifest_digest",
+    "canonical_external_domain_conformance_receipt",
     "evaluate_model_utility",
     "model_utility_digest",
     "model_utility_is_proven",
     "reference_adapter_manifest",
     "reference_pack_manifest",
     "reference_registry",
+    "require_external_domain_abi_compatible",
     "rpc_input_schema",
     "rpc_output_schema",
 ]

@@ -8,17 +8,34 @@ approved semantic Gateway command.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, final
+from datetime import datetime
+from fnmatch import fnmatchcase
+from typing import TYPE_CHECKING, Literal, Protocol, final
 
 from pydantic import Field, model_validator
 
+from faultloom_protocol import (
+    Ed25519PublicKeyRecord,
+    SignedAuthorityGrant,
+    SignedScopeEpoch,
+    verify_authority_grant,
+    verify_scope_epoch,
+)
 from faultloom_protocol.base import Sha256Digest
+from faultloom_protocol.models import AuthorityGrant, DispatchOutcome, EgressPlane
+from faultloom_protocol.signing import SignatureVerificationError
 
 from .models import BurpHeader, BurpModel, BurpScope
 from .policy import BurpPolicyError
 
 if TYPE_CHECKING:
-    from faultloom.execution import GatewayDispatchCommand
+    from faultloom.execution import GatewayDispatchCommand, GatewayResult
+
+
+class GatewayDispatcher(Protocol):
+    """The existing Gateway dispatch surface; this pack owns no transport."""
+
+    def dispatch(self, command: GatewayDispatchCommand) -> GatewayResult: ...
 
 
 class BurpSelectedBudget(BurpModel):
@@ -81,15 +98,41 @@ class BurpGatewayPreview(BurpModel):
     gateway_only: Literal[True] = True
 
 
+class BurpGatewayCandidateReceipt(BurpModel):
+    """A completed Gateway action remains a candidate until independent verification."""
+
+    selection_id: str
+    gateway_receipt_id: str
+    target_id: str
+    action_id: str
+    lease_id: str
+    candidate_only: Literal[True] = True
+    gateway_dispatched: Literal[True] = True
+    verification_evidence: Literal[False] = False
+    verification_status: Literal["unverified"] = "unverified"
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedBurpGatewayDispatch:
     """The exact approved command, ready for the existing Gateway live path."""
 
     command: GatewayDispatchCommand
     preview: BurpGatewayPreview
+    command_digest: Sha256Digest
 
     def gateway_command(self) -> GatewayDispatchCommand:
         return self.command
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveBurpDispatchAuthority:
+    """Separately signed authority and scope material for one active handoff."""
+
+    authority: SignedAuthorityGrant
+    authority_public_key: Ed25519PublicKeyRecord
+    scope_epoch: SignedScopeEpoch
+    scope_public_key: Ed25519PublicKeyRecord
+    verified_at: datetime
 
 
 @final
@@ -151,6 +194,7 @@ class ActiveBurpRequestPreparer:
                 action_id=command.intent.action_id,
                 lease_id=command.lease.lease_id,
             ),
+            command_digest=_command_digest(command),
         )
 
     @staticmethod
@@ -205,7 +249,184 @@ class ActiveBurpRequestPreparer:
             )
 
 
+@final
+class ActiveBurpGatewayHandoff:
+    """Dispatch one unchanged prepared item through the preapproved Gateway only."""
+
+    def __init__(self, authority: ActiveBurpDispatchAuthority) -> None:
+        if type(authority) is not ActiveBurpDispatchAuthority:
+            raise BurpPolicyError("authority_invalid", "active Burp authority must have the exact type")
+        self._authority = authority
+
+    def execute(
+        self,
+        prepared: PreparedBurpGatewayDispatch,
+        gateway: GatewayDispatcher,
+    ) -> BurpGatewayCandidateReceipt:
+        from faultloom.execution import GatewayDeniedResult, GatewayDispatchCommand, GatewayDispatchResult
+
+        if type(prepared) is not PreparedBurpGatewayDispatch:
+            raise BurpPolicyError("command_invalid", "prepared Burp handoff must have the exact type")
+        command = prepared.command
+        if type(command) is not GatewayDispatchCommand:
+            raise BurpPolicyError("command_invalid", "Gateway command must have the exact type")
+        try:
+            command_digest = _command_digest(command)
+        except Exception as exc:
+            raise BurpPolicyError(
+                "command_changed", "Gateway command is not a canonical prepared command"
+            ) from exc
+        if command_digest != prepared.command_digest:
+            raise BurpPolicyError("command_changed", "Gateway command changed after Burp preparation")
+        grant = self._verified_grant(command)
+        self._require_authorized_command(command, grant)
+        try:
+            result = gateway.dispatch(command)
+        except AttributeError as exc:
+            raise BurpPolicyError("gateway_invalid", "Gateway dispatcher has no dispatch surface") from exc
+        if type(result) is GatewayDeniedResult:
+            raise BurpPolicyError("gateway_denied", "Gateway denied the prepared active Burp action")
+        if type(result) is not GatewayDispatchResult:
+            raise BurpPolicyError("gateway_result_invalid", "Gateway returned an invalid dispatch result")
+        self._require_receipt_binding(command, result)
+        return BurpGatewayCandidateReceipt(
+            selection_id=prepared.preview.selection_id,
+            gateway_receipt_id=result.receipt.receipt_id,
+            target_id=command.intent.target_id,
+            action_id=command.intent.action_id,
+            lease_id=command.lease.lease_id,
+        )
+
+    def _verified_grant(self, command: GatewayDispatchCommand) -> AuthorityGrant:
+        authority = self._authority
+        if (
+            type(authority.authority) is not SignedAuthorityGrant
+            or type(authority.authority_public_key) is not Ed25519PublicKeyRecord
+            or type(authority.scope_epoch) is not SignedScopeEpoch
+            or type(authority.scope_public_key) is not Ed25519PublicKeyRecord
+            or type(authority.verified_at) is not datetime
+            or authority.verified_at.tzinfo is None
+            or authority.verified_at.utcoffset() is None
+        ):
+            raise BurpPolicyError("authority_invalid", "signed active Burp authority is malformed")
+        try:
+            grant = verify_authority_grant(
+                authority.authority,
+                authority.authority_public_key,
+                now=authority.verified_at,
+                minimum_version=command.lease.grant_version,
+                expected_grant_id=command.lease.grant_id,
+            )
+            epoch = verify_scope_epoch(
+                authority.scope_epoch,
+                authority.scope_public_key,
+                now=authority.verified_at,
+                minimum_epoch=command.lease.scope_epoch,
+                expected_grant_id=grant.grant_id,
+            )
+        except (SignatureVerificationError, ValueError) as exc:
+            raise BurpPolicyError(
+                "authority_invalid", "signed active Burp authority or scope was rejected"
+            ) from exc
+        if (
+            authority.authority_public_key.key_id != command.lease.authority_key_id
+            or authority.scope_public_key.key_id != command.lease.authority_key_id
+            or grant.grant_version != command.lease.grant_version
+            or epoch.epoch != command.lease.scope_epoch
+        ):
+            raise BurpPolicyError("authority_mismatch", "signed authority is not bound to the lease")
+        return grant
+
+    def _require_authorized_command(
+        self,
+        command: GatewayDispatchCommand,
+        grant: AuthorityGrant,
+    ) -> None:
+        now = self._authority.verified_at
+        endpoint = command.request.endpoint
+        if endpoint.hostname != "127.0.0.1":
+            raise BurpPolicyError(
+                "target_not_owned_loopback", "active Burp candidate handoff permits owned loopback only"
+            )
+        target = next(
+            (item for item in grant.targets if item.target_id == command.intent.target_id),
+            None,
+        )
+        if target is None:
+            raise BurpPolicyError("target_not_authorized", "Gateway target is absent from signed authority")
+        if (
+            endpoint.hostname not in target.hostnames
+            or endpoint.port not in target.ports
+            or endpoint.scheme.value not in target.protocols
+            or not _matches_any(endpoint.path, target.paths)
+            or command.request.method not in target.methods
+        ):
+            raise BurpPolicyError("target_not_authorized", "Gateway endpoint is outside signed authority")
+        policy = grant.action_policy
+        if (
+            command.intent.pack_id not in grant.pack_ids
+            or command.intent.action_class not in policy.allowed_classes
+            or command.intent.action_kind not in policy.allowed_families
+            or command.request.method not in policy.allowed_methods
+            or not _matches_any(endpoint.path, policy.allowed_path_patterns)
+            or command.identity.identity_id not in grant.identities
+            or command.identity.tenant_id not in grant.tenants
+            or command.lease.egress_plane is not EgressPlane.TARGET_GATEWAY
+        ):
+            raise BurpPolicyError("authority_mismatch", "Gateway command is outside signed authority")
+        if not any(window.starts_at <= now < window.ends_at for window in grant.execution_windows):
+            raise BurpPolicyError("authority_expired", "signed authority is outside its execution window")
+        lease = command.lease
+        if not lease.issued_at <= now < lease.expires_at:
+            raise BurpPolicyError("authority_expired", "Gateway lease is not active")
+        budget = grant.budget
+        reservation = lease.reservation
+        if (
+            reservation.request_bytes > budget.max_request_bytes
+            or reservation.response_bytes > budget.max_response_bytes
+            or reservation.duration_seconds > budget.max_duration_seconds
+        ):
+            raise BurpPolicyError("budget_not_authorized", "Gateway reservation exceeds signed budget")
+
+    @staticmethod
+    def _require_receipt_binding(
+        command: GatewayDispatchCommand,
+        result: object,
+    ) -> None:
+        from faultloom.execution import GatewayDispatchResult
+        if type(result) is not GatewayDispatchResult:
+            raise BurpPolicyError("gateway_result_invalid", "Gateway returned an invalid dispatch result")
+        receipt = result.receipt
+        if (
+            receipt.outcome is not DispatchOutcome.COMPLETED
+            or receipt.action_id != command.intent.action_id
+            or receipt.lease_id != command.lease.lease_id
+            or receipt.grant_id != command.lease.grant_id
+            or receipt.grant_version != command.lease.grant_version
+            or receipt.authority_key_id != command.lease.authority_key_id
+            or receipt.scope_epoch != command.lease.scope_epoch
+            or receipt.target_id != command.intent.target_id
+            or receipt.identity_id != command.identity.identity_id
+            or receipt.tenant_id != command.identity.tenant_id
+            or receipt.reservation != command.lease.reservation
+            or receipt.egress_plane is not EgressPlane.TARGET_GATEWAY
+        ):
+            raise BurpPolicyError(
+                "gateway_receipt_mismatch", "Gateway receipt is not bound to the approved command"
+            )
+
+
 def _redact_header(header: BurpHeader) -> BurpHeader:
     """Retain only header names: arbitrary Burp values are never preview-safe."""
 
     return BurpHeader(name=header.name, value="<redacted>")
+
+
+def _matches_any(value: str, patterns: tuple[str, ...]) -> bool:
+    return any(fnmatchcase(value, pattern) for pattern in patterns)
+
+
+def _command_digest(command: GatewayDispatchCommand) -> str:
+    from faultloom.execution.wire import execution_sha256_digest
+
+    return execution_sha256_digest(command)

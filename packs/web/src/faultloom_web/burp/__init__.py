@@ -1,5 +1,8 @@
 from .active import (
+    ActiveBurpDispatchAuthority,
+    ActiveBurpGatewayHandoff,
     ActiveBurpRequestPreparer,
+    BurpGatewayCandidateReceipt,
     BurpGatewayPreview,
     BurpSelectedBudget,
     BurpSelectedIdentity,
@@ -26,9 +29,12 @@ from .models import (
 from .policy import BurpPolicyError, PassiveBurpPolicyAdapter
 
 __all__ = [
+    "ActiveBurpDispatchAuthority",
+    "ActiveBurpGatewayHandoff",
     "ActiveBurpRequestPreparer",
     "BurpHeader",
     "BurpGatewayPreview",
+    "BurpGatewayCandidateReceipt",
     "BurpHistoryItem",
     "BurpPolicyError",
     "BurpScope",

@@ -6,10 +6,13 @@ import json
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from threading import Lock, Thread
 from typing import BinaryIO, Literal, cast, final, override
 from urllib.parse import urlparse
 from urllib.request import urlopen
+
+from faultloom_cloud import CloudTrustInputManifest, load_cloud_trust_input_manifest
 
 CaseId = Literal[
     "iam-trust-mismatch",
@@ -25,15 +28,29 @@ class CloudTrustFixtureResponse:
     body: bytes
 
 
+@dataclass(frozen=True)
+class CloudTrustCleanupProof:
+    fixture_closed: bool
+    loopback_server_running: Literal[False]
+    provider_api_calls: Literal[0]
+    gateway_dispatches: Literal[0]
+    secret_material_found: Literal[False]
+    cleanup_complete: Literal[True] = True
+
+
 @final
 class LoopbackCloudTrustFixture:
     """Expose fixed, credential-free projections over owned loopback GET routes."""
+
+    _MANIFEST_PATH = Path(__file__).with_name("manifest.g45.json")
 
     def __init__(self) -> None:
         self._requests: list[tuple[str, str]] = []
         self._request_lock = Lock()
         self._server: ThreadingHTTPServer | None = None
         self._thread: Thread | None = None
+        self._manifest = load_cloud_trust_input_manifest(self._MANIFEST_PATH)
+        self._closed = False
 
     def __enter__(self) -> "LoopbackCloudTrustFixture":
         fixture = self
@@ -70,6 +87,9 @@ class LoopbackCloudTrustFixture:
             self._server.server_close()
         if self._thread is not None:
             self._thread.join(timeout=2)
+        self._server = None
+        self._thread = None
+        self._closed = True
 
     @property
     def base_url(self) -> str:
@@ -84,6 +104,10 @@ class LoopbackCloudTrustFixture:
     def requests(self) -> tuple[tuple[str, str], ...]:
         with self._request_lock:
             return tuple(self._requests)
+
+    @property
+    def manifest(self) -> CloudTrustInputManifest:
+        return self._manifest
 
     def read(self, case_id: CaseId) -> CloudTrustFixtureResponse:
         url = f"{self.base_url}/{case_id}"
@@ -103,6 +127,28 @@ class LoopbackCloudTrustFixture:
             raise AssertionError("fixture did not use a loopback endpoint")
         if any(method != "GET" for method, _path in self.requests):
             raise AssertionError("fixture received a non-read-only request")
+
+    def cleanup_proof(self) -> CloudTrustCleanupProof:
+        """Prove that the owned fixture stopped and serialized no secret values."""
+
+        if not self._closed or self._server is not None or self._thread is not None:
+            raise AssertionError("cloud trust fixture cleanup has not completed")
+        serialized = b"\n".join(self._routes().values()) + self._MANIFEST_PATH.read_bytes()
+        lowered = serialized.lower()
+        secret_markers = (
+            b"access_token",
+            b"refresh_token",
+            b"client_secret",
+            b"authorization",
+            b"bearer ",
+            b"password",
+            b"credential",
+        )
+        if any(marker in lowered for marker in secret_markers):
+            raise AssertionError("cloud trust fixture serialized secret-like material")
+        return CloudTrustCleanupProof(fixture_closed=True, loopback_server_running=False,
+                                      provider_api_calls=0, gateway_dispatches=0,
+                                      secret_material_found=False)
 
     def _record(self, method: str, path: str) -> None:
         with self._request_lock:

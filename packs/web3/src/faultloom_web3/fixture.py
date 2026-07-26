@@ -1,76 +1,147 @@
-"""Candidate-evidence contracts for the inert G44 fixture."""
+"""Data contracts for the inert G44 fixture.
+
+This module constructs canonical records.  Verification is deliberately kept in
+``verifier.py`` so a verifier can consume JSON without importing or running the lab.
+"""
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Literal
 
 
 Surface = Literal["web_api", "llm_mcp", "web3_simulator"]
-Bridge = Literal["within_surface", "web_api_to_llm_mcp", "llm_mcp_to_web3"]
-G44_EXPECTED_SEMANTIC_SIGNATURES = (
-    "web_api.request_received",
-    "web_api.synthetic_document_selected",
-    "bridge.web_api_to_llm_mcp",
-    "llm.synthetic_instruction_observed",
-    "mcp.zero_value_tool_candidate",
-    "bridge.llm_mcp_to_web3",
-    "web3.zero_value_simulation",
-    "web3.inert_canary_observed",
-)
-G44_EXPECTED_SURFACE_TRANSITIONS: tuple[tuple[Surface, Surface], ...] = (
-    ("web_api", "web_api"),
-    ("web_api", "web_api"),
-    ("web_api", "llm_mcp"),
-    ("llm_mcp", "llm_mcp"),
-    ("llm_mcp", "llm_mcp"),
-    ("llm_mcp", "web3_simulator"),
-    ("web3_simulator", "web3_simulator"),
-    ("web3_simulator", "web3_simulator"),
-)
-G44_EXPECTED_BRIDGES: tuple[Bridge, ...] = (
-    "within_surface",
-    "within_surface",
-    "web_api_to_llm_mcp",
-    "within_surface",
-    "within_surface",
-    "llm_mcp_to_web3",
-    "within_surface",
-    "within_surface",
-)
-G44_EXPECTED_EFFECTS = (
-    "effect.g44.web-request",
-    "effect.g44.document",
-    "effect.g44.llm-input",
-    "effect.g44.llm-candidate",
-    "effect.g44.mcp-candidate",
-    "effect.g44.web3-input",
-    "effect.g44.zero-value",
-    "effect.web3.g44-inert-zero-value-canary",
-)
-G44_FINAL_STATE_ID = "state.g44.final-inert-canary"
+Boundary = Literal["within_surface", "web_api_to_llm_mcp", "llm_mcp_to_web3"]
+PolicyKind = Literal["lease", "no_dispatch"]
+
+
+def canonical_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode()
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
 class CandidateEdge:
-    edge_id: str
     source_surface: Surface
     target_surface: Surface
-    bridge: Bridge
-    lease_id: str
-    semantic_signature: str
-    effect_id: str
+    boundary: Boundary
+    prerequisites: tuple[str, ...]
+    effect: str
+    pre_state: tuple[tuple[str, object], ...]
+    post_state: tuple[tuple[str, object], ...]
+    primitive: str
+    policy_kind: PolicyKind
+    identity_id: str
+    budget: tuple[int, int, int, int]
+
+    @property
+    def semantic_signature(self) -> str:
+        return canonical_sha256(self.semantic_document())
+
+    @property
+    def edge_id(self) -> str:
+        return "edge." + canonical_sha256(
+            {
+                "boundary": self.boundary,
+                "semantic_signature": self.semantic_signature,
+                "source_surface": self.source_surface,
+                "target_surface": self.target_surface,
+            }
+        ).removeprefix("sha256:")
+
+    def semantic_document(self) -> dict[str, object]:
+        return {
+            "effect": self.effect,
+            "post_state": dict(self.post_state),
+            "pre_state": dict(self.pre_state),
+            "prerequisites": list(self.prerequisites),
+            "primitive": self.primitive,
+        }
+
+    def document(
+        self,
+        *,
+        run_id: str,
+        order: int,
+        fixture_tick: int,
+        pack_id: str,
+        adapter_id: str,
+    ) -> dict[str, object]:
+        policy = self._policy_document(
+            run_id=run_id,
+            fixture_tick=fixture_tick,
+            pack_id=pack_id,
+            adapter_id=adapter_id,
+        )
+        return {
+            "boundary": self.boundary,
+            "budget": list(self.budget),
+            "edge_id": self.edge_id,
+            "effect": self.effect,
+            "identity_id": self.identity_id,
+            "order": order,
+            "policy": policy,
+            "post_state": dict(self.post_state),
+            "pre_state": dict(self.pre_state),
+            "prerequisites": list(self.prerequisites),
+            "primitive": self.primitive,
+            "semantic_signature": self.semantic_signature,
+            "source_surface": self.source_surface,
+            "target_surface": self.target_surface,
+        }
+
+    def _policy_document(
+        self,
+        *,
+        run_id: str,
+        fixture_tick: int,
+        pack_id: str,
+        adapter_id: str,
+    ) -> dict[str, object]:
+        common: dict[str, object] = {
+            "edge_id": self.edge_id,
+            "semantic_signature": self.semantic_signature,
+        }
+        if self.policy_kind == "no_dispatch":
+            body = {
+                **common,
+                "dispatch": False,
+                "kind": "no_dispatch",
+                "reason": "structural_verification_only",
+            }
+        else:
+            body = {
+                **common,
+                "adapter_id": adapter_id,
+                "authority_epoch": "epoch.g44.owned-fixture.1",
+                "budget_reservation": list(self.budget),
+                "cleanup_obligation": "restore_declared_initial_state",
+                "compiled_action": f"inert-local:{self.primitive}",
+                "engagement_id": "engagement.g44.owned-simulation",
+                "expires_at_tick": fixture_tick + 10,
+                "identity_id": self.identity_id,
+                "intent": "owned_inert_fixture_transition",
+                "issued_at_tick": fixture_tick,
+                "kind": "lease",
+                "pack_id": pack_id,
+                "reversible": True,
+                "run_id": run_id,
+                "scope_decision": "allow_owned_inert_simulation_only",
+            }
+        return {**body, "receipt_id": "receipt." + canonical_sha256(body).removeprefix("sha256:")}
 
 
 @dataclass(frozen=True, slots=True)
 class CandidateEvidence:
     classification: Literal["candidate_only"]
     edge_ids: tuple[str, ...]
-    lease_ids: tuple[str, ...]
     semantic_signatures: tuple[str, ...]
     final_canary_reached: bool
     final_effect_id: str | None
-    final_state_id: str | None
     lost_ids: int
     duplicate_effects: int
 
@@ -78,39 +149,19 @@ class CandidateEvidence:
 def candidate_evidence(
     executed: tuple[CandidateEdge, ...], *, expected_depth: int
 ) -> CandidateEvidence:
-    """Record deterministic candidate evidence without claiming verification."""
+    """Retain the small candidate summary; it is not an independent verdict."""
 
     edge_ids = tuple(edge.edge_id for edge in executed)
-    lease_ids = tuple(edge.lease_id for edge in executed)
-    effects = tuple(edge.effect_id for edge in executed)
-    if len(set(edge_ids)) != len(edge_ids) or len(set(lease_ids)) != len(lease_ids):
-        raise ValueError("every candidate edge and lease must be unique")
     signatures = tuple(edge.semantic_signature for edge in executed)
-    transitions = tuple(
-        (edge.source_surface, edge.target_surface) for edge in executed
-    )
-    bridges = tuple(edge.bridge for edge in executed)
-    surface_continuity = all(
-        left.target_surface == right.source_surface
-        for left, right in zip(executed, executed[1:], strict=False)
-    )
-    duplicate_effects = len(effects) - len(set(effects))
-    final_reached = (
-        expected_depth == len(G44_EXPECTED_SEMANTIC_SIGNATURES)
-        and signatures == G44_EXPECTED_SEMANTIC_SIGNATURES
-        and transitions == G44_EXPECTED_SURFACE_TRANSITIONS
-        and bridges == G44_EXPECTED_BRIDGES
-        and effects == G44_EXPECTED_EFFECTS
-        and surface_continuity
-    )
+    effects = tuple(edge.effect for edge in executed)
+    unique = len(edge_ids) == len(set(edge_ids)) == expected_depth
+    final_reached = unique and effects[-1:] == ("effect.web3.g44-inert-zero-value-canary",)
     return CandidateEvidence(
         classification="candidate_only",
         edge_ids=edge_ids,
-        lease_ids=lease_ids,
         semantic_signatures=signatures,
         final_canary_reached=final_reached,
         final_effect_id=effects[-1] if final_reached else None,
-        final_state_id=G44_FINAL_STATE_ID if final_reached else None,
         lost_ids=0,
-        duplicate_effects=duplicate_effects,
+        duplicate_effects=len(effects) - len(set(effects)),
     )

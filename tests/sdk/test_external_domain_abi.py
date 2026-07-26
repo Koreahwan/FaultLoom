@@ -1,18 +1,37 @@
 from __future__ import annotations
 
+from datetime import timedelta
+from pathlib import Path
+
 import pytest
 
 import faultloom_sdk
 import faultloom_protocol.models as m
-from faultloom_protocol import sha256_digest
+from faultloom_protocol import (
+    AuthoritySigner,
+    SignatureRollbackError,
+    SignatureTamperError,
+    UnknownKeyError,
+    sha256_digest,
+    sign_authority_grant,
+)
 from faultloom_sdk.external_domain import (
     EXTERNAL_DOMAIN_ABI_VERSION,
     ExternalAdapterBinding,
     ExternalDomainAdmissionError,
     ExternalDomainDeclaration,
     ExternalDomainRegistry,
+    VerifiedExternalDomainAdmission,
+    canonical_external_domain_manifest_digest,
+)
+from faultloom_sdk.external_domain_conformance import (
+    build_external_domain_conformance_receipt,
+    canonical_external_domain_conformance_receipt,
 )
 from tests.protocol.factories import D1, D2, sample_models
+
+
+FIXTURE = Path(__file__).parent / "fixtures" / "external_domain_v1_declaration.json"
 
 
 def _pack(*, pack_id: str = "pack.external.cloud") -> m.PackManifest:
@@ -112,7 +131,10 @@ def _registry() -> ExternalDomainRegistry:
 
 def test_v1_fixture_admits_as_data_without_loading_or_execution() -> None:
     assert faultloom_sdk.EXTERNAL_DOMAIN_ABI_VERSION == EXTERNAL_DOMAIN_ABI_VERSION
-    declaration = _declaration()
+    declaration = ExternalDomainDeclaration.model_validate_json(
+        FIXTURE.read_text(encoding="utf-8")
+    )
+    assert declaration == _declaration()
     receipt = _registry().admit(
         declaration,
         grant=_grant(),
@@ -126,11 +148,227 @@ def test_v1_fixture_admits_as_data_without_loading_or_execution() -> None:
         declaration.adapter_bindings[0].manifest_digest,
     )
     assert receipt.authority_grant_digest == sha256_digest(_grant())
+    assert receipt.declaration_digest == canonical_external_domain_manifest_digest(declaration)
+
+
+def test_signed_grant_binds_the_canonical_manifest_digest_and_rejects_rollback() -> None:
+    grant = _grant()
+    signer = AuthoritySigner.from_private_bytes(bytes(range(32)))
+    signed = sign_authority_grant(
+        grant,
+        signer,
+        signed_at=grant.issued_at + timedelta(minutes=1),
+    )
+    declaration = ExternalDomainDeclaration.model_validate_json(
+        FIXTURE.read_text(encoding="utf-8")
+    )
+
+    verified_admission = _registry().admit_signed(
+        declaration,
+        signed_grant=signed,
+        trusted_public_key=signer.public_key_record,
+        minimum_grant_version=grant.grant_version,
+        now=grant.issued_at + timedelta(minutes=2),
+        requested_capabilities=("cloud.iam.observe", "cloud.read_only_api"),
+        requested_actions=("cloud.iam.read",),
+    )
+    receipt = build_external_domain_conformance_receipt(
+        verified_admission,
+        trusted_public_key=signer.public_key_record,
+        minimum_grant_version=grant.grant_version,
+        now=grant.issued_at + timedelta(minutes=2),
+    )
+
+    assert receipt.canonical_manifest_digest == canonical_external_domain_manifest_digest(
+        declaration
+    )
+    assert receipt.signed_authority_grant_digest == sha256_digest(grant)
+    assert verified_admission.pinned_verifier_key_id == signer.public_key_record.key_id
+    assert verified_admission.signed_grant_envelope_digest == sha256_digest(signed)
+    with pytest.raises((AttributeError, TypeError)):
+        verified_admission.pinned_verifier_key_id = signer.key_id  # type: ignore[misc]
+    assert canonical_external_domain_conformance_receipt(receipt) == (
+        canonical_external_domain_conformance_receipt(
+            build_external_domain_conformance_receipt(
+                verified_admission,
+                trusted_public_key=signer.public_key_record,
+                minimum_grant_version=grant.grant_version,
+                now=grant.issued_at + timedelta(minutes=2),
+            )
+        )
+    )
+
+    with pytest.raises(SignatureRollbackError, match="below trusted minimum"):
+        _registry().admit_signed(
+            declaration,
+            signed_grant=signed,
+            trusted_public_key=signer.public_key_record,
+            minimum_grant_version=grant.grant_version + 1,
+            now=grant.issued_at + timedelta(minutes=2),
+        )
+
+
+def test_unsigned_or_forged_admission_cannot_create_a_conformance_receipt() -> None:
+    signer = AuthoritySigner.from_private_bytes(bytes(range(32)))
+    grant = _grant()
+    now = grant.issued_at + timedelta(minutes=2)
+    candidate = _registry().admit(_declaration(), grant=_grant())
+    assert not hasattr(candidate, "signed_authority_grant_digest")
+    with pytest.raises(ExternalDomainAdmissionError, match="verified signed admission"):
+        build_external_domain_conformance_receipt(  # type: ignore[arg-type]
+            candidate,
+            trusted_public_key=signer.public_key_record,
+            now=now,
+        )
+
+    with pytest.raises(TypeError, match="only created by admit_signed"):
+        VerifiedExternalDomainAdmission()
+
+    forged = object.__new__(VerifiedExternalDomainAdmission)
+    object.__setattr__(forged, "_VerifiedExternalDomainAdmission__admission", candidate)
+    object.__setattr__(
+        forged,
+        "_VerifiedExternalDomainAdmission__pinned_verifier_key_id",
+        "ed25519:sha256:" + "0" * 64,
+    )
+    object.__setattr__(
+        forged,
+        "_VerifiedExternalDomainAdmission__signed_authority_grant_digest",
+        candidate.authority_grant_digest,
+    )
+    object.__setattr__(
+        forged,
+        "_VerifiedExternalDomainAdmission__signed_grant_envelope_digest",
+        candidate.declaration_digest,
+    )
+    with pytest.raises(ExternalDomainAdmissionError, match="verified signed admission"):
+        build_external_domain_conformance_receipt(
+            forged,
+            trusted_public_key=signer.public_key_record,
+            now=now,
+        )
+
+
+def test_private_factory_cannot_bind_unsigned_admission_to_an_unrelated_signature() -> None:
+    """Importing the private helper cannot replace receipt-time verification."""
+
+    from faultloom_sdk.external_domain import _verified_external_domain_admission
+
+    unsigned_grant = _grant()
+    candidate = _registry().admit(_declaration(), grant=unsigned_grant)
+    signer = AuthoritySigner.from_private_bytes(bytes(range(32)))
+    other_grant = unsigned_grant.model_copy(
+        update={"grant_version": unsigned_grant.grant_version + 1}
+    )
+    signed_other_grant = sign_authority_grant(
+        other_grant,
+        signer,
+        signed_at=other_grant.issued_at + timedelta(minutes=1),
+    )
+    wrapped = _verified_external_domain_admission(
+        admission=candidate,
+        pinned_verifier_key_id=signer.public_key_record.key_id,
+        signed_grant=signed_other_grant,
+    )
+
+    with pytest.raises(
+        ExternalDomainAdmissionError,
+        match="verified grant digest does not match admission authority binding",
+    ):
+        build_external_domain_conformance_receipt(
+            wrapped,
+            trusted_public_key=signer.public_key_record,
+            minimum_grant_version=other_grant.grant_version,
+            now=other_grant.issued_at + timedelta(minutes=2),
+        )
+
+
+def test_private_factory_receipt_rechecks_the_actual_signature_bytes() -> None:
+    """A matching payload digest is insufficient when the signature is forged."""
+
+    from faultloom_sdk.external_domain import _verified_external_domain_admission
+
+    grant = _grant()
+    candidate = _registry().admit(_declaration(), grant=grant)
+    signer = AuthoritySigner.from_private_bytes(bytes(range(32)))
+    signed = sign_authority_grant(
+        grant,
+        signer,
+        signed_at=grant.issued_at + timedelta(minutes=1),
+    )
+    tampered = signed.model_copy(
+        update={
+            "signature": signed.signature.model_copy(
+                update={"signature": "A" * 86}
+            )
+        }
+    )
+    wrapped = _verified_external_domain_admission(
+        admission=candidate,
+        pinned_verifier_key_id=signer.public_key_record.key_id,
+        signed_grant=tampered,
+    )
+
+    with pytest.raises(SignatureTamperError, match="verification failed"):
+        build_external_domain_conformance_receipt(
+            wrapped,
+            trusted_public_key=signer.public_key_record,
+            minimum_grant_version=grant.grant_version,
+            now=grant.issued_at + timedelta(minutes=2),
+        )
+
+
+def test_receipt_revalidates_the_envelope_against_consumer_pinned_key() -> None:
+    grant = _grant()
+    signer = AuthoritySigner.from_private_bytes(bytes(range(32)))
+    other_signer = AuthoritySigner.from_private_bytes(bytes(range(1, 33)))
+    now = grant.issued_at + timedelta(minutes=2)
+    signed = sign_authority_grant(
+        grant,
+        signer,
+        signed_at=grant.issued_at + timedelta(minutes=1),
+    )
+    verified_admission = _registry().admit_signed(
+        _declaration(),
+        signed_grant=signed,
+        trusted_public_key=signer.public_key_record,
+        minimum_grant_version=grant.grant_version,
+        now=now,
+    )
+
+    with pytest.raises(ExternalDomainAdmissionError, match="trusted key differs"):
+        build_external_domain_conformance_receipt(
+            verified_admission,
+            trusted_public_key=other_signer.public_key_record,
+            minimum_grant_version=grant.grant_version,
+            now=now,
+        )
+
+
+def test_cross_key_signed_grant_cannot_create_a_conformance_receipt() -> None:
+    grant = _grant()
+    signer = AuthoritySigner.from_private_bytes(bytes(range(32)))
+    other_signer = AuthoritySigner.from_private_bytes(bytes(range(1, 33)))
+    signed = sign_authority_grant(
+        grant,
+        signer,
+        signed_at=grant.issued_at + timedelta(minutes=1),
+    )
+
+    with pytest.raises(UnknownKeyError, match="supplied trusted key"):
+        _registry().admit_signed(
+            _declaration(),
+            signed_grant=signed,
+            trusted_public_key=other_signer.public_key_record,
+            now=grant.issued_at + timedelta(minutes=2),
+        )
 
 
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
+        ("abi_version", "0.9.0", "unsupported external-domain ABI"),
+        ("abi_version", "1.0.1", "unsupported external-domain ABI"),
         ("abi_version", "2.0.0", "unsupported external-domain ABI"),
         ("egress_contract", "direct", "direct egress is forbidden"),
         ("cleanup_contract", "best_effort", "cleanup receipt contract is required"),

@@ -1,5 +1,5 @@
-"""Loopback-only Cloud/IAM/OAuth fixture projections."""
+"""Loopback-only, signed-input Cloud/IAM/OAuth fixture projections."""
 
-from .fixture import LoopbackCloudTrustFixture
+from .fixture import CloudTrustCleanupProof, LoopbackCloudTrustFixture
 
-__all__ = ["LoopbackCloudTrustFixture"]
+__all__ = ["CloudTrustCleanupProof", "LoopbackCloudTrustFixture"]
