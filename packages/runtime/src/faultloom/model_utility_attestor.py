@@ -34,7 +34,10 @@ from .model_utility_proxy_models import (
     LocalModelProcessResponse,
     LocalModelRuntimeProfile,
 )
-from .model_utility_sandbox import pinned_process_launch
+from .model_utility_sandbox import (
+    canonical_model_utility_launch_digest,
+    pinned_process_launch,
+)
 
 _DIGEST_PREFIX = "sha256:"
 _MAX_ATTESTOR_REQUEST_BYTES = 16_781_312
@@ -145,7 +148,7 @@ def exchange_with_transcript(
     try:
         with pinned_process_launch(config, encoded) as launch:
             completed = run_bounded_process(launch)
-            fixed_argv_digest = sha256_digest(launch.argv)
+            fixed_argv_digest = canonical_model_utility_launch_digest(launch)
     except subprocess.TimeoutExpired:
         error = LocalModelProcessError("local model process timed out")
     except BoundedProcessError:

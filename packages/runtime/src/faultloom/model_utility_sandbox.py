@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 
+from faultloom_protocol import sha256_digest
+
 from .model_utility_process import BoundedProcessLaunch
 from .model_utility_proxy_models import (
     FAULTLOOM_UTILITY_V1_BUNDLE_DIGEST,
@@ -36,6 +38,13 @@ _RUNTIME_ARGUMENTS = (
     MODEL_SNAPSHOT_TOKEN,
 )
 _MAX_ARTIFACT_BYTES = 128 * 1024 * 1024 * 1024
+MODEL_UTILITY_LAUNCH_DIGEST_VERSION = "faultloom.model-utility-launch.v1"
+_DESCRIPTOR_TOKENS = (
+    "@faultloom-fd:sandbox",
+    "@faultloom-fd:runtime",
+    "@faultloom-fd:model",
+    "@faultloom-fd:bundle",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,13 +173,27 @@ def _launch(
     encoded: bytes,
     descriptors: tuple[int, int, int, int],
 ) -> BoundedProcessLaunch:
+    return BoundedProcessLaunch(
+        argv=_launch_argv(descriptors),
+        stdin=encoded,
+        environment=MappingProxyType(
+            {"LANG": "C.UTF-8", "PATH": "/usr/bin:/bin"}
+        ),
+        pass_fds=descriptors,
+        timeout_seconds=config.timeout_seconds,
+        maximum_stdout_bytes=config.maximum_response_bytes,
+        maximum_stderr_bytes=config.maximum_response_bytes,
+    )
+
+
+def _launch_argv(descriptors: tuple[int, int, int, int]) -> tuple[str, ...]:
     sandbox = f"/proc/self/fd/{descriptors[0]}"
     runtime, model, bundle = (str(value) for value in descriptors[1:])
     runtime_arguments = tuple(
         _SANDBOX_MODEL_PATH if value == MODEL_SNAPSHOT_TOKEN else value
         for value in _RUNTIME_ARGUMENTS
     )
-    argv = (
+    return (
         sandbox,
         "--die-with-parent",
         "--new-session",
@@ -235,16 +258,86 @@ def _launch(
         _SANDBOX_RUNTIME_PATH,
         *runtime_arguments,
     )
-    return BoundedProcessLaunch(
-        argv=argv,
-        stdin=encoded,
-        environment=MappingProxyType(
-            {"LANG": "C.UTF-8", "PATH": "/usr/bin:/bin"}
-        ),
-        pass_fds=descriptors,
-        timeout_seconds=config.timeout_seconds,
-        maximum_stdout_bytes=config.maximum_response_bytes,
-        maximum_stderr_bytes=config.maximum_response_bytes,
+
+
+def canonical_model_utility_launch_digest(launch: BoundedProcessLaunch) -> str:
+    """Digest a pinned launch without binding process-local descriptor numbers."""
+
+    if type(launch) is not BoundedProcessLaunch:
+        raise LocalModelProcessError("model utility launch type is invalid")
+    descriptors = launch.pass_fds
+    if (
+        type(descriptors) is not tuple
+        or len(descriptors) != 4
+        or any(
+            type(descriptor) is not int or descriptor < 3
+            for descriptor in descriptors
+        )
+        or len(set(descriptors)) != 4
+    ):
+        raise LocalModelProcessError("model utility launch descriptors are invalid")
+    try:
+        for descriptor in descriptors:
+            _ = os.fstat(descriptor)
+    except OSError:
+        raise LocalModelProcessError(
+            "model utility launch descriptor is unavailable"
+        ) from None
+
+    argv = launch.argv
+    if (
+        type(argv) is not tuple
+        or not argv
+        or any(type(value) is not str for value in argv)
+    ):
+        raise LocalModelProcessError("model utility launch argv is invalid")
+    exact_descriptors = (
+        descriptors[0],
+        descriptors[1],
+        descriptors[2],
+        descriptors[3],
+    )
+    if argv != _launch_argv(exact_descriptors):
+        raise LocalModelProcessError("model utility launch argv template is invalid")
+    if (
+        len(_DESCRIPTOR_TOKENS) != 4
+        or len(set(_DESCRIPTOR_TOKENS)) != 4
+        or any(type(token) is not str or not token for token in _DESCRIPTOR_TOKENS)
+        or any(token in argv for token in _DESCRIPTOR_TOKENS)
+    ):
+        raise LocalModelProcessError("model utility launch descriptor tokens are invalid")
+
+    bind_destinations = (
+        _SANDBOX_RUNTIME_PATH,
+        _SANDBOX_MODEL_PATH,
+        _SANDBOX_BUNDLE_PATH,
+    )
+    bind_indices = tuple(
+        index for index, value in enumerate(argv) if value == "--ro-bind-data"
+    )
+    if len(bind_indices) != 3:
+        raise LocalModelProcessError("model utility artifact descriptor bindings are invalid")
+
+    canonical_argv = list(argv)
+    canonical_argv[0] = _DESCRIPTOR_TOKENS[0]
+    for offset, (index, descriptor, destination) in enumerate(
+        zip(bind_indices, descriptors[1:], bind_destinations, strict=True),
+        start=1,
+    ):
+        if index + 2 >= len(argv) or argv[index + 1 : index + 3] != (
+            str(descriptor),
+            destination,
+        ):
+            raise LocalModelProcessError(
+                "model utility artifact descriptor binding is invalid"
+            )
+        canonical_argv[index + 1] = _DESCRIPTOR_TOKENS[offset]
+
+    return sha256_digest(
+        {
+            "argv": tuple(canonical_argv),
+            "schema_version": MODEL_UTILITY_LAUNCH_DIGEST_VERSION,
+        }
     )
 
 
@@ -273,4 +366,8 @@ def pinned_process_launch(
         yield _launch(config, encoded, exact_descriptors)
 
 
-__all__ = ["pinned_process_launch"]
+__all__ = [
+    "MODEL_UTILITY_LAUNCH_DIGEST_VERSION",
+    "canonical_model_utility_launch_digest",
+    "pinned_process_launch",
+]

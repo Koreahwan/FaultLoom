@@ -6,12 +6,15 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+import faultloom.model_utility_sandbox as model_utility_sandbox
 from faultloom.model_utility_attestation_state import (
     AttestationStateError,
     MonotonicAttestationState,
@@ -31,9 +34,9 @@ from faultloom.model_utility_proxy_models import (
     LocalModelProcessRequest,
     LocalModelRuntimeProfile,
 )
+from faultloom.model_utility_sandbox import canonical_model_utility_launch_digest
 from faultloom_protocol import (
     AuthoritySigner,
-    sha256_digest,
     verify_model_producer_attestation,
 )
 from faultloom_sdk import ModelUtilityArm, UtilityDecision
@@ -107,6 +110,87 @@ def _producer_frame(request: LocalModelProcessRequest) -> ProducerAttestorReques
         allocation_id="producer-allocation-1",
         trusted_minimum_sequence=0,
     )
+
+
+@contextmanager
+def _held_launch(
+    config: LocalModelProcessConfig,
+    stdin: bytes = b"",
+) -> Generator[BoundedProcessLaunch, None, None]:
+    descriptors = tuple(os.open(os.devnull, os.O_RDONLY) for _ in range(4))
+    try:
+        yield model_utility_sandbox._launch(config, stdin, descriptors)
+    finally:
+        for descriptor in descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def test_canonical_launch_digest_normalizes_only_four_held_descriptor_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config()
+    with _held_launch(config) as first, _held_launch(config) as second:
+        first_digest = canonical_model_utility_launch_digest(first)
+        assert canonical_model_utility_launch_digest(second) == first_digest
+
+        altered_argv = list(first.argv)
+        altered_argv[altered_argv.index("--uid") + 1] = "1"
+        with pytest.raises(LocalModelProcessError, match="argv template is invalid"):
+            canonical_model_utility_launch_digest(
+                replace(first, argv=tuple(altered_argv))
+            )
+
+        with pytest.raises(LocalModelProcessError, match="descriptors are invalid"):
+            canonical_model_utility_launch_digest(
+                replace(first, pass_fds=first.pass_fds[:-1])
+            )
+        with pytest.raises(LocalModelProcessError, match="descriptors are invalid"):
+            canonical_model_utility_launch_digest(
+                replace(
+                    first,
+                    pass_fds=(
+                        first.pass_fds[0],
+                        first.pass_fds[1],
+                        first.pass_fds[1],
+                        first.pass_fds[3],
+                    ),
+                )
+            )
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(
+                model_utility_sandbox,
+                "_DESCRIPTOR_TOKENS",
+                ("same", "same", "model", "bundle"),
+            )
+            with pytest.raises(LocalModelProcessError, match="tokens are invalid"):
+                canonical_model_utility_launch_digest(first)
+
+        wrong_source = list(first.argv)
+        first_binding = wrong_source.index("--ro-bind-data") + 1
+        wrong_source[first_binding] = str(second.pass_fds[1])
+        with pytest.raises(LocalModelProcessError, match="argv template is invalid"):
+            canonical_model_utility_launch_digest(
+                replace(first, argv=tuple(wrong_source))
+            )
+
+        misplaced_source = list(first.argv)
+        misplaced_source[first_binding], misplaced_source[first_binding + 1] = (
+            misplaced_source[first_binding + 1],
+            misplaced_source[first_binding],
+        )
+        with pytest.raises(LocalModelProcessError, match="argv template is invalid"):
+            canonical_model_utility_launch_digest(
+                replace(first, argv=tuple(misplaced_source))
+            )
+
+    with _held_launch(config) as closed_launch:
+        os.close(closed_launch.pass_fds[0])
+        with pytest.raises(LocalModelProcessError, match="unavailable"):
+            canonical_model_utility_launch_digest(closed_launch)
 
 
 def test_state_is_monotonic_across_restart_and_concurrency(tmp_path: Path) -> None:
@@ -253,20 +337,11 @@ def test_attestor_binds_actual_llama_digest_and_exact_canonical_transcript(
     config = _config()
     request = _request(config)
     raw_wrapper_stdout = _response(request) + b"\n"
-    launch = BoundedProcessLaunch(
-        argv=("/pinned/bwrap", "--unshare-net", "--", "/pinned/runtime"),
-        stdin=b"",
-        environment={},
-        pass_fds=(),
-        timeout_seconds=2,
-        maximum_stdout_bytes=4096,
-        maximum_stderr_bytes=4096,
-    )
-
     @contextmanager
     def pinned(_config_value: object, encoded: bytes):
         assert encoded == _wire(request) + b"\n"
-        yield launch
+        with _held_launch(config, encoded) as launch:
+            yield launch
 
     monkeypatch.setattr("faultloom.model_utility_attestor.pinned_process_launch", pinned)
     monkeypatch.setattr(
@@ -292,7 +367,18 @@ def test_attestor_binds_actual_llama_digest_and_exact_canonical_transcript(
     assert payload.raw_llama_stdout_digest == _digest(b"actual llama stdout")
     assert payload.raw_llama_stdout_digest != _digest(raw_wrapper_stdout)
     assert payload.output_digest == result.response.output_digest
-    assert payload.fixed_argv_digest == sha256_digest(launch.argv)
+    with _held_launch(config) as equivalent_launch:
+        assert payload.fixed_argv_digest == canonical_model_utility_launch_digest(
+            equivalent_launch
+        )
+    verified = verify_model_producer_attestation(
+        result.producer_receipt,
+        {signer.key_id: signer.public_key_record},
+        minimum_sequence=1,
+        expected_session_id="model-session-1",
+        expected_evaluator_challenge="0123456789abcdef" * 4,
+    )
+    assert verified.fixed_argv_digest == payload.fixed_argv_digest
 
 
 def test_attestor_rejects_noncanonical_wrapper_stdout(
@@ -302,19 +388,10 @@ def test_attestor_rejects_noncanonical_wrapper_stdout(
     request = _request(config)
     canonical = _response(request) + b"\n"
     noncanonical = json.dumps(json.loads(canonical), sort_keys=True).encode() + b"\n"
-    launch = BoundedProcessLaunch(
-        argv=("/pinned/bwrap",),
-        stdin=b"",
-        environment={},
-        pass_fds=(),
-        timeout_seconds=2,
-        maximum_stdout_bytes=4096,
-        maximum_stderr_bytes=4096,
-    )
-
     @contextmanager
     def pinned(_config_value: object, _encoded: bytes):
-        yield launch
+        with _held_launch(config) as launch:
+            yield launch
 
     monkeypatch.setattr("faultloom.model_utility_attestor.pinned_process_launch", pinned)
     monkeypatch.setattr(
