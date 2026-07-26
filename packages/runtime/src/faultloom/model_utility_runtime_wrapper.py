@@ -32,10 +32,14 @@ _PR_SET_CHILD_SUBREAPER = 36
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _DECISIONS = frozenset(("positive", "negative", "inconclusive"))
-_DECISION_SCHEMA = (
-    '{"type":"object","additionalProperties":false,"required":["decision","output"],'
-    '"properties":{"decision":{"enum":["positive","negative","inconclusive"]},'
-    '"output":{"type":"string"}}}'
+_DECISION_GRAMMAR = """root ::= \"{\\\"decision\\\":\" decision \",\\\"output\\\":\\\"\" characters \"\\\"}\"
+decision ::= \"\\\"positive\\\"\" | \"\\\"negative\\\"\" | \"\\\"inconclusive\\\"\"
+characters ::= character*
+character ::= [^\"\\\\\\n\\r]
+"""
+_PROMPT_PREFIX = (
+    "Return exactly one JSON object with keys decision and output. "
+    "decision must be positive, negative, or inconclusive.\n"
 )
 _REQUEST_KEYS = frozenset(
     (
@@ -455,11 +459,11 @@ def _llama_argv(runtime_root: Path, prompt_file: Path) -> tuple[str, ...]:
         "--no-show-timings",
         "--no-warmup",
         "--no-context-shift",
-        "--conversation",
         "--single-turn",
         "--simple-io",
-        "--json-schema",
-        _DECISION_SCHEMA,
+        "--grammar",
+        _DECISION_GRAMMAR,
+        "--no-conversation",
         "--log-disable",
     )
 
@@ -492,14 +496,27 @@ def _parse_decision(raw: bytes, prompt: str) -> tuple[str, str]:
         return "inconclusive", ""
     prompt_marker = "> " + prompt + "\n"
     exit_marker = "\n\n\nExiting...\n"
-    if text.count(prompt_marker) != 1 or not text.endswith(exit_marker):
-        if "Error:" in text or "Failed to" in text:
-            raise WrapperError("model runtime reported an error")
+    if not text.endswith(exit_marker):
         raise WrapperError("model generation markers are invalid")
-    preamble, generated = text.split(prompt_marker, 1)
-    if "Error:" in preamble or "Failed to" in preamble:
-        raise WrapperError("model runtime reported an error")
-    generated = generated[: -len(exit_marker)]
+    if not prompt.startswith(_PROMPT_PREFIX):
+        raise WrapperError("model prompt is invalid")
+    if prompt in text or prompt_marker in text:
+        raise WrapperError("model prompt was echoed")
+    payload = prompt.removeprefix(_PROMPT_PREFIX)
+    try:
+        payload_object = json.loads(payload)
+    except json.JSONDecodeError:
+        payload_object = None
+    if (
+        type(payload_object) is dict
+        and frozenset(payload_object) == frozenset(("decision", "output"))
+        and payload_object.get("decision") in _DECISIONS
+        and type(payload_object.get("output")) is str
+        and len(payload_object["output"]) <= _MAX_OUTPUT_CHARS
+        and payload in text
+    ):
+        raise WrapperError("model prompt was echoed")
+    generated = text[: -len(exit_marker)]
     decoder = json.JSONDecoder()
     matches: list[tuple[str, str]] = []
     for offset, character in enumerate(generated):
@@ -529,10 +546,7 @@ def _main() -> int:
     with tempfile.TemporaryDirectory(prefix="faultloom-model-") as temporary:
         temporary_root = Path(temporary)
         runtime_root = _extract_bundle(Path(_BUNDLE_PATH), temporary_root)
-        prompt = (
-            "Return exactly one JSON object with keys decision and output. "
-            "decision must be positive, negative, or inconclusive.\n" + str(request["payload"])
-        )
+        prompt = _PROMPT_PREFIX + str(request["payload"])
         prompt_file = temporary_root / "prompt.txt"
         descriptor = os.open(
             prompt_file,
