@@ -7,6 +7,7 @@ import selectors
 import subprocess
 import sys
 import time
+import zipfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,13 +38,94 @@ class BoundedProcessResult:
     stdout: bytes
 
 
+_SUPERVISOR_PACKAGE = "faultloom"
+_SUPERVISOR_FILENAME = "model_utility_process_supervisor.py"
+_SUPERVISOR_SOURCE = "source"
+_SUPERVISOR_WHEEL = "wheel"
+_SUPERVISOR_BOOTSTRAP = """import __future__,ctypes,os,pkgutil,runpy,signal,subprocess,sys,time,zipimport
+from pathlib import Path
+root=sys.argv.pop(1)
+kind=sys.argv.pop(1)
+sys.argv[0]=root+\"/faultloom/model_utility_process_supervisor.py\"
+sys.path[:]=[root]
+if kind == \"source\":
+    runpy.run_path(sys.argv[0],run_name=\"__main__\")
+elif kind == \"wheel\":
+    code=zipimport.zipimporter(root+\"/faultloom\").get_code(\"model_utility_process_supervisor\")
+    if code is None: raise RuntimeError(\"supervisor code is unavailable\")
+    exec(code,{\"__name__\":\"__main__\",\"__file__\":sys.argv[0],\"__package__\":None})
+else:
+    raise RuntimeError(\"supervisor origin kind is invalid\")
+"""
+
+
+def _supervisor_import_root(origin: object) -> tuple[str, str]:
+    if type(origin) is not str:
+        raise BoundedProcessError("supervisor module origin is invalid")
+    module = Path(origin)
+    if not module.is_absolute() or module.name != "model_utility_process.py":
+        raise BoundedProcessError("supervisor module origin is invalid")
+
+    if module.parent.name == _SUPERVISOR_PACKAGE:
+        try:
+            source_module = module.resolve(strict=True)
+        except OSError:
+            source_module = None
+        if source_module is not None:
+            source_root = source_module.parents[1]
+            expected = source_root / _SUPERVISOR_PACKAGE / module.name
+            supervisor = source_root / _SUPERVISOR_PACKAGE / _SUPERVISOR_FILENAME
+            try:
+                source_supervisor = supervisor.resolve(strict=True)
+            except OSError:
+                source_supervisor = None
+            if (
+                source_module == expected
+                and source_root.is_dir()
+                and source_supervisor == supervisor
+                and supervisor.is_file()
+            ):
+                return _SUPERVISOR_SOURCE, str(source_root)
+
+    suffix = f"{os.sep}{_SUPERVISOR_PACKAGE}{os.sep}{module.name}"
+    if not origin.endswith(suffix):
+        raise BoundedProcessError("supervisor module origin is invalid")
+    archive = Path(origin[: -len(suffix)])
+    if not archive.is_absolute() or archive.suffix != ".whl":
+        raise BoundedProcessError("supervisor module origin is invalid")
+    try:
+        archive = archive.resolve(strict=True)
+        regular_archive = archive.is_file()
+    except OSError:
+        regular_archive = False
+    if not regular_archive or not zipfile.is_zipfile(archive):
+        raise BoundedProcessError("supervisor module origin is invalid")
+    try:
+        with zipfile.ZipFile(archive) as wheel:
+            members: set[str] = {str(member) for member in wheel.namelist()}
+    except OSError:
+        members = set()
+    package = f"{_SUPERVISOR_PACKAGE}/"
+    if {
+        f"{package}{module.name}",
+        f"{package}{_SUPERVISOR_FILENAME}",
+    } - members:
+        raise BoundedProcessError("supervisor module origin is invalid")
+    return _SUPERVISOR_WHEEL, str(archive)
+
+
 def _supervisor_argv(launch: BoundedProcessLaunch) -> tuple[str, ...]:
-    supervisor = Path(__file__).with_name("model_utility_process_supervisor.py")
+    kind, root = _supervisor_import_root(__file__)
     descriptors = ",".join(str(value) for value in launch.pass_fds)
     return (
         sys.executable,
         "-I",
-        str(supervisor),
+        "-S",
+        "-B",
+        "-c",
+        _SUPERVISOR_BOOTSTRAP,
+        root,
+        kind,
         "--pass-fds",
         descriptors,
         "--",

@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from faultloom import model_utility_process as bounded_process
 import faultloom.model_utility_sandbox as model_utility_sandbox
 from faultloom.model_utility_attestation_state import (
     AttestationStateError,
@@ -191,6 +192,14 @@ def test_canonical_launch_digest_normalizes_only_four_held_descriptor_bindings(
         os.close(closed_launch.pass_fds[0])
         with pytest.raises(LocalModelProcessError, match="unavailable"):
             canonical_model_utility_launch_digest(closed_launch)
+
+
+def test_supervisor_wrapper_does_not_change_canonical_model_launch_digest() -> None:
+    config = _config()
+    with _held_launch(config) as launch:
+        expected = canonical_model_utility_launch_digest(launch)
+        _ = bounded_process._supervisor_argv(launch)
+        assert canonical_model_utility_launch_digest(launch) == expected
 
 
 def test_state_is_monotonic_across_restart_and_concurrency(tmp_path: Path) -> None:
