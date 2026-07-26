@@ -7,17 +7,22 @@ import pytest
 from pydantic import ValidationError
 
 from faultloom_protocol import (
-    SCHEMA_VERSION,
     AuthoritySigner,
+    EVALUATION_MODEL_TYPES,
+    MODEL_ATTESTATION_MODEL_TYPES,
     ModelProducerAttestation,
     ModelVerifierAttestation,
+    REQUIRED_MODEL_TYPES,
+    SCHEMA_VERSION,
     SignatureTamperError,
     SignedModelProducerAttestation,
     SignedModelVerifierAttestation,
     UnknownKeyError,
+    WIRE_MODEL_TYPES,
     attestation_signing_bytes,
     canonical_json_bytes,
     parse_canonical_model_producer_attestation,
+    schema_catalog,
     sha256_digest,
     verify_model_attestation_pair,
     verify_model_producer_attestation,
@@ -155,6 +160,28 @@ def test_independent_attestations_round_trip_and_bind() -> None:
     assert producer_payload.status == "accepted"
     assert verifier_payload.outcome == "passed"
     assert parse_canonical_model_producer_attestation(canonical_json_bytes(producer)) == producer
+
+
+def test_authoritative_schema_catalog_registers_attestation_models_once_in_order() -> None:
+    catalog = schema_catalog()
+    names = tuple(catalog)
+    attestation_names = tuple(model.__name__ for model in MODEL_ATTESTATION_MODEL_TYPES)
+    authoritative_types = (
+        *REQUIRED_MODEL_TYPES,
+        *WIRE_MODEL_TYPES,
+        *EVALUATION_MODEL_TYPES,
+        *MODEL_ATTESTATION_MODEL_TYPES,
+    )
+    authoritative_names = tuple(model.__name__ for model in authoritative_types)
+
+    assert names == authoritative_names
+    assert names[-len(attestation_names) :] == attestation_names
+    assert len(names) == len(set(names)) == len(set(authoritative_types))
+    for model in MODEL_ATTESTATION_MODEL_TYPES:
+        schema = catalog[model.__name__]
+        assert schema == model.model_json_schema()
+        assert schema["type"] == "object"
+        assert schema["additionalProperties"] is False
 
 
 def test_payload_mutation_and_digest_mutation_are_rejected() -> None:

@@ -27,6 +27,7 @@ from .canonical import sha256_digest
 from .compatibility import SemVer, require_protocol_compatible
 from .enum_integrity import _install_protocol_enum_catalog
 from .evaluation import EVALUATION_ENUM_TYPES, EVALUATION_MODEL_TYPES
+from .model_attestation_contracts import MODEL_ATTESTATION_MODEL_TYPES
 
 Port = Annotated[int, Field(ge=1, le=65535)]
 PositiveInt = Annotated[int, Field(ge=1, le=MAX_INT64)]
@@ -1575,5 +1576,6 @@ def schema_catalog() -> dict[str, dict[str, object]]:
             *REQUIRED_MODEL_TYPES,
             *WIRE_MODEL_TYPES,
             *EVALUATION_MODEL_TYPES,
+            *MODEL_ATTESTATION_MODEL_TYPES,
         )
     }
