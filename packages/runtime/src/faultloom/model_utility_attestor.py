@@ -163,7 +163,7 @@ def exchange_with_transcript(
             raise LocalModelProcessError(
                 "local model process returned a malformed response"
             ) from None
-        if _canonical_local_model_bytes(response) != completed.stdout:
+        if _canonical_local_model_bytes(response) + b"\n" != completed.stdout:
             raise LocalModelProcessError("local model response JSON is not canonical")
         if (
             response.request_id != request.request_id

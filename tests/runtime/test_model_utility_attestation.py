@@ -252,7 +252,7 @@ def test_attestor_binds_actual_llama_digest_and_exact_canonical_transcript(
 ) -> None:
     config = _config()
     request = _request(config)
-    raw_wrapper_stdout = _response(request)
+    raw_wrapper_stdout = _response(request) + b"\n"
     launch = BoundedProcessLaunch(
         argv=("/pinned/bwrap", "--unshare-net", "--", "/pinned/runtime"),
         stdin=b"",
@@ -300,8 +300,8 @@ def test_attestor_rejects_noncanonical_wrapper_stdout(
 ) -> None:
     config = _config()
     request = _request(config)
-    canonical = _response(request)
-    noncanonical = json.dumps(json.loads(canonical), sort_keys=True).encode()
+    canonical = _response(request) + b"\n"
+    noncanonical = json.dumps(json.loads(canonical), sort_keys=True).encode() + b"\n"
     launch = BoundedProcessLaunch(
         argv=("/pinned/bwrap",),
         stdin=b"",
