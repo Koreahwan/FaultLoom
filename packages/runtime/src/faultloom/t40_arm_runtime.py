@@ -40,6 +40,17 @@ AttestationIdentifier = Annotated[
 ]
 EvaluatorChallenge = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 ArmIdentifier = Literal["legacy", "thin_frontier", "faultloom"]
+T40RunKey = Literal[
+    "control",
+    "off.context_compiler",
+    "off.specialist",
+    "off.tool_planner",
+    "off.t32",
+    "off.t33",
+    "off.t34",
+    "off.t35",
+    "off.adapters",
+]
 
 
 def canonical_json_bytes(value: object) -> bytes:
@@ -116,6 +127,7 @@ class T40ArmRequest(_StrictModel):
     )
     request_id: Identifier
     arm_id: ArmIdentifier
+    run_key: T40RunKey = "control"
     arm_runtime_digest: Sha256Digest
     case_digest: Sha256Digest
     private_input_digest: Sha256Digest
@@ -151,6 +163,8 @@ class T40ArmRequest(_StrictModel):
         )
         if self.arm_id == "thin_frontier" and any(value is None for value in attestation_context):
             raise T40ArmRuntimeError("thin-frontier producer attestation context is incomplete")
+        if self.arm_id != "faultloom" and self.run_key != "control":
+            raise T40ArmRuntimeError("only the FaultLoom arm accepts a component ablation")
         if self.evaluator_challenge is not None and len(
             set(bytes.fromhex(self.evaluator_challenge))
         ) < 8:

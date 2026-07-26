@@ -10,11 +10,17 @@ import tempfile
 from pathlib import Path
 
 from faultloom.state import EngagementKey, StateStore
-from faultloom.t40_web_pack_process import WEB_PACK_PROCESS_SCHEMA_VERSION, runtime_artifact_digest
+from faultloom.t40_web_pack_process import (
+    WEB_PACK_PROCESS_SCHEMA_VERSION,
+    WebPackProcessRequest,
+    runtime_artifact_digest,
+)
 from faultloom_protocol import canonical_json_bytes, sha256_digest
 from pydantic import ValidationError
 
-from .web_api import WebApiRunFacade, WebApiRunRequest, WebApiRunResult
+from .web_api.inputs import WebApiRunRequest
+from .web_api.results import WebApiRunResult
+from .web_api.runner import WebApiRunFacade, _build_identity, _run_surface
 
 _MAX_REQUEST_BYTES = 1_048_576
 
@@ -43,7 +49,10 @@ def worker_artifact_digest() -> str:
     finally:
         os.close(descriptor)
     identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-    if identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) or len(data) != before.st_size:
+    if (
+        identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        or len(data) != before.st_size
+    ):
         raise RuntimeError("Web pack worker changed while being read")
     return f"sha256:{hashlib.sha256(data).hexdigest()}"
 
@@ -73,16 +82,26 @@ def _component_digests(result: WebApiRunResult) -> dict[str, str]:
     }
 
 
+def _disabled_digest(component: str) -> str:
+    return sha256_digest({"component": component, "status": "disabled"})
+
+
 def _serve(encoded: bytes) -> bytes:
     if not encoded or len(encoded) > _MAX_REQUEST_BYTES:
         raise ValueError("Web pack request size is invalid")
     if not encoded.endswith(b"\n") or encoded.count(b"\n") != 1:
         raise ValueError("Web pack request must be one JSON line")
     try:
-        request = WebApiRunRequest.model_validate_json(encoded[:-1])
+        raw = WebPackProcessRequest.model_validate_json(encoded[:-1])
+        request = WebApiRunRequest.model_validate_json(canonical_json_bytes(raw.request))
     except ValidationError as exc:
         raise ValueError("Web pack request is invalid") from exc
-    canonical_request = canonical_json_bytes(request.model_dump(mode="json"))
+    envelope = {
+        "request": request.model_dump(mode="json"),
+        "run_key": raw.run_key,
+        "schema_version": raw.schema_version,
+    }
+    canonical_request = canonical_json_bytes(envelope)
     if encoded[:-1] != canonical_request:
         raise ValueError("Web pack request is not canonical")
     with tempfile.TemporaryDirectory(prefix="faultloom-t40-web-") as root:
@@ -94,16 +113,44 @@ def _serve(encoded: bytes) -> bytes:
             EngagementKey.generate(),
             anchor_root=anchor_root,
         ) as store:
-            result = WebApiRunFacade(store).run(request)
+            if raw.run_key == "control":
+                result = WebApiRunFacade(store).run(request)
+                component_digests = _component_digests(result)
+            else:
+                component_digests = {
+                    "identity_workflow": _disabled_digest("identity_workflow"),
+                    "api_async": _disabled_digest("api_async"),
+                    "cross_surface_chain": _disabled_digest("cross_surface_chain"),
+                }
+                if raw.run_key != "off.identity_workflow":
+                    identity = _build_identity(request.identity)
+                    component_digests["identity_workflow"] = sha256_digest(
+                        {
+                            "identity_graph": identity.identity_graph.model_dump(mode="json"),
+                            "workflow_graph": identity.workflow_graph.model_dump(mode="json"),
+                        }
+                    )
+                if raw.run_key != "off.api_async":
+                    surface = _run_surface(store, request.surface)
+                    component_digests["api_async"] = sha256_digest(
+                        {
+                            "completed_effect_ids": surface.completed_effect_ids,
+                            "surface_graph": surface.graph.model_dump(mode="json"),
+                        }
+                    )
+            component_use = {
+                "api_async": raw.run_key != "off.api_async",
+                "cross_surface_chain": raw.run_key == "control",
+                "identity_workflow": raw.run_key != "off.identity_workflow",
+            }
     response = {
-        "component_digests": _component_digests(result),
-        "component_use": {
-            "api_async": True,
-            "cross_surface_chain": True,
-            "identity_workflow": True,
-        },
-        "request_digest": sha256_digest(request.model_dump(mode="json")),
-        "result_digest": sha256_digest(result.model_dump(mode="json")),
+        "component_digests": component_digests,
+        "component_use": component_use,
+        "request_digest": sha256_digest(envelope),
+        "result_digest": sha256_digest(
+            {"component_digests": component_digests, "component_use": component_use}
+        ),
+        "run_key": raw.run_key,
         "runtime_artifact_digest": runtime_artifact_digest(),
         "schema_version": WEB_PACK_PROCESS_SCHEMA_VERSION,
         "worker_artifact_digest": worker_artifact_digest(),

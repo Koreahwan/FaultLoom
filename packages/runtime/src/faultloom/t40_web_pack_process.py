@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import importlib
 import os
 import stat
 import subprocess
@@ -16,12 +15,19 @@ from faultloom_protocol import canonical_json_bytes, sha256_digest
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .model_utility_process import BoundedProcessError, BoundedProcessLaunch, run_bounded_process
+from .t40_faultloom_install import FORMAL_SITE_ROOT
 
 WEB_PACK_PROCESS_SCHEMA_VERSION = "faultloom.t40-web-pack-process.v1"
 _MAX_REQUEST_BYTES = 1_048_576
 _MAX_RESPONSE_BYTES = 65_536
 _MAX_ARTIFACT_BYTES = 1_048_576
 _DIGEST = Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
+WebPackRunKey = Literal[
+    "control",
+    "off.identity_workflow",
+    "off.api_async",
+    "off.cross_surface_chain",
+]
 
 
 class WebPackProcessError(RuntimeError):
@@ -29,7 +35,7 @@ class WebPackProcessError(RuntimeError):
 
 
 class WebPackComponentUse(BaseModel):
-    """The three actual engine paths the one-shot facade always executes."""
+    """The three actual engine paths selected by the closed run key."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
@@ -48,12 +54,25 @@ class WebPackComponentDigests(BaseModel):
     cross_surface_chain: _DIGEST
 
 
+class WebPackProcessRequest(BaseModel):
+    """One fixed worker request with a closed component-ablation vocabulary."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal["faultloom.t40-web-pack-process-request.v1"] = (
+        "faultloom.t40-web-pack-process-request.v1"
+    )
+    run_key: WebPackRunKey = "control"
+    request: dict[str, object]
+
+
 class WebPackProcessResponse(BaseModel):
     """The public-safe response from the fixed one-shot Web pack worker."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     schema_version: Literal["faultloom.t40-web-pack-process.v1"]
+    run_key: WebPackRunKey
     request_digest: _DIGEST
     result_digest: _DIGEST
     worker_artifact_digest: _DIGEST
@@ -105,14 +124,14 @@ def runtime_artifact_digest() -> str:
 
 
 def _worker_path() -> Path:
-    module = importlib.import_module("faultloom_web.t40_worker")
-    origin = getattr(module, "__file__", None)
-    if type(origin) is not str:
+    path = FORMAL_SITE_ROOT / "faultloom_web/t40_worker.py"
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError:
+        raise WebPackProcessError("installed Web pack worker is unavailable") from None
+    if resolved != path or not resolved.is_relative_to(FORMAL_SITE_ROOT):
         raise WebPackProcessError("installed Web pack worker origin is invalid")
-    path = Path(origin)
-    if path.name != "t40_worker.py" or path.parent.name != "faultloom_web":
-        raise WebPackProcessError("installed Web pack worker origin is invalid")
-    return path
+    return resolved
 
 
 class WebPackProcessClient:
@@ -123,27 +142,46 @@ class WebPackProcessClient:
             raise ValueError("timeout_seconds must be an integer from 1 through 30")
         self._timeout_seconds = timeout_seconds
 
-    def run(self, request: object) -> WebPackProcessResponse:
+    def run(
+        self,
+        request: object,
+        *,
+        run_key: WebPackRunKey = "control",
+    ) -> WebPackProcessResponse:
         """Run the exact request without accepting a caller-selected process surface."""
 
-        from faultloom_web.web_api import WebApiRunRequest
+        from faultloom_web.web_api.inputs import WebApiRunRequest
 
         if type(request) is not WebApiRunRequest:
             raise TypeError("Web pack process requires an exact WebApiRunRequest")
-        encoded = canonical_json_bytes(request.model_dump(mode="json")) + b"\n"
+        envelope = {
+            "request": request.model_dump(mode="json"),
+            "run_key": run_key,
+            "schema_version": "faultloom.t40-web-pack-process-request.v1",
+        }
+        encoded = canonical_json_bytes(envelope) + b"\n"
         if len(encoded) > _MAX_REQUEST_BYTES:
             raise WebPackProcessError("Web pack request exceeds its byte limit")
         response = self._parse_response(self._fixed_exchange(encoded))
-        expected_worker = _read_private_regular_file(_worker_path(), label="installed Web pack worker")[1]
+        expected_worker = _read_private_regular_file(
+            _worker_path(), label="installed Web pack worker"
+        )[1]
         expected_runtime = runtime_artifact_digest()
-        if response.request_digest != sha256_digest(request.model_dump(mode="json")):
+        if response.run_key != run_key:
+            raise WebPackProcessError("Web pack response run key differs from its request")
+        if response.request_digest != sha256_digest(envelope):
             raise WebPackProcessError("Web pack response is not bound to its request")
         if response.worker_artifact_digest != expected_worker:
             raise WebPackProcessError("Web pack worker digest differs from the installed artifact")
         if response.runtime_artifact_digest != expected_runtime:
             raise WebPackProcessError("Web pack runtime digest differs from the installed artifact")
-        if not all(response.component_use.model_dump().values()):
-            raise WebPackProcessError("Web pack response does not prove all real components ran")
+        expected = {
+            "identity_workflow": run_key != "off.identity_workflow",
+            "api_async": run_key != "off.api_async",
+            "cross_surface_chain": run_key == "control",
+        }
+        if response.component_use.model_dump() != expected:
+            raise WebPackProcessError("Web pack response component use contradicts its run key")
         return response
 
     def _fixed_exchange(self, encoded: bytes) -> bytes:
@@ -154,8 +192,23 @@ class WebPackProcessClient:
         executable = Path(sys.executable)
         if not executable.is_absolute() or not executable.is_file():
             raise WebPackProcessError("installed Python executable is invalid")
+        _ = _worker_path()
+        bootstrap = (
+            "import runpy,sys;"
+            "sys.path[:0]=sys.argv[1:];"
+            "sys.argv=['faultloom_web.t40_worker'];"
+            "runpy.run_module('faultloom_web.t40_worker',run_name='__main__')"
+        )
         launch = BoundedProcessLaunch(
-            argv=(str(executable), "-I", "-B", "-m", "faultloom_web.t40_worker"),
+            argv=(
+                str(executable),
+                "-I",
+                "-S",
+                "-B",
+                "-c",
+                bootstrap,
+                FORMAL_SITE_ROOT.as_posix(),
+            ),
             stdin=encoded,
             environment=MappingProxyType(
                 {
@@ -198,6 +251,8 @@ __all__ = [
     "WebPackComponentUse",
     "WebPackProcessClient",
     "WebPackProcessError",
+    "WebPackProcessRequest",
     "WebPackProcessResponse",
+    "WebPackRunKey",
     "runtime_artifact_digest",
 ]

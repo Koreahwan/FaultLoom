@@ -37,6 +37,7 @@ from .t40_arm_runtime import (
 )
 
 Sha256Digest = Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
+Identifier = Annotated[str, Field(min_length=1, max_length=128, pattern=r"^[a-z0-9][a-z0-9._-]*$")]
 RealArmIdentifier = Literal["thin_frontier", "faultloom"]
 RealRuntimeClass = Literal["thin_frontier_reference", "faultloom_v2"]
 FaultLoomComponent = Literal[
@@ -63,6 +64,7 @@ _SCHEMA_FAULTLOOM_RUN_KEYS = frozenset(
     ("control", *(f"off.{item}" for item in _FAULTLOOM_COMPONENTS))
 )
 _MAX_MODEL_PAYLOAD_BYTES = 4096
+_MAX_FAULTLOOM_MODEL_PAYLOAD_BYTES = 32_768
 
 
 class _StrictModel(BaseModel):
@@ -97,8 +99,25 @@ class T40ComponentUse(_StrictModel):
 
 class _T40ComponentTrace(_StrictModel):
     component: FaultLoomComponent
-    status: Literal["absent", "used", "disabled"]
+    status: Literal["absent", "used", "disabled", "blocked"]
     trace_digest: Sha256Digest
+
+
+class _T40ComponentContext(_StrictModel):
+    """Bounded, redacted actual facts made visible to the one model call."""
+
+    component: Identifier
+    summary: Annotated[str, Field(min_length=2, max_length=16_384)]
+
+    @model_validator(mode="after")
+    def _summary_is_canonical_json(self) -> Self:
+        try:
+            value = json.loads(self.summary)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise T40ArmRuntimeError("component context summary is malformed") from None
+        if canonical_json_bytes(value).decode("ascii") != self.summary:
+            raise T40ArmRuntimeError("component context summary is not canonical JSON")
+        return self
 
 
 class T40RealArmResponse(_StrictModel):
@@ -128,6 +147,8 @@ class T40RealArmResponse(_StrictModel):
     disabled_component: FaultLoomComponent | None
     component_trace: tuple[_T40ComponentTrace, ...]
     component_trace_digest: Sha256Digest
+    component_context: tuple[_T40ComponentContext, ...] = ()
+    component_context_digest: Sha256Digest = Field(default_factory=lambda: _digest_json(()))
     model_response_digest: Sha256Digest
     model_decision: UtilityDecision
     model_output_digest: Sha256Digest
@@ -163,11 +184,16 @@ class T40RealArmResponse(_StrictModel):
             tuple(item.model_dump(mode="json") for item in self.component_trace)
         ):
             raise T40ArmRuntimeError("real-arm component trace digest mismatch")
+        if self.component_context_digest != _digest_json(
+            tuple(item.model_dump(mode="json") for item in self.component_context)
+        ):
+            raise T40ArmRuntimeError("real-arm component context digest mismatch")
         statuses = tuple(item.status for item in self.component_trace)
         if self.arm_id == "thin_frontier":
             if (
                 self.run_key != "control"
                 or self.disabled_component is not None
+                or self.component_context
                 or any(status != "absent" for status in statuses)
                 or any(self.component_use.model_dump(mode="python").values())
             ):
@@ -175,15 +201,37 @@ class T40RealArmResponse(_StrictModel):
         else:
             if self.run_key not in _SCHEMA_FAULTLOOM_RUN_KEYS:
                 raise T40ArmRuntimeError("FaultLoom run key is not registered")
-            expected_disabled = None if self.run_key == "control" else self.run_key.removeprefix("off.")
+            expected_disabled = (
+                None if self.run_key == "control" else self.run_key.removeprefix("off.")
+            )
             if self.disabled_component != expected_disabled:
                 raise T40ArmRuntimeError("FaultLoom disabled component does not match its run key")
             expected_statuses = tuple(
-                "disabled" if item == expected_disabled else "used"
+                "disabled"
+                if item == expected_disabled
+                else "blocked"
+                if item == "t35" and expected_disabled in {"t32", "t33"}
+                else "used"
                 for item in expected_components
             )
             if statuses != expected_statuses:
                 raise T40ArmRuntimeError("FaultLoom component trace does not match its ablation")
+            context_names = tuple(item.component for item in self.component_context)
+            expected_context = tuple(
+                sorted(
+                    {
+                        "semantic_depth",
+                        "web_pack",
+                        *(() if expected_disabled == "context_compiler" else ("context_compiler",)),
+                        *(() if expected_disabled == "specialist" else ("specialist",)),
+                        *(() if expected_disabled == "tool_planner" else ("tool_planner",)),
+                        *(() if expected_disabled == "t34" else ("patch_variant",)),
+                        *(() if expected_disabled == "adapters" else ("adapter_use",)),
+                    }
+                )
+            )
+            if context_names != expected_context:
+                raise T40ArmRuntimeError("FaultLoom component context does not match its ablation")
             component_values = self.component_use.model_dump(mode="python")
             for component, status in zip(expected_components, statuses, strict=True):
                 if component_values[component] is not (status == "used"):
@@ -254,6 +302,53 @@ def _thin_frontier_model_request(
     )
 
 
+def _faultloom_model_request(
+    request: T40ArmRequest,
+    policy: T40ArmPolicy,
+    *,
+    component_trace: tuple[_T40ComponentTrace, ...],
+    component_context: tuple[_T40ComponentContext, ...],
+) -> LocalModelProcessRequest:
+    """Bind the one FaultLoom model call to canonical actual component receipts."""
+
+    if request.arm_id != "faultloom":
+        raise T40ArmRuntimeError("FaultLoom model request rejects a different arm")
+    payload = canonical_json_bytes(
+        {
+            "arm_contract": "faultloom_v2",
+            "budget": policy.budget.model_dump(mode="json"),
+            "component_trace": tuple(item.model_dump(mode="json") for item in component_trace),
+            "component_context": tuple(item.model_dump(mode="json") for item in component_context),
+            "dispatch_route": policy.dispatch_route,
+            "gateway_policy_digest": policy.gateway_policy_digest,
+            "generation_config_digest": policy.generation_config_digest,
+            "network_route": policy.network_route,
+            "private_input_digest": request.private_input_digest,
+            "requested_tools": request.requested_tools,
+            "run_key": request.run_key,
+            "safety_policy_digest": policy.safety_policy_digest,
+            "tool_inventory": policy.allowed_tools,
+            "tool_schema_digest": policy.tool_schema_digest,
+        }
+    )
+    if len(payload) > _MAX_FAULTLOOM_MODEL_PAYLOAD_BYTES:
+        raise T40ArmRuntimeError("FaultLoom model-visible input exceeds its fixed limit")
+    return LocalModelProcessRequest(
+        request_id=request.request_id,
+        case_id=request.request_id,
+        case_digest=request.case_digest,
+        arm=ModelUtilityArm.TREATMENT,
+        model_snapshot_digest=request.model_snapshot_digest,
+        runtime_artifact_digest=request.model_runtime_digest,
+        prompt_digest=_digest_bytes(payload),
+        tool_schema_digest=request.tool_schema_digest,
+        budget_digest=request.budget_digest,
+        generation_config_digest=request.generation_config_digest,
+        seed=42,
+        payload=payload.decode("ascii"),
+    )
+
+
 def _model_response_from_arm(response: T40RealArmResponse) -> LocalModelProcessResponse:
     return LocalModelProcessResponse(
         request_id=response.request_id,
@@ -298,7 +393,8 @@ def _producer_payload_matches(
     return (
         payload.session_id == request.session_id
         and payload.evaluator_challenge == request.evaluator_challenge
-        and payload.canonical_request_digest == _digest_bytes(_canonical_local_model_bytes(model_request))
+        and payload.canonical_request_digest
+        == _digest_bytes(_canonical_local_model_bytes(model_request))
         and payload.parsed_response_digest
         == _digest_bytes(_canonical_local_model_bytes(model_response))
         and payload.raw_llama_stdout_digest == model_response.raw_llama_stdout_digest
@@ -367,7 +463,10 @@ def _sign_thin_frontier_response(
     if any(tool not in policy.allowed_tools for tool in request.requested_tools):
         raise T40ArmRuntimeError("requested tool is not admitted")
     expected_model_request = _thin_frontier_model_request(request, policy)
-    if type(model_request) is not LocalModelProcessRequest or model_request != expected_model_request:
+    if (
+        type(model_request) is not LocalModelProcessRequest
+        or model_request != expected_model_request
+    ):
         raise T40ArmRuntimeError("thin-frontier model request binding mismatch")
     if type(model_response) is not LocalModelProcessResponse:
         raise T40ArmRuntimeError("real arm requires an exact pinned-model response")
@@ -382,7 +481,9 @@ def _sign_thin_frontier_response(
         or model_response.output_tokens > policy.budget.maximum_output_tokens
     ):
         raise T40ArmRuntimeError("real arm exceeded its shared token budget")
-    if type(producer_receipt) is not SignedModelProducerAttestation or not _producer_payload_matches(
+    if type(
+        producer_receipt
+    ) is not SignedModelProducerAttestation or not _producer_payload_matches(
         producer_receipt=producer_receipt,
         request=request,
         policy=policy,
@@ -438,6 +539,8 @@ def _sign_thin_frontier_response(
         "component_trace_digest": _digest_json(
             tuple(item.model_dump(mode="json") for item in component_trace)
         ),
+        "component_context": (),
+        "component_context_digest": _digest_json(()),
         "model_response_digest": response_digest,
         "model_decision": model_response.decision,
         "model_output_digest": model_response.output_digest,
@@ -454,6 +557,121 @@ def _sign_thin_frontier_response(
         "input_tokens": model_response.input_tokens,
         "output_tokens": model_response.output_tokens,
         "component_use": T40ComponentUse(),
+        "producer_receipt": producer_receipt,
+        "signing_key_digest": _digest_bytes(public_key),
+    }
+    unsigned = T40RealArmResponse.model_validate({"signature": "A" * 88, **values})
+    signature = base64.b64encode(
+        signing_key.sign(canonical_json_bytes(_unsigned_response(unsigned)))
+    ).decode("ascii")
+    return T40RealArmResponse.model_validate({"signature": signature, **values})
+
+
+def _sign_faultloom_response(
+    *,
+    request: T40ArmRequest,
+    policy: T40ArmPolicy,
+    model_request: LocalModelProcessRequest,
+    model_response: LocalModelProcessResponse,
+    producer_receipt: SignedModelProducerAttestation,
+    component_trace: tuple[_T40ComponentTrace, ...],
+    component_context: tuple[_T40ComponentContext, ...],
+    component_use: T40ComponentUse,
+    runtime_implementation_digest: str,
+    signing_key: Ed25519PrivateKey,
+) -> T40RealArmResponse:
+    """Sign one actual FaultLoom run after validating every producer binding."""
+
+    if type(request) is not T40ArmRequest or type(policy) is not T40ArmPolicy:
+        raise T40ArmRuntimeError("FaultLoom requires exact request and policy values")
+    if request.arm_id != "faultloom" or not _policy_bindings_match(request, policy):
+        raise T40ArmRuntimeError("FaultLoom response binding mismatch")
+    if any(tool not in policy.allowed_tools for tool in request.requested_tools):
+        raise T40ArmRuntimeError("requested tool is not admitted")
+    expected_request = _faultloom_model_request(
+        request,
+        policy,
+        component_trace=component_trace,
+        component_context=component_context,
+    )
+    if model_request != expected_request:
+        raise T40ArmRuntimeError("FaultLoom model request binding mismatch")
+    if (
+        type(model_response) is not LocalModelProcessResponse
+        or model_response.request_id != request.request_id
+        or model_response.model_snapshot_digest != request.model_snapshot_digest
+        or model_response.runtime_artifact_digest != request.model_runtime_digest
+    ):
+        raise T40ArmRuntimeError("pinned-model response binding mismatch")
+    if (
+        model_response.input_tokens > policy.budget.maximum_input_tokens
+        or model_response.output_tokens > policy.budget.maximum_output_tokens
+    ):
+        raise T40ArmRuntimeError("real arm exceeded its shared token budget")
+    if not _producer_payload_matches(
+        producer_receipt=producer_receipt,
+        request=request,
+        policy=policy,
+        model_request=model_request,
+        model_response=model_response,
+    ):
+        raise T40ArmRuntimeError("producer receipt does not bind the exact model exchange")
+    request_digest = _request_digest(request)
+    response_digest = _digest_json(model_response.model_dump(mode="json"))
+    observation_digest = _digest_json(
+        {
+            "model_output_digest": model_response.output_digest,
+            "model_response_digest": response_digest,
+            "request_digest": request_digest,
+        }
+    )
+    public_key = signing_key.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    )
+    disabled = None if request.run_key == "control" else request.run_key.removeprefix("off.")
+    values: dict[str, object] = {
+        "request_id": request.request_id,
+        "arm_id": "faultloom",
+        "runtime_class": "faultloom_v2",
+        "case_digest": request.case_digest,
+        "request_digest": request_digest,
+        "private_input_digest": request.private_input_digest,
+        "policy_digest": request.policy_digest,
+        "model_snapshot_digest": request.model_snapshot_digest,
+        "model_runtime_digest": request.model_runtime_digest,
+        "tool_schema_digest": request.tool_schema_digest,
+        "gateway_policy_digest": request.gateway_policy_digest,
+        "safety_policy_digest": request.safety_policy_digest,
+        "generation_config_digest": request.generation_config_digest,
+        "budget_digest": request.budget_digest,
+        "runtime_artifact_digest": model_response.runtime_artifact_digest,
+        "runtime_implementation_digest": runtime_implementation_digest,
+        "run_key": request.run_key,
+        "disabled_component": disabled,
+        "component_trace": component_trace,
+        "component_trace_digest": _digest_json(
+            tuple(item.model_dump(mode="json") for item in component_trace)
+        ),
+        "component_context": component_context,
+        "component_context_digest": _digest_json(
+            tuple(item.model_dump(mode="json") for item in component_context)
+        ),
+        "model_response_digest": response_digest,
+        "model_decision": model_response.decision,
+        "model_output_digest": model_response.output_digest,
+        "raw_model_stdout_digest": model_response.raw_llama_stdout_digest,
+        "observation": model_response.output,
+        "observation_digest": observation_digest,
+        "model_snapshot_loads": 1,
+        "model_calls": 1,
+        "dispatch_count": 1,
+        "tool_dispatches": 0,
+        "dispatched_oos": 0,
+        "escaped_oos": 0,
+        "safety_violations": 0,
+        "input_tokens": model_response.input_tokens,
+        "output_tokens": model_response.output_tokens,
+        "component_use": component_use,
         "producer_receipt": producer_receipt,
         "signing_key_digest": _digest_bytes(public_key),
     }
@@ -487,6 +705,8 @@ def verify_real_arm_response(
         raise T40ArmRuntimeError("real-arm response is not canonical JSON")
     if not _policy_bindings_match(request, policy):
         raise T40ArmRuntimeError("shared policy binding mismatch")
+    if any(tool not in policy.allowed_tools for tool in request.requested_tools):
+        raise T40ArmRuntimeError("requested tool is not admitted")
     if (
         request.session_id is None
         or request.evaluator_challenge is None
@@ -497,9 +717,7 @@ def verify_real_arm_response(
     if (
         minimum_producer_sequence != request.trusted_minimum_sequence + 1
         or not hmac.compare_digest(expected_session_id, request.session_id)
-        or not hmac.compare_digest(
-            expected_evaluator_challenge, request.evaluator_challenge
-        )
+        or not hmac.compare_digest(expected_evaluator_challenge, request.evaluator_challenge)
     ):
         raise T40ArmRuntimeError("caller producer replay context does not match the arm request")
     expected_identity = (
@@ -567,8 +785,22 @@ def verify_real_arm_response(
         )
     except (TypeError, ValueError) as exc:
         raise T40ArmRuntimeError("real-arm producer receipt is untrusted") from exc
-    model_request = _thin_frontier_model_request(request, policy)
+    model_request = (
+        _thin_frontier_model_request(request, policy)
+        if response.arm_id == "thin_frontier"
+        else _faultloom_model_request(
+            request,
+            policy,
+            component_trace=response.component_trace,
+            component_context=response.component_context,
+        )
+    )
     model_response = _model_response_from_arm(response)
+    if (
+        model_response.input_tokens > policy.budget.maximum_input_tokens
+        or model_response.output_tokens > policy.budget.maximum_output_tokens
+    ):
+        raise T40ArmRuntimeError("real arm exceeded its shared token budget")
     if response.model_response_digest != _digest_bytes(
         _canonical_local_model_bytes(model_response)
     ):

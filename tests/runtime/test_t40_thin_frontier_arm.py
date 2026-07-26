@@ -170,6 +170,18 @@ def _forked_worker(launch: BoundedProcessLaunch) -> BoundedProcessResult:
     child = os.fork()
     if child == 0:
         try:
+            # The production path execs a fresh interpreter.  The fork-only
+            # test seam must not inherit modules imported while pytest collected
+            # unrelated FaultLoom-arm tests in the parent process.
+            for name in (
+                "faultloom.context",
+                "faultloom.semantic_depth",
+                "faultloom.research.specialist",
+                "faultloom.tool_planner.planner",
+                "faultloom.patch_variant.engine",
+                "faultloom.chain.engine",
+            ):
+                sys.modules.pop(name, None)
             thin._serve_one(*launch.pass_fds)
         except Exception:  # noqa: BLE001 - child harness must map every failure to an exit code
             os._exit(2)

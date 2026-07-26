@@ -1,22 +1,82 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 
+import _cffi_backend
+import annotated_types
+import cryptography
+import faultloom
+import faultloom_protocol
+import pydantic
+import pydantic_core
 import pytest
+import typing_inspection
+from faultloom import t40_web_pack_process as web_process
 from faultloom.model_utility_process import BoundedProcessLaunch, run_bounded_process
-from faultloom.t40_web_pack_process import WebPackProcessClient, WebPackProcessError
+from faultloom.t40_web_pack_process import (
+    WebPackProcessClient,
+    WebPackProcessError,
+    WebPackRunKey,
+)
 from faultloom_protocol import canonical_json_bytes
 from faultloom_web import t40_worker
+
 from labs.web_api import web_api_fixture
 
 
-def _request_bytes() -> bytes:
+@pytest.fixture(scope="module")
+def installed_site(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    site = tmp_path_factory.mktemp("formal-installed-site")
+    modules = (
+        faultloom,
+        faultloom_protocol,
+        t40_worker,
+        pydantic,
+        pydantic_core,
+        cryptography,
+        annotated_types,
+        typing_inspection,
+    )
+    copied: set[str] = set()
+    for module in modules:
+        assert module.__file__ is not None
+        source = Path(module.__file__).resolve()
+        package = source.parent
+        name = package.name
+        if name in copied:
+            continue
+        shutil.copytree(
+            package,
+            site / name,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+        copied.add(name)
+    import typing_extensions
+
+    assert typing_extensions.__file__ is not None
+    shutil.copy2(typing_extensions.__file__, site / "typing_extensions.py")
+    assert _cffi_backend.__file__ is not None
+    shutil.copy2(_cffi_backend.__file__, site / Path(_cffi_backend.__file__).name)
+    return site
+
+
+def _request_bytes(run_key: str = "control") -> bytes:
     request = web_api_fixture().positive
-    return canonical_json_bytes(request.model_dump(mode="json")) + b"\n"
+    return (
+        canonical_json_bytes(
+            {
+                "request": request.model_dump(mode="json"),
+                "run_key": run_key,
+                "schema_version": "faultloom.t40-web-pack-process-request.v1",
+            }
+        )
+        + b"\n"
+    )
 
 
 def _wait_for_pid_exit(pid_file: Path) -> None:
@@ -44,6 +104,48 @@ def test_worker_executes_the_real_web_facade_and_redacts_its_result() -> None:
     assert "compiled_intents" not in response
 
 
+def test_live_checkout_client_is_not_an_installed_worker() -> None:
+    with pytest.raises(WebPackProcessError, match="unavailable"):
+        WebPackProcessClient().run(web_api_fixture().positive)
+
+
+@pytest.mark.parametrize(
+    "run_key",
+    ("control", "off.identity_workflow", "off.api_async", "off.cross_surface_chain"),
+)
+def test_client_executes_installed_worker_transport_without_import_environment(
+    run_key: WebPackRunKey,
+    installed_site: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_process, "FORMAL_SITE_ROOT", installed_site)
+    response = WebPackProcessClient().run(web_api_fixture().positive, run_key=run_key)
+    assert response.run_key == run_key
+    assert response.worker_artifact_digest
+
+
+@pytest.mark.parametrize(
+    "run_key",
+    (
+        "off.identity_workflow",
+        "off.api_async",
+        "off.cross_surface_chain",
+    ),
+)
+def test_worker_ablation_skips_exactly_one_real_component(
+    run_key: str,
+) -> None:
+    response = json.loads(t40_worker._serve(_request_bytes(run_key)))
+
+    assert response["run_key"] == run_key
+    expected = {
+        "identity_workflow": run_key != "off.identity_workflow",
+        "api_async": run_key != "off.api_async",
+        "cross_surface_chain": False,
+    }
+    assert response["component_use"] == expected
+
+
 def test_client_rejects_tampered_worker_output_via_its_only_private_exchange_seam(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -53,6 +155,8 @@ def test_client_rejects_tampered_worker_output_via_its_only_private_exchange_sea
     tampered = canonical_json_bytes(response) + b"\n"
     client = WebPackProcessClient()
     monkeypatch.setattr(client, "_fixed_exchange", lambda _encoded: tampered)
+    assert t40_worker.__file__ is not None
+    monkeypatch.setattr(web_process, "FORMAL_SITE_ROOT", Path(t40_worker.__file__).parents[1])
 
     with pytest.raises(WebPackProcessError, match="worker digest"):
         client.run(request)
