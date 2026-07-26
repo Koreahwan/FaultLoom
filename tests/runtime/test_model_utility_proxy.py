@@ -83,7 +83,7 @@ def test_default_runtime_digest_is_checked_in_wrapper_pin() -> None:
     )
 
     assert config.runtime_executable_digest == (
-        "sha256:dee6503779cfa372e6f2259f888a3514b0b0f03cfad040b670b19a7e20266559"
+        "sha256:7648ed97e097bc07ee6e4223b2bfc94b7c400d33fb848a0b0e83d7ae46d2a0dd"
     )
 
 
