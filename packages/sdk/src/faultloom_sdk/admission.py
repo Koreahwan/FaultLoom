@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
-from faultloom_protocol import sha256_digest
+from faultloom_protocol import Ed25519PublicKeyRecord, sha256_digest
 from faultloom_protocol.models import AdapterManifest, EvidenceCapability
 from pydantic import ValidationError
 
 from .model_utility import ModelUtilityEvaluation
+from .model_utility_admission import (
+    ModelUtilityAdmissionError,
+    VerifiedModelUtilityAdmission,
+)
 from .admission_models import (
     ADMISSION_GATE_ORDER,
     AdapterAdmissionReceipt,
     AdapterAdmissionSnapshot,
     AdapterAdmissionState,
     AdmissionGate,
+    AdmissionOutcome,
     derive_admission_state,
 )
 from .registry import ManifestRegistry
@@ -74,7 +79,7 @@ class AdapterAdmissionRegistry:
             raise AdapterAdmissionError(
                 "model utility admission requires a canonical evaluation"
             )
-        return self._record(receipt)
+        return self._append_receipt(receipt)
 
     def record_model_utility(
         self,
@@ -93,7 +98,61 @@ class AdapterAdmissionRegistry:
             "trusted model utility attestation is unavailable"
         )
 
-    def _record(self, receipt: AdapterAdmissionReceipt) -> AdapterAdmissionSnapshot:
+    def record_verified_model_utility(
+        self,
+        proof: VerifiedModelUtilityAdmission,
+        *,
+        producer_trust_registry: dict[str, Ed25519PublicKeyRecord],
+        verifier_trust_registry: dict[str, Ed25519PublicKeyRecord],
+        minimum_producer_sequence: int,
+        minimum_verifier_sequence: int,
+        minimum_admission_sequence: int,
+        expected_session_id: str,
+        expected_evaluator_challenge: str,
+    ) -> AdapterAdmissionSnapshot:
+        """Admit only a consumer-revalidated verifier-signed utility proof.
+
+        The caller owns durable session/challenge replay state and must persist
+        and advance the three minimum sequence floors after acceptance.
+        """
+
+        if type(proof) is not VerifiedModelUtilityAdmission:
+            raise AdapterAdmissionError("model utility admission requires a verified proof")
+        try:
+            manifest = self._require_manifest(proof.adapter_id)
+            parts = proof.revalidated_parts(
+                manifest=manifest,
+                producer_trust_registry=producer_trust_registry,
+                verifier_trust_registry=verifier_trust_registry,
+                minimum_producer_sequence=minimum_producer_sequence,
+                minimum_verifier_sequence=minimum_verifier_sequence,
+                minimum_admission_sequence=minimum_admission_sequence,
+                expected_session_id=expected_session_id,
+                expected_evaluator_challenge=expected_evaluator_challenge,
+            )
+        except (
+            AdapterAdmissionError,
+            ModelUtilityAdmissionError,
+            AttributeError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise AdapterAdmissionError("utility admission proof did not revalidate") from exc
+        admission, evaluation = parts
+        receipt = AdapterAdmissionReceipt(
+            adapter_id=manifest.adapter_id,
+            manifest_digest=sha256_digest(manifest),
+            gate=AdmissionGate.MODEL_UTILITY,
+            outcome=AdmissionOutcome.PASSED,
+            artifact_digest=admission.evaluation_digest,
+            evaluation_digest=admission.evaluation_digest,
+            dispatched_oos=evaluation.metrics.dispatched_oos,
+            escaped_oos=evaluation.metrics.escaped_oos,
+            tool_only_false_verified=evaluation.metrics.tool_only_false_verified,
+        )
+        return self._append_receipt(receipt)
+
+    def _append_receipt(self, receipt: AdapterAdmissionReceipt) -> AdapterAdmissionSnapshot:
         manifest = self._require_manifest(receipt.adapter_id)
         if receipt.manifest_digest != sha256_digest(manifest):
             raise AdapterAdmissionError("admission receipt manifest digest mismatch")

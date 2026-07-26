@@ -17,6 +17,8 @@ from .compatibility import (
 from .gateway_receipt import GatewayEpochReceiptIssuer
 from .model_attestation import *  # noqa: F403
 from .model_attestation import __all__ as _MODEL_ATTESTATION_PUBLIC_EXPORTS
+from .model_utility_admission import *  # noqa: F403
+from .model_utility_admission import __all__ as _MODEL_UTILITY_ADMISSION_PUBLIC_EXPORTS
 from .evaluation import *  # noqa: F403
 from .evaluation import __all__ as _EVALUATION_PUBLIC_EXPORTS
 from .models import *  # noqa: F403
@@ -69,6 +71,7 @@ __all__ = [
     "schema_catalog",
     "GatewayEpochReceiptIssuer",
     *_MODEL_ATTESTATION_PUBLIC_EXPORTS,
+    *_MODEL_UTILITY_ADMISSION_PUBLIC_EXPORTS,
     "AuthoritySigner",
     "Ed25519PublicKeyRecord",
     "SignatureBlock",

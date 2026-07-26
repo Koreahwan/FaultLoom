@@ -25,11 +25,10 @@ from faultloom_sdk import (
     AdmissionGate,
     AdmissionOutcome,
     ManifestRegistry,
-    model_utility_digest,
     reference_registry,
 )
 from tests.protocol.factories import NOW, sample_models
-from tests.sdk.model_utility_support import valid_utility_evaluation
+from tests.sdk.model_utility_admission_support import record_verified, verified_proof
 
 
 def _admitted(
@@ -48,19 +47,11 @@ def _admitted(
                 artifact_digest=manifest.output_schema_digest,
             )
         )
-    evaluation_digest = model_utility_digest(valid_utility_evaluation())
-    # The public SDK deliberately has no self-attestation path for this gate.
-    # The planner unit test injects the state that a separate trusted evaluator
-    # would have produced; model-utility admission itself is tested elsewhere.
-    admission._record(  # noqa: SLF001 - test-only trusted-attestation fixture
-        AdapterAdmissionReceipt(
-            adapter_id=manifest.adapter_id,
-            manifest_digest=digest,
-            gate=AdmissionGate.MODEL_UTILITY,
-            outcome=AdmissionOutcome.PASSED,
-            artifact_digest=evaluation_digest,
-            evaluation_digest=evaluation_digest,
-        )
+    proof, producer_signer, verifier_signer, producer, verifier, _ = verified_proof(
+        manifest=manifest
+    )
+    _ = record_verified(
+        admission, proof, producer_signer, verifier_signer, producer, verifier
     )
     return admission
 

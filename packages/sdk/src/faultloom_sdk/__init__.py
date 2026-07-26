@@ -67,6 +67,11 @@ from .model_utility_evaluator import (
     evaluate_model_utility,
     model_utility_is_proven,
 )
+from .model_utility_admission import (
+    ModelUtilityAdmissionError,
+    VerifiedModelUtilityAdmission,
+    verify_model_utility_admission,
+)
 from .rpc import (
     CompileActionRequest,
     CompileActionResponse,
@@ -116,6 +121,7 @@ __all__ = [
     "IndependentVerifierOutcome",
     "IndependentVerifierVerdict",
     "ModelUtilityArm",
+    "ModelUtilityAdmissionError",
     "ModelUtilityArmConfig",
     "ModelUtilityCase",
     "ModelUtilityCaseOutcome",
@@ -135,6 +141,7 @@ __all__ = [
     "RpcMethod",
     "UnknownDescriptorError",
     "UtilityDecision",
+    "VerifiedModelUtilityAdmission",
     "derive_model_utility_metrics",
     "build_external_domain_conformance_receipt",
     "canonical_external_domain_manifest_digest",
@@ -142,6 +149,7 @@ __all__ = [
     "evaluate_model_utility",
     "model_utility_digest",
     "model_utility_is_proven",
+    "verify_model_utility_admission",
     "reference_adapter_manifest",
     "reference_pack_manifest",
     "reference_registry",
