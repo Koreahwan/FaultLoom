@@ -34,6 +34,11 @@ class _StrictModel(BaseModel):
 
 Sha256Digest = Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
 Identifier = Annotated[str, Field(min_length=1, max_length=128, pattern=r"^[a-z0-9][a-z0-9._-]*$")]
+AttestationIdentifier = Annotated[
+    str,
+    Field(min_length=1, max_length=256, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$"),
+]
+EvaluatorChallenge = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 ArmIdentifier = Literal["legacy", "thin_frontier", "faultloom"]
 
 
@@ -124,6 +129,11 @@ class T40ArmRequest(_StrictModel):
     budget_digest: Sha256Digest
     requested_tools: tuple[Identifier, ...]
     private_input: Annotated[str, Field(min_length=1, max_length=1_048_576)]
+    session_id: AttestationIdentifier | None = None
+    evaluator_challenge: EvaluatorChallenge | None = None
+    allocation_id: AttestationIdentifier | None = None
+    trusted_minimum_sequence: Annotated[int, Field(strict=True, ge=0, lt=(2**63) - 1)] | None = None
+    core_wheel_digest: Sha256Digest | None = None
 
     @model_validator(mode="after")
     def _private_input_digest_is_exact(self) -> Self:
@@ -132,6 +142,19 @@ class T40ArmRequest(_StrictModel):
             raise T40ArmRuntimeError("private input digest mismatch")
         if tuple(sorted(set(self.requested_tools))) != self.requested_tools:
             raise T40ArmRuntimeError("requested tools must be sorted and unique")
+        attestation_context = (
+            self.session_id,
+            self.evaluator_challenge,
+            self.allocation_id,
+            self.trusted_minimum_sequence,
+            self.core_wheel_digest,
+        )
+        if self.arm_id == "thin_frontier" and any(value is None for value in attestation_context):
+            raise T40ArmRuntimeError("thin-frontier producer attestation context is incomplete")
+        if self.evaluator_challenge is not None and len(
+            set(bytes.fromhex(self.evaluator_challenge))
+        ) < 8:
+            raise T40ArmRuntimeError("evaluator challenge lacks sufficient diversity")
         return self
 
 
