@@ -15,6 +15,8 @@ from .compatibility import (
     require_protocol_compatible,
 )
 from .gateway_receipt import GatewayEpochReceiptIssuer
+from .model_attestation import *  # noqa: F403
+from .model_attestation import __all__ as _MODEL_ATTESTATION_PUBLIC_EXPORTS
 from .evaluation import *  # noqa: F403
 from .evaluation import __all__ as _EVALUATION_PUBLIC_EXPORTS
 from .models import *  # noqa: F403
@@ -66,6 +68,7 @@ __all__ = [
     "WIRE_MODEL_TYPES",
     "schema_catalog",
     "GatewayEpochReceiptIssuer",
+    *_MODEL_ATTESTATION_PUBLIC_EXPORTS,
     "AuthoritySigner",
     "Ed25519PublicKeyRecord",
     "SignatureBlock",

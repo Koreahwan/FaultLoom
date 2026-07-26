@@ -126,6 +126,7 @@ def _trusted_protocol_type(value_type: type[object]) -> bool:
         "faultloom_protocol.base",
         "faultloom_protocol.evaluation_manifest",
         "faultloom_protocol.evaluation_results",
+        "faultloom_protocol.model_attestation",
         "faultloom_protocol.models",
     }:
         return False
