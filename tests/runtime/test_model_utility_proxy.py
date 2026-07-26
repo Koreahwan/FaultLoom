@@ -74,6 +74,19 @@ def _config(
     )
 
 
+def test_default_runtime_digest_is_checked_in_wrapper_pin() -> None:
+    config = LocalModelProcessConfig(
+        profile=LocalModelRuntimeProfile.FAULTLOOM_UTILITY_V1,
+        timeout_seconds=2,
+        maximum_request_bytes=4096,
+        maximum_response_bytes=4096,
+    )
+
+    assert config.runtime_executable_digest == (
+        "sha256:dee6503779cfa372e6f2259f888a3514b0b0f03cfad040b670b19a7e20266559"
+    )
+
+
 def _request(config: LocalModelProcessConfig) -> LocalModelProcessRequest:
     return LocalModelProcessRequest(
         request_id="utility-request-1",
