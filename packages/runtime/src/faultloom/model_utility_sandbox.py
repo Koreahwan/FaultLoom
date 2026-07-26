@@ -15,6 +15,7 @@ from types import MappingProxyType
 
 from .model_utility_process import BoundedProcessLaunch
 from .model_utility_proxy_models import (
+    FAULTLOOM_UTILITY_V1_BUNDLE_DIGEST,
     FAULTLOOM_UTILITY_V1_MODEL_DIGEST,
     FAULTLOOM_UTILITY_V1_RUNTIME_DIGEST,
     FAULTLOOM_UTILITY_V1_SANDBOX_DIGEST,
@@ -27,7 +28,13 @@ from .model_utility_proxy_models import (
 _PROFILE_ROOT = Path("/opt/faultloom/model-utility-v1")
 _SANDBOX_MODEL_PATH = "/opt/faultloom/model-snapshot"
 _SANDBOX_RUNTIME_PATH = "/opt/faultloom/runtime"
-_RUNTIME_ARGUMENTS = ("--model", MODEL_SNAPSHOT_TOKEN, "--json")
+_SANDBOX_BUNDLE_PATH = "/opt/faultloom/llama-b10107-bin-ubuntu-x64.tar.gz"
+_RUNTIME_ARGUMENTS = (
+    "--bundle",
+    _SANDBOX_BUNDLE_PATH,
+    "--model",
+    MODEL_SNAPSHOT_TOKEN,
+)
 _MAX_ARTIFACT_BYTES = 128 * 1024 * 1024 * 1024
 
 
@@ -143,15 +150,22 @@ def _artifact_specs(_profile: LocalModelRuntimeProfile) -> tuple[_ArtifactSpec, 
             False,
             "model snapshot",
         ),
+        _ArtifactSpec(
+            _PROFILE_ROOT / "llama-b10107-bin-ubuntu-x64.tar.gz",
+            FAULTLOOM_UTILITY_V1_BUNDLE_DIGEST,
+            False,
+            "runtime bundle",
+        ),
     )
 
 
 def _launch(
     config: LocalModelProcessConfig,
     encoded: bytes,
-    descriptors: tuple[int, int, int],
+    descriptors: tuple[int, int, int, int],
 ) -> BoundedProcessLaunch:
-    sandbox, runtime, model = (f"/proc/self/fd/{value}" for value in descriptors)
+    sandbox = f"/proc/self/fd/{descriptors[0]}"
+    runtime, model, bundle = (str(value) for value in descriptors[1:])
     runtime_arguments = tuple(
         _SANDBOX_MODEL_PATH if value == MODEL_SNAPSHOT_TOKEN else value
         for value in _RUNTIME_ARGUMENTS
@@ -187,6 +201,9 @@ def _launch(
         "--symlink",
         "usr/lib",
         "/lib",
+        "--symlink",
+        "usr/lib64",
+        "/lib64",
         "--proc",
         "/proc",
         "--dev",
@@ -197,12 +214,21 @@ def _launch(
         "/opt",
         "--dir",
         "/opt/faultloom",
-        "--ro-bind",
+        "--perms",
+        "0500",
+        "--ro-bind-data",
         runtime,
         _SANDBOX_RUNTIME_PATH,
-        "--ro-bind",
+        "--perms",
+        "0400",
+        "--ro-bind-data",
         model,
         _SANDBOX_MODEL_PATH,
+        "--perms",
+        "0400",
+        "--ro-bind-data",
+        bundle,
+        _SANDBOX_BUNDLE_PATH,
         "--chdir",
         "/tmp",
         "--",
@@ -236,9 +262,14 @@ def pinned_process_launch(
             descriptor = _open_pinned_artifact(spec)
             _ = stack.callback(os.close, descriptor)
             descriptors.append(descriptor)
-        if len(descriptors) != 3:
+        if len(descriptors) != 4:
             raise LocalModelProcessError("local model artifact set is incomplete")
-        exact_descriptors = (descriptors[0], descriptors[1], descriptors[2])
+        exact_descriptors = (
+            descriptors[0],
+            descriptors[1],
+            descriptors[2],
+            descriptors[3],
+        )
         yield _launch(config, encoded, exact_descriptors)
 
 

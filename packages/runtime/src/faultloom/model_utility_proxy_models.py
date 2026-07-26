@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 from enum import StrEnum
-from typing import Annotated, ClassVar, Self
+from typing import Annotated, ClassVar, Literal, Self
 
 from faultloom_protocol.base import Identifier, NonEmptyStr, Sha256Digest
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -14,13 +14,16 @@ from faultloom_sdk import ModelUtilityArm, UtilityDecision
 
 MODEL_SNAPSHOT_TOKEN = "{MODEL_SNAPSHOT}"
 FAULTLOOM_UTILITY_V1_SANDBOX_DIGEST = (
-    "sha256:b7ad567477c83756aab9a542b2be04f77dbae25115d85f22070d74d8cc4779dc"
+    "sha256:52231e1caf55bcbc667b269f49c63599a6f7db4767ae6a039580d0ff853db712"
 )
 FAULTLOOM_UTILITY_V1_RUNTIME_DIGEST = (
-    "sha256:d92c6a81b2ff50096bcda80885427d1f59a25b5f483f7055523504925d16ab23"
+    "sha256:cc9d6d525c158ed4dfa6e9a4a5c921911d09747d821d99845143f2f4126d5b1c"
 )
 FAULTLOOM_UTILITY_V1_MODEL_DIGEST = (
-    "sha256:9372c470eeadd5ecd9c3c74c2b3cb633f8e2f2fad799250a0f70d652b6b825e4"
+    "sha256:48ab3034d0dd401fbc721eb1df3217902fee7dab9078992d66431f09b7750201"
+)
+FAULTLOOM_UTILITY_V1_BUNDLE_DIGEST = (
+    "sha256:afe1ae0b706c4a0830b218a9249037b7a6cc723f81deb78825662128b25453e6"
 )
 
 
@@ -57,7 +60,15 @@ class LocalModelProcessConfig(_LocalProcessModel):
 
     @property
     def runtime_executable_digest(self) -> str:
+        """Digest of the standalone wrapper bound by existing requests."""
+
         return FAULTLOOM_UTILITY_V1_RUNTIME_DIGEST
+
+    @property
+    def runtime_bundle_digest(self) -> str:
+        """Digest of the separately pinned llama.cpp dynamic bundle."""
+
+        return FAULTLOOM_UTILITY_V1_BUNDLE_DIGEST
 
 
 class LocalModelProcessRequest(_LocalProcessModel):
@@ -71,7 +82,7 @@ class LocalModelProcessRequest(_LocalProcessModel):
     tool_schema_digest: Sha256Digest
     budget_digest: Sha256Digest
     generation_config_digest: Sha256Digest
-    seed: Annotated[int, Field(strict=True, ge=0)]
+    seed: Literal[42]
     payload: NonEmptyStr
 
 
@@ -80,7 +91,7 @@ class LocalModelProcessResponse(_LocalProcessModel):
     model_snapshot_digest: Sha256Digest
     runtime_artifact_digest: Sha256Digest
     decision: UtilityDecision
-    output: str
+    output: Annotated[str, Field(max_length=4096)]
     output_digest: Sha256Digest
     input_tokens: Annotated[int, Field(strict=True, ge=0)]
     output_tokens: Annotated[int, Field(strict=True, ge=0)]

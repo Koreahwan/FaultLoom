@@ -48,6 +48,25 @@ def _config(
     _ = _write(profile_root / "bwrap", b"sandbox", executable=True)
     _ = _write(profile_root / "runtime", b"runtime", executable=True)
     _ = _write(profile_root / "model.gguf", b"model")
+    _ = _write(
+        profile_root / "llama-b10107-bin-ubuntu-x64.tar.gz", b"bundle"
+    )
+    monkeypatch.setattr(
+        "faultloom.model_utility_sandbox.FAULTLOOM_UTILITY_V1_SANDBOX_DIGEST",
+        _digest_bytes(b"sandbox"),
+    )
+    monkeypatch.setattr(
+        "faultloom.model_utility_sandbox.FAULTLOOM_UTILITY_V1_RUNTIME_DIGEST",
+        _digest_bytes(b"runtime"),
+    )
+    monkeypatch.setattr(
+        "faultloom.model_utility_sandbox.FAULTLOOM_UTILITY_V1_MODEL_DIGEST",
+        _digest_bytes(b"model"),
+    )
+    monkeypatch.setattr(
+        "faultloom.model_utility_sandbox.FAULTLOOM_UTILITY_V1_BUNDLE_DIGEST",
+        _digest_bytes(b"bundle"),
+    )
     return LocalModelProcessConfig(
         profile=LocalModelRuntimeProfile.FAULTLOOM_UTILITY_V1,
         timeout_seconds=2,
@@ -120,6 +139,25 @@ def test_proxy_uses_exact_argv_without_shell_and_disables_network(
     assert "--clearenv" in launch.argv
     assert MODEL_SNAPSHOT_TOKEN not in launch.argv
     assert "/opt/faultloom/model-snapshot" in launch.argv
+    assert "/opt/faultloom/llama-b10107-bin-ubuntu-x64.tar.gz" in launch.argv
+    assert launch.argv[launch.argv.index("/lib64") - 2 : launch.argv.index("/lib64") + 1] == (
+        "--symlink",
+        "usr/lib64",
+        "/lib64",
+    )
+    assert len(launch.pass_fds) == 4
+    for descriptor, destination in zip(
+        launch.pass_fds[1:],
+        (
+            "/opt/faultloom/runtime",
+            "/opt/faultloom/model-snapshot",
+            "/opt/faultloom/llama-b10107-bin-ubuntu-x64.tar.gz",
+        ),
+        strict=True,
+    ):
+        assert ("--ro-bind-data", str(descriptor), destination) == launch.argv[
+            launch.argv.index(str(descriptor)) - 1 : launch.argv.index(str(descriptor)) + 2
+        ]
     assert launch.environment == {"LANG": "C.UTF-8", "PATH": "/usr/bin:/bin"}
 
 
@@ -270,6 +308,37 @@ def test_verified_model_bytes_are_immutable_after_source_rewrite(
     # Then: launched bytes remain the exact verified snapshot.
     assert before == b"model"
     assert after == before
+
+
+def test_verified_bundle_bytes_are_immutable_and_ordered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    with pinned_process_launch(config, b"request") as launch:
+        assert tuple(os.pread(fd, 16, 0) for fd in launch.pass_fds) == (
+            b"sandbox",
+            b"runtime",
+            b"model",
+            b"bundle",
+        )
+        _ = (tmp_path / "profile" / "llama-b10107-bin-ubuntu-x64.tar.gz").write_bytes(
+            b"substituted"
+        )
+        assert os.pread(launch.pass_fds[3], 16, 0) == b"bundle"
+
+
+def test_proxy_rejects_substituted_bundle_before_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    _ = (tmp_path / "profile" / "llama-b10107-bin-ubuntu-x64.tar.gz").write_bytes(
+        b"substituted"
+    )
+    with pytest.raises(LocalModelProcessError, match="runtime bundle digest"):
+        with pinned_process_launch(config, b"request"):
+            raise AssertionError("must not yield")
 
 
 def test_artifact_open_error_does_not_retain_raw_context(
