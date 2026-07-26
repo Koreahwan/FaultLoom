@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -8,6 +9,7 @@ from pathlib import Path
 
 import pytest
 from faultloom import model_utility_process as bounded_process
+from faultloom import model_utility_process_supervisor as process_supervisor
 from faultloom.model_utility_process import (
     BoundedProcessError,
     BoundedProcessLaunch,
@@ -134,3 +136,72 @@ def test_supervisor_cleanup_eperm_and_timeout_fail_closed() -> None:
 
     assert bounded_process._finish_supervisor(PermissionDeniedProcess()) is False  # type: ignore[arg-type]
     assert bounded_process._finish_supervisor(TimedOutProcess()) is False  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("unrelated", ("over-limit", "unreadable-stat"))
+def test_supervisor_targeted_cleanup_ignores_unrelated_proc_inventory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unrelated: str,
+) -> None:
+    pid_file = tmp_path / f"supervisor-{unrelated}.pid"
+    process_supervisor._set_subreaper()
+    process = subprocess.Popen(
+        (sys.executable, "-c", _setsid_double_fork_script(pid_file, "time.sleep(60)")),
+        start_new_session=True,
+    )
+    record = process_supervisor._process_record(process.pid)
+    assert record is not None
+    deadline = time.monotonic() + 2
+    while not pid_file.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert pid_file.exists()
+
+    class UnrelatedEntry:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    if unrelated == "over-limit":
+        entries = tuple(UnrelatedEntry(str(900_000 + index)) for index in range(5000))
+    else:
+        entries = (UnrelatedEntry("999999"),)
+        original_read_text = Path.read_text
+
+        def unreadable_unrelated(path: Path, *args: object, **kwargs: object) -> str:
+            if str(path) == "/proc/999999/stat":
+                raise PermissionError
+            return original_read_text(path, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(Path, "read_text", unreadable_unrelated)
+    original_iterdir = Path.iterdir
+
+    def unrelated_inventory(path: Path):
+        if str(path) == "/proc":
+            return iter(entries)
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", unrelated_inventory)
+
+    cleanup_ok = process_supervisor._cleanup_descendants(process.pid, record[1])
+    process.returncode = -signal.SIGKILL
+    assert cleanup_ok is True
+    _assert_pid_gone(pid_file)
+
+
+def test_supervisor_signals_known_target_group_before_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    monkeypatch.setattr(
+        process_supervisor,
+        "_signal_target_group",
+        lambda _pid, _start, _signal: events.append("target-group") or True,
+    )
+    monkeypatch.setattr(
+        process_supervisor,
+        "_descendants",
+        lambda: events.append("inventory") or {},
+    )
+    monkeypatch.setattr(process_supervisor, "_reap_exited", lambda: (True, True))
+    assert process_supervisor._cleanup_descendants(123, 456) is True
+    assert events == ["target-group", "inventory"]

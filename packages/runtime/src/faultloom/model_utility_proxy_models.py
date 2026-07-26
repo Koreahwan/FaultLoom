@@ -16,7 +16,7 @@ FAULTLOOM_UTILITY_V1_SANDBOX_DIGEST = (
     "sha256:52231e1caf55bcbc667b269f49c63599a6f7db4767ae6a039580d0ff853db712"
 )
 FAULTLOOM_UTILITY_V1_RUNTIME_DIGEST = (
-    "sha256:22bfc603fbfc1b6c599027cfc538475df64c5bf66a818c608bcae88aae95c2de"
+    "sha256:0feee3c2b0bf91d64850841c754d8b122573cf1c2209672d48c006e3c89bf98d"
 )
 FAULTLOOM_UTILITY_V1_MODEL_DIGEST = (
     "sha256:48ab3034d0dd401fbc721eb1df3217902fee7dab9078992d66431f09b7750201"
@@ -92,6 +92,7 @@ class LocalModelProcessResponse(_LocalProcessModel):
     decision: UtilityDecision
     output: Annotated[str, Field(max_length=4096)]
     output_digest: Sha256Digest
+    raw_llama_stdout_digest: Sha256Digest
     input_tokens: Annotated[int, Field(strict=True, ge=0)]
     output_tokens: Annotated[int, Field(strict=True, ge=0)]
 

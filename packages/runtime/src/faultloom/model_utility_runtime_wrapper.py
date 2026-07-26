@@ -29,7 +29,6 @@ _MAX_CHILD_STDERR_BYTES = 64 * 1024
 _MAX_OUTPUT_CHARS = 4096
 _CHILD_TIMEOUT_SECONDS = 180
 _PR_SET_CHILD_SUBREAPER = 36
-_MAX_PROCESSES = 4096
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _DECISIONS = frozenset(("positive", "negative", "inconclusive"))
@@ -216,7 +215,10 @@ def _run_bounded(argv: tuple[str, ...], stdin: bytes = b"") -> bytes:
         close_fds=True,
         start_new_session=True,
     )
+    target_start: int | None = None
     try:
+        target_record = _process_record(process.pid)
+        target_start = None if target_record is None else target_record[1]
         if process.stdin is None or process.stdout is None or process.stderr is None:
             raise WrapperError("child pipes are unavailable")
         process.stdin.write(stdin)
@@ -255,7 +257,7 @@ def _run_bounded(argv: tuple[str, ...], stdin: bytes = b"") -> bytes:
             raise WrapperError("child returned nonzero status")
         return bytes(output)
     finally:
-        cleanup_ok = _cleanup_descendants()
+        cleanup_ok = _cleanup_descendants(process.pid, target_start)
         for stream in (process.stdin, process.stdout, process.stderr):
             if stream is not None:
                 stream.close()
@@ -289,30 +291,55 @@ def _process_record(pid: int) -> tuple[int, int] | None:
         raise WrapperError("child process identity is invalid") from error
 
 
-def _descendants() -> dict[int, int]:
+def _children_of(pid: int, start_time: int) -> tuple[int, ...]:
+    current = _process_record(pid)
+    if current is None or current[1] != start_time:
+        return ()
     try:
-        pids = [int(entry.name) for entry in Path("/proc").iterdir() if entry.name.isdigit()]
+        tasks = tuple(
+            entry for entry in Path(f"/proc/{pid}/task").iterdir() if entry.name.isdigit()
+        )
+    except FileNotFoundError:
+        return ()
     except OSError as error:
-        raise WrapperError("child process inventory is unavailable") from error
-    if len(pids) > _MAX_PROCESSES:
-        raise WrapperError("child process inventory exceeds its limit")
-    records: dict[int, tuple[int, int]] = {}
-    for pid in pids:
-        record = _process_record(pid)
-        if record is not None:
-            records[pid] = record
-    parents = {os.getpid()}
+        raise WrapperError("known child inventory is unavailable") from error
+    values: list[str] = []
+    for task in tasks:
+        try:
+            values.extend((task / "children").read_text().split())
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise WrapperError("known child inventory is unavailable") from error
+    after = _process_record(pid)
+    if after is None or after[1] != start_time:
+        return ()
+    try:
+        children = tuple(int(value) for value in values)
+    except ValueError as error:
+        raise WrapperError("known child inventory is invalid") from error
+    if any(child <= 0 for child in children) or len(set(children)) != len(children):
+        raise WrapperError("known child inventory is invalid")
+    return children
+
+
+def _descendants() -> dict[int, int]:
+    root = _process_record(os.getpid())
+    if root is None:
+        raise WrapperError("wrapper identity is unavailable")
+    pending = [(os.getpid(), root[1])]
     descendants: dict[int, int] = {}
-    while True:
-        found = {
-            pid: start_time
-            for pid, (parent, start_time) in records.items()
-            if parent in parents and pid not in descendants
-        }
-        if not found:
-            return descendants
-        descendants.update(found)
-        parents = set(found)
+    while pending:
+        parent_pid, parent_start = pending.pop()
+        for child in _children_of(parent_pid, parent_start):
+            if child == os.getpid() or child in descendants:
+                continue
+            record = _process_record(child)
+            if record is None:
+                continue
+            descendants[child] = record[1]
+            pending.append((child, record[1]))
+    return descendants
 
 
 def _signal_identity(pid: int, start_time: int, sent_signal: int) -> bool:
@@ -321,6 +348,24 @@ def _signal_identity(pid: int, start_time: int, sent_signal: int) -> bool:
         return True
     try:
         os.kill(pid, sent_signal)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _signal_target_group(pid: int, start_time: int | None, sent_signal: int) -> bool:
+    if start_time is None:
+        return True
+    current = _process_record(pid)
+    if current is None or current[1] != start_time:
+        return True
+    try:
+        process_group = os.getpgid(pid)
+        if process_group != pid or process_group == os.getpgrp():
+            return False
+        os.killpg(process_group, sent_signal)
     except ProcessLookupError:
         return True
     except OSError:
@@ -341,8 +386,13 @@ def _reap_exited() -> tuple[bool, bool]:
             return True, False
 
 
-def _cleanup_descendants() -> bool:
+def _cleanup_descendants(target_pid: int, target_start: int | None) -> bool:
     for sent_signal, duration in ((signal.SIGTERM, 0.2), (signal.SIGKILL, 1.5)):
+        try:
+            if not _signal_target_group(target_pid, target_start, sent_signal):
+                return False
+        except WrapperError:
+            return False
         deadline = time.monotonic() + duration
         while True:
             try:
@@ -484,6 +534,7 @@ def _main() -> int:
         finally:
             os.close(descriptor)
         raw_output = _run_bounded(_llama_argv(runtime_root, prompt_file))
+        raw_llama_stdout_digest = "sha256:" + hashlib.sha256(raw_output).hexdigest()
         decision, output = _parse_decision(raw_output, prompt)
         response = {
             "decision": decision,
@@ -492,6 +543,7 @@ def _main() -> int:
             "output": output,
             "output_digest": "sha256:" + hashlib.sha256(output.encode()).hexdigest(),
             "output_tokens": _token_count(runtime_root, output) if output else 0,
+            "raw_llama_stdout_digest": raw_llama_stdout_digest,
             "request_id": request["request_id"],
             "runtime_artifact_digest": request["runtime_artifact_digest"],
         }

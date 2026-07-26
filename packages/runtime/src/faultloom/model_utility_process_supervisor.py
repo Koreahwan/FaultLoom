@@ -12,7 +12,6 @@ import time
 from pathlib import Path
 
 _PR_SET_CHILD_SUBREAPER = 36
-_MAX_PROCESSES = 4096
 _CLEANUP_FAILURE = 125
 _stop_requested = False
 
@@ -47,30 +46,55 @@ def _process_record(pid: int) -> tuple[int, int] | None:
         raise SupervisorError("process identity invalid") from error
 
 
-def _descendants() -> dict[int, int]:
+def _children_of(pid: int, start_time: int) -> tuple[int, ...]:
+    current = _process_record(pid)
+    if current is None or current[1] != start_time:
+        return ()
     try:
-        pids = [int(entry.name) for entry in Path("/proc").iterdir() if entry.name.isdigit()]
+        tasks = tuple(
+            entry for entry in Path(f"/proc/{pid}/task").iterdir() if entry.name.isdigit()
+        )
+    except FileNotFoundError:
+        return ()
     except OSError as error:
-        raise SupervisorError("process inventory unavailable") from error
-    if len(pids) > _MAX_PROCESSES:
-        raise SupervisorError("process inventory exceeds its limit")
-    records: dict[int, tuple[int, int]] = {}
-    for pid in pids:
-        record = _process_record(pid)
-        if record is not None:
-            records[pid] = record
-    parents = {os.getpid()}
+        raise SupervisorError("known child inventory unavailable") from error
+    values: list[str] = []
+    for task in tasks:
+        try:
+            values.extend((task / "children").read_text().split())
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise SupervisorError("known child inventory unavailable") from error
+    after = _process_record(pid)
+    if after is None or after[1] != start_time:
+        return ()
+    try:
+        children = tuple(int(value) for value in values)
+    except ValueError as error:
+        raise SupervisorError("known child inventory invalid") from error
+    if any(child <= 0 for child in children) or len(set(children)) != len(children):
+        raise SupervisorError("known child inventory invalid")
+    return children
+
+
+def _descendants() -> dict[int, int]:
+    root = _process_record(os.getpid())
+    if root is None:
+        raise SupervisorError("supervisor identity unavailable")
+    pending = [(os.getpid(), root[1])]
     descendants: dict[int, int] = {}
-    while True:
-        found = {
-            pid: start_time
-            for pid, (parent, start_time) in records.items()
-            if parent in parents and pid not in descendants
-        }
-        if not found:
-            return descendants
-        descendants.update(found)
-        parents = set(found)
+    while pending:
+        parent_pid, parent_start = pending.pop()
+        for child in _children_of(parent_pid, parent_start):
+            if child == os.getpid() or child in descendants:
+                continue
+            record = _process_record(child)
+            if record is None:
+                continue
+            descendants[child] = record[1]
+            pending.append((child, record[1]))
+    return descendants
 
 
 def _signal_identity(pid: int, start_time: int, sent_signal: int) -> bool:
@@ -79,6 +103,24 @@ def _signal_identity(pid: int, start_time: int, sent_signal: int) -> bool:
         return True
     try:
         os.kill(pid, sent_signal)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _signal_target_group(pid: int, start_time: int | None, sent_signal: int) -> bool:
+    if start_time is None:
+        return True
+    current = _process_record(pid)
+    if current is None or current[1] != start_time:
+        return True
+    try:
+        process_group = os.getpgid(pid)
+        if process_group != pid or process_group == os.getpgrp():
+            return False
+        os.killpg(process_group, sent_signal)
     except ProcessLookupError:
         return True
     except OSError:
@@ -99,8 +141,13 @@ def _reap_exited() -> tuple[bool, bool]:
             return True, False
 
 
-def _cleanup_descendants() -> bool:
+def _cleanup_descendants(target_pid: int, target_start: int | None) -> bool:
     for sent_signal, duration in ((signal.SIGTERM, 0.2), (signal.SIGKILL, 1.5)):
+        try:
+            if not _signal_target_group(target_pid, target_start, sent_signal):
+                return False
+        except SupervisorError:
+            return False
         deadline = time.monotonic() + duration
         while True:
             try:
@@ -177,13 +224,19 @@ def main() -> int:
             pass_fds=descriptors,
             start_new_session=True,
         )
+        try:
+            target_record = _process_record(target.pid)
+        except SupervisorError:
+            _ = _cleanup_descendants(target.pid, None)
+            return _CLEANUP_FAILURE
+        target_start = None if target_record is None else target_record[1]
         returncode: int | None = None
         while not _stop_requested:
             returncode = target.poll()
             if returncode is not None:
                 break
             time.sleep(0.01)
-        if not _cleanup_descendants():
+        if not _cleanup_descendants(target.pid, target_start):
             return _CLEANUP_FAILURE
         if _stop_requested:
             return 128 + signal.SIGTERM

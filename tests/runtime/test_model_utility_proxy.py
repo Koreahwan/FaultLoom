@@ -7,8 +7,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
-
+from faultloom.model_utility_process import BoundedProcessError
 from faultloom.model_utility_proxy import (
     MODEL_SNAPSHOT_TOKEN,
     BoundedProcessLaunch,
@@ -19,9 +18,9 @@ from faultloom.model_utility_proxy import (
     LocalModelProcessRequest,
     LocalModelRuntimeProfile,
 )
-from faultloom.model_utility_process import BoundedProcessError
-from faultloom_sdk import ModelUtilityArm, UtilityDecision
 from faultloom.model_utility_sandbox import pinned_process_launch
+from faultloom_sdk import ModelUtilityArm, UtilityDecision
+from pydantic import ValidationError
 
 
 def _digest_bytes(value: bytes) -> str:
@@ -102,6 +101,7 @@ def _response(request: LocalModelProcessRequest) -> bytes:
             "decision": UtilityDecision.NEGATIVE.value,
             "output": output,
             "output_digest": _digest_bytes(output.encode()),
+            "raw_llama_stdout_digest": _digest_bytes(b"raw llama stdout"),
             "input_tokens": 4,
             "output_tokens": 2,
         },
@@ -159,6 +159,49 @@ def test_proxy_uses_exact_argv_without_shell_and_disables_network(
             launch.argv.index(str(descriptor)) - 1 : launch.argv.index(str(descriptor)) + 2
         ]
     assert launch.environment == {"LANG": "C.UTF-8", "PATH": "/usr/bin:/bin"}
+
+
+@pytest.mark.parametrize("raw_digest", (None, "sha256:not-a-digest"))
+def test_proxy_rejects_missing_or_malformed_raw_llama_stdout_digest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raw_digest: str | None,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    request = _request(config)
+    document = json.loads(_response(request))
+    if raw_digest is None:
+        del document["raw_llama_stdout_digest"]
+    else:
+        document["raw_llama_stdout_digest"] = raw_digest
+    monkeypatch.setattr(
+        "faultloom.model_utility_proxy.run_bounded_process",
+        lambda _launch: BoundedProcessResult(
+            returncode=0,
+            stdout=json.dumps(document).encode(),
+        ),
+    )
+    with pytest.raises(LocalModelProcessError, match="malformed response"):
+        DigestPinnedLocalProcessProxy(config).exchange(request)
+
+
+def test_proxy_rejects_response_identity_rebind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    request = _request(config)
+    document = json.loads(_response(request))
+    document["runtime_artifact_digest"] = _digest_bytes(b"rebound runtime")
+    monkeypatch.setattr(
+        "faultloom.model_utility_proxy.run_bounded_process",
+        lambda _launch: BoundedProcessResult(
+            returncode=0,
+            stdout=json.dumps(document).encode(),
+        ),
+    )
+    with pytest.raises(LocalModelProcessError, match="identity mismatch"):
+        DigestPinnedLocalProcessProxy(config).exchange(request)
 
 
 def test_proxy_rejects_substituted_model_before_launch(
@@ -336,9 +379,10 @@ def test_proxy_rejects_substituted_bundle_before_launch(
     _ = (tmp_path / "profile" / "llama-b10107-bin-ubuntu-x64.tar.gz").write_bytes(
         b"substituted"
     )
-    with pytest.raises(LocalModelProcessError, match="runtime bundle digest"):
-        with pinned_process_launch(config, b"request"):
-            raise AssertionError("must not yield")
+    with pytest.raises(
+        LocalModelProcessError, match="runtime bundle digest"
+    ), pinned_process_launch(config, b"request"):
+        raise AssertionError("must not yield")
 
 
 def test_artifact_open_error_does_not_retain_raw_context(
@@ -351,9 +395,10 @@ def test_artifact_open_error_does_not_retain_raw_context(
         raise OSError("API_KEY=do-not-leak")
 
     monkeypatch.setattr("faultloom.model_utility_sandbox.os.open", denied)
-    with pytest.raises(LocalModelProcessError, match="unavailable") as artifact_error:
-        with pinned_process_launch(config, b"request"):
-            raise AssertionError("must not yield")
+    with pytest.raises(
+        LocalModelProcessError, match="unavailable"
+    ) as artifact_error, pinned_process_launch(config, b"request"):
+        raise AssertionError("must not yield")
     assert "do-not-leak" not in str(artifact_error.value)
     assert artifact_error.value.__cause__ is None
     assert artifact_error.value.__context__ is None
@@ -369,9 +414,10 @@ def test_artifact_staging_error_does_not_retain_raw_context(
         raise OSError("API_KEY=do-not-leak")
 
     monkeypatch.setattr("faultloom.model_utility_sandbox.os.fstat", denied)
-    with pytest.raises(LocalModelProcessError, match="unavailable") as artifact_error:
-        with pinned_process_launch(config, b"request"):
-            raise AssertionError("must not yield")
+    with pytest.raises(
+        LocalModelProcessError, match="unavailable"
+    ) as artifact_error, pinned_process_launch(config, b"request"):
+        raise AssertionError("must not yield")
     assert "do-not-leak" not in str(artifact_error.value)
     assert artifact_error.value.__cause__ is None
     assert artifact_error.value.__context__ is None

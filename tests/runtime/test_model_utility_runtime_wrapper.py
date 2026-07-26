@@ -181,7 +181,7 @@ def test_inner_cleanup_failure_surfaces_stable_wrapper_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(wrapper, "_set_subreaper", lambda: None)
-    monkeypatch.setattr(wrapper, "_cleanup_descendants", lambda: False)
+    monkeypatch.setattr(wrapper, "_cleanup_descendants", lambda _pid, _start: False)
     with pytest.raises(wrapper.WrapperError, match="child process cleanup failed"):
         wrapper._run_bounded((sys.executable, "-c", "pass"))
 
@@ -194,6 +194,44 @@ def test_inner_cleanup_eperm_fails_closed(monkeypatch: pytest.MonkeyPatch) -> No
 
     monkeypatch.setattr(os, "kill", permission_denied)
     assert wrapper._signal_identity(123, 7, 15) is False
+
+
+@pytest.mark.parametrize("unrelated", ("over-limit", "unreadable-stat"))
+def test_inner_targeted_cleanup_ignores_unrelated_proc_inventory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unrelated: str,
+) -> None:
+    pid_file = tmp_path / f"inner-{unrelated}.pid"
+
+    class UnrelatedEntry:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    if unrelated == "over-limit":
+        entries = tuple(UnrelatedEntry(str(900_000 + index)) for index in range(5000))
+    else:
+        entries = (UnrelatedEntry("999999"),)
+        original_read_text = Path.read_text
+
+        def unreadable_unrelated(path: Path, *args: object, **kwargs: object) -> str:
+            if str(path) == "/proc/999999/stat":
+                raise PermissionError
+            return original_read_text(path, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(Path, "read_text", unreadable_unrelated)
+    original_iterdir = Path.iterdir
+
+    def unrelated_inventory(path: Path):
+        if str(path) == "/proc":
+            return iter(entries)
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", unrelated_inventory)
+    monkeypatch.setattr(wrapper, "_CHILD_TIMEOUT_SECONDS", 0.25)
+    with pytest.raises(wrapper.WrapperError, match="timed out"):
+        wrapper._run_bounded(_inner_setsid_double_fork_script(pid_file, "time.sleep(60)"))
+    _assert_inner_pid_gone(pid_file)
 
 
 def test_decision_parser_requires_one_exact_bounded_object() -> None:
@@ -297,4 +335,12 @@ def test_wrapper_emits_exactly_one_bound_response_line(
     assert response["decision"] == "negative"
     assert response["output_digest"] == (
         "sha256:" + __import__("hashlib").sha256(b"bounded").hexdigest()
+    )
+    expected_raw = (
+        b"> Return exactly one JSON object with keys decision and output. "
+        b"decision must be positive, negative, or inconclusive.\nbounded prompt\n"
+        b'{"decision":"negative","output":"bounded"}\n\n\nExiting...\n'
+    )
+    assert response["raw_llama_stdout_digest"] == (
+        "sha256:" + __import__("hashlib").sha256(expected_raw).hexdigest()
     )
