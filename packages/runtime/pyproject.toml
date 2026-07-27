@@ -20,6 +20,8 @@ dependencies = [
 [project.scripts]
 faultloom = "faultloom.cli:main"
 faultloom-model-producer-attestor = "faultloom.model_utility_attestor:main"
+faultloom-materialize-adapter-admission = "faultloom.adapter_admission_materializer:main"
+faultloom-materialize-t40-producer-binding = "faultloom.t40_formal_producer_binding:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -372,6 +372,7 @@ def _installed_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path, bytes]:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         path.write_bytes(content)
         path.chmod(0o644)
+    staging_manifest_digest = _digest(b"staging-manifest")
     manifest_payload: dict[str, object] = {
         "schema": "faultloom.ops.t40-formal-python-install-manifest.v1",
         "site_root": {
@@ -382,6 +383,10 @@ def _installed_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path, bytes]:
         },
         "wheels": wheels,
         "dependency_bundle_sha256": _digest(b"dependencies"),
+        "staging_equivalence": {
+            "installed_tree_sha256": _digest(b"installed-tree"),
+            "staging_manifest_sha256": staging_manifest_digest,
+        },
         "installed_tree": [
             {"mode": 0o644, "path": path, "sha256": _digest(content)}
             for path, content in sorted(files.items())
@@ -402,6 +407,11 @@ def _installed_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path, bytes]:
             for name in install._PROFILE_FIELDS
             if name.endswith("_sha256")
         },
+        **{
+            name: _digest(name.encode())
+            for name in install._PROFILE_FIELDS
+            if name.startswith("producer_") and name.endswith("_digest")
+        },
         "schema": "faultloom.ops.t40-formal-install-profile.v1",
         "core_commit": "1" * 40,
         "core_tree": "2" * 40,
@@ -411,6 +421,7 @@ def _installed_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path, bytes]:
         "ops_tree": "6" * 40,
         "private_plan_commitment": _digest(b"private-plan"),
         "expected_calls": 66,
+        "producer_sequence_start": 2,
         "lab_key_id": "lab-v1",
         "producer_key_id": "producer-v1",
         "legacy_arm_key_id": "legacy-v1",
@@ -437,6 +448,7 @@ def _installed_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path, bytes]:
         "network": "disabled",
         "python_install_manifest_sha256": _digest(manifest_raw),
         "dependency_bundle_sha256": manifest_payload["dependency_bundle_sha256"],
+        "staging_manifest_sha256": staging_manifest_digest,
         **wheel_profile_digests,
     }
     profile = tmp_path / "profile.json"

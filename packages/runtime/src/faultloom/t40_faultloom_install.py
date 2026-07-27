@@ -79,7 +79,15 @@ _PROFILE_FIELDS = {
     "private_plan_commitment",
     "independent_verifier_sha256",
     "verifier_policy_sha256",
+    "producer_model_digest",
+    "producer_runtime_wrapper_digest",
+    "producer_runtime_bundle_digest",
+    "producer_sandbox_digest",
+    "producer_fixed_argv_digest",
+    "producer_profile_digest",
+    "staging_manifest_sha256",
     "expected_calls",
+    "producer_sequence_start",
     "lab_key_id",
     "lab_key_sha256",
     "producer_key_id",
@@ -330,6 +338,7 @@ def _validate_formal_installation_at(
     manifest = _verify_envelope(manifest_raw, trusted_root, "formal Python manifest")
     profile_raw = _read_owned_file(profile_path, uid=uid, gid=gid)
     profile = _verify_envelope(profile_raw, trusted_root, "formal install profile")
+    staging_equivalence = manifest.get("staging_equivalence")
     expected_manifest_root = {
         "gid": gid,
         "mode": 0o700,
@@ -338,13 +347,21 @@ def _validate_formal_installation_at(
     }
     if (
         set(manifest)
-        != {"dependency_bundle_sha256", "installed_tree", "schema", "site_root", "wheels"}
+        != {
+            "dependency_bundle_sha256",
+            "installed_tree",
+            "schema",
+            "site_root",
+            "staging_equivalence",
+            "wheels",
+        }
         or manifest.get("site_root") != expected_manifest_root
         or set(profile) != _PROFILE_FIELDS
         or profile.get("schema") != "faultloom.ops.t40-formal-install-profile.v1"
         or profile.get("site_packages") != FORMAL_SITE_ROOT.as_posix()
         or profile.get("network") != "disabled"
         or profile.get("execution") != "one-shot-no-daemon"
+        or profile.get("producer_sequence_start") != 2
         or profile.get("python_argv") != ["/usr/bin/python3.12", "-I", "-S", "-B"]
         or profile.get("environment")
         != {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
@@ -359,6 +376,14 @@ def _validate_formal_installation_at(
         or type(profile.get("argv")) is not list
         or profile.get("python_install_manifest_sha256") != _sha256(manifest_raw)
         or manifest.get("dependency_bundle_sha256") != profile.get("dependency_bundle_sha256")
+        or type(staging_equivalence) is not dict
+        or set(staging_equivalence) != {"installed_tree_sha256", "staging_manifest_sha256"}
+        or staging_equivalence.get("staging_manifest_sha256")
+        != profile.get("staging_manifest_sha256")
+        or any(
+            type(value) is not str or not value.startswith("sha256:") or len(value) != 71
+            for value in staging_equivalence.values()
+        )
     ):
         raise T40FaultLoomInstallError("formal install profile contract is invalid")
     wheels = manifest.get("wheels")
@@ -397,10 +422,38 @@ def _validate_formal_installation_at(
     _verify_tree(site_root, records, uid=uid, gid=gid)
 
 
-def validate_formal_installation() -> None:
+def _installation_authority() -> bytes:
     trusted_root = base64.b64decode(_INSTALLATION_AUTHORITY_PUBLIC_KEY, validate=True)
     if hashlib.sha256(trusted_root).hexdigest() != _INSTALLATION_AUTHORITY_SHA256:
         raise T40FaultLoomInstallError("compiled installation authority is inconsistent")
+    return trusted_root
+
+
+def verified_formal_profile_bindings() -> tuple[str, str]:
+    """Return the signed bundle/staging digests without rewalking the installed tree."""
+
+    profile = _verify_envelope(
+        _read_owned_file(FORMAL_PROFILE_PATH, uid=0, gid=0),
+        _installation_authority(),
+        "formal install profile",
+    )
+    bundle_digest = profile.get("adapter_admission_bundle_sha256")
+    staging_digest = profile.get("staging_manifest_sha256")
+    if (
+        set(profile) != _PROFILE_FIELDS
+        or profile.get("schema") != "faultloom.ops.t40-formal-install-profile.v1"
+        or any(
+            type(value) is not str or not value.startswith("sha256:") or len(value) != 71
+            for value in (bundle_digest, staging_digest)
+        )
+    ):
+        raise T40FaultLoomInstallError("formal install profile bindings are invalid")
+    assert isinstance(bundle_digest, str) and isinstance(staging_digest, str)
+    return bundle_digest, staging_digest
+
+
+def validate_formal_installation() -> None:
+    trusted_root = _installation_authority()
     _validate_formal_installation_at(
         site_root=FORMAL_SITE_ROOT,
         profile_path=FORMAL_PROFILE_PATH,
@@ -437,4 +490,8 @@ def _validate_required_origins(site_root: Path) -> None:
             raise T40FaultLoomInstallError("required module resolved outside the formal site root")
 
 
-__all__ = ["T40FaultLoomInstallError", "validate_formal_installation"]
+__all__ = [
+    "T40FaultLoomInstallError",
+    "validate_formal_installation",
+    "verified_formal_profile_bindings",
+]
