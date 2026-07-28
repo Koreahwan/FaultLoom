@@ -20,8 +20,8 @@ FORMAL_SITE_ROOT = Path("/opt/faultloom/t40-formal-v1/lib/python3.12/site-packag
 FORMAL_PROFILE_PATH = Path("/etc/faultloom/t40-formal-v1/profile.json")
 FORMAL_PYTHON_MANIFEST_PATH = Path("/etc/faultloom/t40-formal-v1/python-install-manifest.json")
 FORMAL_WHEEL_ROOT = Path("/opt/faultloom/t40-formal-v1/wheels")
-_INSTALLATION_AUTHORITY_PUBLIC_KEY = "vZDj5kYxP815EABkn6MuGY548+AbHs67CMo5L9c40D4="
-_INSTALLATION_AUTHORITY_SHA256 = "7d935fb4d2cafda152171d310ab68e3f5ab119731357ad2e645781c52b87d452"
+_INSTALLATION_AUTHORITY_PUBLIC_KEY = "jvMSNBY+/AABxI0l56RgBeypBYbWp1VeaRPMuzfZnBc="
+_INSTALLATION_AUTHORITY_SHA256 = "83aa9091a828f7e066c0565adeecd2798e2564c4528ea59ced847a10a879bc40"
 _MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
 _WHEEL_BINDINGS = {
     "faultloom_wheel": "faultloom_wheel_sha256",
