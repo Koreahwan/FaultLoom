@@ -500,24 +500,62 @@ def _parse_decision(raw: bytes, prompt: str) -> tuple[str, str]:
         raise WrapperError("model generation markers are invalid")
     if not prompt.startswith(_PROMPT_PREFIX):
         raise WrapperError("model prompt is invalid")
-    if prompt in text or prompt_marker in text:
-        raise WrapperError("model prompt was echoed")
     payload = prompt.removeprefix(_PROMPT_PREFIX)
     try:
         payload_object = json.loads(payload)
     except json.JSONDecodeError:
         payload_object = None
-    if (
+    payload_is_decision = (
         type(payload_object) is dict
         and frozenset(payload_object) == frozenset(("decision", "output"))
         and payload_object.get("decision") in _DECISIONS
         and type(payload_object.get("output")) is str
         and len(payload_object["output"]) <= _MAX_OUTPUT_CHARS
-        and payload in text
-    ):
-        raise WrapperError("model prompt was echoed")
+    )
     generated = text[: -len(exit_marker)]
     decoder = json.JSONDecoder()
+    marker_count = generated.count(prompt_marker)
+    if marker_count:
+        if marker_count != 1:
+            raise WrapperError("model prompt was echoed")
+        preamble, framed = generated.split(prompt_marker)
+        if prompt in preamble or prompt in framed or prompt_marker in framed:
+            raise WrapperError("model prompt was echoed")
+        if payload_is_decision and payload in framed:
+            raise WrapperError("model prompt was echoed")
+        for offset, character in enumerate(preamble):
+            if character != "{":
+                continue
+            try:
+                value, _end = decoder.raw_decode(preamble, offset)
+            except json.JSONDecodeError:
+                continue
+            if (
+                type(value) is dict
+                and frozenset(value) == frozenset(("decision", "output"))
+                and value.get("decision") in _DECISIONS
+                and type(value.get("output")) is str
+                and len(value["output"]) <= _MAX_OUTPUT_CHARS
+            ):
+                raise WrapperError("model prompt was echoed")
+        try:
+            value, end = decoder.raw_decode(framed)
+        except json.JSONDecodeError:
+            raise WrapperError("model prompt was echoed") from None
+        if (
+            end != len(framed)
+            or type(value) is not dict
+            or frozenset(value) != frozenset(("decision", "output"))
+            or value.get("decision") not in _DECISIONS
+            or type(value.get("output")) is not str
+            or len(value["output"]) > _MAX_OUTPUT_CHARS
+        ):
+            raise WrapperError("model prompt was echoed")
+        return value["decision"], value["output"]
+    if prompt in generated:
+        raise WrapperError("model prompt was echoed")
+    if payload_is_decision and payload in generated:
+        raise WrapperError("model prompt was echoed")
     matches: list[tuple[str, str]] = []
     for offset, character in enumerate(generated):
         if character != "{":

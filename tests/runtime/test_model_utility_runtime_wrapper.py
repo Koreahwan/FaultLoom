@@ -239,6 +239,37 @@ def test_decision_parser_requires_one_exact_bounded_object() -> None:
     prompt = wrapper._PROMPT_PREFIX + "bounded prompt"
     valid = b'banner\n{"decision":"negative","output":"bounded"}\n\n\nExiting...\n'
     assert wrapper._parse_decision(valid, prompt) == ("negative", "bounded")
+    framed = (
+        "llama banner\n> "
+        + prompt
+        + '\n{"decision":"negative","output":"bounded"}\n\n\nExiting...\n'
+    ).encode()
+    assert wrapper._parse_decision(framed, prompt) == ("negative", "bounded")
+    duplicate_marker = (
+        "> "
+        + prompt
+        + "\n> "
+        + prompt
+        + '\n{"decision":"negative","output":"bounded"}\n\n\nExiting...\n'
+    ).encode()
+    with pytest.raises(wrapper.WrapperError, match="prompt was echoed"):
+        wrapper._parse_decision(duplicate_marker, prompt)
+    marker_after_decision = (
+        '{"decision":"positive","output":"before"}\n> '
+        + prompt
+        + '\n{"decision":"negative","output":"bounded"}\n\n\nExiting...\n'
+    ).encode()
+    with pytest.raises(wrapper.WrapperError, match="prompt was echoed"):
+        wrapper._parse_decision(marker_after_decision, prompt)
+    prompt_after_marker = (
+        "> "
+        + prompt
+        + "\n"
+        + prompt
+        + '\n{"decision":"negative","output":"bounded"}\n\n\nExiting...\n'
+    ).encode()
+    with pytest.raises(wrapper.WrapperError, match="prompt was echoed"):
+        wrapper._parse_decision(prompt_after_marker, prompt)
     ambiguous = b'banner\n{"decision":"negative","output":"bounded"}{"decision":"positive","output":"other"}\n\n\nExiting...\n'
     assert wrapper._parse_decision(ambiguous, prompt) == ("inconclusive", "")
     malformed = b'banner\n{"decision":"negative","output":"x","evidence":"fabricated"}\n\n\nExiting...\n'
