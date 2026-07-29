@@ -26,7 +26,10 @@ _MAX_EXTRACTED_BYTES = 64 * 1024 * 1024
 _MAX_ARCHIVE_MEMBERS = 128
 _MAX_CHILD_STDOUT_BYTES = 64 * 1024
 _MAX_CHILD_STDERR_BYTES = 64 * 1024
+_MAX_INPUT_PAYLOAD_CHARS = 10 * 1024
 _MAX_OUTPUT_CHARS = 4096
+_CONTEXT_TOKENS = 4096
+_MAX_OUTPUT_TOKENS = 256
 _CHILD_TIMEOUT_SECONDS = 180
 _PR_SET_CHILD_SUBREAPER = 36
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
@@ -99,7 +102,7 @@ def _read_request() -> dict[str, object]:
     if (
         type(request["payload"]) is not str
         or not request["payload"]
-        or len(request["payload"]) > _MAX_OUTPUT_CHARS
+        or len(request["payload"]) > _MAX_INPUT_PAYLOAD_CHARS
     ):
         raise WrapperError("request payload is invalid")
     return request
@@ -442,9 +445,9 @@ def _llama_argv(runtime_root: Path, prompt_file: Path) -> tuple[str, ...]:
         "--threads-batch",
         "1",
         "--ctx-size",
-        "1024",
+        str(_CONTEXT_TOKENS),
         "--predict",
-        "256",
+        str(_MAX_OUTPUT_TOKENS),
         "--seed",
         "42",
         "--temp",
@@ -585,6 +588,9 @@ def _main() -> int:
         temporary_root = Path(temporary)
         runtime_root = _extract_bundle(Path(_BUNDLE_PATH), temporary_root)
         prompt = _PROMPT_PREFIX + str(request["payload"])
+        input_tokens = _token_count(runtime_root, prompt)
+        if input_tokens + _MAX_OUTPUT_TOKENS > _CONTEXT_TOKENS:
+            raise WrapperError("prompt exceeds context limit")
         prompt_file = temporary_root / "prompt.txt"
         descriptor = os.open(
             prompt_file,
@@ -600,7 +606,7 @@ def _main() -> int:
         decision, output = _parse_decision(raw_output, prompt)
         response = {
             "decision": decision,
-            "input_tokens": _token_count(runtime_root, prompt),
+            "input_tokens": input_tokens,
             "model_snapshot_digest": request["model_snapshot_digest"],
             "output": output,
             "output_digest": "sha256:" + hashlib.sha256(output.encode()).hexdigest(),

@@ -79,7 +79,7 @@ def test_llama_argv_is_cpu_only_offline_deterministic_and_single_turn(
 ) -> None:
     argv = wrapper._llama_argv(tmp_path / "runtime", tmp_path / "prompt")
     assert ("--threads", "1") == argv[argv.index("--threads") : argv.index("--threads") + 2]
-    assert ("--ctx-size", "1024") == argv[
+    assert ("--ctx-size", "4096") == argv[
         argv.index("--ctx-size") : argv.index("--ctx-size") + 2
     ]
     assert ("--predict", "256") == argv[
@@ -328,6 +328,79 @@ def test_request_protocol_is_exactly_one_newline_and_fixed_seed(
     )
     with pytest.raises(wrapper.WrapperError, match="framing"):
         wrapper._read_request()
+
+
+def test_request_payload_limit_is_distinct_from_output_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = {
+        "arm": "baseline",
+        "budget_digest": "sha256:" + "0" * 64,
+        "case_digest": "sha256:" + "1" * 64,
+        "case_id": "case.1",
+        "generation_config_digest": "sha256:" + "2" * 64,
+        "model_snapshot_digest": "sha256:" + "3" * 64,
+        "payload": "x" * 9321,
+        "prompt_digest": "sha256:" + "4" * 64,
+        "request_id": "request.1",
+        "runtime_artifact_digest": "sha256:" + "5" * 64,
+        "seed": 42,
+        "tool_schema_digest": "sha256:" + "6" * 64,
+    }
+    assert 9321 > wrapper._MAX_OUTPUT_CHARS == 4096
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.TextIOWrapper(io.BytesIO(json.dumps(request).encode() + b"\n")),
+    )
+    assert wrapper._read_request()["payload"] == request["payload"]
+
+    request["payload"] = "x" * (wrapper._MAX_INPUT_PAYLOAD_CHARS + 1)
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.TextIOWrapper(io.BytesIO(json.dumps(request).encode() + b"\n")),
+    )
+    with pytest.raises(wrapper.WrapperError, match="payload"):
+        wrapper._read_request()
+
+
+def test_wrapper_rejects_prompt_without_prediction_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = {
+        "arm": "baseline",
+        "budget_digest": "sha256:" + "0" * 64,
+        "case_digest": "sha256:" + "1" * 64,
+        "case_id": "case.1",
+        "generation_config_digest": "sha256:" + "2" * 64,
+        "model_snapshot_digest": "sha256:" + "3" * 64,
+        "payload": "bounded prompt",
+        "prompt_digest": "sha256:" + "4" * 64,
+        "request_id": "request.1",
+        "runtime_artifact_digest": "sha256:" + "5" * 64,
+        "seed": 42,
+        "tool_schema_digest": "sha256:" + "6" * 64,
+    }
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.TextIOWrapper(io.BytesIO(json.dumps(request).encode() + b"\n")),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["runtime", "--bundle", wrapper._BUNDLE_PATH, "--model", wrapper._MODEL_PATH],
+    )
+    monkeypatch.setattr(wrapper, "_extract_bundle", lambda _bundle, root: root)
+    monkeypatch.setattr(
+        wrapper,
+        "_token_count",
+        lambda _root, _value: wrapper._CONTEXT_TOKENS - wrapper._MAX_OUTPUT_TOKENS + 1,
+    )
+    monkeypatch.setattr(wrapper, "_run_bounded", lambda *_args: pytest.fail("model ran"))
+    with pytest.raises(wrapper.WrapperError, match="context"):
+        wrapper._main()
 
 
 def test_wrapper_emits_exactly_one_bound_response_line(
