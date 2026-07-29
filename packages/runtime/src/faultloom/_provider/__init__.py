@@ -48,6 +48,7 @@ from .openai_compatible import (
     OpenAICompatiblePayloadStore,
     OpenAICompatiblePreset,
     OpenAICompatibleProviderProxy,
+    PinnedHttpsGatewayPort,
     openai_compatible_preset,
 )
 from .proxy import (
@@ -79,6 +80,7 @@ __all__ = [
     "OpenAICompatiblePayloadStore",
     "OpenAICompatiblePreset",
     "OpenAICompatibleProviderProxy",
+    "PinnedHttpsGatewayPort",
     "ProviderAdapter",
     "ProviderAdapterError",
     "ProviderBudgetError",

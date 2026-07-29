@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 import json
+from base64 import b64decode
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
-from faultloom.egress import EgressPlane, ProviderProxy as EgressProviderProxy
+from faultloom.egress import (
+    EgressPlane,
+    ProviderProxy as EgressProviderProxy,
+    TransportOutcome,
+    sha256_digest as egress_sha256_digest,
+)
 from faultloom.provider import (
     BoundEnvironmentCredentialResolver,
     GenerationConfig,
@@ -19,13 +26,15 @@ from faultloom.provider import (
     OpenAICompatiblePayloadStore,
     OpenAICompatiblePreset,
     OpenAICompatibleProviderProxy,
+    PinnedHttpsGatewayPort,
     ProviderObservedMetadata,
     ProxyEffectDisposition,
     ProxyOutcome,
     openai_compatible_preset,
+    provider_proxy_result_attestation_bytes,
     provider_sha256_digest,
 )
-from faultloom_protocol import SecretRef
+from faultloom_protocol import SecretRef, load_public_key
 
 from tests.runtime.provider_test_models import PROXY_SIGNER, digest
 from tests.runtime.test_egress import (
@@ -40,7 +49,10 @@ from tests.runtime.test_egress import (
 @dataclass
 class FakePinnedHttpPort:
     response: OpenAICompatibleHttpResponse
-    calls: list[tuple[object, str, dict[str, str], bytes, int]] = field(default_factory=list)
+    calls: list[tuple[object, str, dict[str, str], bytes, int]] = field(
+        default_factory=list
+    )
+    identity: str = field(default="test.pinned-http.v1", init=False)
 
     def dispatch(
         self,
@@ -109,6 +121,7 @@ def _stack(
     *,
     environment: dict[str, str] | None = None,
 ):
+    tmp_path.mkdir(parents=True, exist_ok=True)
     config = OpenAICompatibleEndpointConfig(
         endpoint_id="endpoint.frontier",
         provider_id="provider.test",
@@ -117,6 +130,18 @@ def _stack(
         credential_ref=_credential(),
         metadata=_metadata(),
     )
+    resolver = StaticResolver(plane=EgressPlane.MODEL_PROVIDER)
+    resolution = resolver.resolve(config.origin)
+    resolution_digest = egress_sha256_digest(resolution)
+    destination_digest = egress_sha256_digest(
+        {
+            "plane": EgressPlane.MODEL_PROVIDER,
+            "endpoint_id": config.endpoint_id,
+            "origin": config.origin,
+            "resolution_digest": resolution_digest,
+        }
+    )
+    resolver.calls.clear()
     payload_store = OpenAICompatiblePayloadStore()
     transport = OpenAICompatibleEgressTransport(
         endpoints=(config,),
@@ -128,6 +153,8 @@ def _stack(
                     endpoint_id=config.endpoint_id,
                     provider_id=config.provider_id,
                     origin=config.origin,
+                    resolution_digest=resolution_digest,
+                    destination_digest=destination_digest,
                     environment_variable="BOUND_PROVIDER_KEY",
                 ),
             ),
@@ -143,7 +170,7 @@ def _stack(
     egress = EgressProviderProxy(
         endpoints=(provider_endpoint(),),
         transport=transport,
-        resolver=StaticResolver(plane=EgressPlane.MODEL_PROVIDER),
+        resolver=resolver,
         authority_state=state,
         live=True,
         clock=lambda: DISPATCH_TIME,
@@ -157,7 +184,7 @@ def _stack(
         transport=transport,
         attestation_signer=PROXY_SIGNER,
     )
-    return proxy, state
+    return proxy, state, transport, payload_store, config
 
 
 def _request(proxy: OpenAICompatibleProviderProxy, authority_digest: str):
@@ -221,7 +248,7 @@ def test_routes_only_through_egress_compiled_transport_and_preserves_raw_respons
     tmp_path: Path,
 ) -> None:
     http = FakePinnedHttpPort(_response())
-    proxy, state = _stack(tmp_path, http)
+    proxy, state, _, _, _ = _stack(tmp_path, http)
     result = proxy.dispatch(_request(proxy, state.authority_digest))
 
     assert result.outcome is ProxyOutcome.COMPLETED
@@ -241,7 +268,7 @@ def test_routes_only_through_egress_compiled_transport_and_preserves_raw_respons
 
 def test_unrelated_environment_values_cannot_supply_a_credential(tmp_path: Path) -> None:
     http = FakePinnedHttpPort(_response())
-    proxy, state = _stack(
+    proxy, state, _, _, _ = _stack(
         tmp_path,
         http,
         environment={"UNRELATED_PROVIDER_KEY": "not-usable"},
@@ -257,7 +284,7 @@ def test_request_metadata_cannot_be_promoted_over_independent_endpoint_metadata(
     tmp_path: Path,
 ) -> None:
     http = FakePinnedHttpPort(_response())
-    proxy, state = _stack(tmp_path, http)
+    proxy, state, _, _, _ = _stack(tmp_path, http)
     request = _request(proxy, state.authority_digest).model_copy(
         update={"runtime_version": "forged"}
     )
@@ -270,12 +297,170 @@ def test_request_metadata_cannot_be_promoted_over_independent_endpoint_metadata(
 def test_oversized_http_response_is_not_retained_or_accepted(tmp_path: Path) -> None:
     oversized = OpenAICompatibleHttpResponse(status=200, body=b"x" * 100_000)
     http = FakePinnedHttpPort(oversized)
-    proxy, state = _stack(tmp_path, http)
+    proxy, state, _, _, _ = _stack(tmp_path, http)
     result = proxy.dispatch(_request(proxy, state.authority_digest))
 
     assert result.outcome is ProxyOutcome.UNKNOWN_OUTCOME
     assert result.reconciliation_required is True
     assert http.calls[0][4] < len(oversized.body)
+
+
+def test_authority_epoch_and_replay_denials_do_not_open_http(tmp_path: Path) -> None:
+    authority_http = FakePinnedHttpPort(_response())
+    authority_proxy, _, _, _, _ = _stack(tmp_path / "authority", authority_http)
+    authority_request = _request(authority_proxy, digest("wrong-authority"))
+    assert authority_proxy.dispatch(authority_request).outcome is ProxyOutcome.DENIED
+    assert authority_http.calls == []
+
+    epoch_http = FakePinnedHttpPort(_response())
+    epoch_proxy, epoch_state, _, _, _ = _stack(tmp_path / "epoch", epoch_http)
+    epoch_request = _request(epoch_proxy, epoch_state.authority_digest).model_copy(
+        update={"scope_epoch": 8}
+    )
+    assert epoch_proxy.dispatch(epoch_request).outcome is ProxyOutcome.DENIED
+    assert epoch_http.calls == []
+
+    replay_http = FakePinnedHttpPort(_response())
+    replay_proxy, replay_state, _, _, _ = _stack(tmp_path / "replay", replay_http)
+    replay_request = _request(replay_proxy, replay_state.authority_digest)
+    assert replay_proxy.dispatch(replay_request).outcome is ProxyOutcome.COMPLETED
+    assert replay_proxy.dispatch(replay_request).outcome is ProxyOutcome.DENIED
+    assert len(replay_http.calls) == 1
+
+
+def test_tampered_compiled_destination_and_address_do_not_open_http(tmp_path: Path) -> None:
+    http = FakePinnedHttpPort(_response())
+    proxy, state, transport, payload_store, _ = _stack(tmp_path, http)
+    request = _request(proxy, state.authority_digest)
+    assert proxy.dispatch(request).outcome is ProxyOutcome.COMPLETED
+    compiled = http.calls[0][0]
+    payload_store.publish(request, _payload())
+    tampered = compiled.model_copy(
+        update={
+            "resolved_addresses": ("1.1.1.1",),
+            "resolution_digest": digest("tampered-resolution"),
+            "destination_digest": digest("tampered-destination"),
+        }
+    )
+    result = transport.dispatch(tampered)
+
+    assert result.outcome is TransportOutcome.FAILED
+    assert result.bytes_sent == 0
+    assert len(http.calls) == 1
+
+
+def test_redirect_is_observed_as_failure_without_following_it(tmp_path: Path) -> None:
+    http = FakePinnedHttpPort(OpenAICompatibleHttpResponse(status=302, body=b"redirect"))
+    proxy, state, _, _, _ = _stack(tmp_path, http)
+    result = proxy.dispatch(_request(proxy, state.authority_digest))
+
+    assert result.outcome is ProxyOutcome.FAILED
+    assert result.response_status == 302
+    assert result.effect_disposition is ProxyEffectDisposition.OBSERVED
+    assert len(http.calls) == 1
+
+
+def test_transport_id_changes_when_trusted_http_component_changes(tmp_path: Path) -> None:
+    first_http = FakePinnedHttpPort(_response())
+    second_http = FakePinnedHttpPort(_response())
+    second_http.identity = "test.pinned-http.alternate.v1"
+    _, _, first_transport, _, _ = _stack(tmp_path / "first", first_http)
+    _, _, second_transport, _, _ = _stack(tmp_path / "second", second_http)
+
+    assert first_transport.transport_id != second_transport.transport_id
+
+
+def test_pinned_https_port_uses_compiled_address_sni_host_and_body_cap(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    http = FakePinnedHttpPort(_response())
+    proxy, state, _, _, _ = _stack(tmp_path, http)
+    assert proxy.dispatch(_request(proxy, state.authority_digest)).outcome is ProxyOutcome.COMPLETED
+    compiled = http.calls[0][0]
+    observed: dict[str, Any] = {}
+
+    class FakeTls:
+        def __init__(self) -> None:
+            self.buffer = bytearray(b"HTTP/1.1 302 Found\r\nContent-Length: 8\r\n\r\nredirect")
+            self.read_sizes: list[int] = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+        def sendall(self, value: bytes) -> None:
+            observed["request"] = value
+
+        def recv(self, size: int) -> bytes:
+            self.read_sizes.append(size)
+            if not self.buffer:
+                return b""
+            value = bytes(self.buffer[:size])
+            del self.buffer[:size]
+            return value
+
+    class FakeRaw:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+    tls = FakeTls()
+
+    class FakeContext:
+        def wrap_socket(self, raw: FakeRaw, *, server_hostname: str) -> FakeTls:
+            observed["server_hostname"] = server_hostname
+            return tls
+
+    def fake_connection(address: tuple[str, int], timeout: int) -> FakeRaw:
+        observed["address"] = address
+        observed["timeout"] = timeout
+        return FakeRaw()
+
+    monkeypatch.setattr(
+        "faultloom._provider.openai_compatible.socket.create_connection",
+        fake_connection,
+    )
+    monkeypatch.setattr(
+        "faultloom._provider.openai_compatible.ssl.create_default_context",
+        FakeContext,
+    )
+    response = PinnedHttpsGatewayPort(timeout_seconds=9).dispatch(
+        compiled,
+        path="/v1/chat/completions",
+        headers={"Authorization": "Bearer test"},
+        body=b"{}",
+        maximum_response_bytes=8,
+    )
+
+    assert observed["address"] == ("8.8.8.8", 443)
+    assert observed["server_hostname"] == "provider.example.invalid"
+    assert b"Host: provider.example.invalid\r\n" in observed["request"]
+    assert b"GET " not in observed["request"]
+    assert 9 in tls.read_sizes
+    assert response == OpenAICompatibleHttpResponse(status=302, body=b"redirect")
+
+
+def test_signed_result_verifies_and_does_not_leak_bound_secret(tmp_path: Path) -> None:
+    http = FakePinnedHttpPort(_response())
+    proxy, state, transport, _, config = _stack(tmp_path, http)
+    result = proxy.dispatch(_request(proxy, state.authority_digest))
+    signature = b64decode(
+        result.attestation_signature + "=" * (-len(result.attestation_signature) % 4),
+        altchars=b"-_",
+        validate=True,
+    )
+
+    load_public_key(proxy.attestation_public_key).verify(
+        signature,
+        provider_proxy_result_attestation_bytes(result),
+    )
+    serialized = config.model_dump_json() + result.model_dump_json() + transport.transport_id
+    assert "bound-secret" not in serialized
 
 
 def test_presets_and_unknown_provider_config_remain_thin_and_path_configurable() -> None:

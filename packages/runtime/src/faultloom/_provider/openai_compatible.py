@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import socket
+import ssl
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -69,6 +71,7 @@ _PRESETS: dict[OpenAICompatiblePreset, tuple[str, str, str]] = {
 }
 _ENVIRONMENT_VARIABLE = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
 _SAFE_PATH = re.compile(r"^/[A-Za-z0-9._~/-]*$")
+_SHA256_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class OpenAICompatibleEndpointConfig(_RuntimeModel):
@@ -96,6 +99,10 @@ class OpenAICompatibleEndpointConfig(_RuntimeModel):
             raise ValueError(
                 "base URL must be an HTTPS URL without credentials, query, or fragment"
             )
+        try:
+            parsed.port
+        except ValueError as exc:
+            raise ValueError("base URL port must be valid") from exc
         if _SAFE_PATH.fullmatch(parsed.path or "/") is None or "//" in parsed.path:
             raise ValueError("base URL path must be canonical")
         if (
@@ -162,6 +169,8 @@ class OpenAICompatibleCredentialBinding:
     endpoint_id: str
     provider_id: str
     origin: str
+    resolution_digest: str
+    destination_digest: str
     environment_variable: str
 
     def __post_init__(self) -> None:
@@ -169,9 +178,18 @@ class OpenAICompatibleCredentialBinding:
             raise ValueError(
                 "credential environment variable must be an uppercase identifier"
             )
+        if not (
+            _SHA256_DIGEST.fullmatch(self.resolution_digest)
+            and _SHA256_DIGEST.fullmatch(self.destination_digest)
+        ):
+            raise ValueError(
+                "credential binding requires pinned resolution and destination digests"
+            )
 
 
 class ProviderCredentialResolver(Protocol):
+    identity: str
+
     def resolve(self, request: CompiledProviderRequest) -> str: ...
 
 
@@ -191,16 +209,34 @@ class BoundEnvironmentCredentialResolver:
             raise ValueError("credential bindings must be unique")
         self._bindings = records
         self._environment = environment
+        self.identity = "credential-resolver.bound-environment.v2:" + hashlib.sha256(
+            json.dumps(
+                [
+                    {
+                        "credential_ref": item.credential_ref.model_dump(mode="json"),
+                        "destination_digest": item.destination_digest,
+                        "endpoint_id": item.endpoint_id,
+                        "environment_variable": item.environment_variable,
+                        "origin": item.origin,
+                        "provider_id": item.provider_id,
+                        "resolution_digest": item.resolution_digest,
+                    }
+                    for item in sorted(records, key=lambda item: item.endpoint_id)
+                ],
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
 
     def resolve(self, request: CompiledProviderRequest) -> str:
-        if not request.destination_digest:
-            raise ValueError("credential resolution requires a compiled destination")
         for binding in self._bindings:
             if (
                 binding.credential_ref == request.credential_ref
                 and binding.endpoint_id == request.endpoint_id
                 and binding.provider_id == request.provider_id
                 and binding.origin == request.origin
+                and binding.resolution_digest == request.resolution_digest
+                and binding.destination_digest == request.destination_digest
             ):
                 value = self._environment.get(binding.environment_variable)
                 if isinstance(value, str) and value:
@@ -220,6 +256,8 @@ class OpenAICompatibleHttpResponse:
 class OpenAICompatibleHttpPort(Protocol):
     """Trusted T17/Gateway HTTP boundary; it must honor compiled destination pins."""
 
+    identity: str
+
     def dispatch(
         self,
         request: CompiledProviderRequest,
@@ -231,10 +269,97 @@ class OpenAICompatibleHttpPort(Protocol):
     ) -> OpenAICompatibleHttpResponse: ...
 
 
+class PinnedHttpsGatewayPort:
+    """Concrete no-proxy HTTPS port for a pre-resolved egress destination."""
+
+    def __init__(self, *, timeout_seconds: int = 30) -> None:
+        if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 300:
+            raise ValueError("pinned HTTPS timeout must be 1 through 300 seconds")
+        self._timeout_seconds = timeout_seconds
+        self.identity = f"gateway.https-pinned-tls.v1:timeout={timeout_seconds}"
+
+    def dispatch(
+        self,
+        request: CompiledProviderRequest,
+        *,
+        path: str,
+        headers: Mapping[str, str],
+        body: bytes,
+        maximum_response_bytes: int,
+    ) -> OpenAICompatibleHttpResponse:
+        origin = urlsplit(request.origin)
+        host = origin.hostname
+        if origin.scheme != "https" or host is None or not request.resolved_addresses:
+            raise ValueError("compiled provider request is not a pinned HTTPS destination")
+        try:
+            port = origin.port or 443
+        except ValueError as exc:
+            raise ValueError("compiled provider origin has an invalid port") from exc
+        host_header = origin.netloc
+        if not path.startswith("/") or "\r" in path or "\n" in path:
+            raise ValueError("provider request path is not safe for HTTP")
+        if any(
+            not isinstance(name, str)
+            or not isinstance(value, str)
+            or "\r" in name
+            or "\n" in name
+            or "\r" in value
+            or "\n" in value
+            for name, value in headers.items()
+        ):
+            raise ValueError("provider request headers are not safe for HTTP")
+        message = (
+            f"POST {path} HTTP/1.1\r\nHost: {host_header}\r\n"
+            f"Content-Length: {len(body)}\r\nConnection: close\r\nAccept-Encoding: identity\r\n"
+            + "".join(f"{name}: {value}\r\n" for name, value in headers.items())
+            + "\r\n"
+        ).encode("ascii") + body
+        last_error: OSError | None = None
+        for address in request.resolved_addresses:
+            try:
+                with socket.create_connection((address, port), self._timeout_seconds) as raw:
+                    context = ssl.create_default_context()
+                    with context.wrap_socket(raw, server_hostname=host) as tls:
+                        tls.sendall(message)
+                        return self._read_response(tls, maximum_response_bytes)
+            except OSError as exc:
+                last_error = exc
+        raise OSError("all compiled provider addresses failed") from last_error
+
+    @staticmethod
+    def _read_response(
+        tls: ssl.SSLSocket, maximum_response_bytes: int
+    ) -> OpenAICompatibleHttpResponse:
+        head = bytearray()
+        while not head.endswith(b"\r\n\r\n"):
+            if len(head) >= 8192:
+                raise ValueError("provider response headers exceed their bounded size")
+            chunk = tls.recv(1)
+            if not chunk:
+                raise ValueError("provider response ended before its headers")
+            head.extend(chunk)
+        body = bytearray()
+        while len(body) <= maximum_response_bytes:
+            chunk = tls.recv(min(65536, maximum_response_bytes + 1 - len(body)))
+            if not chunk:
+                break
+            body.extend(chunk)
+        if len(body) > maximum_response_bytes:
+            raise ValueError("provider response exceeds its bounded body")
+        return PinnedHttpsGatewayPort._parse_response(bytes(head[:-4]), bytes(body))
+
+    @staticmethod
+    def _parse_response(head: bytes, body: bytes) -> OpenAICompatibleHttpResponse:
+        status_line = head.split(b"\r\n", 1)[0].split()
+        if len(status_line) < 2 or not status_line[1].isdigit():
+            raise ValueError("provider response has no valid HTTP status")
+        return OpenAICompatibleHttpResponse(status=int(status_line[1]), body=body)
+
+
 @dataclass(frozen=True, slots=True)
 class _PayloadRecord:
     payload: OpenAICompatibleChatPayload
-    request_digest: str
+    request_binding_digest: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,8 +382,8 @@ class OpenAICompatiblePayloadStore:
             if request.request_id in self._records:
                 raise ValueError("OpenAI-compatible payload request ID is already pending")
             self._records[request.request_id] = _PayloadRecord(
-                payload,
-                sha256_digest(request),
+                payload=payload,
+                request_binding_digest=_payload_request_binding(request),
             )
 
     def consume(
@@ -266,7 +391,11 @@ class OpenAICompatiblePayloadStore:
     ) -> OpenAICompatibleChatPayload | None:
         with self._lock:
             record = self._records.pop(request.request_id, None)
-        if record is None or request.payload_digest != record.payload.prompt_digest():
+        if (
+            record is None
+            or request.payload_digest != record.payload.prompt_digest()
+            or record.request_binding_digest != _compiled_payload_request_binding(request)
+        ):
             return None
         return record.payload
 
@@ -275,11 +404,43 @@ class OpenAICompatiblePayloadStore:
             self._records.pop(request_id, None)
 
 
+def _payload_request_binding(request: ProviderProxyRequest) -> str:
+    return sha256_digest(
+        {
+            "credential_ref": request.credential_ref,
+            "data_policy_id": request.data_policy_id,
+            "endpoint_id": request.endpoint_id,
+            "model_snapshot": request.model_snapshot,
+            "payload_bytes": request.payload_bytes,
+            "payload_digest": request.payload_digest,
+            "provider_id": request.provider_id,
+            "request_id": request.request_id,
+            "tool_ids": request.tool_ids,
+        }
+    )
+
+
+def _compiled_payload_request_binding(request: CompiledProviderRequest) -> str:
+    return sha256_digest(
+        {
+            "credential_ref": request.credential_ref,
+            "data_policy_id": request.data_policy_id,
+            "endpoint_id": request.endpoint_id,
+            "model_snapshot": request.model_snapshot,
+            "payload_bytes": request.payload_bytes,
+            "payload_digest": request.payload_digest,
+            "provider_id": request.provider_id,
+            "request_id": request.request_id,
+            "tool_ids": request.tool_ids,
+        }
+    )
+
+
 class OpenAICompatibleEgressTransport:
     """ProviderTransport implementation invoked only after egress authorization."""
 
     plane = EgressPlane.MODEL_PROVIDER
-    transport_id = "transport.openai-compatible.v1"
+    transport_id = "transport.openai-compatible.v2"
 
     def __init__(
         self,
@@ -287,15 +448,21 @@ class OpenAICompatibleEgressTransport:
         endpoints: Iterable[OpenAICompatibleEndpointConfig],
         payload_store: OpenAICompatiblePayloadStore,
         credential_resolver: ProviderCredentialResolver,
-        http_port: OpenAICompatibleHttpPort,
+        http_port: OpenAICompatibleHttpPort | None = None,
     ) -> None:
         configs = tuple(endpoints)
         if not configs or len({item.endpoint_id for item in configs}) != len(configs):
             raise ValueError(
                 "OpenAI-compatible endpoint IDs must be non-empty and unique"
             )
-        if not callable(getattr(credential_resolver, "resolve", None)) or not callable(
-            getattr(http_port, "dispatch", None)
+        selected_http_port = http_port or PinnedHttpsGatewayPort()
+        if (
+            not callable(getattr(credential_resolver, "resolve", None))
+            or not isinstance(getattr(credential_resolver, "identity", None), str)
+            or not credential_resolver.identity
+            or not callable(getattr(selected_http_port, "dispatch", None))
+            or not isinstance(getattr(selected_http_port, "identity", None), str)
+            or not selected_http_port.identity
         ):
             raise TypeError(
                 "OpenAI-compatible transport requires bound credential and HTTP ports"
@@ -303,7 +470,21 @@ class OpenAICompatibleEgressTransport:
         self._endpoints = {item.endpoint_id: item for item in configs}
         self._payload_store = payload_store
         self._credential_resolver = credential_resolver
-        self._http_port = http_port
+        self._http_port = selected_http_port
+        self.transport_id = "transport.openai-compatible.v2:" + hashlib.sha256(
+            json.dumps(
+                {
+                    "endpoints": [
+                        item.model_dump(mode="json")
+                        for item in sorted(configs, key=lambda item: item.endpoint_id)
+                    ],
+                    "credential_resolver": credential_resolver.identity,
+                    "http_port": selected_http_port.identity,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
         self._lock = RLock()
         self._artifacts: dict[str, _TransportArtifact] = {}
 
