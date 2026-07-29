@@ -1,51 +1,49 @@
 # OpenAI-compatible model providers
 
-`OpenAICompatibleProviderProxy` implements the existing signed
-`ProviderProxyPort` using standard-library HTTPS and the Chat Completions path
-`/chat/completions`. It makes no network call while being configured and it
-never serializes an API key: an endpoint config contains a `SecretRef` plus the
-name of an environment variable, and resolves the key only immediately before
-dispatch.
+`OpenAICompatibleProviderProxy` is a Chat Completions translation layer above
+FaultLoom's existing `egress.ProviderProxy`. It does not open sockets or accept
+an arbitrary URL at dispatch. Every call is compiled by the model-egress plane,
+which rechecks signed authority and epoch state, destination resolution, replay
+holds, provider/model/data policy, request and response byte ceilings, and a
+no-redirect transport binding.
 
-Use `openai_compatible_preset` for a named endpoint and provide the exact model
-ID that is pinned in the corresponding `ProviderModelProfile`; presets do not
-pick a model for you:
+`OpenAICompatibleEgressTransport` is the injected `ProviderTransport` used by
+that plane. Its injected `OpenAICompatibleHttpPort` must honor the compiled
+origin, resolved addresses, destination and dispatch-authorization digests,
+and response-byte ceiling. This keeps concrete HTTP/TLS/Gateway mechanics out
+of the high-level provider adapter.
 
-| Preset | Base URL | Credential environment variable |
-| --- | --- | --- |
-| `KIMI` | `https://api.moonshot.ai/v1` | `MOONSHOT_API_KEY` |
-| `GLM` | `https://open.bigmodel.cn/api/paas/v4` | `BIGMODEL_API_KEY` |
-| `GROK` | `https://api.x.ai/v1` | `XAI_API_KEY` |
+Endpoint configuration stores a validated HTTPS base URL, configurable relative
+Chat Completions path (default `/chat/completions`), exact model ID, `SecretRef`,
+and independently pinned `ProviderObservedMetadata`. It has no API key. A
+credential resolver is injected into the trusted egress transport and is bound
+to the compiled endpoint, provider, origin, destination, and `SecretRef`; the
+optional `BoundEnvironmentCredentialResolver` receives an explicit environment
+mapping and binding, so endpoint configuration cannot select arbitrary ambient
+environment values.
 
-The generic configuration also supports another HTTPS OpenAI-compatible base
-URL. Plain HTTP is accepted only for loopback test servers.
+| Preset | Base URL |
+| --- | --- |
+| `KIMI` | `https://api.moonshot.ai/v1` |
+| `GLM` | `https://open.bigmodel.cn/api/paas/v4` |
+| `GROK` | `https://api.x.ai/v1` |
 
-For an unknown future provider, configure its validated base URL, exact pinned
-model ID, `SecretRef`, and credential environment-variable name; no preset or
-core source change is needed when it implements this API shape. A service that
-is available only through a subscription needs its official API, OAuth, CLI, or
-SDK adapter behind `ProviderProxyPort`. This generic HTTP transport cannot—and
-does not attempt to—turn a consumer subscription, browser session, or cookie
-into an API credential.
+Presets only supply provider and URL defaults. An unknown future provider needs
+only its validated base URL, exact pinned model ID, pinned metadata, secret
+reference, and an official compatible transport; no core source change or
+preset is required. The configured metadata is compared against the request
+and returned as observed metadata—it is never copied from a request and marked
+exact.
 
-This proxy selects neither a profile nor a fallback model. The exact configured
-model must match `ProviderProxyRequest.model_snapshot`; otherwise it signs a
-no-dispatch denial. `ProviderAdapter` continues to bind the pinned
-`ProviderModelProfile` (capability and metadata evidence), scope/policy/data
-references, signed proxy attestation, and token/cost/byte budgets. Ranking or
-automatic model routing is deliberately outside this adapter.
+The existing provider port contains prompt/tool/config digests, not raw tool
+schema bytes. Prompt payloads are digest/byte-bound before egress admission;
+tool-enabled calls remain fail-closed until an attested schema-byte source is
+added. Raw Chat Completions tool-call or reasoning fields remain in the bounded
+response artifact represented by the signed response digest.
 
-The existing provider port carries a prompt digest/byte count, generation
-config digest, tool IDs, and tool-schema digest—not prompt bytes or tool schema
-bytes. Supply a local `OpenAICompatibleChatPayload` resolver and bind its
-`prompt_digest()`, `prompt_bytes()`, and generation digest to the request. A
-mismatch is denied before sending. Tool-enabled calls are also denied until the
-provider contract has an attested source for tool schema bytes.
-
-On a successful response the proxy signs its raw-response SHA-256 digest,
-usage, status, byte counts, configured model identity, and all pre-existing
-request/config/policy digests. Raw Chat Completions fields such as `tool_calls`
-or provider reasoning fields remain inside the response artifact represented by
-that digest; this port does not reinterpret or expose them. HTTP/provider
-errors produce an attested failed result, while connection ambiguity produces
-the existing reconciliation-required unknown outcome.
+This proxy does not route or rank models. `ProviderAdapter` continues to bind
+the pinned `ProviderModelProfile`, capability/metadata evidence, scope/policy
+and data references, signed proxy attestation, and token/cost/byte budgets.
+A subscription-only service needs an official API, OAuth, CLI, or SDK adapter
+behind `ProviderProxyPort`; consumer cookies and browser sessions are not API
+credentials and are not used.
