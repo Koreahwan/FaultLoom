@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import re
 import socket
@@ -12,6 +13,7 @@ from dataclasses import dataclass
 from enum import Enum
 from threading import RLock
 from typing import Literal, Protocol, Self
+from types import MappingProxyType
 from urllib.parse import urlsplit
 
 from faultloom.egress import (
@@ -196,6 +198,8 @@ class ProviderCredentialResolver(Protocol):
 class BoundEnvironmentCredentialResolver:
     """Explicit environment injection, bound to a compiled egress destination."""
 
+    __slots__ = ("_bindings", "_environment", "_identity", "_sealed")
+
     def __init__(
         self,
         *,
@@ -208,8 +212,8 @@ class BoundEnvironmentCredentialResolver:
         ):
             raise ValueError("credential bindings must be unique")
         self._bindings = records
-        self._environment = environment
-        self.identity = "credential-resolver.bound-environment.v2:" + hashlib.sha256(
+        self._environment = MappingProxyType(dict(environment))
+        self._identity = "credential-resolver.bound-environment.v2:" + hashlib.sha256(
             json.dumps(
                 [
                     {
@@ -227,6 +231,16 @@ class BoundEnvironmentCredentialResolver:
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
+        self._sealed = True
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if getattr(self, "_sealed", False):
+            raise AttributeError("credential resolver is immutable after construction")
+        object.__setattr__(self, name, value)
+
+    @property
+    def identity(self) -> str:
+        return self._identity
 
     def resolve(self, request: CompiledProviderRequest) -> str:
         for binding in self._bindings:
@@ -272,11 +286,23 @@ class OpenAICompatibleHttpPort(Protocol):
 class PinnedHttpsGatewayPort:
     """Concrete no-proxy HTTPS port for a pre-resolved egress destination."""
 
+    __slots__ = ("_timeout_seconds", "_identity", "_sealed")
+
     def __init__(self, *, timeout_seconds: int = 30) -> None:
         if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 300:
             raise ValueError("pinned HTTPS timeout must be 1 through 300 seconds")
         self._timeout_seconds = timeout_seconds
-        self.identity = f"gateway.https-pinned-tls.v1:timeout={timeout_seconds}"
+        self._identity = f"gateway.https-pinned-tls.v2:timeout={timeout_seconds}"
+        self._sealed = True
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if getattr(self, "_sealed", False):
+            raise AttributeError("pinned HTTPS port is immutable after construction")
+        object.__setattr__(self, name, value)
+
+    @property
+    def identity(self) -> str:
+        return self._identity
 
     def dispatch(
         self,
@@ -338,22 +364,100 @@ class PinnedHttpsGatewayPort:
             if not chunk:
                 raise ValueError("provider response ended before its headers")
             head.extend(chunk)
-        body = bytearray()
-        while len(body) <= maximum_response_bytes:
-            chunk = tls.recv(min(65536, maximum_response_bytes + 1 - len(body)))
-            if not chunk:
-                break
-            body.extend(chunk)
-        if len(body) > maximum_response_bytes:
-            raise ValueError("provider response exceeds its bounded body")
-        return PinnedHttpsGatewayPort._parse_response(bytes(head[:-4]), bytes(body))
+        status, headers = PinnedHttpsGatewayPort._parse_response_head(bytes(head[:-4]))
+        if 100 <= status < 200:
+            raise ValueError("interim provider responses are not supported")
+        transfer_encoding = headers.get("transfer-encoding")
+        content_length = headers.get("content-length")
+        if transfer_encoding is not None and content_length is not None:
+            raise ValueError("provider response has ambiguous HTTP framing")
+        if transfer_encoding is not None:
+            if transfer_encoding.lower() != b"chunked":
+                raise ValueError("provider response uses unsupported transfer encoding")
+            body = PinnedHttpsGatewayPort._read_chunked_body(
+                tls, maximum_response_bytes
+            )
+        elif content_length is not None:
+            if not content_length.isdigit():
+                raise ValueError("provider response has an invalid content length")
+            length = int(content_length)
+            if length > maximum_response_bytes:
+                raise ValueError("provider response exceeds its bounded body")
+            body = PinnedHttpsGatewayPort._read_exact(tls, length)
+        else:
+            raise ValueError("provider response has no supported HTTP framing")
+        return OpenAICompatibleHttpResponse(status=status, body=body)
 
     @staticmethod
-    def _parse_response(head: bytes, body: bytes) -> OpenAICompatibleHttpResponse:
-        status_line = head.split(b"\r\n", 1)[0].split()
-        if len(status_line) < 2 or not status_line[1].isdigit():
+    def _parse_response_head(head: bytes) -> tuple[int, dict[str, bytes]]:
+        lines = head.split(b"\r\n")
+        status_line = lines[0].split()
+        if (
+            len(status_line) != 3
+            or status_line[0] != b"HTTP/1.1"
+            or len(status_line[1]) != 3
+            or not status_line[1].isdigit()
+        ):
             raise ValueError("provider response has no valid HTTP status")
-        return OpenAICompatibleHttpResponse(status=int(status_line[1]), body=body)
+        headers: dict[str, bytes] = {}
+        for line in lines[1:]:
+            if not line or line[:1] in {b" ", b"\t"} or b":" not in line:
+                raise ValueError("provider response has malformed headers")
+            raw_name, value = line.split(b":", 1)
+            if not raw_name.isascii() or not all(
+                character.isalnum() or character in "-" for character in raw_name.decode()
+            ):
+                raise ValueError("provider response has malformed header names")
+            name = raw_name.decode("ascii").lower()
+            if name in headers:
+                raise ValueError("provider response has duplicate headers")
+            headers[name] = value.strip()
+        return int(status_line[1]), headers
+
+    @staticmethod
+    def _read_exact(tls: ssl.SSLSocket, length: int) -> bytes:
+        body = bytearray()
+        while len(body) < length:
+            chunk = tls.recv(length - len(body))
+            if not chunk:
+                raise ValueError("provider response ended before its framed body")
+            body.extend(chunk)
+        return bytes(body)
+
+    @staticmethod
+    def _read_line(tls: ssl.SSLSocket, maximum_bytes: int) -> bytes:
+        line = bytearray()
+        while not line.endswith(b"\r\n"):
+            if len(line) >= maximum_bytes:
+                raise ValueError("provider response framing line exceeds its bound")
+            chunk = tls.recv(1)
+            if not chunk:
+                raise ValueError("provider response ended in its framed body")
+            line.extend(chunk)
+        return bytes(line[:-2])
+
+    @staticmethod
+    def _read_chunked_body(
+        tls: ssl.SSLSocket, maximum_response_bytes: int
+    ) -> bytes:
+        body = bytearray()
+        while True:
+            raw_size = PinnedHttpsGatewayPort._read_line(tls, 8192)
+            size_text = raw_size.split(b";", 1)[0]
+            if not size_text or not all(
+                character in b"0123456789abcdefABCDEF" for character in size_text
+            ):
+                raise ValueError("provider response has an invalid chunk size")
+            size = int(size_text, 16)
+            if size > maximum_response_bytes - len(body):
+                raise ValueError("provider response exceeds its bounded body")
+            if size == 0:
+                if PinnedHttpsGatewayPort._read_line(tls, 8192):
+                    raise ValueError("provider response trailers are not supported")
+                return bytes(body)
+            body.extend(PinnedHttpsGatewayPort._read_exact(tls, size))
+            if PinnedHttpsGatewayPort._read_exact(tls, 2) != b"\r\n":
+                raise ValueError("provider response chunk has no terminating CRLF")
 
 
 @dataclass(frozen=True, slots=True)
@@ -448,47 +552,107 @@ class OpenAICompatibleEgressTransport:
         endpoints: Iterable[OpenAICompatibleEndpointConfig],
         payload_store: OpenAICompatiblePayloadStore,
         credential_resolver: ProviderCredentialResolver,
-        http_port: OpenAICompatibleHttpPort | None = None,
+    ) -> None:
+        self._initialize(
+            endpoints=endpoints,
+            payload_store=payload_store,
+            credential_resolver=credential_resolver,
+            http_port=PinnedHttpsGatewayPort(),
+            test_only=False,
+        )
+
+    @classmethod
+    def for_testing(
+        cls,
+        *,
+        endpoints: Iterable[OpenAICompatibleEndpointConfig],
+        payload_store: OpenAICompatiblePayloadStore,
+        credential_resolver: ProviderCredentialResolver,
+        http_port: OpenAICompatibleHttpPort,
+    ) -> Self:
+        instance = cls.__new__(cls)
+        instance._initialize(
+            endpoints=endpoints,
+            payload_store=payload_store,
+            credential_resolver=credential_resolver,
+            http_port=http_port,
+            test_only=True,
+        )
+        return instance
+
+    def _initialize(
+        self,
+        *,
+        endpoints: Iterable[OpenAICompatibleEndpointConfig],
+        payload_store: OpenAICompatiblePayloadStore,
+        credential_resolver: ProviderCredentialResolver,
+        http_port: OpenAICompatibleHttpPort,
+        test_only: bool,
     ) -> None:
         configs = tuple(endpoints)
         if not configs or len({item.endpoint_id for item in configs}) != len(configs):
             raise ValueError(
                 "OpenAI-compatible endpoint IDs must be non-empty and unique"
             )
-        selected_http_port = http_port or PinnedHttpsGatewayPort()
         if (
             not callable(getattr(credential_resolver, "resolve", None))
             or not isinstance(getattr(credential_resolver, "identity", None), str)
             or not credential_resolver.identity
-            or not callable(getattr(selected_http_port, "dispatch", None))
-            or not isinstance(getattr(selected_http_port, "identity", None), str)
-            or not selected_http_port.identity
+            or not callable(getattr(http_port, "dispatch", None))
+            or not isinstance(getattr(http_port, "identity", None), str)
+            or not http_port.identity
         ):
             raise TypeError(
                 "OpenAI-compatible transport requires bound credential and HTTP ports"
             )
+        if not test_only and (
+            type(credential_resolver) is not BoundEnvironmentCredentialResolver
+            or type(http_port) is not PinnedHttpsGatewayPort
+        ):
+            raise TypeError("live transport requires immutable bound TLS components")
         self._endpoints = {item.endpoint_id: item for item in configs}
         self._payload_store = payload_store
         self._credential_resolver = credential_resolver
-        self._http_port = selected_http_port
-        self.transport_id = "transport.openai-compatible.v2:" + hashlib.sha256(
+        self._http_port = http_port
+        self._test_only = test_only
+        self._component_descriptor = self._describe_components()
+        self.transport_id = "transport.openai-compatible.v3:" + self._component_descriptor
+        self._lock = RLock()
+        self._artifacts: dict[str, _TransportArtifact] = {}
+
+    @property
+    def test_only(self) -> bool:
+        return self._test_only
+
+    def _describe_components(self) -> str:
+        return hashlib.sha256(
             json.dumps(
                 {
+                    "credential_resolver": self._credential_resolver.identity,
                     "endpoints": [
                         item.model_dump(mode="json")
-                        for item in sorted(configs, key=lambda item: item.endpoint_id)
+                        for item in sorted(
+                            self._endpoints.values(), key=lambda item: item.endpoint_id
+                        )
                     ],
-                    "credential_resolver": credential_resolver.identity,
-                    "http_port": selected_http_port.identity,
+                    "http_port": self._http_port.identity,
+                    "test_only": self._test_only,
                 },
                 sort_keys=True,
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
-        self._lock = RLock()
-        self._artifacts: dict[str, _TransportArtifact] = {}
+
+    def _components_are_current(self) -> bool:
+        try:
+            current = self._describe_components()
+        except Exception:
+            return False
+        return hmac.compare_digest(current, self._component_descriptor)
 
     def dispatch(self, request: CompiledProviderRequest) -> EgressTransportResult:
+        if not self._components_are_current():
+            return self._not_dispatched(request)
         payload = self._payload_store.consume(request)
         endpoint = self._endpoints.get(request.endpoint_id)
         if (
@@ -618,6 +782,8 @@ class OpenAICompatibleProviderProxy:
             raise TypeError(
                 "OpenAI-compatible proxy requires the existing provider egress proxy"
             )
+        if transport.test_only and bool(getattr(egress_proxy, "_live", False)):
+            raise ValueError("test-only transport cannot be attached to live egress")
         self._proxy_id = proxy_id
         self._endpoints = {item.endpoint_id: item for item in configs}
         self._resolver = prompt_resolver
@@ -639,6 +805,8 @@ class OpenAICompatibleProviderProxy:
 
     def dispatch(self, request: ProviderProxyRequest) -> ProviderProxyResult:
         request = ProviderProxyRequest.model_validate(request.model_dump(mode="python"))
+        if request.live and self._transport.test_only:
+            return self._result(request, outcome=ProxyOutcome.DENIED)
         endpoint = self._endpoints.get(request.endpoint_id)
         if not self._request_matches_endpoint(request, endpoint):
             return self._result(request, outcome=ProxyOutcome.DENIED)

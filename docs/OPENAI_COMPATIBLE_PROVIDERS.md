@@ -8,14 +8,17 @@ holds, provider/model/data policy, request and response byte ceilings, and a
 no-redirect transport binding.
 
 `OpenAICompatibleEgressTransport` is the `ProviderTransport` used by that
-plane. Its production default, `PinnedHttpsGatewayPort`, opens TLS only to the
+plane. Its production constructor always creates `PinnedHttpsGatewayPort`,
+which opens TLS only to the
 already compiled `resolved_addresses`; it preserves the compiled origin's Host
 header and TLS SNI, uses the platform certificate verifier, bypasses proxy and
-ambient DNS configuration, follows no redirects, and reads at most the response
-body ceiling plus one byte. A trusted Gateway/T17 port can be injected only with
-a stable component identity; that identity, the bound credential resolver, and
-the complete endpoint configuration are content-addressed into `transport_id`.
-The egress plane rechecks that component digest immediately before dispatch.
+ambient DNS configuration, follows no redirects, and accepts only bounded
+HTTP/1.1 `Content-Length` or chunked responses. The explicit
+`for_testing` factory may accept a fake HTTP port, but a test-only transport
+cannot attach to live egress or dispatch a live proxy request. The immutable
+credential resolver, pinned port, and complete endpoint configuration are
+content-addressed into `transport_id`; the descriptor is recomputed before each
+dispatch.
 
 Endpoint configuration stores a validated HTTPS base URL, configurable relative
 Chat Completions path (default `/chat/completions`), exact model ID, `SecretRef`,

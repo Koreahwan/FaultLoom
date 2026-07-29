@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from faultloom.egress import (
     EgressPlane,
     ProviderProxy as EgressProviderProxy,
@@ -120,6 +122,7 @@ def _stack(
     http_port: FakePinnedHttpPort,
     *,
     environment: dict[str, str] | None = None,
+    egress_live: bool = False,
 ):
     tmp_path.mkdir(parents=True, exist_ok=True)
     config = OpenAICompatibleEndpointConfig(
@@ -143,7 +146,7 @@ def _stack(
     )
     resolver.calls.clear()
     payload_store = OpenAICompatiblePayloadStore()
-    transport = OpenAICompatibleEgressTransport(
+    transport = OpenAICompatibleEgressTransport.for_testing(
         endpoints=(config,),
         payload_store=payload_store,
         credential_resolver=BoundEnvironmentCredentialResolver(
@@ -172,7 +175,7 @@ def _stack(
         transport=transport,
         resolver=resolver,
         authority_state=state,
-        live=True,
+        live=egress_live,
         clock=lambda: DISPATCH_TIME,
     )
     proxy = OpenAICompatibleProviderProxy(
@@ -187,7 +190,12 @@ def _stack(
     return proxy, state, transport, payload_store, config
 
 
-def _request(proxy: OpenAICompatibleProviderProxy, authority_digest: str):
+def _request(
+    proxy: OpenAICompatibleProviderProxy,
+    authority_digest: str,
+    *,
+    live: bool = False,
+):
     payload = _payload()
     from faultloom.provider import ProviderProxyRequest
 
@@ -220,7 +228,7 @@ def _request(proxy: OpenAICompatibleProviderProxy, authority_digest: str):
         payload_digest=payload.prompt_digest(),
         payload_bytes=payload.prompt_bytes(),
         requested_at=DISPATCH_TIME,
-        live=True,
+        live=live,
     )
 
 
@@ -370,6 +378,77 @@ def test_transport_id_changes_when_trusted_http_component_changes(tmp_path: Path
     assert first_transport.transport_id != second_transport.transport_id
 
 
+def test_test_port_cannot_enter_live_paths_or_expose_credentials(tmp_path: Path) -> None:
+    http = FakePinnedHttpPort(_response())
+    proxy, state, transport, payload_store, config = _stack(tmp_path, http)
+    http.response = OpenAICompatibleHttpResponse(status=200, body=b"hostile")
+    assert http.identity == "test.pinned-http.v1"
+
+    result = proxy.dispatch(_request(proxy, state.authority_digest, live=True))
+
+    assert result.outcome is ProxyOutcome.DENIED
+    assert http.calls == []
+    assert "bound-secret" not in result.model_dump_json()
+    with pytest.raises(ValueError, match="test-only transport"):
+        OpenAICompatibleProviderProxy(
+            proxy_id="live-test-only-proxy",
+            endpoints=(config,),
+            prompt_resolver=lambda request: _payload(),
+            payload_store=payload_store,
+            egress_proxy=EgressProviderProxy(
+                endpoints=(provider_endpoint(),),
+                transport=transport,
+                resolver=StaticResolver(plane=EgressPlane.MODEL_PROVIDER),
+                authority_state=state,
+                live=True,
+                clock=lambda: DISPATCH_TIME,
+            ),
+            transport=transport,
+            attestation_signer=PROXY_SIGNER,
+        )
+
+
+def test_mutated_component_descriptor_blocks_test_transport_before_http(
+    tmp_path: Path,
+) -> None:
+    http = FakePinnedHttpPort(_response())
+    proxy, state, transport, payload_store, _ = _stack(tmp_path, http)
+    request = _request(proxy, state.authority_digest)
+    assert proxy.dispatch(request).outcome is ProxyOutcome.COMPLETED
+    compiled = http.calls[0][0]
+    payload_store.publish(request, _payload())
+    http.identity = "test.pinned-http.changed.v1"
+
+    result = transport.dispatch(compiled)
+
+    assert result.outcome is TransportOutcome.FAILED
+    assert result.bytes_sent == 0
+    assert len(http.calls) == 1
+
+
+def test_production_transport_has_immutable_pinned_components(tmp_path: Path) -> None:
+    http = FakePinnedHttpPort(_response())
+    _, _, test_transport, payload_store, config = _stack(tmp_path, http)
+    production = OpenAICompatibleEgressTransport(
+        endpoints=(config,),
+        payload_store=payload_store,
+        credential_resolver=test_transport._credential_resolver,
+    )
+
+    assert production.test_only is False
+    with pytest.raises(AttributeError, match="immutable"):
+        production._credential_resolver._identity = "forged"
+    with pytest.raises(AttributeError, match="immutable"):
+        production._http_port._identity = "forged"
+    with pytest.raises(TypeError):
+        OpenAICompatibleEgressTransport(
+            endpoints=(config,),
+            payload_store=payload_store,
+            credential_resolver=test_transport._credential_resolver,
+            http_port=http,
+        )
+
+
 def test_pinned_https_port_uses_compiled_address_sni_host_and_body_cap(
     tmp_path: Path,
     monkeypatch,
@@ -441,8 +520,38 @@ def test_pinned_https_port_uses_compiled_address_sni_host_and_body_cap(
     assert observed["server_hostname"] == "provider.example.invalid"
     assert b"Host: provider.example.invalid\r\n" in observed["request"]
     assert b"GET " not in observed["request"]
-    assert 9 in tls.read_sizes
+    assert 8 in tls.read_sizes
     assert response == OpenAICompatibleHttpResponse(status=302, body=b"redirect")
+
+
+def test_pinned_https_port_supports_bounded_content_length_and_chunked_framing() -> None:
+    class BufferedTls:
+        def __init__(self, value: bytes) -> None:
+            self.buffer = bytearray(value)
+            self.read_sizes: list[int] = []
+
+        def recv(self, size: int) -> bytes:
+            self.read_sizes.append(size)
+            value = bytes(self.buffer[:size])
+            del self.buffer[:size]
+            return value
+
+    chunked = BufferedTls(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+        b"4\r\ntest\r\n3\r\ning\r\n0\r\n\r\n"
+    )
+    assert PinnedHttpsGatewayPort._read_response(chunked, 8) == OpenAICompatibleHttpResponse(
+        status=200,
+        body=b"testing",
+    )
+    oversized = BufferedTls(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n")
+    with pytest.raises(ValueError, match="bounded body"):
+        PinnedHttpsGatewayPort._read_response(oversized, 8)
+    malformed = BufferedTls(
+        b"HTTP/1.1 100 Continue\r\nContent-Length: 0\r\n\r\n"
+    )
+    with pytest.raises(ValueError, match="interim"):
+        PinnedHttpsGatewayPort._read_response(malformed, 8)
 
 
 def test_signed_result_verifies_and_does_not_leak_bound_secret(tmp_path: Path) -> None:
