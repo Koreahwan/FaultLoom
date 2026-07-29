@@ -36,6 +36,14 @@ from .metadata import (
     ProviderToolSpec,
     provider_tool_schema_digest,
 )
+from .openai_compatible import (
+    OpenAICompatibleChatPayload,
+    OpenAICompatibleEndpointConfig,
+    OpenAICompatibleMessage,
+    OpenAICompatiblePreset,
+    OpenAICompatibleProviderProxy,
+    openai_compatible_preset,
+)
 from .proxy import (
     ProviderProxyPort,
     ProviderProxyRequest,
@@ -54,6 +62,11 @@ __all__ = [
     "MemoryProviderReceiptJournal",
     "MetadataProvenance",
     "MetadataSourceKind",
+    "OpenAICompatibleChatPayload",
+    "OpenAICompatibleEndpointConfig",
+    "OpenAICompatibleMessage",
+    "OpenAICompatiblePreset",
+    "OpenAICompatibleProviderProxy",
     "ProviderAdapter",
     "ProviderAdapterError",
     "ProviderBudgetError",
@@ -85,4 +98,5 @@ __all__ = [
     "provider_canonical_json_bytes",
     "provider_sha256_digest",
     "provider_tool_schema_digest",
+    "openai_compatible_preset",
 ]
