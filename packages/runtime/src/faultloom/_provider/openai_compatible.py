@@ -543,8 +543,24 @@ def _compiled_payload_request_binding(request: CompiledProviderRequest) -> str:
 class OpenAICompatibleEgressTransport:
     """ProviderTransport implementation invoked only after egress authorization."""
 
+    __slots__ = (
+        "_artifacts",
+        "_component_descriptor",
+        "_credential_resolver",
+        "_credential_resolver_ref",
+        "_credential_resolver_type",
+        "_endpoints",
+        "_http_port",
+        "_http_port_ref",
+        "_http_port_type",
+        "_lock",
+        "_payload_store",
+        "_sealed",
+        "_test_only",
+        "transport_id",
+    )
+
     plane = EgressPlane.MODEL_PROVIDER
-    transport_id = "transport.openai-compatible.v2"
 
     def __init__(
         self,
@@ -613,12 +629,22 @@ class OpenAICompatibleEgressTransport:
         self._endpoints = {item.endpoint_id: item for item in configs}
         self._payload_store = payload_store
         self._credential_resolver = credential_resolver
+        self._credential_resolver_ref = credential_resolver
+        self._credential_resolver_type = type(credential_resolver)
         self._http_port = http_port
+        self._http_port_ref = http_port
+        self._http_port_type = type(http_port)
         self._test_only = test_only
         self._component_descriptor = self._describe_components()
         self.transport_id = "transport.openai-compatible.v3:" + self._component_descriptor
         self._lock = RLock()
         self._artifacts: dict[str, _TransportArtifact] = {}
+        self._sealed = True
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if getattr(self, "_sealed", False):
+            raise AttributeError("OpenAI-compatible transport is immutable after construction")
+        object.__setattr__(self, name, value)
 
     @property
     def test_only(self) -> bool:
@@ -644,6 +670,13 @@ class OpenAICompatibleEgressTransport:
         ).hexdigest()
 
     def _components_are_current(self) -> bool:
+        if (
+            self._credential_resolver is not self._credential_resolver_ref
+            or type(self._credential_resolver) is not self._credential_resolver_type
+            or self._http_port is not self._http_port_ref
+            or type(self._http_port) is not self._http_port_type
+        ):
+            return False
         try:
             current = self._describe_components()
         except Exception:

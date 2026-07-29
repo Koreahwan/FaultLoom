@@ -9,8 +9,10 @@ from typing import Any
 import pytest
 
 from faultloom.egress import (
+    EgressOutcome,
     EgressPlane,
     ProviderProxy as EgressProviderProxy,
+    ProviderRequest,
     TransportOutcome,
     sha256_digest as egress_sha256_digest,
 )
@@ -424,6 +426,93 @@ def test_mutated_component_descriptor_blocks_test_transport_before_http(
     assert result.outcome is TransportOutcome.FAILED
     assert result.bytes_sent == 0
     assert len(http.calls) == 1
+
+
+def test_same_identity_outer_port_replacement_cannot_reach_bearer(
+    tmp_path: Path,
+) -> None:
+    original = FakePinnedHttpPort(_response())
+    replacement = FakePinnedHttpPort(_response())
+    proxy, state, transport, payload_store, _ = _stack(tmp_path, original)
+    request = _request(proxy, state.authority_digest)
+    assert proxy.dispatch(request).outcome is ProxyOutcome.COMPLETED
+    compiled = original.calls[0][0]
+    payload_store.publish(request, _payload())
+    assert replacement.identity == original.identity
+
+    with pytest.raises(AttributeError, match="immutable"):
+        transport._http_port = replacement
+    object.__setattr__(transport, "_http_port", replacement)
+    result = transport.dispatch(compiled)
+
+    assert result.outcome is TransportOutcome.FAILED
+    assert result.bytes_sent == 0
+    assert len(original.calls) == 1
+    assert replacement.calls == []
+
+
+def test_same_identity_outer_resolver_replacement_cannot_reach_bearer(
+    tmp_path: Path,
+) -> None:
+    http = FakePinnedHttpPort(_response())
+    proxy, state, transport, payload_store, _ = _stack(tmp_path, http)
+    request = _request(proxy, state.authority_digest)
+    assert proxy.dispatch(request).outcome is ProxyOutcome.COMPLETED
+    compiled = http.calls[0][0]
+    payload_store.publish(request, _payload())
+    replacement = BoundEnvironmentCredentialResolver(
+        bindings=transport._credential_resolver._bindings,
+        environment={"BOUND_PROVIDER_KEY": "replacement-secret"},
+    )
+    assert replacement.identity == transport._credential_resolver.identity
+
+    with pytest.raises(AttributeError, match="immutable"):
+        transport._credential_resolver = replacement
+    object.__setattr__(transport, "_credential_resolver", replacement)
+    result = transport.dispatch(compiled)
+
+    assert result.outcome is TransportOutcome.FAILED
+    assert result.bytes_sent == 0
+    assert len(http.calls) == 1
+
+
+def test_live_egress_rejects_test_transport_before_published_payload_can_send(
+    tmp_path: Path,
+) -> None:
+    http = FakePinnedHttpPort(_response())
+    proxy, state, transport, payload_store, _ = _stack(tmp_path, http)
+    proxy_request = _request(proxy, state.authority_digest, live=True)
+    payload_store.publish(proxy_request, _payload())
+    direct = ProviderRequest(
+        schema_version="0.1.0",
+        request_id=proxy_request.request_id,
+        run_id=proxy_request.run_id,
+        authority_digest=proxy_request.authority_digest,
+        scope_epoch=proxy_request.scope_epoch,
+        endpoint_id=proxy_request.endpoint_id,
+        provider_id=proxy_request.provider_id,
+        model_snapshot=proxy_request.model_snapshot,
+        data_policy_id=proxy_request.data_policy_id,
+        credential_ref=proxy_request.credential_ref,
+        payload_digest=proxy_request.payload_digest,
+        payload_bytes=proxy_request.payload_bytes,
+        requested_at=proxy_request.requested_at,
+        live=True,
+    )
+    egress = EgressProviderProxy(
+        endpoints=(provider_endpoint(),),
+        transport=transport,
+        resolver=StaticResolver(plane=EgressPlane.MODEL_PROVIDER),
+        authority_state=state,
+        live=True,
+        clock=lambda: DISPATCH_TIME,
+    )
+
+    receipt = egress.dispatch(direct)
+
+    assert receipt.outcome is EgressOutcome.DENIED
+    assert receipt.denial_code == "transport_plane_mismatch"
+    assert http.calls == []
 
 
 def test_production_transport_has_immutable_pinned_components(tmp_path: Path) -> None:

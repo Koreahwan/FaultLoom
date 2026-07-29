@@ -18,7 +18,10 @@ HTTP/1.1 `Content-Length` or chunked responses. The explicit
 cannot attach to live egress or dispatch a live proxy request. The immutable
 credential resolver, pinned port, and complete endpoint configuration are
 content-addressed into `transport_id`; the descriptor is recomputed before each
-dispatch.
+dispatch. Live egress itself rejects a transport marked test-only before it
+compiles or invokes a provider transport. The transport also retains and checks
+the original resolver and HTTP-port object identities on every dispatch, so a
+same-identity replacement cannot reach a credential-bearing call.
 
 Endpoint configuration stores a validated HTTPS base URL, configurable relative
 Chat Completions path (default `/chat/completions`), exact model ID, `SecretRef`,

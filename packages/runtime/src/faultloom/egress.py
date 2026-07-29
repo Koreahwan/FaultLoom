@@ -1662,6 +1662,8 @@ class ProviderProxy:
                 return DenialCode.PROVIDER_TOOL_LIVE_DENIED
         if self._transport.plane is not EgressPlane.MODEL_PROVIDER:
             return DenialCode.TRANSPORT_PLANE_MISMATCH
+        if self._live and bool(getattr(self._transport, "test_only", False)):
+            return DenialCode.TRANSPORT_PLANE_MISMATCH
         return None
 
     def _dispatch_compiled(
