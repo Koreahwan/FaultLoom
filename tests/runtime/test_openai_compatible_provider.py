@@ -43,6 +43,7 @@ from faultloom.provider import (
     provider_canonical_json_bytes,
     provider_proxy_result_attestation_bytes,
     provider_sha256_digest,
+    provider_tool_schema_digest,
 )
 from faultloom_protocol import SecretRef, load_public_key
 
@@ -283,6 +284,7 @@ def _function_schema(
     return OpenAICompatibleFunctionSchema(
         tool=ProviderToolSpec(
             tool_id=tool_id,
+            wire_name=name,
             kind=ProviderToolKind.FUNCTION,
             input_schema_digest=provider_sha256_digest(parameters),
             output_schema_digest=digest(f"{tool_id}-output"),
@@ -307,6 +309,42 @@ def _response() -> OpenAICompatibleHttpResponse:
                     }
                 ],
                 "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            }
+        ).encode(),
+    )
+
+
+def _tool_response(
+    arguments_json: str,
+    *,
+    name: str = "lookup",
+    prompt_tokens: int = 10,
+) -> OpenAICompatibleHttpResponse:
+    return OpenAICompatibleHttpResponse(
+        status=200,
+        body=json.dumps(
+            {
+                "model": "frontier-2030-01-01",
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "call_lookup_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": name,
+                                        "arguments": arguments_json,
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": 5,
+                },
             }
         ).encode(),
     )
@@ -375,6 +413,7 @@ def test_attested_function_schema_is_verified_before_tool_wire_serialization(
 
     assert result.outcome is ProxyOutcome.COMPLETED
     assert result.tool_calls[0].call_id == "call_lookup_1"
+    assert result.tool_calls[0].tool_id == "lookup"
     assert result.tool_calls[0].name == "lookup"
     assert result.tool_calls[0].arguments_json == '{"query":"fixture"}'
     body = json.loads(http.calls[0][3])
@@ -468,6 +507,202 @@ def test_malformed_or_oversized_tool_arguments_fail_after_observed_response(
     assert result.outcome is ProxyOutcome.FAILED
     assert result.effect_disposition is ProxyEffectDisposition.OBSERVED
     assert result.tool_calls == ()
+    assert len(http.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "arguments_json",
+    ['{"query":7}', '{"query":"fixture","command":"id"}'],
+)
+def test_tool_arguments_must_match_exact_attested_schema(
+    tmp_path: Path, arguments_json: str
+) -> None:
+    schema = _function_schema()
+    http = FakePinnedHttpPort(_tool_response(arguments_json))
+    proxy, state, _, _, _ = _stack(tmp_path, http, tool_schemas=(schema,))
+
+    result = proxy.dispatch(
+        _request(proxy, state.authority_digest, tool_schemas=(schema,))
+    )
+
+    assert result.outcome is ProxyOutcome.FAILED
+    assert result.effect_disposition is ProxyEffectDisposition.OBSERVED
+    assert result.tool_calls == ()
+    assert len(http.calls) == 1
+
+
+def test_schema_admission_rejects_unsupported_keywords() -> None:
+    parameters = {
+        "type": "object",
+        "properties": {"query": {"type": "string", "pattern": "safe"}},
+        "required": ["query"],
+        "additionalProperties": False,
+    }
+    with pytest.raises(ValueError, match="unsupported keywords"):
+        OpenAICompatibleFunctionSchema(
+            tool=ProviderToolSpec(
+                tool_id="lookup",
+                wire_name="lookup",
+                kind=ProviderToolKind.FUNCTION,
+                input_schema_digest=provider_sha256_digest(parameters),
+                output_schema_digest=digest("lookup-output"),
+            ),
+            name="lookup",
+            schema_bytes=provider_canonical_json_bytes(parameters),
+        )
+
+
+def test_wire_name_remap_changes_tool_and_proxy_contract_and_is_signed(
+    tmp_path: Path,
+) -> None:
+    lookup = _function_schema()
+    remapped = _function_schema(name="shell_exec")
+    assert lookup.tool.input_schema_digest == remapped.tool.input_schema_digest
+    assert lookup.tool.output_schema_digest == remapped.tool.output_schema_digest
+    assert provider_tool_schema_digest((lookup.tool,)) != provider_tool_schema_digest(
+        (remapped.tool,)
+    )
+
+    lookup_proxy, _, _, _, _ = _stack(
+        tmp_path / "lookup", FakePinnedHttpPort(_tool_response('{"query":"fixture"}')),
+        tool_schemas=(lookup,),
+    )
+    http = FakePinnedHttpPort(
+        _tool_response('{"query":"fixture"}', name="shell_exec")
+    )
+    remap_proxy, state, _, _, _ = _stack(
+        tmp_path / "remap", http, tool_schemas=(remapped,)
+    )
+    assert lookup_proxy.contract_digest != remap_proxy.contract_digest
+
+    result = remap_proxy.dispatch(
+        _request(remap_proxy, state.authority_digest, tool_schemas=(remapped,))
+    )
+
+    assert result.outcome is ProxyOutcome.COMPLETED
+    assert result.tool_calls[0].tool_id == "lookup"
+    assert result.tool_calls[0].name == "shell_exec"
+    signature = b64decode(
+        result.attestation_signature + "=" * (-len(result.attestation_signature) % 4),
+        altchars=b"-_",
+        validate=True,
+    )
+    load_public_key(remap_proxy.attestation_public_key).verify(
+        signature,
+        provider_proxy_result_attestation_bytes(result),
+    )
+
+
+def test_schema_mutation_after_component_check_cannot_change_wire_snapshot(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    schema = _function_schema()
+    request_schema = _function_schema()
+    http = FakePinnedHttpPort(_tool_response('{"query":"fixture"}'))
+    proxy, state, transport, _, _ = _stack(
+        tmp_path, http, tool_schemas=(schema,)
+    )
+    request = _request(
+        proxy, state.authority_digest, tool_schemas=(request_schema,)
+    )
+    original_check = transport._components_are_current
+
+    def mutate_after_check(current_transport: OpenAICompatibleEgressTransport) -> bool:
+        current = original_check()
+        object.__setattr__(
+            schema,
+            "schema_bytes",
+            provider_canonical_json_bytes(
+                {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                    "additionalProperties": False,
+                }
+            ),
+        )
+        return current
+
+    monkeypatch.setattr(
+        OpenAICompatibleEgressTransport,
+        "_components_are_current",
+        mutate_after_check,
+    )
+    result = proxy.dispatch(request)
+
+    assert result.outcome is ProxyOutcome.COMPLETED
+    assert json.loads(http.calls[0][3])["tools"][0]["function"]["parameters"] == {
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"],
+        "additionalProperties": False,
+    }
+
+
+def test_internal_schema_mutation_from_payload_store_callback_fails_closed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    schema = _function_schema()
+    http = FakePinnedHttpPort(_tool_response('{"query":"fixture"}'))
+    proxy, state, transport, payload_store, _ = _stack(
+        tmp_path, http, tool_schemas=(schema,)
+    )
+    request = _request(proxy, state.authority_digest, tool_schemas=(schema,))
+    original_consume = payload_store.consume
+
+    def mutate_during_consume(compiled_request):
+        consumed = original_consume(compiled_request)
+        object.__setattr__(
+            transport._tool_schemas["lookup"],
+            "schema_bytes",
+            provider_canonical_json_bytes(
+                {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                    "additionalProperties": False,
+                }
+            ),
+        )
+        return consumed
+
+    monkeypatch.setattr(payload_store, "consume", mutate_during_consume)
+    result = proxy.dispatch(request)
+
+    assert result.outcome is ProxyOutcome.PRE_SEND_FAILED
+    assert result.effect_disposition is ProxyEffectDisposition.NOT_DISPATCHED
+    assert http.calls == []
+
+
+def test_empty_tool_set_requires_exact_empty_contract_digest(tmp_path: Path) -> None:
+    http = FakePinnedHttpPort(_response())
+    proxy, state, _, _, _ = _stack(tmp_path, http)
+    forged = _request(
+        proxy,
+        state.authority_digest,
+        tool_schema_digest=digest("arbitrary-accepted-tools"),
+    )
+
+    result = proxy.dispatch(forged)
+
+    assert result.outcome is ProxyOutcome.DENIED
+    assert result.accepted_tool_schema_digest is None
+    assert http.calls == []
+
+
+def test_oversized_provider_usage_fails_as_observed_response(tmp_path: Path) -> None:
+    http = FakePinnedHttpPort(
+        _tool_response('{"query":"fixture"}', prompt_tokens=2**63)
+    )
+    proxy, state, _, _, _ = _stack(tmp_path, http)
+
+    result = proxy.dispatch(_request(proxy, state.authority_digest))
+
+    assert result.outcome is ProxyOutcome.FAILED
+    assert result.effect_disposition is ProxyEffectDisposition.OBSERVED
+    assert result.reconciliation_required is False
     assert len(http.calls) == 1
 
 

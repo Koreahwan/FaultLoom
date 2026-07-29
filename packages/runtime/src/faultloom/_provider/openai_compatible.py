@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import re
 import socket
 import ssl
@@ -12,8 +13,8 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from threading import RLock
-from typing import Any, Literal, Protocol, Self
 from types import MappingProxyType
+from typing import Any, Literal, Protocol, Self, cast
 from urllib.parse import urlsplit
 
 from faultloom.egress import (
@@ -84,6 +85,14 @@ _FUNCTION_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _MAX_TOOL_SCHEMA_BYTES = 16_384
 _MAX_TOOL_CALLS = 16
 _MAX_TOOL_ARGUMENT_BYTES = 4_096
+_MAX_TOOL_SCHEMA_DEPTH = 16
+_MAX_TOOL_SCHEMA_NODES = 256
+_SUPPORTED_SCHEMA_TYPES = frozenset(
+    {"array", "boolean", "integer", "null", "number", "object", "string"}
+)
+_SUPPORTED_SCHEMA_KEYWORDS = frozenset(
+    {"additionalProperties", "items", "properties", "required", "type"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +111,8 @@ class OpenAICompatibleFunctionSchema:
         tool = ProviderToolSpec.model_validate(self.tool.model_dump(mode="python"))
         if tool.kind is not ProviderToolKind.FUNCTION:
             raise ValueError("OpenAI-compatible schemas only admit function tools")
+        if tool.wire_name != self.name:
+            raise ValueError("function name must equal the attested tool wire name")
         try:
             schema = _load_json_object(self.schema_bytes.decode("utf-8"))
         except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
@@ -110,6 +121,7 @@ class OpenAICompatibleFunctionSchema:
             raise ValueError("function schema source must contain exact canonical JSON bytes")
         if not hmac.compare_digest(sha256_digest(schema), tool.input_schema_digest):
             raise ValueError("function schema source does not match the attested input digest")
+        _admit_tool_schema(schema)
         object.__setattr__(self, "tool", tool)
 
     def wire_function(self) -> dict[str, object]:
@@ -209,10 +221,10 @@ class OpenAICompatibleChatPayload(_RuntimeModel):
         return {"messages": tuple(message.as_wire() for message in self.messages)}
 
     def prompt_digest(self) -> str:
-        return sha256_digest(self.prompt_material())
+        return sha256_digest(cast(Any, self.prompt_material()))
 
     def prompt_bytes(self) -> int:
-        return len(provider_canonical_json_bytes(self.prompt_material()))
+        return len(provider_canonical_json_bytes(cast(Any, self.prompt_material())))
 
 
 PromptResolver = Callable[[ProviderProxyRequest], OpenAICompatibleChatPayload]
@@ -243,7 +255,8 @@ class OpenAICompatibleCredentialBinding:
 
 
 class ProviderCredentialResolver(Protocol):
-    identity: str
+    @property
+    def identity(self) -> str: ...
 
     def resolve(self, request: CompiledProviderRequest) -> str: ...
 
@@ -323,7 +336,8 @@ class OpenAICompatibleHttpResponse:
 class OpenAICompatibleHttpPort(Protocol):
     """Trusted T17/Gateway HTTP boundary; it must honor compiled destination pins."""
 
-    identity: str
+    @property
+    def identity(self) -> str: ...
 
     def dispatch(
         self,
@@ -530,6 +544,7 @@ class _ConsumedPayload:
 class _TransportArtifact:
     response: OpenAICompatibleHttpResponse | None
     not_dispatched: bool
+    tool_schemas: tuple[OpenAICompatibleFunctionSchema, ...]
 
 
 class OpenAICompatiblePayloadStore:
@@ -697,14 +712,27 @@ class OpenAICompatibleEgressTransport:
         ):
             raise TypeError("live transport requires immutable bound TLS components")
         self._endpoints = {item.endpoint_id: item for item in configs}
-        schemas = tuple(tool_schemas)
-        if any(type(schema) is not OpenAICompatibleFunctionSchema for schema in schemas):
+        supplied_schemas = tuple(tool_schemas)
+        if any(
+            type(schema) is not OpenAICompatibleFunctionSchema
+            for schema in supplied_schemas
+        ):
             raise TypeError("OpenAI-compatible tool schemas require exact canonical sources")
+        schemas = tuple(
+            OpenAICompatibleFunctionSchema(
+                tool=schema.tool,
+                name=schema.name,
+                schema_bytes=schema.schema_bytes,
+            )
+            for schema in supplied_schemas
+        )
         if len({schema.tool.tool_id for schema in schemas}) != len(schemas):
             raise ValueError("OpenAI-compatible tool schema IDs must be unique")
         if len({schema.name for schema in schemas}) != len(schemas):
             raise ValueError("OpenAI-compatible function names must be unique")
-        self._tool_schemas = {schema.tool.tool_id: schema for schema in schemas}
+        self._tool_schemas = MappingProxyType(
+            {schema.tool.tool_id: schema for schema in schemas}
+        )
         self._payload_store = payload_store
         self._credential_resolver = credential_resolver
         self._credential_resolver_ref = credential_resolver
@@ -714,7 +742,7 @@ class OpenAICompatibleEgressTransport:
         self._http_port_type = type(http_port)
         self._test_only = test_only
         self._component_descriptor = self._describe_components()
-        self.transport_id = "transport.openai-compatible.v3:" + self._component_descriptor
+        self.transport_id = "transport.openai-compatible.v4:" + self._component_descriptor
         self._lock = RLock()
         self._artifacts: dict[str, _TransportArtifact] = {}
         self._sealed = True
@@ -771,6 +799,8 @@ class OpenAICompatibleEgressTransport:
         if not self._components_are_current():
             return self._not_dispatched(request)
         consumed = self._payload_store.consume(request)
+        if not self._components_are_current():
+            return self._not_dispatched(request)
         endpoint = self._endpoints.get(request.endpoint_id)
         if (
             consumed is None
@@ -786,7 +816,15 @@ class OpenAICompatibleEgressTransport:
         )
         if tools is None:
             return self._not_dispatched(request)
-        body = _request_body(endpoint.model, consumed.payload, tools)
+        tool_snapshots = tuple(
+            OpenAICompatibleFunctionSchema(
+                tool=schema.tool,
+                name=schema.name,
+                schema_bytes=schema.schema_bytes,
+            )
+            for schema in tools
+        )
+        body = _request_body(endpoint.model, consumed.payload, tool_snapshots)
         raw_body = json.dumps(
             body, separators=(",", ":"), ensure_ascii=False
         ).encode("utf-8")
@@ -826,7 +864,11 @@ class OpenAICompatibleEgressTransport:
                 bytes_received=0,
             )
         with self._lock:
-            self._artifacts[request.request_id] = _TransportArtifact(response, False)
+            self._artifacts[request.request_id] = _TransportArtifact(
+                response,
+                False,
+                tool_snapshots,
+            )
         return EgressTransportResult(
             schema_version="0.1.0",
             plane=EgressPlane.MODEL_PROVIDER,
@@ -850,8 +892,6 @@ class OpenAICompatibleEgressTransport:
         *,
         tool_schema_digest: str | None = None,
     ) -> tuple[OpenAICompatibleFunctionSchema, ...] | None:
-        if not request.tool_ids:
-            return ()
         if len(request.tool_ids) != len(set(request.tool_ids)):
             return None
         schemas = tuple(self._tool_schemas.get(tool_id) for tool_id in request.tool_ids)
@@ -875,7 +915,7 @@ class OpenAICompatibleEgressTransport:
 
     def _not_dispatched(self, request: CompiledProviderRequest) -> EgressTransportResult:
         with self._lock:
-            self._artifacts[request.request_id] = _TransportArtifact(None, True)
+            self._artifacts[request.request_id] = _TransportArtifact(None, True, ())
         return EgressTransportResult(
             schema_version="0.1.0",
             plane=EgressPlane.MODEL_PROVIDER,
@@ -941,10 +981,23 @@ class OpenAICompatibleProviderProxy:
         self._transport = transport
         self._signer = attestation_signer
         self.contract_digest = sha256_digest(
-            {
-                "purpose": "faultloom.openai_compatible_provider_proxy.v2",
-                "endpoints": tuple(item.model_dump(mode="json") for item in configs),
-            }
+            cast(
+                Any,
+                {
+                    "purpose": "faultloom.openai_compatible_provider_proxy.v3",
+                    "endpoints": tuple(
+                        item.model_dump(mode="json") for item in configs
+                    ),
+                    "tool_schemas": tuple(
+                        schema.descriptor()
+                        for schema in sorted(
+                            transport._tool_schemas.values(),
+                            key=lambda item: item.tool.tool_id,
+                        )
+                    ),
+                    "transport_id": transport.transport_id,
+                },
+            )
         )
         self.attestation_public_key = attestation_signer.public_key_record
 
@@ -959,6 +1012,7 @@ class OpenAICompatibleProviderProxy:
         endpoint = self._endpoints.get(request.endpoint_id)
         if not self._request_matches_endpoint(request, endpoint):
             return self._result(request, outcome=ProxyOutcome.DENIED)
+        assert endpoint is not None
         if not self._transport.tools_match_request(request):
             return self._result(request, outcome=ProxyOutcome.DENIED)
         try:
@@ -1046,7 +1100,13 @@ class OpenAICompatibleProviderProxy:
                 bytes_received=receipt.bytes_received,
                 reconciliation_required=True,
             )
-        return self._completed_or_failed(request, endpoint, artifact.response, receipt)
+        return self._completed_or_failed(
+            request,
+            endpoint,
+            artifact.response,
+            receipt,
+            artifact.tool_schemas,
+        )
 
     @staticmethod
     def _request_matches_endpoint(
@@ -1082,6 +1142,7 @@ class OpenAICompatibleProviderProxy:
         endpoint: OpenAICompatibleEndpointConfig,
         response: OpenAICompatibleHttpResponse,
         receipt: EgressReceipt,
+        tool_schemas: tuple[OpenAICompatibleFunctionSchema, ...],
     ) -> ProviderProxyResult:
         try:
             decoded = json.loads(response.body)
@@ -1098,8 +1159,14 @@ class OpenAICompatibleProviderProxy:
                 or usage["completion_tokens"] < 0
             ):
                 raise ValueError
-            tool_calls = self._parse_tool_calls(decoded["choices"][0], request)
-        except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+            tool_calls = self._parse_tool_calls(
+                decoded["choices"][0], request, tool_schemas
+            )
+            parsed_usage = ProviderUsage(
+                input_tokens=usage["prompt_tokens"],
+                output_tokens=usage["completion_tokens"],
+            )
+        except Exception:
             return self._result(
                 request,
                 outcome=ProxyOutcome.FAILED,
@@ -1117,15 +1184,15 @@ class OpenAICompatibleProviderProxy:
             bytes_received=receipt.bytes_received,
             response_digest=receipt.response_digest,
             metadata=endpoint.metadata,
-            usage=ProviderUsage(
-                input_tokens=usage["prompt_tokens"],
-                output_tokens=usage["completion_tokens"],
-            ),
+            usage=parsed_usage,
             tool_calls=tool_calls,
         )
 
     def _parse_tool_calls(
-        self, choice: object, request: ProviderProxyRequest
+        self,
+        choice: object,
+        request: ProviderProxyRequest,
+        schemas: tuple[OpenAICompatibleFunctionSchema, ...],
     ) -> tuple[ProviderToolCall, ...]:
         # Existing text/JSON calls do not interpret incidental provider extensions.
         if not request.tool_ids:
@@ -1137,10 +1204,7 @@ class OpenAICompatibleProviderProxy:
             return ()
         if type(raw_calls) is not list or len(raw_calls) > _MAX_TOOL_CALLS:
             raise ValueError("provider tool calls exceed their bounded shape")
-        schemas = self._transport._tools_for_request(request)
-        if schemas is None:
-            raise ValueError("provider tool call request is no longer schema-bound")
-        names = {schema.name for schema in schemas}
+        schemas_by_name = {schema.name: schema for schema in schemas}
         calls: list[ProviderToolCall] = []
         call_ids: set[str] = set()
         for raw_call in raw_calls:
@@ -1163,17 +1227,23 @@ class OpenAICompatibleProviderProxy:
             if (
                 not call_id
                 or len(call_id) > 256
-                or name not in names
+                or name not in schemas_by_name
                 or len(arguments_json.encode("utf-8")) > _MAX_TOOL_ARGUMENT_BYTES
             ):
                 raise ValueError("provider tool call exceeds its exact configured bounds")
-            _load_json_object(arguments_json)
+            arguments = _load_json_object(arguments_json)
+            schema = schemas_by_name[name]
+            _validate_tool_arguments(
+                arguments,
+                _load_json_object(schema.schema_bytes.decode("utf-8")),
+            )
             if call_id in call_ids:
                 raise ValueError("provider tool call IDs must be unique")
             call_ids.add(call_id)
             calls.append(
                 ProviderToolCall(
                     call_id=call_id,
+                    tool_id=schema.tool.tool_id,
                     name=name,
                     arguments_json=arguments_json,
                 )
@@ -1232,7 +1302,7 @@ class OpenAICompatibleProviderProxy:
             "accepted_proxy_id": self.proxy_id if completed else None,
             "accepted_proxy_contract_digest": self.contract_digest if completed else None,
         }
-        draft = ProviderProxyResult.model_construct(**payload)
+        draft = ProviderProxyResult.model_construct(**cast(Any, payload))
         payload["proxy_receipt_digest"] = sha256_digest(
             draft.model_dump(
                 mode="python",
@@ -1291,3 +1361,112 @@ def _load_json_object(value: str) -> dict[str, Any]:
     if type(parsed) is not dict:
         raise ValueError("JSON value must be an object")
     return parsed
+
+
+def _admit_tool_schema(schema: dict[str, Any]) -> None:
+    if schema.get("type") != "object":
+        raise ValueError("function parameter schemas require an object root")
+    remaining = _MAX_TOOL_SCHEMA_NODES
+
+    def visit(node: object, depth: int) -> None:
+        nonlocal remaining
+        remaining -= 1
+        if remaining < 0 or depth > _MAX_TOOL_SCHEMA_DEPTH:
+            raise ValueError("function schema exceeds its structural bounds")
+        if type(node) is not dict or not node:
+            raise ValueError("function schemas require non-empty schema objects")
+        unsupported = set(node) - _SUPPORTED_SCHEMA_KEYWORDS
+        if unsupported:
+            raise ValueError("function schema contains unsupported keywords")
+        schema_type = node.get("type")
+        if schema_type not in _SUPPORTED_SCHEMA_TYPES:
+            raise ValueError("function schema requires one supported exact type")
+        properties = node.get("properties")
+        required = node.get("required")
+        additional = node.get("additionalProperties")
+        items = node.get("items")
+        if schema_type == "object":
+            if type(properties) is not dict or type(required) is not list:
+                raise ValueError("object schemas require properties and required")
+            if type(additional) is not bool:
+                raise ValueError("object schemas require boolean additionalProperties")
+            if items is not None:
+                raise ValueError("object schemas cannot contain items")
+            if any(type(name) is not str or not name for name in properties):
+                raise ValueError("object schema property names must be non-empty strings")
+            if (
+                any(type(name) is not str for name in required)
+                or len(required) != len(set(required))
+                or not set(required).issubset(properties)
+            ):
+                raise ValueError("object schema required names must be unique properties")
+            admitted_properties = cast(dict[str, object], properties)
+            for child in admitted_properties.values():
+                visit(child, depth + 1)
+            return
+        if any(value is not None for value in (properties, required, additional)):
+            raise ValueError("non-object schemas cannot contain object keywords")
+        if schema_type == "array":
+            if items is None:
+                raise ValueError("array schemas require items")
+            visit(items, depth + 1)
+        elif items is not None:
+            raise ValueError("non-array schemas cannot contain items")
+
+    visit(schema, 0)
+
+
+def _validate_tool_arguments(arguments: object, schema: dict[str, Any]) -> None:
+    remaining = _MAX_TOOL_SCHEMA_NODES
+
+    def visit_untyped(value: object, depth: int) -> None:
+        nonlocal remaining
+        remaining -= 1
+        if remaining < 0 or depth > _MAX_TOOL_SCHEMA_DEPTH:
+            raise ValueError("tool arguments exceed their structural bounds")
+        if type(value) is dict:
+            for child in cast(dict[str, object], value).values():
+                visit_untyped(child, depth + 1)
+        elif type(value) is list:
+            for child in cast(list[object], value):
+                visit_untyped(child, depth + 1)
+
+    def visit(value: object, node: dict[str, Any], depth: int) -> None:
+        nonlocal remaining
+        remaining -= 1
+        if remaining < 0 or depth > _MAX_TOOL_SCHEMA_DEPTH:
+            raise ValueError("tool arguments exceed their structural bounds")
+        schema_type = node["type"]
+        valid_type = {
+            "array": type(value) is list,
+            "boolean": type(value) is bool,
+            "integer": type(value) is int,
+            "null": value is None,
+            "number": type(value) in {int, float},
+            "object": type(value) is dict,
+            "string": type(value) is str,
+        }[schema_type]
+        if not valid_type:
+            raise ValueError("tool arguments do not match the admitted schema type")
+        if schema_type == "object":
+            object_value = cast(dict[str, object], value)
+            properties = cast(dict[str, dict[str, Any]], node["properties"])
+            required = cast(list[str], node["required"])
+            if any(name not in object_value for name in required):
+                raise ValueError("tool arguments omit a required property")
+            if not node["additionalProperties"] and any(
+                name not in properties for name in object_value
+            ):
+                raise ValueError("tool arguments contain an additional property")
+            for name, child in object_value.items():
+                if name in properties:
+                    visit(child, properties[name], depth + 1)
+                else:
+                    visit_untyped(child, depth + 1)
+        elif schema_type == "array":
+            for child in cast(list[object], value):
+                visit(child, cast(dict[str, Any], node["items"]), depth + 1)
+        elif schema_type == "number" and type(value) is float and not math.isfinite(value):
+            raise ValueError("tool arguments require a finite number")
+
+    visit(arguments, schema, 0)

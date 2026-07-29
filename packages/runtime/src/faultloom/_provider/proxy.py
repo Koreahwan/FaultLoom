@@ -47,6 +47,7 @@ class ProviderToolCall(_RuntimeModel):
     )
 
     call_id: ShortStr
+    tool_id: Identifier
     name: ShortStr
     arguments_json: NonEmptyStr
 

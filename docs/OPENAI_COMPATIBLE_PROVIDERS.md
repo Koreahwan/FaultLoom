@@ -48,19 +48,32 @@ exact.
 Prompt payloads are digest/byte-bound before egress admission. Function calls
 use `OpenAICompatibleFunctionSchema`: its source is exact canonical JSON bytes,
 the source digest must equal the matching `ProviderToolSpec.input_schema_digest`,
-and its complete ordered-free tool contract must equal the request's
+and the tool ID and provider wire name are fields of that same spec. The
+complete ordered-free tool contract must equal the request's
 `tool_schema_digest` (which the adapter has already matched to the pinned
 profile). The transport rejects missing, mismatched, or duplicate tool IDs and
-function names before it serializes `tools` or `tool_choice: "auto"`; an empty
-tool request continues to emit neither field.
+function names before it serializes `tools` or `tool_choice: "auto"`. An empty
+tool request still emits neither field, but its digest must equal the canonical
+empty tool contract. The transport clones each admitted schema into an exact
+canonical snapshot, and both its identity and the proxy contract bind the full
+snapshot.
+
+Schema admission supports only a bounded recursive subset: the exact JSON
+types `object`, `array`, `string`, `integer`, `number`, `boolean`, and `null`,
+with `properties`, `required`, and boolean `additionalProperties` for objects,
+and `items` for arrays. Unsupported keywords, schemas deeper than 16 levels,
+or schemas larger than 256 nodes are rejected before dispatch.
 
 For a valid tool-enabled response, the proxy accepts at most 16 calls from the
 first completion choice. Each call retains its provider ID, configured function
 name, and exact JSON argument string in the signed `ProviderToolCall` result.
 Arguments must be a duplicate-free JSON object no larger than 4096 UTF-8 bytes;
-unknown names, duplicate call IDs, malformed arguments, or an oversized call
-make the observed response fail closed. Plain text and JSON-format requests do
-not interpret incidental provider `tool_calls` extensions.
+they are then recursively validated against the exact admitted schema before a
+call can complete. Each signed call carries both the FaultLoom tool ID and the
+provider wire name. Unknown names, missing or additional properties, type
+mismatches, duplicate call IDs, malformed arguments, or an oversized call make
+the observed response fail closed. Plain text and JSON-format requests do not
+interpret incidental provider `tool_calls` extensions.
 
 This proxy does not route or rank models. `ProviderAdapter` continues to bind
 the pinned `ProviderModelProfile`, capability/metadata evidence, scope/policy

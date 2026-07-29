@@ -32,9 +32,16 @@ class MetadataProvenance(_RuntimeModel):
 
 class ProviderToolSpec(_RuntimeModel):
     tool_id: Identifier
+    wire_name: Identifier | None = None
     kind: ProviderToolKind
     input_schema_digest: Sha256Digest
     output_schema_digest: Sha256Digest
+
+    @model_validator(mode="after")
+    def _bind_default_wire_name(self) -> Self:
+        if self.wire_name is None:
+            object.__setattr__(self, "wire_name", self.tool_id)
+        return self
 
 
 def provider_tool_schema_digest(tools: Iterable[ProviderToolSpec]) -> str:
