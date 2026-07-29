@@ -45,11 +45,22 @@ preset is required. The configured metadata is compared against the request
 and returned as observed metadata—it is never copied from a request and marked
 exact.
 
-The existing provider port contains prompt/tool/config digests, not raw tool
-schema bytes. Prompt payloads are digest/byte-bound before egress admission;
-tool-enabled calls remain fail-closed until an attested schema-byte source is
-added. Raw Chat Completions tool-call or reasoning fields remain in the bounded
-response artifact represented by the signed response digest.
+Prompt payloads are digest/byte-bound before egress admission. Function calls
+use `OpenAICompatibleFunctionSchema`: its source is exact canonical JSON bytes,
+the source digest must equal the matching `ProviderToolSpec.input_schema_digest`,
+and its complete ordered-free tool contract must equal the request's
+`tool_schema_digest` (which the adapter has already matched to the pinned
+profile). The transport rejects missing, mismatched, or duplicate tool IDs and
+function names before it serializes `tools` or `tool_choice: "auto"`; an empty
+tool request continues to emit neither field.
+
+For a valid tool-enabled response, the proxy accepts at most 16 calls from the
+first completion choice. Each call retains its provider ID, configured function
+name, and exact JSON argument string in the signed `ProviderToolCall` result.
+Arguments must be a duplicate-free JSON object no larger than 4096 UTF-8 bytes;
+unknown names, duplicate call IDs, malformed arguments, or an oversized call
+make the observed response fail closed. Plain text and JSON-format requests do
+not interpret incidental provider `tool_calls` extensions.
 
 This proxy does not route or rank models. `ProviderAdapter` continues to bind
 the pinned `ProviderModelProfile`, capability/metadata evidence, scope/policy

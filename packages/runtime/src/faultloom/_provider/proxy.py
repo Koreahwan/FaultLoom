@@ -14,7 +14,7 @@ from faultloom_protocol.base import (
     Sha256Digest,
     ShortStr,
 )
-from pydantic import model_validator
+from pydantic import ConfigDict, model_validator
 
 from .common import (
     ProviderPlane,
@@ -32,6 +32,23 @@ from .metadata import ProviderObservedMetadata
 class ProviderUsage(_RuntimeModel):
     input_tokens: Signed64NonNegative
     output_tokens: Signed64NonNegative
+
+
+class ProviderToolCall(_RuntimeModel):
+    """A bounded, signed function invocation returned by a provider."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        revalidate_instances="always",
+        strict=True,
+        str_strip_whitespace=False,
+        validate_default=True,
+    )
+
+    call_id: ShortStr
+    name: ShortStr
+    arguments_json: NonEmptyStr
 
 
 class ProviderProxyRequest(_RuntimeModel):
@@ -86,6 +103,7 @@ class ProviderProxyResult(_RuntimeModel):
     reconciliation_required: bool = False
     observed_metadata: ProviderObservedMetadata | None = None
     usage: ProviderUsage | None = None
+    tool_calls: tuple[ProviderToolCall, ...] = ()
     accepted_prompt_digest: Sha256Digest | None = None
     accepted_compiled_context_digest: Sha256Digest | None = None
     accepted_tool_schema_digest: Sha256Digest | None = None
@@ -136,6 +154,8 @@ class ProviderProxyResult(_RuntimeModel):
             raise ValueError("completed proxy responses require metadata, usage, and digests")
         if pre_send and any(value is not None for value in completed_fields):
             raise ValueError("pre-send proxy outcomes cannot carry provider response fields")
+        if pre_send and self.tool_calls:
+            raise ValueError("pre-send proxy outcomes cannot carry provider tool calls")
         digest_payload = self.model_dump(
             mode="python",
             exclude={"proxy_receipt_digest", "attestation_signature"},

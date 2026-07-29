@@ -13,6 +13,8 @@ from faultloom.egress import (
     EgressPlane,
     ProviderProxy as EgressProviderProxy,
     ProviderRequest,
+    ProviderTool,
+    ProviderToolKind as EgressProviderToolKind,
     TransportOutcome,
     sha256_digest as egress_sha256_digest,
 )
@@ -25,6 +27,7 @@ from faultloom.provider import (
     OpenAICompatibleCredentialBinding,
     OpenAICompatibleEgressTransport,
     OpenAICompatibleEndpointConfig,
+    OpenAICompatibleFunctionSchema,
     OpenAICompatibleHttpResponse,
     OpenAICompatibleMessage,
     OpenAICompatiblePayloadStore,
@@ -32,9 +35,12 @@ from faultloom.provider import (
     OpenAICompatibleProviderProxy,
     PinnedHttpsGatewayPort,
     ProviderObservedMetadata,
+    ProviderToolKind,
+    ProviderToolSpec,
     ProxyEffectDisposition,
     ProxyOutcome,
     openai_compatible_preset,
+    provider_canonical_json_bytes,
     provider_proxy_result_attestation_bytes,
     provider_sha256_digest,
 )
@@ -125,6 +131,7 @@ def _stack(
     *,
     environment: dict[str, str] | None = None,
     egress_live: bool = False,
+    tool_schemas: tuple[OpenAICompatibleFunctionSchema, ...] = (),
 ):
     tmp_path.mkdir(parents=True, exist_ok=True)
     config = OpenAICompatibleEndpointConfig(
@@ -170,10 +177,24 @@ def _stack(
             ),
         ),
         http_port=http_port,
+        tool_schemas=tool_schemas,
     )
     state = authority_state(grant(), tmp_path / "egress.sqlite3")
+    egress_endpoint = provider_endpoint().model_copy(
+        update={
+            "tools": provider_endpoint().tools
+            + tuple(
+                ProviderTool(
+                    schema_version="0.1.0",
+                    tool_id=schema.tool.tool_id,
+                    kind=EgressProviderToolKind.LOCAL,
+                )
+                for schema in tool_schemas
+            )
+        }
+    )
     egress = EgressProviderProxy(
-        endpoints=(provider_endpoint(),),
+        endpoints=(egress_endpoint,),
         transport=transport,
         resolver=resolver,
         authority_state=state,
@@ -197,6 +218,8 @@ def _request(
     authority_digest: str,
     *,
     live: bool = False,
+    tool_schemas: tuple[OpenAICompatibleFunctionSchema, ...] = (),
+    tool_schema_digest: str | None = None,
 ):
     payload = _payload()
     from faultloom.provider import ProviderProxyRequest
@@ -220,7 +243,18 @@ def _request(
         context_window=8192,
         prompt_digest=payload.prompt_digest(),
         compiled_context_digest=digest("context"),
-        tool_schema_digest=digest("tools"),
+        tool_schema_digest=(
+            tool_schema_digest
+            if tool_schema_digest is not None
+            else provider_sha256_digest(
+                {
+                    "schema_version": "0.1.0",
+                    "tools": tuple(
+                        schema.tool.model_dump(mode="python") for schema in tool_schemas
+                    ),
+                }
+            )
+        ),
         output_schema_digest=digest("output"),
         config_digest=provider_sha256_digest(payload.generation),
         policy_ref="policy-1",
@@ -229,8 +263,32 @@ def _request(
         credential_ref=_credential(),
         payload_digest=payload.prompt_digest(),
         payload_bytes=payload.prompt_bytes(),
+        tool_ids=tuple(schema.tool.tool_id for schema in tool_schemas),
         requested_at=DISPATCH_TIME,
         live=live,
+    )
+
+
+def _function_schema(
+    *,
+    tool_id: str = "lookup",
+    name: str = "lookup",
+) -> OpenAICompatibleFunctionSchema:
+    parameters = {
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"],
+        "additionalProperties": False,
+    }
+    return OpenAICompatibleFunctionSchema(
+        tool=ProviderToolSpec(
+            tool_id=tool_id,
+            kind=ProviderToolKind.FUNCTION,
+            input_schema_digest=provider_sha256_digest(parameters),
+            output_schema_digest=digest(f"{tool_id}-output"),
+        ),
+        name=name,
+        schema_bytes=provider_canonical_json_bytes(parameters),
     )
 
 
@@ -272,8 +330,145 @@ def test_routes_only_through_egress_compiled_transport_and_preserves_raw_respons
     assert compiled.follow_redirects is False
     assert path == "/v1/chat/completions"
     assert headers["Authorization"] == "Bearer bound-secret"
-    assert json.loads(body)["model"] == "frontier-2030-01-01"
+    wire_body = json.loads(body)
+    assert wire_body["model"] == "frontier-2030-01-01"
+    assert "tools" not in wire_body
+    assert "tool_choice" not in wire_body
     assert maximum_response_bytes > len(_response().body)
+
+
+def test_attested_function_schema_is_verified_before_tool_wire_serialization(
+    tmp_path: Path,
+) -> None:
+    schema = _function_schema()
+    response = OpenAICompatibleHttpResponse(
+        status=200,
+        body=json.dumps(
+            {
+                "model": "frontier-2030-01-01",
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "call_lookup_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "lookup",
+                                        "arguments": '{"query":"fixture"}',
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            }
+        ).encode(),
+    )
+    http = FakePinnedHttpPort(response)
+    proxy, state, _, _, _ = _stack(tmp_path, http, tool_schemas=(schema,))
+
+    result = proxy.dispatch(
+        _request(proxy, state.authority_digest, tool_schemas=(schema,))
+    )
+
+    assert result.outcome is ProxyOutcome.COMPLETED
+    assert result.tool_calls[0].call_id == "call_lookup_1"
+    assert result.tool_calls[0].name == "lookup"
+    assert result.tool_calls[0].arguments_json == '{"query":"fixture"}'
+    body = json.loads(http.calls[0][3])
+    assert body["tool_choice"] == "auto"
+    assert body["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": json.loads(schema.schema_bytes),
+            },
+        }
+    ]
+
+
+def test_missing_mismatched_or_duplicate_schema_bindings_do_not_open_http(tmp_path: Path) -> None:
+    schema = _function_schema()
+    response = FakePinnedHttpPort(_response())
+    proxy, state, _, _, _ = _stack(tmp_path, response, tool_schemas=(schema,))
+    valid = _request(proxy, state.authority_digest, tool_schemas=(schema,))
+
+    missing_proxy, missing_state, _, _, _ = _stack(
+        tmp_path / "missing", FakePinnedHttpPort(_response())
+    )
+    missing = _request(
+        missing_proxy, missing_state.authority_digest, tool_schemas=(schema,)
+    )
+    assert missing_proxy.dispatch(missing).outcome is ProxyOutcome.DENIED
+    assert missing_proxy._transport._http_port.calls == []
+
+    mismatched = valid.model_copy(update={"tool_schema_digest": digest("forged-tools")})
+    assert proxy.dispatch(mismatched).outcome is ProxyOutcome.DENIED
+    assert response.calls == []
+
+    duplicate = valid.model_copy(update={"tool_ids": ("lookup", "lookup")})
+    assert proxy.dispatch(duplicate).outcome is ProxyOutcome.DENIED
+    assert response.calls == []
+
+    with pytest.raises(ValueError, match="canonical JSON"):
+        OpenAICompatibleFunctionSchema(
+            tool=schema.tool,
+            name="lookup",
+            schema_bytes=b'{"type": "object"}',
+        )
+
+
+@pytest.mark.parametrize(
+    "arguments_json",
+    [
+        '{"query":"first","query":"second"}',
+        "x" * 4_097,
+    ],
+)
+def test_malformed_or_oversized_tool_arguments_fail_after_observed_response(
+    tmp_path: Path, arguments_json: str
+) -> None:
+    schema = _function_schema()
+    http = FakePinnedHttpPort(
+        OpenAICompatibleHttpResponse(
+            status=200,
+            body=json.dumps(
+                {
+                    "model": "frontier-2030-01-01",
+                    "choices": [
+                        {
+                            "message": {
+                                "tool_calls": [
+                                    {
+                                        "id": "call_lookup_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "lookup",
+                                            "arguments": arguments_json,
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+                }
+            ).encode(),
+        )
+    )
+    proxy, state, _, _, _ = _stack(tmp_path, http, tool_schemas=(schema,))
+
+    result = proxy.dispatch(
+        _request(proxy, state.authority_digest, tool_schemas=(schema,))
+    )
+
+    assert result.outcome is ProxyOutcome.FAILED
+    assert result.effect_disposition is ProxyEffectDisposition.OBSERVED
+    assert result.tool_calls == ()
+    assert len(http.calls) == 1
 
 
 def test_unrelated_environment_values_cannot_supply_a_credential(tmp_path: Path) -> None:

@@ -27,7 +27,7 @@ from .metadata import (
     ProviderObservedMetadata,
     ProviderToolSpec,
 )
-from .proxy import ProviderProxyRequest, ProviderProxyResult, ProviderUsage
+from .proxy import ProviderProxyRequest, ProviderProxyResult, ProviderToolCall, ProviderUsage
 from .receipt import ProviderCallReceipt
 
 _PROVIDER_ENUM_TYPES: Final = (
@@ -50,6 +50,7 @@ _PROVIDER_MODEL_TYPES: Final = (
     ProviderModelProfile,
     ProviderObservedMetadata,
     ProviderUsage,
+    ProviderToolCall,
     ProviderProxyRequest,
     ProviderProxyResult,
     ProviderCallReceipt,
