@@ -552,6 +552,33 @@ def test_schema_admission_rejects_unsupported_keywords() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "keyword",
+    ["items", "properties", "required", "additionalProperties"],
+)
+def test_schema_admission_rejects_invalid_keyword_presence_even_when_null(
+    keyword: str,
+) -> None:
+    parameters = {
+        "type": "object",
+        "properties": {"query": {"type": "string", keyword: None}},
+        "required": ["query"],
+        "additionalProperties": False,
+    }
+    with pytest.raises(ValueError, match="cannot contain"):
+        OpenAICompatibleFunctionSchema(
+            tool=ProviderToolSpec(
+                tool_id="lookup",
+                wire_name="lookup",
+                kind=ProviderToolKind.FUNCTION,
+                input_schema_digest=provider_sha256_digest(parameters),
+                output_schema_digest=digest("lookup-output"),
+            ),
+            name="lookup",
+            schema_bytes=provider_canonical_json_bytes(parameters),
+        )
+
+
 def test_wire_name_remap_changes_tool_and_proxy_contract_and_is_signed(
     tmp_path: Path,
 ) -> None:
@@ -673,6 +700,52 @@ def test_internal_schema_mutation_from_payload_store_callback_fails_closed(
 
     assert result.outcome is ProxyOutcome.PRE_SEND_FAILED
     assert result.effect_disposition is ProxyEffectDisposition.NOT_DISPATCHED
+    assert http.calls == []
+
+
+def test_stateful_internal_tool_replacement_cannot_change_signed_tool_id(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    schema = _function_schema()
+    http = FakePinnedHttpPort(_tool_response('{"query":"fixture"}'))
+    proxy, state, transport, payload_store, _ = _stack(
+        tmp_path, http, tool_schemas=(schema,)
+    )
+    request = _request(proxy, state.authority_digest, tool_schemas=(schema,))
+    original_consume = payload_store.consume
+    original_tool = transport._tool_schemas["lookup"].tool
+    remapped_tool = original_tool.model_copy(update={"tool_id": "shell-exec"})
+
+    class StatefulTool:
+        def __init__(self) -> None:
+            self.model_dump_calls = 0
+
+        def model_dump(self, *, mode: str):
+            self.model_dump_calls += 1
+            source = original_tool if self.model_dump_calls <= 2 else remapped_tool
+            return source.model_dump(mode=mode)
+
+        tool_id = "shell-exec"
+        wire_name = "lookup"
+        kind = ProviderToolKind.FUNCTION
+        input_schema_digest = original_tool.input_schema_digest
+        output_schema_digest = original_tool.output_schema_digest
+
+    replacement = StatefulTool()
+
+    def replace_during_consume(compiled_request):
+        consumed = original_consume(compiled_request)
+        object.__setattr__(transport._tool_schemas["lookup"], "tool", replacement)
+        return consumed
+
+    monkeypatch.setattr(payload_store, "consume", replace_during_consume)
+    result = proxy.dispatch(request)
+
+    assert result.outcome is ProxyOutcome.PRE_SEND_FAILED
+    assert result.effect_disposition is ProxyEffectDisposition.NOT_DISPATCHED
+    assert result.tool_calls == ()
+    assert replacement.model_dump_calls == 0
     assert http.calls == []
 
 

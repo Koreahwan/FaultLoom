@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from enum import Enum
 from threading import RLock
 from types import MappingProxyType
-from typing import Any, Literal, Protocol, Self, cast
+from typing import Any, Literal, NamedTuple, Protocol, Self, cast
 from urllib.parse import urlsplit
 
 from faultloom.egress import (
@@ -44,7 +44,6 @@ from .intent import GenerationConfig
 from .metadata import (
     ProviderObservedMetadata,
     ProviderToolSpec,
-    provider_tool_schema_digest,
 )
 from .proxy import (
     ProviderProxyRequest,
@@ -95,6 +94,16 @@ _SUPPORTED_SCHEMA_KEYWORDS = frozenset(
 )
 
 
+class _FunctionSchemaSnapshot(NamedTuple):
+    tool_id: str
+    wire_name: str
+    kind: str
+    input_schema_digest: str
+    output_schema_digest: str
+    name: str
+    schema_bytes: bytes
+
+
 @dataclass(frozen=True, slots=True)
 class OpenAICompatibleFunctionSchema:
     """An exact canonical function-schema source bound to a ProviderToolSpec."""
@@ -139,6 +148,102 @@ class OpenAICompatibleFunctionSchema:
             "name": self.name,
             "schema_digest": sha256_digest(_load_json_object(self.schema_bytes.decode("utf-8"))),
         }
+
+
+def _function_schema_snapshot(
+    schema: OpenAICompatibleFunctionSchema,
+) -> _FunctionSchemaSnapshot:
+    if type(schema) is not OpenAICompatibleFunctionSchema:
+        raise TypeError("function schema snapshots require the exact schema type")
+    tool = object.__getattribute__(schema, "tool")
+    name = object.__getattribute__(schema, "name")
+    schema_bytes = object.__getattribute__(schema, "schema_bytes")
+    if type(tool) is not ProviderToolSpec:
+        raise TypeError("function schema snapshots require the exact tool type")
+    tool_id = tool.tool_id
+    wire_name = tool.wire_name
+    kind = tool.kind
+    input_schema_digest = tool.input_schema_digest
+    output_schema_digest = tool.output_schema_digest
+    if (
+        type(tool_id) is not str
+        or type(wire_name) is not str
+        or type(kind) is not ProviderToolKind
+        or kind is not ProviderToolKind.FUNCTION
+        or type(input_schema_digest) is not str
+        or type(output_schema_digest) is not str
+        or type(name) is not str
+        or type(schema_bytes) is not bytes
+        or wire_name != name
+        or _FUNCTION_NAME.fullmatch(name) is None
+        or not 2 <= len(schema_bytes) <= _MAX_TOOL_SCHEMA_BYTES
+    ):
+        raise ValueError("function schema snapshot contains non-canonical fields")
+    parsed = _load_json_object(schema_bytes.decode("utf-8"))
+    if (
+        provider_canonical_json_bytes(parsed) != schema_bytes
+        or not hmac.compare_digest(sha256_digest(parsed), input_schema_digest)
+    ):
+        raise ValueError("function schema snapshot does not match its attested digest")
+    _admit_tool_schema(parsed)
+    return _FunctionSchemaSnapshot(
+        tool_id,
+        wire_name,
+        kind.value,
+        input_schema_digest,
+        output_schema_digest,
+        name,
+        schema_bytes,
+    )
+
+
+def _snapshot_tool_contract(snapshot: _FunctionSchemaSnapshot) -> dict[str, object]:
+    return {
+        "schema_version": "0.1.0",
+        "tool_id": snapshot.tool_id,
+        "wire_name": snapshot.wire_name,
+        "kind": snapshot.kind,
+        "input_schema_digest": snapshot.input_schema_digest,
+        "output_schema_digest": snapshot.output_schema_digest,
+    }
+
+
+def _snapshot_descriptor(snapshot: _FunctionSchemaSnapshot) -> dict[str, object]:
+    return {
+        "tool": _snapshot_tool_contract(snapshot),
+        "name": snapshot.name,
+        "schema_digest": snapshot.input_schema_digest,
+    }
+
+
+def _snapshot_tool_schema_digest(
+    snapshots: tuple[_FunctionSchemaSnapshot, ...],
+) -> str:
+    tool_ids = tuple(snapshot.tool_id for snapshot in snapshots)
+    if len(tool_ids) != len(set(tool_ids)):
+        raise ValueError("provider tool IDs must be unique")
+    return sha256_digest(
+        cast(
+            Any,
+            {
+                "schema_version": "0.1.0",
+                "tools": tuple(
+                    _snapshot_tool_contract(snapshot)
+                    for snapshot in sorted(snapshots, key=lambda item: item.tool_id)
+                ),
+            },
+        )
+    )
+
+
+def _snapshot_wire_function(snapshot: _FunctionSchemaSnapshot) -> dict[str, object]:
+    return {
+        "type": "function",
+        "function": {
+            "name": snapshot.name,
+            "parameters": _load_json_object(snapshot.schema_bytes.decode("utf-8")),
+        },
+    }
 
 
 class OpenAICompatibleEndpointConfig(_RuntimeModel):
@@ -544,7 +649,7 @@ class _ConsumedPayload:
 class _TransportArtifact:
     response: OpenAICompatibleHttpResponse | None
     not_dispatched: bool
-    tool_schemas: tuple[OpenAICompatibleFunctionSchema, ...]
+    tool_schemas: tuple[_FunctionSchemaSnapshot, ...]
 
 
 class OpenAICompatiblePayloadStore:
@@ -636,6 +741,7 @@ class OpenAICompatibleEgressTransport:
         "_payload_store",
         "_sealed",
         "_test_only",
+        "_tool_schema_baseline",
         "_tool_schemas",
         "transport_id",
     )
@@ -718,20 +824,32 @@ class OpenAICompatibleEgressTransport:
             for schema in supplied_schemas
         ):
             raise TypeError("OpenAI-compatible tool schemas require exact canonical sources")
+        snapshots = tuple(
+            _function_schema_snapshot(schema) for schema in supplied_schemas
+        )
+        if len({snapshot.tool_id for snapshot in snapshots}) != len(snapshots):
+            raise ValueError("OpenAI-compatible tool schema IDs must be unique")
+        if len({snapshot.name for snapshot in snapshots}) != len(snapshots):
+            raise ValueError("OpenAI-compatible function names must be unique")
         schemas = tuple(
             OpenAICompatibleFunctionSchema(
-                tool=schema.tool,
-                name=schema.name,
-                schema_bytes=schema.schema_bytes,
+                tool=ProviderToolSpec(
+                    tool_id=snapshot.tool_id,
+                    wire_name=snapshot.wire_name,
+                    kind=ProviderToolKind.FUNCTION,
+                    input_schema_digest=snapshot.input_schema_digest,
+                    output_schema_digest=snapshot.output_schema_digest,
+                ),
+                name=snapshot.name,
+                schema_bytes=snapshot.schema_bytes,
             )
-            for schema in supplied_schemas
+            for snapshot in snapshots
         )
-        if len({schema.tool.tool_id for schema in schemas}) != len(schemas):
-            raise ValueError("OpenAI-compatible tool schema IDs must be unique")
-        if len({schema.name for schema in schemas}) != len(schemas):
-            raise ValueError("OpenAI-compatible function names must be unique")
         self._tool_schemas = MappingProxyType(
             {schema.tool.tool_id: schema for schema in schemas}
+        )
+        self._tool_schema_baseline = tuple(
+            sorted(snapshots, key=lambda snapshot: snapshot.tool_id)
         )
         self._payload_store = payload_store
         self._credential_resolver = credential_resolver
@@ -741,7 +859,9 @@ class OpenAICompatibleEgressTransport:
         self._http_port_ref = http_port
         self._http_port_type = type(http_port)
         self._test_only = test_only
-        self._component_descriptor = self._describe_components()
+        self._component_descriptor = self._describe_components(
+            self._tool_schema_baseline
+        )
         self.transport_id = "transport.openai-compatible.v4:" + self._component_descriptor
         self._lock = RLock()
         self._artifacts: dict[str, _TransportArtifact] = {}
@@ -756,7 +876,10 @@ class OpenAICompatibleEgressTransport:
     def test_only(self) -> bool:
         return self._test_only
 
-    def _describe_components(self) -> str:
+    def _describe_components(
+        self,
+        snapshots: tuple[_FunctionSchemaSnapshot, ...],
+    ) -> str:
         return hashlib.sha256(
             json.dumps(
                 {
@@ -769,10 +892,7 @@ class OpenAICompatibleEgressTransport:
                     ],
                     "http_port": self._http_port.identity,
                     "tool_schemas": [
-                        schema.descriptor()
-                        for schema in sorted(
-                            self._tool_schemas.values(), key=lambda schema: schema.tool.tool_id
-                        )
+                        _snapshot_descriptor(snapshot) for snapshot in snapshots
                     ],
                     "test_only": self._test_only,
                 },
@@ -781,25 +901,48 @@ class OpenAICompatibleEgressTransport:
             ).encode("utf-8")
         ).hexdigest()
 
-    def _components_are_current(self) -> bool:
+    def _verified_tool_snapshots(
+        self,
+    ) -> tuple[_FunctionSchemaSnapshot, ...] | None:
         if (
             self._credential_resolver is not self._credential_resolver_ref
             or type(self._credential_resolver) is not self._credential_resolver_type
             or self._http_port is not self._http_port_ref
             or type(self._http_port) is not self._http_port_type
         ):
-            return False
+            return None
         try:
-            current = self._describe_components()
+            keyed_snapshots = tuple(
+                (key, _function_schema_snapshot(schema))
+                for key, schema in self._tool_schemas.items()
+            )
+            if any(
+                type(key) is not str or key != snapshot.tool_id
+                for key, snapshot in keyed_snapshots
+            ):
+                return None
+            snapshots = tuple(
+                sorted(
+                    (snapshot for _, snapshot in keyed_snapshots),
+                    key=lambda snapshot: snapshot.tool_id,
+                )
+            )
+            current = self._describe_components(snapshots)
         except Exception:
-            return False
-        return hmac.compare_digest(current, self._component_descriptor)
+            return None
+        if not hmac.compare_digest(current, self._component_descriptor):
+            return None
+        return snapshots
+
+    def _components_are_current(self) -> bool:
+        return self._verified_tool_snapshots() is not None
 
     def dispatch(self, request: CompiledProviderRequest) -> EgressTransportResult:
         if not self._components_are_current():
             return self._not_dispatched(request)
         consumed = self._payload_store.consume(request)
-        if not self._components_are_current():
+        schema_snapshot = self._verified_tool_snapshots()
+        if schema_snapshot is None:
             return self._not_dispatched(request)
         endpoint = self._endpoints.get(request.endpoint_id)
         if (
@@ -812,19 +955,13 @@ class OpenAICompatibleEgressTransport:
         ):
             return self._not_dispatched(request)
         tools = self._tools_for_request(
-            request, tool_schema_digest=consumed.tool_schema_digest
+            request,
+            tool_schema_digest=consumed.tool_schema_digest,
+            schema_snapshot=schema_snapshot,
         )
         if tools is None:
             return self._not_dispatched(request)
-        tool_snapshots = tuple(
-            OpenAICompatibleFunctionSchema(
-                tool=schema.tool,
-                name=schema.name,
-                schema_bytes=schema.schema_bytes,
-            )
-            for schema in tools
-        )
-        body = _request_body(endpoint.model, consumed.payload, tool_snapshots)
+        body = _request_body(endpoint.model, consumed.payload, tools)
         raw_body = json.dumps(
             body, separators=(",", ":"), ensure_ascii=False
         ).encode("utf-8")
@@ -867,7 +1004,7 @@ class OpenAICompatibleEgressTransport:
             self._artifacts[request.request_id] = _TransportArtifact(
                 response,
                 False,
-                tool_snapshots,
+                tools,
             )
         return EgressTransportResult(
             schema_version="0.1.0",
@@ -891,14 +1028,23 @@ class OpenAICompatibleEgressTransport:
         request: ProviderProxyRequest | CompiledProviderRequest,
         *,
         tool_schema_digest: str | None = None,
-    ) -> tuple[OpenAICompatibleFunctionSchema, ...] | None:
+        schema_snapshot: tuple[_FunctionSchemaSnapshot, ...] | None = None,
+    ) -> tuple[_FunctionSchemaSnapshot, ...] | None:
         if len(request.tool_ids) != len(set(request.tool_ids)):
             return None
-        schemas = tuple(self._tool_schemas.get(tool_id) for tool_id in request.tool_ids)
-        if any(schema is None for schema in schemas):
+        available = (
+            schema_snapshot
+            if schema_snapshot is not None
+            else self._verified_tool_snapshots()
+        )
+        if available is None:
             return None
-        resolved = tuple(schema for schema in schemas if schema is not None)
-        digest = provider_tool_schema_digest(schema.tool for schema in resolved)
+        by_id = {snapshot.tool_id: snapshot for snapshot in available}
+        schemas = tuple(by_id.get(tool_id) for tool_id in request.tool_ids)
+        if any(snapshot is None for snapshot in schemas):
+            return None
+        resolved = tuple(snapshot for snapshot in schemas if snapshot is not None)
+        digest = _snapshot_tool_schema_digest(resolved)
         if tool_schema_digest is None:
             if not isinstance(request, ProviderProxyRequest):
                 return None
@@ -989,11 +1135,8 @@ class OpenAICompatibleProviderProxy:
                         item.model_dump(mode="json") for item in configs
                     ),
                     "tool_schemas": tuple(
-                        schema.descriptor()
-                        for schema in sorted(
-                            transport._tool_schemas.values(),
-                            key=lambda item: item.tool.tool_id,
-                        )
+                        _snapshot_descriptor(snapshot)
+                        for snapshot in transport._tool_schema_baseline
                     ),
                     "transport_id": transport.transport_id,
                 },
@@ -1142,7 +1285,7 @@ class OpenAICompatibleProviderProxy:
         endpoint: OpenAICompatibleEndpointConfig,
         response: OpenAICompatibleHttpResponse,
         receipt: EgressReceipt,
-        tool_schemas: tuple[OpenAICompatibleFunctionSchema, ...],
+        tool_schemas: tuple[_FunctionSchemaSnapshot, ...],
     ) -> ProviderProxyResult:
         try:
             decoded = json.loads(response.body)
@@ -1192,7 +1335,7 @@ class OpenAICompatibleProviderProxy:
         self,
         choice: object,
         request: ProviderProxyRequest,
-        schemas: tuple[OpenAICompatibleFunctionSchema, ...],
+        schemas: tuple[_FunctionSchemaSnapshot, ...],
     ) -> tuple[ProviderToolCall, ...]:
         # Existing text/JSON calls do not interpret incidental provider extensions.
         if not request.tool_ids:
@@ -1243,7 +1386,7 @@ class OpenAICompatibleProviderProxy:
             calls.append(
                 ProviderToolCall(
                     call_id=call_id,
-                    tool_id=schema.tool.tool_id,
+                    tool_id=schema.tool_id,
                     name=name,
                     arguments_json=arguments_json,
                 )
@@ -1320,7 +1463,7 @@ class OpenAICompatibleProviderProxy:
 def _request_body(
     model: str,
     payload: OpenAICompatibleChatPayload,
-    tools: tuple[OpenAICompatibleFunctionSchema, ...] = (),
+    tools: tuple[_FunctionSchemaSnapshot, ...] = (),
 ) -> dict[str, object]:
     generation = payload.generation
     body: dict[str, object] = {
@@ -1335,7 +1478,7 @@ def _request_body(
     if generation.response_format == "json":
         body["response_format"] = {"type": "json_object"}
     if tools:
-        body["tools"] = [tool.wire_function() for tool in tools]
+        body["tools"] = [_snapshot_wire_function(tool) for tool in tools]
         body["tool_choice"] = "auto"
     return body
 
@@ -1390,7 +1533,7 @@ def _admit_tool_schema(schema: dict[str, Any]) -> None:
                 raise ValueError("object schemas require properties and required")
             if type(additional) is not bool:
                 raise ValueError("object schemas require boolean additionalProperties")
-            if items is not None:
+            if "items" in node:
                 raise ValueError("object schemas cannot contain items")
             if any(type(name) is not str or not name for name in properties):
                 raise ValueError("object schema property names must be non-empty strings")
@@ -1404,13 +1547,16 @@ def _admit_tool_schema(schema: dict[str, Any]) -> None:
             for child in admitted_properties.values():
                 visit(child, depth + 1)
             return
-        if any(value is not None for value in (properties, required, additional)):
+        if any(
+            keyword in node
+            for keyword in ("properties", "required", "additionalProperties")
+        ):
             raise ValueError("non-object schemas cannot contain object keywords")
         if schema_type == "array":
-            if items is None:
+            if "items" not in node:
                 raise ValueError("array schemas require items")
             visit(items, depth + 1)
-        elif items is not None:
+        elif "items" in node:
             raise ValueError("non-array schemas cannot contain items")
 
     visit(schema, 0)
