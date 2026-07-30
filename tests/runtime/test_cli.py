@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
@@ -11,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from faultloom import cli
-from faultloom_protocol import AuthoritySigner, sign_authority_grant
+from faultloom_protocol import AuthoritySigner, SignedAuthorityGrant, sign_authority_grant
 from tests.protocol.factories import NOW, sample_models
 
 
@@ -30,14 +31,48 @@ def _authority_files(
     hostnames: tuple[str, ...] = ("localhost",),
     cidrs: tuple[str, ...] = (),
     pack_ids: tuple[str, ...] = ("pack.web",),
+    paths: tuple[str, ...] | None = None,
+    methods: tuple[str, ...] | None = None,
+    protocols: tuple[str, ...] | None = None,
+    request_deny: tuple[str, str] | None = None,
+    observe_only: bool = False,
     now: datetime = NOW,
     signer_seed: int = 0,
 ) -> tuple[Path, Path]:
     directory.mkdir(parents=True, exist_ok=True)
     grant = sample_models()["AuthorityGrant"]
     target = grant.targets[0].model_copy(
-        update={"hostnames": hostnames, "cidrs": cidrs}
+        update={
+            "hostnames": hostnames,
+            "cidrs": cidrs,
+            **({"paths": paths} if paths is not None else {}),
+            **({"methods": methods} if methods is not None else {}),
+            **({"protocols": protocols} if protocols is not None else {}),
+        }
     )
+    policy = grant.action_policy.model_copy(
+        update={
+            **({"allowed_path_patterns": paths} if paths is not None else {}),
+            **({"allowed_methods": methods} if methods is not None else {}),
+        }
+    )
+    if request_deny is not None:
+        denied_method, denied_path = request_deny
+        policy = policy.model_copy(
+            update={
+                "denied": (
+                    policy.denied[0].model_copy(
+                        update={
+                            "action_families": ("http.semantic",),
+                            "methods": (denied_method,),
+                            "path_pattern": denied_path,
+                        }
+                    ),
+                )
+            }
+        )
+    if observe_only:
+        policy = policy.model_copy(update={"allowed_classes": (policy.allowed_classes[0],)})
     expires_at = now + timedelta(hours=2)
     window = grant.execution_windows[0].model_copy(
         update={"starts_at": now, "ends_at": expires_at}
@@ -49,6 +84,7 @@ def _authority_files(
             "expires_at": expires_at,
             "targets": (target,),
             "pack_ids": pack_ids,
+            "action_policy": policy,
             "execution_windows": (window,),
         }
     )
@@ -62,6 +98,69 @@ def _authority_files(
         signer.public_key_record.model_dump_json(indent=2), encoding="utf-8"
     )
     return authority_path, key_path
+
+
+def _manual_workspace_for_request_check(
+    tmp_path: Path,
+    *,
+    request_deny: tuple[str, str] | None = None,
+    observe_only: bool = False,
+) -> tuple[Path, Path]:
+    now = datetime.now(UTC) - timedelta(minutes=1)
+    authority_path, key_path = _authority_files(
+        tmp_path / "grant",
+        hostnames=("example.com",),
+        paths=("/api/*",),
+        methods=("GET",),
+        protocols=("https",),
+        request_deny=request_deny,
+        observe_only=observe_only,
+        now=now,
+    )
+    workspace = tmp_path / "manual-run"
+    assert cli.main(
+        _run_arguments(authority_path, key_path) + ["--workspace", str(workspace)]
+    ) == cli.EXIT_OK
+    return workspace, key_path
+
+
+def _check_request_arguments(
+    workspace: Path,
+    trusted_key: Path,
+    **overrides: object,
+) -> list[str]:
+    values = {
+        "hostname": "example.com",
+        "port": "443",
+        "scheme": "https",
+        "method": "get",
+        "path": "/api/items",
+        "request_bytes": "100",
+        "response_bytes": "200",
+    }
+    values.update(overrides)
+    return [
+        "scope",
+        "check-request",
+        "--workspace",
+        str(workspace),
+        "--trusted-key",
+        str(trusted_key),
+        "--hostname",
+        str(values["hostname"]),
+        "--port",
+        str(values["port"]),
+        "--scheme",
+        str(values["scheme"]),
+        "--method",
+        str(values["method"]),
+        "--path",
+        str(values["path"]),
+        "--request-bytes",
+        str(values["request_bytes"]),
+        "--response-bytes",
+        str(values["response_bytes"]),
+    ]
 
 
 def _module_environment() -> dict[str, str]:
@@ -471,6 +570,229 @@ def test_external_authorized_run_creates_manual_workspace_without_socket(
         "reports",
     ):
         assert (workspace / relative).is_dir()
+
+
+def test_scope_check_request_is_offline_and_returns_signed_scope(
+    tmp_path: Path,
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(tmp_path)
+
+    process = _run_module(
+        _check_request_arguments(workspace, key_path),
+        reject_sockets=True,
+    )
+
+    assert process.returncode == cli.EXIT_OK
+    assert process.stderr == ""
+    result = json.loads(process.stdout)
+    assert result["authorized"] is True
+    assert result["action_class"] == "safe_probe"
+    assert result["dispatch_performed"] is False
+    assert result["network_access"] == "none"
+    assert result["method"] == "GET"
+    assert result["hostname"] == "example.com"
+    assert result["target_id"] == "target.lab"
+    assert result["pack_id"] == "pack.web"
+    assert result["budget_accounting"] == "operator_enforced"
+    assert result["budget"] == {
+        "max_concurrency": 2,
+        "max_duration_seconds": 3600,
+        "max_request_bytes": 4096,
+        "max_response_bytes": 65536,
+        "rate_per_minute": 10,
+        "schema_version": "0.1.0",
+        "total_actions": 100,
+    }
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    (
+        ("hostname", "other.example"),
+        ("port", "80"),
+        ("scheme", "http"),
+        ("method", "POST"),
+        ("path", "/other"),
+    ),
+)
+def test_scope_check_request_rejects_target_mismatches(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    option: str,
+    value: str,
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(tmp_path)
+    capsys.readouterr()
+
+    assert (
+        cli.main(_check_request_arguments(workspace, key_path, **{option: value}))
+        == cli.EXIT_AUTHORITY
+    )
+    assert capsys.readouterr().out == ""
+
+
+def test_scope_check_request_honors_request_scoped_explicit_deny(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(
+        tmp_path,
+        request_deny=("GET", "/api/*"),
+    )
+    capsys.readouterr()
+
+    assert cli.main(_check_request_arguments(workspace, key_path)) == cli.EXIT_AUTHORITY
+    assert "explicit signed deny" in capsys.readouterr().err
+
+
+def test_scope_check_request_rejects_observe_only_policy(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(tmp_path, observe_only=True)
+    capsys.readouterr()
+
+    assert cli.main(_check_request_arguments(workspace, key_path)) == cli.EXIT_AUTHORITY
+    assert "signed action policy" in capsys.readouterr().err
+
+
+def test_scope_check_request_rejects_inactive_signed_window(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(tmp_path)
+    capsys.readouterr()
+    authority_path = workspace / "authority.json"
+    envelope = SignedAuthorityGrant.model_validate_json(
+        authority_path.read_text(encoding="utf-8")
+    )
+    now = datetime.now(UTC)
+    inactive_window = envelope.payload.execution_windows[0].model_copy(
+        update={
+            "starts_at": now + timedelta(minutes=10),
+            "ends_at": now + timedelta(hours=1),
+        }
+    )
+    inactive_grant = envelope.payload.model_copy(
+        update={"execution_windows": (inactive_window,)}
+    )
+    signer = AuthoritySigner.from_private_bytes(bytes(range(32)))
+    authority_content = sign_authority_grant(
+        inactive_grant,
+        signer,
+        signed_at=now,
+    ).model_dump_json(indent=2).encode("utf-8")
+    authority_path.write_bytes(authority_content)
+    run_path = workspace / "run.json"
+    manifest = json.loads(run_path.read_text(encoding="utf-8"))
+    manifest["authority_sha256"] = hashlib.sha256(authority_content).hexdigest()
+    manifest["execution_windows"] = [inactive_window.model_dump(mode="json")]
+    run_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    assert cli.main(_check_request_arguments(workspace, key_path)) == cli.EXIT_AUTHORITY
+    assert "outside every signed execution window" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("request_bytes", "response_bytes"),
+    (("4097", "200"), ("100", "65537")),
+)
+def test_scope_check_request_enforces_signed_byte_limits(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    request_bytes: str,
+    response_bytes: str,
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(tmp_path)
+    capsys.readouterr()
+
+    assert (
+        cli.main(
+            _check_request_arguments(
+                workspace,
+                key_path,
+                request_bytes=request_bytes,
+                response_bytes=response_bytes,
+            )
+        )
+        == cli.EXIT_AUTHORITY
+    )
+    assert "signed byte budget" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("tamper_kind", ("authority", "trusted_key", "digest", "binding"))
+def test_scope_check_request_rejects_tampered_workspace_bindings(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    tamper_kind: str,
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(tmp_path)
+    capsys.readouterr()
+    if tamper_kind == "authority":
+        authority = workspace / "authority.json"
+        authority.write_bytes(authority.read_bytes() + b" ")
+    elif tamper_kind == "trusted_key":
+        key = workspace / "trusted-key.json"
+        key.write_bytes(key.read_bytes() + b" ")
+    else:
+        run = workspace / "run.json"
+        manifest = json.loads(run.read_text(encoding="utf-8"))
+        if tamper_kind == "digest":
+            manifest["authority_sha256"] = "0" * 64
+        else:
+            manifest["grant_version"] = 999
+        run.write_text(json.dumps(manifest), encoding="utf-8")
+
+    assert cli.main(_check_request_arguments(workspace, key_path)) == cli.EXIT_AUTHORITY
+    assert capsys.readouterr().out == ""
+
+
+def test_scope_check_request_rejects_workspace_key_replacement(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    workspace, pinned_key_path = _manual_workspace_for_request_check(tmp_path)
+    capsys.readouterr()
+    now = datetime.now(UTC) - timedelta(minutes=1)
+    replacement_authority_path, replacement_key_path = _authority_files(
+        tmp_path / "replacement",
+        hostnames=("example.com",),
+        paths=("/api/*",),
+        methods=("GET",),
+        protocols=("https",),
+        now=now,
+        signer_seed=1,
+    )
+    replacement_authority = replacement_authority_path.read_bytes()
+    replacement_key = replacement_key_path.read_bytes()
+    envelope = SignedAuthorityGrant.model_validate_json(replacement_authority)
+    grant = envelope.payload
+    (workspace / "authority.json").write_bytes(replacement_authority)
+    (workspace / "trusted-key.json").write_bytes(replacement_key)
+    run_path = workspace / "run.json"
+    manifest = json.loads(run_path.read_text(encoding="utf-8"))
+    manifest.update(
+        {
+            "authority_sha256": hashlib.sha256(replacement_authority).hexdigest(),
+            "trusted_key_sha256": hashlib.sha256(replacement_key).hexdigest(),
+            "grant_id": grant.grant_id,
+            "grant_version": grant.grant_version,
+            "target": grant.targets[0].model_dump(mode="json"),
+            "pack_id": grant.pack_ids[0],
+            "action_policy": grant.action_policy.model_dump(mode="json"),
+            "budget": grant.budget.model_dump(mode="json"),
+            "execution_windows": [
+                window.model_dump(mode="json") for window in grant.execution_windows
+            ],
+        }
+    )
+    run_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    assert (
+        cli.main(_check_request_arguments(workspace, pinned_key_path))
+        == cli.EXIT_AUTHORITY
+    )
+    assert "authority verification failed" in capsys.readouterr().err
 
 
 def test_manual_evidence_add_streams_file_and_records_digest(

@@ -70,7 +70,32 @@ Read `run-01\README.md`, then use Burp Suite or a browser manually within the
 signed host, port, path, method, budget, and time window. Do not use `--live`;
 automatic Gateway dispatch is not part of this personal Windows beta.
 
-## 5. Add exported evidence
+## 5. Check a request before Burp sends it
+
+Before a model or operator sends a request through Burp, validate the exact
+request metadata against the signed workspace:
+
+```powershell
+& $FaultLoom scope check-request `
+  --workspace "$Job\run-01" `
+  --trusted-key "$Root\authority\authority-public-key.json" `
+  --hostname example.com `
+  --port 443 `
+  --scheme https `
+  --method GET `
+  --path '/api/profile' `
+  --request-bytes 2048 `
+  --response-bytes 1048576
+```
+
+Continue only when the JSON result says `"authorized": true`. This command
+rechecks the workspace's signed authority against the public key kept outside
+that workspace, plus its target, `safe_probe` action policy, explicit denies,
+execution window, and per-request byte limits. It opens no socket and does not
+call Burp. Total actions, rate, concurrency, actual response size, and the
+separate Burp write approval remain operator-enforced.
+
+## 6. Add exported evidence
 
 Export requests/responses, notes, or screenshots from your tool, then record
 each file:
@@ -87,7 +112,7 @@ Evidence is copied into `evidence\raw` with a SHA-256 sidecar. Review exports
 for passwords, cookies, tokens, API keys, and unnecessary personal data before
 sharing them.
 
-## 6. Create a submission draft
+## 7. Create a submission draft
 
 Put exact reproduction steps in a UTF-8 text file, then run:
 
@@ -110,6 +135,7 @@ the customer's or bounty program's official channel.
 
 Ready now: signed scopes, manual authorized workspaces, bounded evidence
 ingestion, SHA-256 records, metadata checks for Web, LLM, and the registered
-candidate packs, and finding drafts. Linux-only durable resume, automatic
+candidate packs, offline Burp request scope checks, and finding drafts.
+Linux-only durable resume, automatic
 Gateway target dispatch, automatic exploitation, and automatic external
 submission are not enabled in this Windows personal beta.

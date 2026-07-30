@@ -3,7 +3,8 @@
 This kit contains two independent, non-installing components:
 
 - `faultloom.exe`: signed engagement scopes, offline manual workspaces,
-  evidence ingestion, and unverified finding drafts.
+  offline Burp request scope checks, evidence ingestion, and unverified finding
+  drafts.
 - `windows-authority/`: the native `faultloom_ctl.exe` -> broker -> independent
   reviewer boundary for bounded local host checks.
 

@@ -67,6 +67,8 @@ PACK_IDS = {
     "web3": "pack.web3.future-fixture",
 }
 LIVE_PACK_IDS = frozenset({"pack.web"})
+OFFLINE_REQUEST_ACTION_FAMILY = "http.semantic"
+OFFLINE_REQUEST_ACTION_CLASS = ActionClass.SAFE_PROBE
 
 ModelT = TypeVar("ModelT", bound=ProtocolModel)
 
@@ -563,6 +565,28 @@ def _parse_protocol_file(
             f"invalid {model_type.__name__} file {path}: {exc}",
             exit_code=EXIT_AUTHORITY,
         ) from exc
+
+
+def _parse_workspace_run_file(path: Path, content: bytes) -> dict[str, object]:
+    try:
+        text = content.decode("utf-8")
+        _validate_json_depth(text)
+        manifest = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
+        raise CliError(
+            f"invalid manual run workspace file {path}: {exc}",
+            exit_code=EXIT_AUTHORITY,
+        ) from exc
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema") != "faultloom.manual-run.v1"
+        or not isinstance(manifest.get("run_id"), str)
+    ):
+        raise CliError(
+            f"invalid manual run workspace {path.parent}: unsupported run.json",
+            exit_code=EXIT_AUTHORITY,
+        )
+    return manifest
 
 
 def _trusted_key_path(arguments: argparse.Namespace) -> Path:
@@ -1336,6 +1360,201 @@ def _path_matches(pattern: str, path: str) -> bool:
     return path.startswith(pattern[:-1]) if pattern.endswith("*") else path == pattern
 
 
+def _request_hostname_matches_target(hostname: str, target: TargetAsset) -> bool:
+    if hostname in target.hostnames:
+        return True
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    if str(address) != hostname:
+        return False
+    return any(address in ipaddress.ip_network(cidr) for cidr in target.cidrs)
+
+
+def _request_matches_explicit_deny(
+    deny: ExplicitDeny,
+    *,
+    target_id: str,
+    hostname: str,
+    method: str,
+    path: str,
+) -> bool:
+    return (
+        (
+            not deny.action_families
+            or OFFLINE_REQUEST_ACTION_FAMILY in deny.action_families
+        )
+        and (deny.target_id is None or deny.target_id == target_id)
+        and (not deny.methods or method in deny.methods)
+        and (deny.path_pattern is None or _path_matches(deny.path_pattern, path))
+        and (deny.host_pattern is None or fnmatchcase(hostname, deny.host_pattern))
+    )
+
+
+def _request_byte_count(value: str, *, label: str) -> int:
+    try:
+        count = int(value)
+    except ValueError as exc:
+        raise CliError(f"{label} must be a non-negative integer", exit_code=EXIT_AUTHORITY) from exc
+    if count < 0:
+        raise CliError(f"{label} must be a non-negative integer", exit_code=EXIT_AUTHORITY)
+    return count
+
+
+def _scope_check_request(arguments: argparse.Namespace) -> int:
+    workspace: Path = arguments.workspace
+    authority_path = workspace / "authority.json"
+    workspace_key_path = workspace / "trusted-key.json"
+    run_path = workspace / "run.json"
+    trusted_key_path = _trusted_key_path(arguments)
+    try:
+        trusted_key_path.resolve(strict=True).relative_to(workspace.resolve(strict=True))
+    except ValueError:
+        pass
+    except OSError as exc:
+        raise CliError(
+            f"cannot resolve trusted public-key record: {exc}",
+            exit_code=EXIT_AUTHORITY,
+        ) from exc
+    else:
+        raise CliError(
+            "trusted public-key record must be outside the workspace",
+            exit_code=EXIT_AUTHORITY,
+        )
+    authority_content, workspace_key_content = _capture_protocol_file_pair(
+        authority_path,
+        workspace_key_path,
+    )
+    trusted_key_content = _capture_single_protocol_file(trusted_key_path)
+    run_content = _capture_single_protocol_file(run_path)
+    envelope = _parse_protocol_file(
+        authority_path,
+        authority_content,
+        SignedAuthorityGrant,
+    )
+    public_key = _parse_protocol_file(
+        trusted_key_path,
+        trusted_key_content,
+        Ed25519PublicKeyRecord,
+    )
+    manifest = _parse_workspace_run_file(run_path, run_content)
+    now = _utc_now()
+    try:
+        grant = verify_authority_grant(envelope, public_key, now=now)
+    except (SignatureVerificationError, ValueError) as exc:
+        raise CliError(
+            f"authority verification failed: {exc}", exit_code=EXIT_AUTHORITY
+        ) from exc
+
+    manifest_target = manifest.get("target")
+    target_id = manifest_target.get("target_id") if isinstance(manifest_target, dict) else None
+    targets = [target for target in grant.targets if target.target_id == target_id]
+    if len(targets) != 1:
+        raise CliError(
+            "run.json target is absent from, or ambiguous in, the signed authority grant",
+            exit_code=EXIT_AUTHORITY,
+        )
+    target = targets[0]
+    if (
+        manifest.get("grant_id") != grant.grant_id
+        or manifest.get("grant_version") != grant.grant_version
+        or manifest.get("pack_id") not in grant.pack_ids
+        or manifest_target != target.model_dump(mode="json")
+        or manifest.get("action_policy") != grant.action_policy.model_dump(mode="json")
+        or manifest.get("budget") != grant.budget.model_dump(mode="json")
+        or manifest.get("execution_windows")
+        != [window.model_dump(mode="json") for window in grant.execution_windows]
+        or manifest.get("authority_sha256") != hashlib.sha256(authority_content).hexdigest()
+        or workspace_key_content != trusted_key_content
+        or manifest.get("trusted_key_sha256")
+        != hashlib.sha256(workspace_key_content).hexdigest()
+        or manifest.get("trusted_key_sha256")
+        != hashlib.sha256(trusted_key_content).hexdigest()
+    ):
+        raise CliError(
+            "run.json is not bound to the verified authority grant",
+            exit_code=EXIT_AUTHORITY,
+        )
+    if not any(
+        window.starts_at <= now < window.ends_at for window in grant.execution_windows
+    ):
+        raise CliError(
+            "current time is outside every signed execution window",
+            exit_code=EXIT_AUTHORITY,
+        )
+
+    method = arguments.method.upper()
+    path = arguments.path
+    if not path.startswith("/"):
+        raise CliError("request path must start with '/'", exit_code=EXIT_AUTHORITY)
+    request_bytes = _request_byte_count(arguments.request_bytes, label="request bytes")
+    response_bytes = _request_byte_count(arguments.response_bytes, label="response bytes")
+    if (
+        not _request_hostname_matches_target(arguments.hostname, target)
+        or (target.ports and arguments.port not in target.ports)
+        or (target.protocols and arguments.scheme not in target.protocols)
+        or (target.methods and method not in target.methods)
+        or (target.paths and not any(_path_matches(pattern, path) for pattern in target.paths))
+    ):
+        raise CliError(
+            "request is outside the selected signed target", exit_code=EXIT_AUTHORITY
+        )
+    policy = grant.action_policy
+    if (
+        OFFLINE_REQUEST_ACTION_FAMILY not in policy.allowed_families
+        or OFFLINE_REQUEST_ACTION_CLASS not in policy.allowed_classes
+        or (policy.allowed_methods and method not in policy.allowed_methods)
+        or (
+            policy.allowed_path_patterns
+            and not any(_path_matches(pattern, path) for pattern in policy.allowed_path_patterns)
+        )
+    ):
+        raise CliError(
+            "request is outside the signed action policy", exit_code=EXIT_AUTHORITY
+        )
+    if any(
+        _request_matches_explicit_deny(
+            deny,
+            target_id=target.target_id,
+            hostname=arguments.hostname,
+            method=method,
+            path=path,
+        )
+        for deny in policy.denied
+    ):
+        raise CliError("request matches an explicit signed deny", exit_code=EXIT_AUTHORITY)
+    if (
+        request_bytes > grant.budget.max_request_bytes
+        or response_bytes > grant.budget.max_response_bytes
+    ):
+        raise CliError(
+            "request exceeds the signed byte budget", exit_code=EXIT_AUTHORITY
+        )
+    _emit_json(
+        {
+            "authorized": True,
+            "action_class": OFFLINE_REQUEST_ACTION_CLASS.value,
+            "budget": grant.budget.model_dump(mode="json"),
+            "budget_accounting": "operator_enforced",
+            "dispatch_performed": False,
+            "grant_id": grant.grant_id,
+            "grant_version": grant.grant_version,
+            "method": method,
+            "network_access": "none",
+            "pack_id": manifest["pack_id"],
+            "path": path,
+            "port": arguments.port,
+            "request_bytes": request_bytes,
+            "response_bytes": response_bytes,
+            "scheme": arguments.scheme,
+            "target_id": target.target_id,
+            "hostname": arguments.hostname,
+        }
+    )
+    return EXIT_OK
+
+
 def _validate_live_command(
     command: object,
     *,
@@ -1733,6 +1952,20 @@ def build_parser() -> argparse.ArgumentParser:
     scope_revoke = scope_commands.add_parser("revoke", help="revoke an authority grant")
     scope_revoke.add_argument("grant_id")
     _set_unavailable(scope_revoke, "scope revoke")
+    scope_check_request = scope_commands.add_parser(
+        "check-request",
+        help="offline-check a Burp request against a signed manual workspace",
+    )
+    scope_check_request.add_argument("--workspace", type=Path, required=True)
+    scope_check_request.add_argument("--trusted-key", type=Path)
+    scope_check_request.add_argument("--hostname", required=True)
+    scope_check_request.add_argument("--port", type=_port, required=True)
+    scope_check_request.add_argument("--scheme", choices=("http", "https"), required=True)
+    scope_check_request.add_argument("--method", required=True)
+    scope_check_request.add_argument("--path", required=True)
+    scope_check_request.add_argument("--request-bytes", required=True)
+    scope_check_request.add_argument("--response-bytes", required=True)
+    scope_check_request.set_defaults(handler=_scope_check_request)
 
     run = commands.add_parser("run", help="start an authorized research run")
     run.add_argument("--authority", type=Path, required=True)
