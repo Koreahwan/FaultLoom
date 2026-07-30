@@ -56,18 +56,6 @@ def _held_launch(
             os.close(descriptor)
 
 
-@pytest.fixture
-def pinned(monkeypatch: pytest.MonkeyPatch) -> None:
-    @contextmanager
-    def held(config: LocalModelProcessConfig, encoded: bytes):
-        with _held_launch(config, encoded) as launch:
-            yield launch
-
-    monkeypatch.setattr(
-        "faultloom.t40_formal_producer_binding.pinned_process_launch", held
-    )
-
-
 def _binding() -> FormalProducerBinding:
     return materialize_formal_producer_binding(
         core_wheel_digest=_digest(b"core-wheel"),
@@ -78,7 +66,6 @@ def _binding() -> FormalProducerBinding:
 
 
 def test_binding_matches_actual_transient_attestor_receipt(
-    pinned: None,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -151,7 +138,38 @@ def test_binding_matches_actual_transient_attestor_receipt(
     assert payload.profile_digest == binding.producer_profile_digest
 
 
-def test_parse_rejects_noncanonical_and_mutated_bindings(pinned: None) -> None:
+def test_template_digest_matches_an_actual_held_launch() -> None:
+    config = LocalModelProcessConfig(
+        profile=LocalModelRuntimeProfile.FAULTLOOM_UTILITY_V1,
+        timeout_seconds=30,
+        maximum_request_bytes=65_536,
+        maximum_response_bytes=4096,
+    )
+    expected = "sha256:3683c53906741d42404f1b9916302003c7ae828dbd9a04bbdbb212cad755d67b"
+    assert (
+        model_utility_sandbox.canonical_model_utility_launch_template_digest()
+        == expected
+    )
+    with _held_launch(config) as launch:
+        assert (
+            model_utility_sandbox.canonical_model_utility_launch_digest(launch)
+            == expected
+        )
+
+
+def test_binding_materialization_does_not_open_installed_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_if_opened(_spec: object) -> int:
+        raise AssertionError(
+            "pre-install binding materialization opened a runtime artifact"
+        )
+
+    monkeypatch.setattr(model_utility_sandbox, "_open_source", fail_if_opened)
+    assert _binding().producer_fixed_argv_digest.startswith("sha256:")
+
+
+def test_parse_rejects_noncanonical_and_mutated_bindings() -> None:
     binding = _binding()
     raw = canonical_json_bytes(binding.model_dump(mode="json", by_alias=True))
     assert parse_formal_producer_binding(raw) == binding
@@ -177,7 +195,6 @@ def test_parse_rejects_noncanonical_and_mutated_bindings(pinned: None) -> None:
 
 
 def test_cli_stdout_is_exactly_parseable_without_trailing_bytes(
-    pinned: None,
     capsysbinary: pytest.CaptureFixture[bytes],
 ) -> None:
     exit_code = main(
@@ -211,7 +228,6 @@ def test_cli_stdout_is_exactly_parseable_without_trailing_bytes(
     ),
 )
 def test_binding_rejects_policy_mutations(
-    pinned: None,
     field: str,
     value: int,
 ) -> None:
@@ -226,7 +242,7 @@ def test_binding_rejects_policy_mutations(
         materialize_formal_producer_binding(**arguments)
 
 
-def test_binding_uses_exact_fixed_artifact_constants(pinned: None) -> None:
+def test_binding_uses_exact_fixed_artifact_constants() -> None:
     binding = _binding()
     assert binding.producer_model_digest == FAULTLOOM_UTILITY_V1_MODEL_DIGEST
     assert (

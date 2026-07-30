@@ -21,8 +21,7 @@ from .model_utility_proxy_models import (
     LocalModelRuntimeProfile,
 )
 from .model_utility_sandbox import (
-    canonical_model_utility_launch_digest,
-    pinned_process_launch,
+    canonical_model_utility_launch_template_digest,
 )
 
 FORMAL_PRODUCER_BINDING_SCHEMA = "faultloom.core.t40-formal-producer-binding.v1"
@@ -69,8 +68,9 @@ class FormalProducerBinding(_BindingModel):
             maximum_request_bytes=self.maximum_request_bytes,
             maximum_response_bytes=self.maximum_response_bytes,
         )
-        with pinned_process_launch(config, b"") as launch:
-            expected_fixed_argv_digest = canonical_model_utility_launch_digest(launch)
+        expected_fixed_argv_digest = (
+            canonical_model_utility_launch_template_digest()
+        )
         if (
             self.producer_model_digest != config.model_snapshot_digest
             or self.producer_runtime_wrapper_digest
@@ -126,15 +126,14 @@ def materialize_formal_producer_binding(
     maximum_request_bytes: int,
     maximum_response_bytes: int,
 ) -> FormalProducerBinding:
-    """Verify installed artifacts and derive the exact attestor bindings."""
+    """Derive the expected bindings for the fixed formal producer profile."""
 
     config = _config(
         timeout_seconds=timeout_seconds,
         maximum_request_bytes=maximum_request_bytes,
         maximum_response_bytes=maximum_response_bytes,
     )
-    with pinned_process_launch(config, b"") as launch:
-        fixed_argv_digest = canonical_model_utility_launch_digest(launch)
+    fixed_argv_digest = canonical_model_utility_launch_template_digest()
     return FormalProducerBinding(
         schema=FORMAL_PRODUCER_BINDING_SCHEMA,
         core_wheel_digest=core_wheel_digest,
@@ -152,7 +151,7 @@ def materialize_formal_producer_binding(
 
 
 def parse_formal_producer_binding(raw: bytes) -> FormalProducerBinding:
-    """Re-verify a canonical binding against the installed fixed profile."""
+    """Re-verify a canonical binding against the fixed profile contract."""
 
     if type(raw) is not bytes or not raw or len(raw) > _MAX_DOCUMENT_BYTES:
         raise LocalModelProcessError("formal producer binding framing is invalid")

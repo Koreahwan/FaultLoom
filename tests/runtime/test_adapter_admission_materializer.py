@@ -5,19 +5,14 @@ import hashlib
 import json
 import os
 import subprocess
-from collections.abc import Generator
-from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from faultloom import adapter_admission_materializer as materializer
 from faultloom import adapter_admission_verifier as verifier
-from faultloom import model_utility_sandbox
 from faultloom import t40_faultloom_admission as consumer
 from faultloom import t40_faultloom_install as install
-from faultloom.model_utility_process import BoundedProcessLaunch
-from faultloom.model_utility_proxy_models import LocalModelProcessConfig
 from faultloom.t40_formal_producer_binding import materialize_formal_producer_binding
 from faultloom_protocol import canonical_json_bytes, sha256_digest
 from faultloom_sdk import AdapterAdmissionState, reference_registry
@@ -160,23 +155,6 @@ def _signed_install_profile(root: Path) -> tuple[Path, bytes, dict[str, object]]
     return path, public, payload
 
 
-@contextmanager
-def _held_formal_launch(
-    config: LocalModelProcessConfig, stdin: bytes = b""
-) -> Generator[BoundedProcessLaunch, None, None]:
-    descriptors = (
-        os.open(os.devnull, os.O_RDONLY),
-        os.open(os.devnull, os.O_RDONLY),
-        os.open(os.devnull, os.O_RDONLY),
-        os.open(os.devnull, os.O_RDONLY),
-    )
-    try:
-        yield model_utility_sandbox._launch(config, stdin, descriptors)
-    finally:
-        for descriptor in descriptors:
-            os.close(descriptor)
-
-
 def _run(root: Path, *, same_keys: bool = False) -> tuple[int, str]:
     producer = bytes(range(32))
     verifier = producer if same_keys else bytes(range(32, 64))
@@ -251,12 +229,6 @@ def test_dry_fixture_runs_two_distinct_process_invocations_and_consumer_accepts(
     assert bundle.verifier.payload.verifier_key_id.startswith("ed25519:sha256:")
     assert bundle.producer.payload.producer_key_id != bundle.verifier.payload.verifier_key_id
 
-    @contextmanager
-    def held(config: LocalModelProcessConfig, encoded: bytes):
-        with _held_formal_launch(config, encoded) as launch:
-            yield launch
-
-    monkeypatch.setattr("faultloom.t40_formal_producer_binding.pinned_process_launch", held)
     formal_binding = materialize_formal_producer_binding(
         core_wheel_digest=bundle.producer.payload.core_wheel_digest,
         timeout_seconds=20,

@@ -260,12 +260,11 @@ def _launch_argv(descriptors: tuple[int, int, int, int]) -> tuple[str, ...]:
     )
 
 
-def canonical_model_utility_launch_digest(launch: BoundedProcessLaunch) -> str:
-    """Digest a pinned launch without binding process-local descriptor numbers."""
+def _canonical_model_utility_launch_digest(
+    argv: tuple[str, ...], descriptors: tuple[int, ...]
+) -> str:
+    """Digest the fixed argv while normalizing its four descriptor slots."""
 
-    if type(launch) is not BoundedProcessLaunch:
-        raise LocalModelProcessError("model utility launch type is invalid")
-    descriptors = launch.pass_fds
     if (
         type(descriptors) is not tuple
         or len(descriptors) != 4
@@ -276,15 +275,6 @@ def canonical_model_utility_launch_digest(launch: BoundedProcessLaunch) -> str:
         or len(set(descriptors)) != 4
     ):
         raise LocalModelProcessError("model utility launch descriptors are invalid")
-    try:
-        for descriptor in descriptors:
-            _ = os.fstat(descriptor)
-    except OSError:
-        raise LocalModelProcessError(
-            "model utility launch descriptor is unavailable"
-        ) from None
-
-    argv = launch.argv
     if (
         type(argv) is not tuple
         or not argv
@@ -341,6 +331,32 @@ def canonical_model_utility_launch_digest(launch: BoundedProcessLaunch) -> str:
     )
 
 
+def canonical_model_utility_launch_template_digest() -> str:
+    """Digest the reviewed launch template without opening installed artifacts."""
+
+    descriptors = (3, 4, 5, 6)
+    return _canonical_model_utility_launch_digest(
+        _launch_argv(descriptors), descriptors
+    )
+
+
+def canonical_model_utility_launch_digest(launch: BoundedProcessLaunch) -> str:
+    """Digest a pinned launch without binding process-local descriptor numbers."""
+
+    if type(launch) is not BoundedProcessLaunch:
+        raise LocalModelProcessError("model utility launch type is invalid")
+    descriptors = launch.pass_fds
+    digest = _canonical_model_utility_launch_digest(launch.argv, descriptors)
+    try:
+        for descriptor in descriptors:
+            _ = os.fstat(descriptor)
+    except OSError:
+        raise LocalModelProcessError(
+            "model utility launch descriptor is unavailable"
+        ) from None
+    return digest
+
+
 @contextmanager
 def pinned_process_launch(
     config: LocalModelProcessConfig,
@@ -369,5 +385,6 @@ def pinned_process_launch(
 __all__ = [
     "MODEL_UTILITY_LAUNCH_DIGEST_VERSION",
     "canonical_model_utility_launch_digest",
+    "canonical_model_utility_launch_template_digest",
     "pinned_process_launch",
 ]
