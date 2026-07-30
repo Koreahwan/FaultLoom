@@ -9,6 +9,8 @@ import ipaddress
 import json
 import os
 import secrets
+import shutil
+import sqlite3
 import stat
 import sys
 from dataclasses import dataclass
@@ -69,6 +71,8 @@ PACK_IDS = {
 LIVE_PACK_IDS = frozenset({"pack.web"})
 OFFLINE_REQUEST_ACTION_FAMILY = "http.semantic"
 OFFLINE_REQUEST_ACTION_CLASS = ActionClass.SAFE_PROBE
+REQUEST_ACCOUNTING_FILENAME = "request-accounting.sqlite3"
+REQUEST_ACCOUNTING_STATE_KEY = "request_accounting_state_id"
 
 ModelT = TypeVar("ModelT", bound=ProtocolModel)
 
@@ -1001,19 +1005,55 @@ def _create_manual_workspace(
 ) -> dict[str, object]:
     try:
         workspace.mkdir(parents=True, exist_ok=False, mode=0o700)
-        os.chmod(workspace, 0o700)
-        for relative in (
-            "evidence/raw",
-            "evidence/normalized",
-            "findings",
-            "reports",
-        ):
-            (workspace / relative).mkdir(parents=True, mode=0o700)
     except OSError as exc:
         raise CliError(
             f"cannot create new run workspace {workspace}: {exc}",
             exit_code=EXIT_USAGE,
         ) from exc
+    try:
+        return _initialize_manual_workspace(
+            workspace,
+            authority_content=authority_content,
+            key_content=key_content,
+            grant=grant,
+            target=target,
+            pack_id=pack_id,
+            now=now,
+        )
+    except Exception as exc:
+        try:
+            shutil.rmtree(workspace)
+        except OSError as cleanup_exc:
+            raise CliError(
+                f"cannot clean failed new run workspace {workspace}: {cleanup_exc}",
+                exit_code=EXIT_USAGE,
+            ) from exc
+        if isinstance(exc, CliError):
+            raise
+        raise CliError(
+            f"cannot initialize new run workspace {workspace}: {exc}",
+            exit_code=EXIT_USAGE,
+        ) from exc
+
+
+def _initialize_manual_workspace(
+    workspace: Path,
+    *,
+    authority_content: bytes,
+    key_content: bytes,
+    grant: AuthorityGrant,
+    target: TargetAsset,
+    pack_id: str,
+    now: datetime,
+) -> dict[str, object]:
+    os.chmod(workspace, 0o700)
+    for relative in (
+        "evidence/raw",
+        "evidence/normalized",
+        "findings",
+        "reports",
+    ):
+        (workspace / relative).mkdir(parents=True, mode=0o700)
 
     run_id = f"run.{now:%Y%m%dT%H%M%SZ}.{secrets.token_hex(4)}"
     manifest: dict[str, object] = {
@@ -1027,6 +1067,7 @@ def _create_manual_workspace(
         "grant_version": grant.grant_version,
         "authority_sha256": hashlib.sha256(authority_content).hexdigest(),
         "trusted_key_sha256": hashlib.sha256(key_content).hexdigest(),
+        REQUEST_ACCOUNTING_STATE_KEY: secrets.token_hex(32),
         "target": target.model_dump(mode="json"),
         "pack_id": pack_id,
         "action_policy": grant.action_policy.model_dump(mode="json"),
@@ -1080,6 +1121,7 @@ FaultLoom did not open a network socket or dispatch an action when creating it.
         (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8"),
         mode=0o600,
     )
+    _initialize_request_accounting(workspace, manifest)
     return manifest
 
 
@@ -1402,12 +1444,15 @@ def _request_byte_count(value: str, *, label: str) -> int:
     return count
 
 
-def _scope_check_request(arguments: argparse.Namespace) -> int:
-    workspace: Path = arguments.workspace
+def _verified_request_workspace(
+    workspace: Path,
+    trusted_key_path: Path,
+    *,
+    require_active: bool = True,
+) -> tuple[dict[str, object], AuthorityGrant, TargetAsset, datetime]:
     authority_path = workspace / "authority.json"
     workspace_key_path = workspace / "trusted-key.json"
     run_path = workspace / "run.json"
-    trusted_key_path = _trusted_key_path(arguments)
     try:
         trusted_key_path.resolve(strict=True).relative_to(workspace.resolve(strict=True))
     except ValueError:
@@ -1428,20 +1473,23 @@ def _scope_check_request(arguments: argparse.Namespace) -> int:
     )
     trusted_key_content = _capture_single_protocol_file(trusted_key_path)
     run_content = _capture_single_protocol_file(run_path)
-    envelope = _parse_protocol_file(
-        authority_path,
-        authority_content,
-        SignedAuthorityGrant,
-    )
+    envelope = _parse_protocol_file(authority_path, authority_content, SignedAuthorityGrant)
     public_key = _parse_protocol_file(
-        trusted_key_path,
-        trusted_key_content,
-        Ed25519PublicKeyRecord,
+        trusted_key_path, trusted_key_content, Ed25519PublicKeyRecord
     )
     manifest = _parse_workspace_run_file(run_path, run_content)
     now = _utc_now()
+    verification_now = (
+        now
+        if require_active
+        else max(
+            envelope.payload.issued_at,
+            envelope.payload.not_before,
+            envelope.signature.signed_at,
+        )
+    )
     try:
-        grant = verify_authority_grant(envelope, public_key, now=now)
+        grant = verify_authority_grant(envelope, public_key, now=verification_now)
     except (SignatureVerificationError, ValueError) as exc:
         raise CliError(
             f"authority verification failed: {exc}", exit_code=EXIT_AUTHORITY
@@ -1456,8 +1504,17 @@ def _scope_check_request(arguments: argparse.Namespace) -> int:
             exit_code=EXIT_AUTHORITY,
         )
     target = targets[0]
+    state_id = manifest.get(REQUEST_ACCOUNTING_STATE_KEY)
+    if state_id is None:
+        raise CliError(
+            "workspace predates request accounting; create a new run workspace",
+            exit_code=EXIT_AUTHORITY,
+        )
     if (
-        manifest.get("grant_id") != grant.grant_id
+        not isinstance(state_id, str)
+        or len(state_id) != 64
+        or any(character not in "0123456789abcdef" for character in state_id)
+        or manifest.get("grant_id") != grant.grant_id
         or manifest.get("grant_version") != grant.grant_version
         or manifest.get("pack_id") not in grant.pack_ids
         or manifest_target != target.model_dump(mode="json")
@@ -1476,13 +1533,317 @@ def _scope_check_request(arguments: argparse.Namespace) -> int:
             "run.json is not bound to the verified authority grant",
             exit_code=EXIT_AUTHORITY,
         )
-    if not any(
+    if require_active and not any(
         window.starts_at <= now < window.ends_at for window in grant.execution_windows
     ):
         raise CliError(
             "current time is outside every signed execution window",
             exit_code=EXIT_AUTHORITY,
         )
+    return manifest, grant, target, now
+
+
+def _request_accounting_connection(workspace: Path) -> sqlite3.Connection:
+    path = workspace / REQUEST_ACCOUNTING_FILENAME
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        raise CliError("request accounting state is missing", exit_code=EXIT_AUTHORITY)
+    except OSError as exc:
+        raise CliError(
+            f"cannot inspect request accounting state: {exc}", exit_code=EXIT_AUTHORITY
+        ) from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise CliError(
+            "request accounting state is not a regular private file",
+            exit_code=EXIT_AUTHORITY,
+        )
+    if os.name != "nt" and metadata.st_mode & 0o077:
+        raise CliError(
+            "request accounting state is not private", exit_code=EXIT_AUTHORITY
+        )
+    try:
+        return sqlite3.connect(path, timeout=10, isolation_level=None)
+    except sqlite3.Error as exc:
+        raise CliError(
+            f"cannot open request accounting state: {exc}", exit_code=EXIT_AUTHORITY
+        ) from exc
+
+
+def _accounting_metadata(manifest: dict[str, object]) -> dict[str, str]:
+    required = (
+        "run_id",
+        "grant_id",
+        "grant_version",
+        "authority_sha256",
+        "trusted_key_sha256",
+        REQUEST_ACCOUNTING_STATE_KEY,
+    )
+    metadata = {key: str(manifest[key]) for key in required}
+    if any(not metadata[key] for key in required):
+        raise CliError(
+            "manual workspace has invalid accounting bindings", exit_code=EXIT_AUTHORITY
+        )
+    return metadata
+
+
+def _prepare_request_accounting(
+    connection: sqlite3.Connection,
+    manifest: dict[str, object],
+    *,
+    initialize: bool = False,
+) -> None:
+    expected = _accounting_metadata(manifest)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        if initialize:
+            connection.execute(
+                "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            connection.execute(
+                """CREATE TABLE reservations (
+                    reservation_id TEXT PRIMARY KEY,
+                    created_at REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    request_fingerprint TEXT NOT NULL,
+                    request_bytes INTEGER NOT NULL,
+                    response_limit INTEGER NOT NULL,
+                    completed_at REAL,
+                    observed_response_bytes INTEGER
+                )"""
+            )
+        objects = dict(
+            connection.execute(
+                "SELECT name, type FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+            )
+        )
+        expected_objects = {"metadata": "table", "reservations": "table"}
+        columns = tuple(
+            (row[1], row[2], row[3], row[5])
+            for row in connection.execute("PRAGMA table_info(reservations)")
+        )
+        metadata_columns = tuple(
+            (row[1], row[2], row[3], row[5])
+            for row in connection.execute("PRAGMA table_info(metadata)")
+        )
+        expected_columns = (
+            ("reservation_id", "TEXT", 0, 1),
+            ("created_at", "REAL", 1, 0),
+            ("expires_at", "REAL", 1, 0),
+            ("request_fingerprint", "TEXT", 1, 0),
+            ("request_bytes", "INTEGER", 1, 0),
+            ("response_limit", "INTEGER", 1, 0),
+            ("completed_at", "REAL", 0, 0),
+            ("observed_response_bytes", "INTEGER", 0, 0),
+        )
+        if (
+            objects != expected_objects
+            or metadata_columns != (("key", "TEXT", 0, 1), ("value", "TEXT", 1, 0))
+            or columns != expected_columns
+        ):
+            raise CliError(
+                "request accounting state has an invalid schema", exit_code=EXIT_AUTHORITY
+            )
+        rows = dict(connection.execute("SELECT key, value FROM metadata"))
+        if initialize:
+            connection.executemany(
+                "INSERT INTO metadata(key, value) VALUES(?, ?)", expected.items()
+            )
+        elif rows != expected:
+            raise CliError(
+                "request accounting state is not bound to the verified workspace",
+                exit_code=EXIT_AUTHORITY,
+            )
+    except CliError:
+        connection.rollback()
+        raise
+    except sqlite3.Error as exc:
+        connection.rollback()
+        raise CliError(
+            f"invalid request accounting state: {exc}", exit_code=EXIT_AUTHORITY
+        ) from exc
+
+
+def _initialize_request_accounting(
+    workspace: Path, manifest: dict[str, object]
+) -> None:
+    try:
+        _write_new_file(workspace / REQUEST_ACCOUNTING_FILENAME, b"", mode=0o600)
+    except CliError as exc:
+        raise CliError(
+            f"cannot initialize request accounting state: {exc}", exit_code=EXIT_USAGE
+        ) from exc
+    connection = _request_accounting_connection(workspace)
+    try:
+        _prepare_request_accounting(connection, manifest, initialize=True)
+        connection.commit()
+    except CliError:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def _request_fingerprint(
+    *,
+    hostname: str,
+    port: int,
+    scheme: str,
+    method: str,
+    path: str,
+    request_bytes: int,
+    response_bytes: int,
+) -> str:
+    metadata = {
+        "hostname": hostname,
+        "method": method,
+        "path": path,
+        "port": port,
+        "request_bytes": request_bytes,
+        "response_bytes": response_bytes,
+        "scheme": scheme,
+    }
+    encoded = json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _active_reservation_count(connection: sqlite3.Connection, now: float) -> int:
+    return connection.execute(
+        "SELECT COUNT(*) FROM reservations WHERE completed_at IS NULL AND expires_at > ?", (now,)
+    ).fetchone()[0]
+
+
+def _reserve_request(
+    *,
+    workspace: Path,
+    manifest: dict[str, object],
+    grant: AuthorityGrant,
+    now: datetime,
+    hostname: str,
+    port: int,
+    scheme: str,
+    method: str,
+    path: str,
+    request_bytes: int,
+    response_bytes: int,
+) -> dict[str, object]:
+    now_seconds = now.timestamp()
+    expires_at = min(
+        now_seconds + grant.budget.max_duration_seconds,
+        max(
+            window.ends_at.timestamp()
+            for window in grant.execution_windows
+            if window.starts_at <= now < window.ends_at
+        ),
+    )
+    connection = _request_accounting_connection(workspace)
+    try:
+        _prepare_request_accounting(connection, manifest)
+        total = connection.execute("SELECT COUNT(*) FROM reservations").fetchone()[0]
+        rate = connection.execute(
+            "SELECT COUNT(*) FROM reservations WHERE created_at > ?", (now_seconds - 60,)
+        ).fetchone()[0]
+        active = _active_reservation_count(connection, now_seconds)
+        if total >= grant.budget.total_actions:
+            raise CliError("signed total action budget is exhausted", exit_code=EXIT_AUTHORITY)
+        if rate >= grant.budget.rate_per_minute:
+            raise CliError("signed rate budget is exhausted", exit_code=EXIT_AUTHORITY)
+        if active >= grant.budget.max_concurrency:
+            raise CliError("signed concurrency budget is exhausted", exit_code=EXIT_AUTHORITY)
+        reservation_id = f"reservation.{secrets.token_hex(16)}"
+        connection.execute(
+            """INSERT INTO reservations(
+                reservation_id, created_at, expires_at, request_fingerprint,
+                request_bytes, response_limit
+            ) VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                reservation_id,
+                now_seconds,
+                expires_at,
+                _request_fingerprint(
+                    hostname=hostname,
+                    port=port,
+                    scheme=scheme,
+                    method=method,
+                    path=path,
+                    request_bytes=request_bytes,
+                    response_bytes=response_bytes,
+                ),
+                request_bytes,
+                response_bytes,
+            ),
+        )
+        connection.commit()
+    except CliError:
+        connection.rollback()
+        raise
+    except sqlite3.Error as exc:
+        connection.rollback()
+        raise CliError(f"cannot reserve request budget: {exc}", exit_code=EXIT_AUTHORITY) from exc
+    finally:
+        connection.close()
+    return {
+        "reservation_id": reservation_id,
+        "reservation_expires_at": datetime.fromtimestamp(expires_at, UTC).isoformat().replace(
+            "+00:00", "Z"
+        ),
+        "remaining_budget": {
+            "total_actions": grant.budget.total_actions - total - 1,
+            "rate_per_minute": grant.budget.rate_per_minute - rate - 1,
+            "max_concurrency": grant.budget.max_concurrency - active - 1,
+        },
+    }
+
+
+def _complete_request(
+    *,
+    workspace: Path,
+    manifest: dict[str, object],
+    reservation_id: str,
+    observed_response_bytes: int,
+) -> dict[str, object]:
+    connection = _request_accounting_connection(workspace)
+    try:
+        _prepare_request_accounting(connection, manifest)
+        row = connection.execute(
+            "SELECT response_limit, completed_at FROM reservations WHERE reservation_id = ?",
+            (reservation_id,),
+        ).fetchone()
+        if row is None:
+            raise CliError("unknown request reservation", exit_code=EXIT_AUTHORITY)
+        if row[1] is not None:
+            raise CliError("request reservation is already complete", exit_code=EXIT_AUTHORITY)
+        within_reserved_response_budget = observed_response_bytes <= row[0]
+        connection.execute(
+            "UPDATE reservations SET completed_at = ?, observed_response_bytes = ? "
+            "WHERE reservation_id = ?",
+            (_utc_now().timestamp(), observed_response_bytes, reservation_id),
+        )
+        connection.commit()
+    except CliError:
+        connection.rollback()
+        raise
+    except sqlite3.Error as exc:
+        connection.rollback()
+        raise CliError(
+            f"cannot complete request reservation: {exc}", exit_code=EXIT_AUTHORITY
+        ) from exc
+    finally:
+        connection.close()
+    return {
+        "observed_response_bytes": observed_response_bytes,
+        "completed": True,
+        "dispatch_performed": False,
+        "network_access": "none",
+        "reservation_id": reservation_id,
+        "within_reserved_response_budget": within_reserved_response_budget,
+    }
+
+
+def _scope_check_request(arguments: argparse.Namespace) -> int:
+    workspace: Path = arguments.workspace
+    trusted_key_path = _trusted_key_path(arguments)
+    manifest, grant, target, now = _verified_request_workspace(workspace, trusted_key_path)
 
     method = arguments.method.upper()
     path = arguments.path
@@ -1531,12 +1892,25 @@ def _scope_check_request(arguments: argparse.Namespace) -> int:
         raise CliError(
             "request exceeds the signed byte budget", exit_code=EXIT_AUTHORITY
         )
+    reservation = _reserve_request(
+        workspace=workspace,
+        manifest=manifest,
+        grant=grant,
+        now=now,
+        hostname=arguments.hostname,
+        port=arguments.port,
+        scheme=arguments.scheme,
+        method=method,
+        path=path,
+        request_bytes=request_bytes,
+        response_bytes=response_bytes,
+    )
     _emit_json(
         {
             "authorized": True,
             "action_class": OFFLINE_REQUEST_ACTION_CLASS.value,
             "budget": grant.budget.model_dump(mode="json"),
-            "budget_accounting": "operator_enforced",
+            "budget_accounting": "operator_local_reservation",
             "dispatch_performed": False,
             "grant_id": grant.grant_id,
             "grant_version": grant.grant_version,
@@ -1550,9 +1924,26 @@ def _scope_check_request(arguments: argparse.Namespace) -> int:
             "scheme": arguments.scheme,
             "target_id": target.target_id,
             "hostname": arguments.hostname,
+            **reservation,
         }
     )
     return EXIT_OK
+
+
+def _scope_complete_request(arguments: argparse.Namespace) -> int:
+    manifest, _, _, _ = _verified_request_workspace(
+        arguments.workspace, _trusted_key_path(arguments), require_active=False
+    )
+    completion = _complete_request(
+        workspace=arguments.workspace,
+        manifest=manifest,
+        reservation_id=arguments.reservation_id,
+        observed_response_bytes=_request_byte_count(
+            arguments.observed_response_bytes, label="observed response bytes"
+        ),
+    )
+    _emit_json(completion)
+    return EXIT_OK if completion["within_reserved_response_budget"] else EXIT_AUTHORITY
 
 
 def _validate_live_command(
@@ -1966,6 +2357,15 @@ def build_parser() -> argparse.ArgumentParser:
     scope_check_request.add_argument("--request-bytes", required=True)
     scope_check_request.add_argument("--response-bytes", required=True)
     scope_check_request.set_defaults(handler=_scope_check_request)
+    scope_complete_request = scope_commands.add_parser(
+        "complete-request",
+        help="record an offline Burp request reservation completion",
+    )
+    scope_complete_request.add_argument("--workspace", type=Path, required=True)
+    scope_complete_request.add_argument("--trusted-key", type=Path)
+    scope_complete_request.add_argument("--reservation-id", required=True)
+    scope_complete_request.add_argument("--observed-response-bytes", required=True)
+    scope_complete_request.set_defaults(handler=_scope_complete_request)
 
     run = commands.add_parser("run", help="start an authorized research run")
     run.add_argument("--authority", type=Path, required=True)

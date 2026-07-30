@@ -3,8 +3,8 @@
 This kit contains two independent, non-installing components:
 
 - `faultloom.exe`: signed engagement scopes, offline manual workspaces,
-  offline Burp request scope checks, evidence ingestion, and unverified finding
-  drafts.
+  offline Burp request scope checks with owner-local reservation records,
+  evidence ingestion, and unverified finding drafts.
 - `windows-authority/`: the native `faultloom_ctl.exe` -> broker -> independent
   reviewer boundary for bounded local host checks.
 
@@ -41,6 +41,10 @@ available with `faultloom.exe --help`.
 The kit is usable for manual Burp/browser work within a signed scope. Automatic
 Gateway target dispatch (`run --live`), automatic exploitation, remote host
 management, and automatic submission remain disabled.
+
+Request reservations are an advisory guard against accidental budget overruns
+while their workspace remains intact. They are not a tamper-resistant boundary;
+Burp's separate write approval remains the request-sending boundary.
 
 Verify `SHA256SUMS.txt` before copying the kit to another location. Keep local
 authority private keys outside this kit and outside Git or cloud-sync folders.

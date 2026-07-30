@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import socket
 import subprocess
 import sys
@@ -36,6 +37,7 @@ def _authority_files(
     protocols: tuple[str, ...] | None = None,
     request_deny: tuple[str, str] | None = None,
     observe_only: bool = False,
+    budget_updates: dict[str, int] | None = None,
     now: datetime = NOW,
     signer_seed: int = 0,
 ) -> tuple[Path, Path]:
@@ -86,6 +88,11 @@ def _authority_files(
             "pack_ids": pack_ids,
             "action_policy": policy,
             "execution_windows": (window,),
+            **(
+                {"budget": grant.budget.model_copy(update=budget_updates)}
+                if budget_updates is not None
+                else {}
+            ),
         }
     )
     private_key = bytes((value + signer_seed) % 256 for value in range(32))
@@ -105,6 +112,7 @@ def _manual_workspace_for_request_check(
     *,
     request_deny: tuple[str, str] | None = None,
     observe_only: bool = False,
+    budget_updates: dict[str, int] | None = None,
 ) -> tuple[Path, Path]:
     now = datetime.now(UTC) - timedelta(minutes=1)
     authority_path, key_path = _authority_files(
@@ -115,6 +123,7 @@ def _manual_workspace_for_request_check(
         protocols=("https",),
         request_deny=request_deny,
         observe_only=observe_only,
+        budget_updates=budget_updates,
         now=now,
     )
     workspace = tmp_path / "manual-run"
@@ -129,7 +138,7 @@ def _check_request_arguments(
     trusted_key: Path,
     **overrides: object,
 ) -> list[str]:
-    values = {
+    values: dict[str, object] = {
         "hostname": "example.com",
         "port": "443",
         "scheme": "https",
@@ -160,6 +169,23 @@ def _check_request_arguments(
         str(values["request_bytes"]),
         "--response-bytes",
         str(values["response_bytes"]),
+    ]
+
+
+def _complete_request_arguments(
+    workspace: Path, trusted_key: Path, reservation_id: str, observed_response_bytes: str
+) -> list[str]:
+    return [
+        "scope",
+        "complete-request",
+        "--workspace",
+        str(workspace),
+        "--trusted-key",
+        str(trusted_key),
+        "--reservation-id",
+        reservation_id,
+        "--observed-response-bytes",
+        observed_response_bytes,
     ]
 
 
@@ -593,7 +619,13 @@ def test_scope_check_request_is_offline_and_returns_signed_scope(
     assert result["hostname"] == "example.com"
     assert result["target_id"] == "target.lab"
     assert result["pack_id"] == "pack.web"
-    assert result["budget_accounting"] == "operator_enforced"
+    assert result["budget_accounting"] == "operator_local_reservation"
+    assert result["reservation_id"].startswith("reservation.")
+    assert result["remaining_budget"] == {
+        "max_concurrency": 1,
+        "rate_per_minute": 9,
+        "total_actions": 99,
+    }
     assert result["budget"] == {
         "max_concurrency": 2,
         "max_duration_seconds": 3600,
@@ -603,6 +635,274 @@ def test_scope_check_request_is_offline_and_returns_signed_scope(
         "schema_version": "0.1.0",
         "total_actions": 100,
     }
+    completion = _run_module(
+        _complete_request_arguments(workspace, key_path, result["reservation_id"], "200"),
+        reject_sockets=True,
+    )
+    assert completion.returncode == cli.EXIT_OK
+    assert json.loads(completion.stdout)["observed_response_bytes"] == 200
+
+
+def test_manual_workspace_rolls_back_if_accounting_initialization_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    authority_path, key_path = _authority_files(tmp_path / "grant")
+    workspace = tmp_path / "failed-run"
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+
+    def fail_initialize(*args: object, **kwargs: object) -> None:
+        raise cli.CliError("injected accounting initialization failure", exit_code=cli.EXIT_USAGE)
+
+    monkeypatch.setattr(cli, "_initialize_request_accounting", fail_initialize)
+    assert (
+        cli.main(_run_arguments(authority_path, key_path) + ["--workspace", str(workspace)])
+        == cli.EXIT_USAGE
+    )
+    assert not workspace.exists()
+    assert "injected accounting initialization failure" in capsys.readouterr().err
+
+
+def test_scope_check_request_reservation_rejects_total_budget_overrun(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A second authorized request must not exceed a signed one-action budget."""
+    workspace, key_path = _manual_workspace_for_request_check(
+        tmp_path, budget_updates={"total_actions": 1}
+    )
+    capsys.readouterr()
+
+    assert cli.main(_check_request_arguments(workspace, key_path)) == cli.EXIT_OK
+    capsys.readouterr()
+    assert cli.main(_check_request_arguments(workspace, key_path)) == cli.EXIT_AUTHORITY
+    assert "total action budget" in capsys.readouterr().err
+
+
+def test_scope_check_request_reservation_rejects_rate_budget_overrun(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(
+        tmp_path, budget_updates={"rate_per_minute": 1}
+    )
+    capsys.readouterr()
+
+    assert cli.main(_check_request_arguments(workspace, key_path)) == cli.EXIT_OK
+    capsys.readouterr()
+    assert cli.main(_check_request_arguments(workspace, key_path)) == cli.EXIT_AUTHORITY
+    assert "rate budget" in capsys.readouterr().err
+
+
+def test_scope_request_completion_releases_concurrency_and_records_observed_bytes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(
+        tmp_path, budget_updates={"max_concurrency": 1}
+    )
+    capsys.readouterr()
+
+    assert cli.main(_check_request_arguments(workspace, key_path)) == cli.EXIT_OK
+    first = json.loads(capsys.readouterr().out)
+    assert cli.main(_check_request_arguments(workspace, key_path)) == cli.EXIT_AUTHORITY
+    assert "concurrency budget" in capsys.readouterr().err
+
+    assert (
+        cli.main(_complete_request_arguments(workspace, key_path, first["reservation_id"], "150"))
+        == cli.EXIT_OK
+    )
+    completed = json.loads(capsys.readouterr().out)
+    assert completed["observed_response_bytes"] == 150
+    assert completed["dispatch_performed"] is False
+    assert completed["network_access"] == "none"
+    assert cli.main(_check_request_arguments(workspace, key_path)) == cli.EXIT_OK
+
+    connection = sqlite3.connect(workspace / cli.REQUEST_ACCOUNTING_FILENAME)
+    try:
+        assert connection.execute(
+            "SELECT observed_response_bytes FROM reservations WHERE reservation_id = ?",
+            (first["reservation_id"],),
+        ).fetchone() == (150,)
+    finally:
+        connection.close()
+
+
+def test_expired_request_reservations_release_concurrency_but_keep_total_and_rate_usage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(
+        tmp_path,
+        budget_updates={
+            "total_actions": 2,
+            "rate_per_minute": 2,
+            "max_concurrency": 1,
+            "max_duration_seconds": 1,
+        },
+    )
+    capsys.readouterr()
+    now = datetime.now(UTC)
+    monkeypatch.setattr(cli, "_utc_now", lambda: now)
+    assert cli.main(_check_request_arguments(workspace, key_path)) == cli.EXIT_OK
+    capsys.readouterr()
+    monkeypatch.setattr(cli, "_utc_now", lambda: now + timedelta(seconds=2))
+
+    assert cli.main(_check_request_arguments(workspace, key_path)) == cli.EXIT_OK
+    result = json.loads(capsys.readouterr().out)
+    assert result["remaining_budget"] == {
+        "max_concurrency": 0,
+        "rate_per_minute": 0,
+        "total_actions": 0,
+    }
+
+
+def test_expired_request_reservation_can_still_be_completed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(
+        tmp_path, budget_updates={"max_duration_seconds": 1}
+    )
+    capsys.readouterr()
+    now = datetime.now(UTC)
+    monkeypatch.setattr(cli, "_utc_now", lambda: now)
+    assert cli.main(_check_request_arguments(workspace, key_path)) == cli.EXIT_OK
+    reservation_id = json.loads(capsys.readouterr().out)["reservation_id"]
+    monkeypatch.setattr(cli, "_utc_now", lambda: now + timedelta(seconds=2))
+
+    assert (
+        cli.main(_complete_request_arguments(workspace, key_path, reservation_id, "200"))
+        == cli.EXIT_OK
+    )
+
+
+def test_scope_request_completion_records_oversized_then_rejects_duplicate_and_unknown(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(
+        tmp_path, budget_updates={"max_concurrency": 1}
+    )
+    capsys.readouterr()
+    assert cli.main(_check_request_arguments(workspace, key_path)) == cli.EXIT_OK
+    reservation_id = json.loads(capsys.readouterr().out)["reservation_id"]
+
+    assert (
+        cli.main(_complete_request_arguments(workspace, key_path, reservation_id, "201"))
+        == cli.EXIT_AUTHORITY
+    )
+    oversized = json.loads(capsys.readouterr().out)
+    assert oversized["observed_response_bytes"] == 201
+    assert oversized["within_reserved_response_budget"] is False
+    connection = sqlite3.connect(workspace / cli.REQUEST_ACCOUNTING_FILENAME)
+    try:
+        assert connection.execute(
+            "SELECT observed_response_bytes FROM reservations WHERE reservation_id = ?",
+            (reservation_id,),
+        ).fetchone() == (201,)
+    finally:
+        connection.close()
+    assert cli.main(_check_request_arguments(workspace, key_path)) == cli.EXIT_OK
+    capsys.readouterr()
+    assert (
+        cli.main(_complete_request_arguments(workspace, key_path, reservation_id, "200"))
+        == cli.EXIT_AUTHORITY
+    )
+    assert "already complete" in capsys.readouterr().err
+    assert (
+        cli.main(_complete_request_arguments(workspace, key_path, "reservation.unknown", "0"))
+        == cli.EXIT_AUTHORITY
+    )
+    assert "unknown request reservation" in capsys.readouterr().err
+
+
+def test_scope_request_accounting_rejects_tampered_state_bindings(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(tmp_path)
+    capsys.readouterr()
+    assert cli.main(_check_request_arguments(workspace, key_path)) == cli.EXIT_OK
+    capsys.readouterr()
+    connection = sqlite3.connect(workspace / cli.REQUEST_ACCOUNTING_FILENAME)
+    try:
+        connection.execute("UPDATE metadata SET value = 'replaced' WHERE key = 'run_id'")
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert cli.main(_check_request_arguments(workspace, key_path)) == cli.EXIT_AUTHORITY
+    assert "not bound to the verified workspace" in capsys.readouterr().err
+
+
+def test_scope_request_accounting_rejects_pre_accounting_workspace(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(tmp_path)
+    run_path = workspace / "run.json"
+    manifest = json.loads(run_path.read_text(encoding="utf-8"))
+    del manifest[cli.REQUEST_ACCOUNTING_STATE_KEY]
+    run_path.write_text(json.dumps(manifest), encoding="utf-8")
+    capsys.readouterr()
+
+    assert cli.main(_check_request_arguments(workspace, key_path)) == cli.EXIT_AUTHORITY
+    assert "predates request accounting" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("tamper", ("missing", "blank", "extra_table"))
+def test_scope_request_accounting_rejects_missing_replaced_or_extended_state(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], tamper: str
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(tmp_path)
+    state_path = workspace / cli.REQUEST_ACCOUNTING_FILENAME
+    if tamper == "missing":
+        state_path.unlink()
+    elif tamper == "blank":
+        state_path.write_bytes(b"")
+    else:
+        connection = sqlite3.connect(state_path)
+        try:
+            connection.execute("CREATE TABLE unexpected_state (value TEXT)")
+            connection.commit()
+        finally:
+            connection.close()
+    capsys.readouterr()
+
+    assert cli.main(_check_request_arguments(workspace, key_path)) == cli.EXIT_AUTHORITY
+    assert "request accounting state" in capsys.readouterr().err
+
+
+def test_scope_request_concurrent_processes_allow_one_active_reservation(
+    tmp_path: Path,
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(
+        tmp_path, budget_updates={"max_concurrency": 1}
+    )
+    command = [sys.executable, "-m", "faultloom", *_check_request_arguments(workspace, key_path)]
+    first = subprocess.Popen(
+        command,
+        cwd=ROOT,
+        env=_module_environment(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    second = subprocess.Popen(
+        command,
+        cwd=ROOT,
+        env=_module_environment(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    first_stdout, first_stderr = first.communicate(timeout=30)
+    second_stdout, second_stderr = second.communicate(timeout=30)
+
+    assert sorted((first.returncode, second.returncode)) == [cli.EXIT_OK, cli.EXIT_AUTHORITY]
+    outcomes = ((first_stdout, first_stderr), (second_stdout, second_stderr))
+    dispatched = sum(
+        json.loads(stdout)["dispatch_performed"] is False
+        for stdout, _ in outcomes
+        if stdout
+    )
+    assert dispatched == 1
+    assert sum("concurrency budget" in stderr for _, stderr in outcomes) == 1
 
 
 @pytest.mark.parametrize(

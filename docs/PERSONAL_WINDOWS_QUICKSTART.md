@@ -91,9 +91,32 @@ request metadata against the signed workspace:
 Continue only when the JSON result says `"authorized": true`. This command
 rechecks the workspace's signed authority against the public key kept outside
 that workspace, plus its target, `safe_probe` action policy, explicit denies,
-execution window, and per-request byte limits. It opens no socket and does not
-call Burp. Total actions, rate, concurrency, actual response size, and the
-separate Burp write approval remain operator-enforced.
+execution window, and per-request byte limits. It atomically creates an
+owner-local request reservation and returns its `reservation_id`, expiry, and
+remaining signed action, rate, and concurrency budgets. It opens no socket and
+does not call Burp.
+
+After Burp has sent the request, record the observed response size and release
+the reservation's concurrency slot. Use the returned `reservation_id` and do
+not include a request or response body in this command:
+
+```powershell
+& $FaultLoom scope complete-request `
+  --workspace "$Job\run-01" `
+  --trusted-key "$Root\authority\authority-public-key.json" `
+  --reservation-id 'reservation.from-check-request' `
+  --observed-response-bytes 12345
+```
+
+This is advisory owner-local accounting, not tamper-resistant enforcement: any
+process able to modify the workspace can reset or replace its accounting state.
+It does not grant Burp permission. Burp request-sending and settings tools
+retain their separate `writes` approval requirement, which remains the hard
+send boundary.
+
+This accounting begins with RC6. A workspace created by RC5 predates it and
+must not be reused: create a fresh signed run workspace instead. There is
+intentionally no reset or migration command.
 
 ## 6. Add exported evidence
 
@@ -136,6 +159,13 @@ the customer's or bounty program's official channel.
 Ready now: signed scopes, manual authorized workspaces, bounded evidence
 ingestion, SHA-256 records, metadata checks for Web, LLM, and the registered
 candidate packs, offline Burp request scope checks, and finding drafts.
+Within an intact workspace, request checks persist advisory owner-local
+reservations and reject additional reservations that exceed the recorded signed
+total, 60-second rate, active concurrency, or per-request byte budgets. A
+completion records only the operator-observed response byte count and releases
+concurrency. If the observed response exceeds its reserved budget, FaultLoom
+records that fact and returns an authorization failure after emitting the
+result.
 Linux-only durable resume, automatic
 Gateway target dispatch, automatic exploitation, and automatic external
 submission are not enabled in this Windows personal beta.
