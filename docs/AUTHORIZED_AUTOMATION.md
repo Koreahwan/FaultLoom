@@ -160,9 +160,11 @@ binds exactly one local raw HTTP/1.1 request file to the signed workspace by
 SHA-256 and byte length. It validates the canonical request line and exactly
 one Host header against the signed endpoint metadata before reserving budget.
 `scope complete-request` requires the same request bytes again and can bind a
-local response file digest; neither command opens a socket, invokes Burp, or
-prints request/response contents. This is an owner-local preflight and audit
-guard, not an enforcement hook inside Burp itself.
+local response file digest when that file is within the reserved response
+limit; an oversized response file is rejected. Neither command opens a
+socket, invokes Burp, or prints request/response contents. This is an
+owner-local preflight and audit guard, not an enforcement hook inside Burp
+itself.
 
 The normal runtime is fail-closed and live mode is off by default. A POSIX
 `run --live` process is supported only when an external controller provisions

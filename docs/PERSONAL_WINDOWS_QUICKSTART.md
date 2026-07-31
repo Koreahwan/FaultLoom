@@ -106,7 +106,8 @@ After Burp has sent the request, provide the same raw request file again. The
 completion re-hashes it before releasing the reservation's concurrency slot;
 any method, path, Host, header, or body change fails closed. A response file is
 optional, but binds the recorded response length and SHA-256 without printing
-its contents:
+its contents. A response file larger than the reserved response limit is
+rejected; use `--observed-response-bytes` when only the length is available:
 
 ```powershell
 & $FaultLoom scope complete-request `

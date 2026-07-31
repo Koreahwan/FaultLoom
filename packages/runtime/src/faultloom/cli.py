@@ -1532,7 +1532,16 @@ def _parse_raw_http11_request(
     if len(host_values) != 1:
         raise CliError("raw request must contain exactly one Host header", exit_code=EXIT_AUTHORITY)
     default_port = (scheme == "https" and port == 443) or (scheme == "http" and port == 80)
-    expected_host = hostname if default_port else f"{hostname}:{port}"
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        host_authority = hostname
+    else:
+        # URI authorities require brackets around IPv6 literals. Keep the
+        # signed hostname unbracketed for target matching and fingerprinting,
+        # and serialize it separately for the HTTP Host field.
+        host_authority = f"[{address.compressed}]" if address.version == 6 else address.compressed
+    expected_host = host_authority if default_port else f"{host_authority}:{port}"
     if host_values[0].lower() != expected_host.lower():
         raise CliError("raw request Host header does not match the signed endpoint", exit_code=EXIT_AUTHORITY)
     if len(content_lengths) > 1:
@@ -2003,18 +2012,22 @@ def _complete_request(
                     "response file length changed while being inspected",
                     exit_code=EXIT_AUTHORITY,
                 )
-            if response_size <= row[3]:
-                response_content = _capture_bounded_local_file(
-                    response_file,
-                    maximum_bytes=row[3],
-                    label="response",
+            if response_size > row[3]:
+                raise CliError(
+                    "response file exceeds the reserved response limit",
+                    exit_code=EXIT_AUTHORITY,
                 )
-                if len(response_content) != observed_response_bytes:
-                    raise CliError(
-                        "response file length changed while being read",
-                        exit_code=EXIT_AUTHORITY,
-                    )
-                response_sha256 = hashlib.sha256(response_content).hexdigest()
+            response_content = _capture_bounded_local_file(
+                response_file,
+                maximum_bytes=row[3],
+                label="response",
+            )
+            if len(response_content) != observed_response_bytes:
+                raise CliError(
+                    "response file length changed while being read",
+                    exit_code=EXIT_AUTHORITY,
+                )
+            response_sha256 = hashlib.sha256(response_content).hexdigest()
         within_reserved_response_budget = observed_response_bytes <= row[3]
         connection.execute(
             "UPDATE reservations SET completed_at = ?, observed_response_bytes = ?, response_sha256 = ? "

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import sqlite3
@@ -32,6 +33,7 @@ def _authority_files(
     hostnames: tuple[str, ...] = ("localhost",),
     cidrs: tuple[str, ...] = (),
     pack_ids: tuple[str, ...] = ("pack.web",),
+    ports: tuple[int, ...] | None = None,
     paths: tuple[str, ...] | None = None,
     methods: tuple[str, ...] | None = None,
     protocols: tuple[str, ...] | None = None,
@@ -47,6 +49,7 @@ def _authority_files(
         update={
             "hostnames": hostnames,
             "cidrs": cidrs,
+            **({"ports": ports} if ports is not None else {}),
             **({"paths": paths} if paths is not None else {}),
             **({"methods": methods} if methods is not None else {}),
             **({"protocols": protocols} if protocols is not None else {}),
@@ -110,6 +113,8 @@ def _authority_files(
 def _manual_workspace_for_request_check(
     tmp_path: Path,
     *,
+    hostname: str = "example.com",
+    ports: tuple[int, ...] = (443,),
     request_deny: tuple[str, str] | None = None,
     observe_only: bool = False,
     budget_updates: dict[str, int] | None = None,
@@ -117,7 +122,8 @@ def _manual_workspace_for_request_check(
     now = datetime.now(UTC) - timedelta(minutes=1)
     authority_path, key_path = _authority_files(
         tmp_path / "grant",
-        hostnames=("example.com",),
+        hostnames=(hostname,),
+        ports=ports,
         paths=("/api/*",),
         methods=("GET",),
         protocols=("https",),
@@ -152,7 +158,17 @@ def _check_request_arguments(
     hostname = str(values["hostname"])
     port = int(str(values["port"]))
     scheme = str(values["scheme"])
-    host_header = hostname if (scheme, port) in {("https", 443), ("http", 80)} else f"{hostname}:{port}"
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        host_authority = hostname
+    else:
+        host_authority = f"[{address.compressed}]" if address.version == 6 else address.compressed
+    host_header = (
+        host_authority
+        if (scheme, port) in {("https", 443), ("http", 80)}
+        else f"{host_authority}:{port}"
+    )
     prefix = (
         f"{str(values['method']).upper()} {values['path']} HTTP/1.1\r\n"
         f"Host: {host_header}\r\n"
@@ -193,8 +209,9 @@ def _complete_request_arguments(
     observed_response_bytes: str,
     *,
     request_file: Path | None = None,
+    response_file: Path | None = None,
 ) -> list[str]:
-    return [
+    arguments = [
         "scope",
         "complete-request",
         "--workspace",
@@ -205,9 +222,12 @@ def _complete_request_arguments(
         reservation_id,
         "--request-file",
         str(request_file or workspace / "request.raw"),
-        "--observed-response-bytes",
-        observed_response_bytes,
     ]
+    if response_file is None:
+        arguments.extend(("--observed-response-bytes", observed_response_bytes))
+    else:
+        arguments.extend(("--response-file", str(response_file)))
+    return arguments
 
 
 def _module_environment() -> dict[str, str]:
@@ -698,6 +718,53 @@ def test_scope_verify_request_rejects_raw_endpoint_mutations_before_authorizing(
     assert expected_error in captured.err
 
 
+@pytest.mark.parametrize("port", (443, 8443))
+def test_scope_verify_request_serializes_ipv6_host_authority_with_brackets(
+    tmp_path: Path, port: int
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(
+        tmp_path, hostname="::1", ports=(port,)
+    )
+    arguments = _check_request_arguments(
+        workspace,
+        key_path,
+        hostname="::1",
+        port=str(port),
+    )
+
+    assert cli.main(arguments) == cli.EXIT_OK
+
+
+@pytest.mark.parametrize(
+    ("host_header", "expected_error"),
+    (
+        ("::1", "Host header does not match"),
+        ("::1:8443", "Host header does not match"),
+        ("[::2]", "Host header does not match"),
+    ),
+)
+def test_scope_verify_request_rejects_noncanonical_or_unrelated_ipv6_host(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    host_header: str,
+    expected_error: str,
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(
+        tmp_path, hostname="::1", ports=(443, 8443)
+    )
+    capsys.readouterr()
+    arguments = _check_request_arguments(
+        workspace, key_path, hostname="::1", port="8443"
+    )
+    request_path = workspace / "request.raw"
+    request_path.write_bytes(
+        request_path.read_bytes().replace(b"Host: [::1]:8443", f"Host: {host_header}".encode())
+    )
+
+    assert cli.main(arguments) == cli.EXIT_AUTHORITY
+    assert expected_error in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("mutation", ("header", "body"))
 def test_scope_complete_request_rejects_changed_exact_request_digest(
     tmp_path: Path,
@@ -824,6 +891,42 @@ def test_scope_complete_request_binds_local_response_digest_without_network(
     result = json.loads(completed.stdout)
     assert result["observed_response_bytes"] == len(response_path.read_bytes())
     assert result["response_sha256"] == hashlib.sha256(response_path.read_bytes()).hexdigest()
+
+
+def test_scope_complete_request_rejects_response_file_over_reserved_limit(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(
+        tmp_path, budget_updates={"max_response_bytes": 200}
+    )
+    capsys.readouterr()
+    assert cli.main(_check_request_arguments(workspace, key_path)) == cli.EXIT_OK
+    reservation_id = json.loads(capsys.readouterr().out)["reservation_id"]
+    response_path = workspace / "response.raw"
+    response_path.write_bytes(b"x" * 201)
+
+    assert (
+        cli.main(
+            _complete_request_arguments(
+                workspace,
+                key_path,
+                reservation_id,
+                "201",
+                response_file=response_path,
+            )
+        )
+        == cli.EXIT_AUTHORITY
+    )
+    assert "response file exceeds the reserved response limit" in capsys.readouterr().err
+    connection = sqlite3.connect(workspace / cli.REQUEST_ACCOUNTING_FILENAME)
+    try:
+        assert connection.execute(
+            "SELECT completed_at, observed_response_bytes, response_sha256 "
+            "FROM reservations WHERE reservation_id = ?",
+            (reservation_id,),
+        ).fetchone() == (None, None, None)
+    finally:
+        connection.close()
 
 
 def test_manual_workspace_rolls_back_if_accounting_initialization_fails(
