@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -37,6 +38,16 @@ class AutomationCompileDependencies:
         [Path, Path], tuple[dict[str, object], AuthorityGrant, TargetAsset, datetime]
     ]
     capture_file: Callable[[Path], bytes]
+    emit_json: Callable[[object], None]
+
+
+@dataclass(frozen=True, slots=True)
+class AutomationExportHandoffDependencies:
+    verify_workspace: Callable[
+        [Path, Path], tuple[dict[str, object], AuthorityGrant, TargetAsset, datetime]
+    ]
+    capture_file: Callable[[Path], bytes]
+    write_new_file: Callable[[Path, bytes], None]
     emit_json: Callable[[object], None]
 
 
@@ -128,6 +139,109 @@ def _validate_request_binding(
         or request.poc_context.pack_id != manifest.get("pack_id")
     ):
         raise AutomationCompileError("automation PoC context target or pack does not match run.json", authority=True)
+
+
+def _handoff_generation() -> object:
+    """Return the fixed, provider-neutral settings for a manual model handoff."""
+
+    from faultloom.provider import GenerationConfig
+
+    return GenerationConfig(
+        max_output_tokens=1_024,
+        temperature_milli=0,
+        top_p_milli=1_000,
+        seed=0,
+        response_format="json",
+    )
+
+
+def _model_handoff_bytes(request: AutomationRequest) -> bytes:
+    """Build the canonical offline bundle given to an operator-selected model."""
+
+    from faultloom.automation import (
+        ReasoningTurnRequest,
+        build_reasoning_chat_payload,
+        model_turn_function_schema,
+        model_turn_provider_tool_spec,
+        model_turn_schema_digest,
+    )
+    from faultloom.provider import provider_canonical_json_bytes
+
+    context = ReasoningTurnRequest.from_request(request)
+    generation = _handoff_generation()
+    payload = build_reasoning_chat_payload(context, generation=generation)
+    tool = model_turn_provider_tool_spec()
+    document: dict[str, object] = {
+        "messages": [message.as_wire() for message in payload.messages],
+        "function_tool": {
+            "id": tool.tool_id,
+            "name": tool.wire_name,
+            "parameters": model_turn_function_schema(),
+        },
+        "generation": payload.generation.model_dump(mode="json"),
+        "instructions": [
+            "Give this bundle to any model UI, CLI, or official API.",
+            "Save exactly the one function-arguments object as model-turn.json.",
+            "Run faultloom automation compile with this request and model-turn.json.",
+        ],
+        "limits": request.limits.model_dump(mode="json"),
+        "model_provenance": "unattested_manual_handoff",
+        "network_access": "none",
+        "output_schema_digest": model_turn_schema_digest(),
+        "provider_disclosure_verification": "not_performed_by_export",
+        "request_digest": sha256_digest(request.model_dump(mode="json")),
+        "run_id": context.run_id,
+        "schema": "faultloom.model-handoff.v1",
+        "tool_schema_digest": tool.input_schema_digest,
+    }
+    return provider_canonical_json_bytes(document) + b"\n"
+
+
+def export_automation_handoff(
+    arguments: object,
+    *,
+    dependencies: AutomationExportHandoffDependencies,
+) -> int:
+    """Create one offline, provider-neutral model-turn handoff bundle."""
+
+    workspace = getattr(arguments, "workspace")
+    trusted_key = getattr(arguments, "trusted_key")
+    request_path = getattr(arguments, "request")
+    out_path = getattr(arguments, "out")
+    minimum_grant_version = getattr(arguments, "minimum_grant_version")
+    if (
+        not isinstance(workspace, Path)
+        or not isinstance(trusted_key, Path)
+        or not isinstance(request_path, Path)
+        or not isinstance(out_path, Path)
+        or type(minimum_grant_version) is not int
+    ):
+        raise AutomationCompileError("automation export-handoff arguments are invalid", authority=False)
+
+    manifest, grant, target, now = dependencies.verify_workspace(workspace, trusted_key)
+    request = _parse_request(request_path, dependencies.capture_file(request_path))
+    _validate_request_binding(
+        manifest=manifest,
+        grant=grant,
+        target=target,
+        now=now,
+        minimum_grant_version=minimum_grant_version,
+        request=request,
+    )
+    content = _model_handoff_bytes(request)
+    dependencies.write_new_file(out_path, content)
+    dependencies.emit_json(
+        {
+            "automatic_submission": False,
+            "handoff": str(out_path),
+            "independent_verification": False,
+            "network_access": "none",
+            "provider_dispatch": False,
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "target_dispatch": False,
+        }
+    )
+    return 0
 
 
 def compile_automation(

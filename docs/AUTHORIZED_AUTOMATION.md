@@ -106,6 +106,32 @@ request, or submit a report. A model CLI or API adapter that produced the input
 turn remains responsible for its own provider provenance; offline compilation
 does not retroactively attest which model produced the file.
 
+### 5. Provider-neutral manual model handoff
+
+When no configured provider adapter is appropriate, export the same bounded
+prompt and one restricted function contract for a model UI, CLI, or official
+API chosen by the operator:
+
+```text
+faultloom automation export-handoff \
+  --workspace <signed-manual-workspace> \
+  --trusted-key <public-key-outside-workspace> \
+  --request <automation-request.json> \
+  --out <model-handoff.json>
+```
+
+The export repeats the exact workspace, grant, run, target, pack, and request
+binding checks used by `automation compile`, and requires
+`provider_network_access=none`. It creates one private, create-once canonical
+JSON file (mode `0600`) and makes no network, provider, Gateway, target,
+dispatch, submission, or verification call. The bundle is deliberately marked
+`unattested_manual_handoff`: it contains no credentials, cookies, or endpoints,
+and export does not verify provider disclosure or attest what model will use it.
+
+Give the bundle to the selected model, save exactly its one function-arguments
+object as `model-turn.json`, then run the existing `automation compile` command.
+The resulting artifact remains a candidate requiring independent verification.
+
 ## Optional authorized target dispatch
 
 Dispatch is a separate, explicit operator/controller step. It does not happen

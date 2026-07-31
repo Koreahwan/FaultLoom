@@ -188,7 +188,25 @@ The Markdown file in `findings\` is a draft. Reproduce the issue, remove
 secrets, match the program's severity rubric, and submit it yourself through
 the customer's or bounty program's official channel.
 
-## 9. Optional offline model-turn compilation
+## 9. Optional offline model-turn handoff and compilation
+
+To prepare an offline prompt for a model UI, local CLI, or official API without
+configuring a FaultLoom provider, export a private handoff from the exact signed
+request:
+
+```powershell
+& $FaultLoom automation export-handoff `
+  --workspace "$Job\run-01" `
+  --trusted-key "$Root\authority\authority-public-key.json" `
+  --request 'C:\path\to\automation-request.json' `
+  --out 'C:\path\to\model-handoff.json'
+```
+
+The export requires `provider_network_access=none`; it creates the handoff once
+with private permissions and does not contact a provider, Burp, a Gateway, or a
+target. Give that file to the chosen model and save exactly one returned
+function-arguments object as `model-turn.json`. The handoff contains no
+credentials, cookies, or endpoint, and does not attest the model or provider.
 
 If Codex or another model client has already produced an exact FaultLoom
 `AutomationRequest` and structured `ModelTurn` JSON file, compile them inside

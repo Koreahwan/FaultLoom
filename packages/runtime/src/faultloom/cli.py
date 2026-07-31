@@ -48,7 +48,9 @@ from .adapter_cli import configure_adapter_parser
 from .automation_cli import (
     AutomationCompileDependencies,
     AutomationCompileError,
+    AutomationExportHandoffDependencies,
     compile_automation,
+    export_automation_handoff,
 )
 from .verification_cli import (
     VerificationCliDependencies,
@@ -1850,6 +1852,26 @@ def _automation_compile(arguments: argparse.Namespace) -> int:
         ) from exc
 
 
+def _automation_export_handoff(arguments: argparse.Namespace) -> int:
+    try:
+        return export_automation_handoff(
+            arguments,
+            dependencies=AutomationExportHandoffDependencies(
+                verify_workspace=_verified_request_workspace,
+                capture_file=_capture_single_protocol_file,
+                write_new_file=lambda path, content: _write_new_file(
+                    path, content, mode=0o600
+                ),
+                emit_json=_emit_json,
+            ),
+        )
+    except AutomationCompileError as exc:
+        raise CliError(
+            str(exc),
+            exit_code=EXIT_AUTHORITY if exc.authority else EXIT_USAGE,
+        ) from exc
+
+
 def _request_accounting_connection(workspace: Path) -> sqlite3.Connection:
     path = workspace / REQUEST_ACCOUNTING_FILENAME
     try:
@@ -2840,6 +2862,18 @@ def build_parser() -> argparse.ArgumentParser:
     automation_compile.add_argument("--request", type=Path, required=True)
     automation_compile.add_argument("--model-turn", type=Path, required=True)
     automation_compile.set_defaults(handler=_automation_compile)
+    automation_export_handoff = automation_commands.add_parser(
+        "export-handoff",
+        help="export an offline provider-neutral model-turn handoff",
+    )
+    automation_export_handoff.add_argument("--workspace", type=Path, required=True)
+    automation_export_handoff.add_argument("--trusted-key", type=Path, required=True)
+    automation_export_handoff.add_argument(
+        "--minimum-grant-version", type=_positive_int, default=1
+    )
+    automation_export_handoff.add_argument("--request", type=Path, required=True)
+    automation_export_handoff.add_argument("--out", type=Path, required=True)
+    automation_export_handoff.set_defaults(handler=_automation_export_handoff)
 
     resume = commands.add_parser("resume", help="resume a durable run")
     _configure_resume_command(resume, operation_name="resume")

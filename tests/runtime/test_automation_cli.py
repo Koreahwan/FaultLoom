@@ -18,6 +18,7 @@ from faultloom.automation import (
     ObservationExcerpt,
     sign_model_disclosure_approval,
 )
+from faultloom.provider import provider_canonical_json_bytes
 from faultloom_protocol import AuthorityGrant, AuthoritySigner, sign_authority_grant, sha256_digest
 from faultloom.tool_planner import PlanningBudget
 from tests.protocol.factories import NOW, sample_models
@@ -212,6 +213,21 @@ def _compile_arguments(workspace: Path, trusted_key: Path, request: Path, turn: 
     ]
 
 
+def _export_arguments(workspace: Path, trusted_key: Path, request: Path, out: Path) -> list[str]:
+    return [
+        "automation",
+        "export-handoff",
+        "--workspace",
+        str(workspace),
+        "--trusted-key",
+        str(trusted_key),
+        "--request",
+        str(request),
+        "--out",
+        str(out),
+    ]
+
+
 def test_automation_compile_publishes_scrubbed_offline_candidate_bundle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -385,3 +401,166 @@ def test_automation_compile_rejects_authority_binding_failures(
     )
     assert "Traceback" not in capsys.readouterr().err
     assert not (workspace / "automation").exists()
+
+
+def test_automation_export_handoff_is_canonical_offline_and_compilable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    workspace, trusted_key, grant = _workspace(tmp_path, monkeypatch)
+    request = _request(workspace, grant)
+    request_path = tmp_path / "request.json"
+    out_path = tmp_path / "model-handoff.json"
+    second_out_path = tmp_path / "model-handoff-copy.json"
+    request_path.write_text(request.model_dump_json(), encoding="utf-8")
+
+    def reject_network(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("automation export-handoff opened a network socket")
+
+    def reject_provider_or_gateway(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("automation export-handoff used provider or gateway execution")
+
+    import faultloom.automation.execution_bridge as execution_bridge
+    import faultloom.automation.provider_runner as provider_runner
+
+    monkeypatch.setattr(socket, "socket", reject_network)
+    monkeypatch.setattr(
+        provider_runner, "run_provider_automation_turn", reject_provider_or_gateway
+    )
+    monkeypatch.setattr(
+        execution_bridge, "execute_admitted_tool_plan", reject_provider_or_gateway
+    )
+    assert cli.main(_export_arguments(workspace, trusted_key, request_path, out_path)) == 0
+    receipt = json.loads(capsys.readouterr().out.splitlines()[-1])
+    content = out_path.read_bytes()
+    document = json.loads(content)
+    assert content == provider_canonical_json_bytes(document) + b"\n"
+    assert receipt == {
+        "automatic_submission": False,
+        "handoff": str(out_path),
+        "independent_verification": False,
+        "network_access": "none",
+        "provider_dispatch": False,
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "target_dispatch": False,
+    }
+    assert stat.S_IMODE(out_path.stat().st_mode) == 0o600
+    assert document["schema"] == "faultloom.model-handoff.v1"
+    assert document["run_id"] == request.observations.run_id
+    assert document["request_digest"] == sha256_digest(request.model_dump(mode="json"))
+    assert document["model_provenance"] == "unattested_manual_handoff"
+    assert document["provider_disclosure_verification"] == "not_performed_by_export"
+    assert document["network_access"] == "none"
+    assert document["generation"] == {
+        "max_output_tokens": 1024,
+        "response_format": "json",
+        "seed": 0,
+        "schema_version": "0.1.0",
+        "temperature_milli": 0,
+        "top_p_milli": 1000,
+    }
+    tool = document["function_tool"]
+    assert tool["id"] == "faultloom-model-turn-v1"
+    assert tool["name"] == "faultloom-model-turn-v1"
+    assert document["tool_schema_digest"] == sha256_digest(tool["parameters"])
+    assert document["output_schema_digest"] != document["tool_schema_digest"]
+    assert document["limits"] == request.limits.model_dump(mode="json")
+    assert document["messages"][0]["role"] == "system"
+    assert all("provider.test" not in message["content"] for message in document["messages"])
+
+    assert (
+        cli.main(_export_arguments(workspace, trusted_key, request_path, second_out_path))
+        == 0
+    )
+    assert second_out_path.read_bytes() == content
+    _ = capsys.readouterr()
+
+    turn_path = tmp_path / "model-turn.json"
+    turn_path.write_bytes(_turn(request))
+    assert cli.main(_compile_arguments(workspace, trusted_key, request_path, turn_path)) == 0
+    compile_receipt = json.loads(capsys.readouterr().out.splitlines()[-1])
+    result = json.loads(Path(compile_receipt["result"]).read_text(encoding="utf-8"))
+    assert result["verification_status"] == "candidate_only_requires_independent_verification"
+    assert result["target_dispatch_performed"] is False
+    assert result["automatic_submission_performed"] is False
+
+
+def test_automation_export_handoff_is_create_once_and_refuses_symlink_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    workspace, trusted_key, grant = _workspace(tmp_path, monkeypatch)
+    request_path = tmp_path / "request.json"
+    request_path.write_text(_request(workspace, grant).model_dump_json(), encoding="utf-8")
+    out_path = tmp_path / "model-handoff.json"
+    arguments = _export_arguments(workspace, trusted_key, request_path, out_path)
+    assert cli.main(arguments) == 0
+    original = out_path.read_bytes()
+    _ = capsys.readouterr()
+    assert cli.main(arguments) == cli.EXIT_USAGE
+    assert out_path.read_bytes() == original
+    assert "cannot create" in capsys.readouterr().err
+
+    external = tmp_path / "external.json"
+    external.write_text("external", encoding="utf-8")
+    symlink_out = tmp_path / "symlink-handoff.json"
+    symlink_out.symlink_to(external)
+    assert (
+        cli.main(_export_arguments(workspace, trusted_key, request_path, symlink_out))
+        == cli.EXIT_USAGE
+    )
+    assert external.read_text(encoding="utf-8") == "external"
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_exit"),
+    (
+        (b"not-json", cli.EXIT_USAGE),
+        (b'{"request":1,"request":2}', cli.EXIT_USAGE),
+        (b"[" * 129 + b"0" + b"]" * 129, cli.EXIT_USAGE),
+        (b" " * (cli.MAX_PROTOCOL_FILE_BYTES + 1), cli.EXIT_AUTHORITY),
+    ),
+)
+def test_automation_export_handoff_rejects_malformed_duplicate_deep_or_oversized_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    content: bytes,
+    expected_exit: int,
+) -> None:
+    workspace, trusted_key, _grant = _workspace(tmp_path, monkeypatch)
+    request_path = tmp_path / "request.json"
+    out_path = tmp_path / "model-handoff.json"
+    request_path.write_bytes(content)
+    assert cli.main(_export_arguments(workspace, trusted_key, request_path, out_path)) == expected_exit
+    assert not out_path.exists()
+    assert "Traceback" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("failure", ("provider_only", "workspace_drift"))
+def test_automation_export_handoff_rejects_provider_or_workspace_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure: str,
+) -> None:
+    workspace, trusted_key, grant = _workspace(tmp_path, monkeypatch)
+    request = _request(workspace, grant)
+    if failure == "provider_only":
+        request = request.model_copy(update={"provider_network_access": "provider_only"})
+    else:
+        manifest_path = workspace / "run.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["run_id"] = "run.workspace-drift"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    request_path = tmp_path / "request.json"
+    out_path = tmp_path / "model-handoff.json"
+    request_path.write_text(request.model_dump_json(), encoding="utf-8")
+    assert (
+        cli.main(_export_arguments(workspace, trusted_key, request_path, out_path))
+        == cli.EXIT_AUTHORITY
+    )
+    assert not out_path.exists()
+    assert "Traceback" not in capsys.readouterr().err

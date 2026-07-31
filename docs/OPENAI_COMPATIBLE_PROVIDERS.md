@@ -81,3 +81,14 @@ and data references, signed proxy attestation, and token/cost/byte budgets.
 A subscription-only service needs an official API, OAuth, CLI, or SDK adapter
 behind `ProviderProxyPort`; consumer cookies and browser sessions are not API
 credentials and are not used.
+
+## Offline manual handoff
+
+`faultloom automation export-handoff` is outside this provider transport. It
+renders the canonical bounded messages and one restricted function schema for
+manual use with any model UI, CLI, or official API, but opens no provider
+connection and supplies no endpoint, credential, or cookie. Its bundle is
+explicitly `unattested_manual_handoff`; it neither verifies provider disclosure
+nor claims provider/model attestation. The operator saves the returned single
+function-arguments object and submits it to the separate offline
+`faultloom automation compile` command, which remains candidate-only.
