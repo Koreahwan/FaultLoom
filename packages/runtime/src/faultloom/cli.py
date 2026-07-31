@@ -1443,16 +1443,52 @@ def _workspace_evidence(
     return [records[evidence_id] for evidence_id in wanted]
 
 
-def _exchange_evidence_component_line(component: object, *, label: str) -> str:
+def _is_lower_hex(value: str, *, length: int) -> bool:
+    return len(value) == length and all(
+        character in "0123456789abcdef" for character in value
+    )
+
+
+def _is_exchange_stored_filename(value: object, *, component_name: str) -> bool:
+    if not isinstance(value, str) or not value.isascii():
+        return False
+    parts = value.split(".")
+    if len(parts) != 6:
+        return False
+    _, timestamp, token, component, data, extension = parts
+    return (
+        parts[0] == "evidence"
+        and len(timestamp) == 16
+        and timestamp[:8].isdigit()
+        and timestamp[8] == "T"
+        and timestamp[9:15].isdigit()
+        and timestamp[15] == "Z"
+        and _is_lower_hex(token, length=8)
+        and component == component_name
+        and data == "data"
+        and 1 <= len(extension) <= 9
+        and all(character in "abcdefghijklmnopqrstuvwxyz0123456789" for character in extension)
+    )
+
+
+def _is_reservation_id(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith("reservation.")
+        and _is_lower_hex(value.removeprefix("reservation."), length=32)
+    )
+
+
+def _exchange_evidence_component_line(
+    component: object, *, component_name: str
+) -> str:
     if not isinstance(component, dict):
         raise CliError("invalid archived exchange evidence summary", exit_code=EXIT_USAGE)
     stored_file = component.get("stored_file")
     size_bytes = component.get("size_bytes")
     sha256 = component.get("sha256")
     if (
-        not isinstance(stored_file, str)
-        or not stored_file
-        or stored_file != Path(stored_file).name
+        not _is_exchange_stored_filename(stored_file, component_name=component_name)
         or type(size_bytes) is not int
         or size_bytes < 0
         or not isinstance(sha256, str)
@@ -1461,7 +1497,8 @@ def _exchange_evidence_component_line(component: object, *, label: str) -> str:
     ):
         raise CliError("invalid archived exchange evidence summary", exit_code=EXIT_USAGE)
     return (
-        f"  - {label}: `{stored_file}` — {size_bytes} bytes — SHA-256 `{sha256}`"
+        f"  - {component_name.title()}: `{stored_file}` — {size_bytes} bytes "
+        f"— SHA-256 `{sha256}`"
     )
 
 
@@ -1476,7 +1513,7 @@ def _finding_evidence_lines(item: dict[str, object]) -> list[str]:
                 stored_file=item.get("stored_file", "unknown"),
             )
         ]
-    if not isinstance(item.get("reservation_id"), str):
+    if not _is_reservation_id(item.get("reservation_id")):
         raise CliError("invalid archived exchange evidence summary", exit_code=EXIT_USAGE)
     return [
         "- `{evidence_id}` — {kind} exchange — reservation `{reservation_id}`".format(
@@ -1484,8 +1521,8 @@ def _finding_evidence_lines(item: dict[str, object]) -> list[str]:
             kind=item.get("kind", "other"),
             reservation_id=item["reservation_id"],
         ),
-        _exchange_evidence_component_line(item.get("request"), label="Request"),
-        _exchange_evidence_component_line(item.get("response"), label="Response"),
+        _exchange_evidence_component_line(item.get("request"), component_name="request"),
+        _exchange_evidence_component_line(item.get("response"), component_name="response"),
     ]
 
 

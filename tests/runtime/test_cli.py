@@ -1587,8 +1587,52 @@ def test_manual_evidence_add_exchange_archives_completed_pair_and_finding_select
         assert str(component["size_bytes"]) in report
         assert component["sha256"] in report
 
-    record["response"]["sha256"] = "not-a-digest"
-    Path(result["record"]).write_text(json.dumps(record), encoding="utf-8")
+    malformed = json.loads(json.dumps(record))
+    malformed["response"]["sha256"] = "not-a-digest"
+    Path(result["record"]).write_text(json.dumps(malformed), encoding="utf-8")
+    assert cli.main(
+        [
+            "finding",
+            "new",
+            "--workspace",
+            str(workspace),
+            "--title",
+            "Malformed exchange",
+            "--severity",
+            "low",
+            "--evidence",
+            result["evidence_id"],
+        ]
+    ) == cli.EXIT_USAGE
+    assert "invalid archived exchange evidence summary" in capsys.readouterr().err
+
+    for component_name, stored_file in (
+        ("request", ".."),
+        ("response", record["response"]["stored_file"] + "\n"),
+        ("response", record["response"]["stored_file"] + "`"),
+    ):
+        malformed = json.loads(json.dumps(record))
+        malformed[component_name]["stored_file"] = stored_file
+        Path(result["record"]).write_text(json.dumps(malformed), encoding="utf-8")
+        assert cli.main(
+            [
+                "finding",
+                "new",
+                "--workspace",
+                str(workspace),
+                "--title",
+                "Malformed exchange",
+                "--severity",
+                "low",
+                "--evidence",
+                result["evidence_id"],
+            ]
+        ) == cli.EXIT_USAGE
+        assert "invalid archived exchange evidence summary" in capsys.readouterr().err
+
+    malformed = json.loads(json.dumps(record))
+    malformed["reservation_id"] = "reservation." + "0" * 31 + "`"
+    Path(result["record"]).write_text(json.dumps(malformed), encoding="utf-8")
     assert cli.main(
         [
             "finding",
