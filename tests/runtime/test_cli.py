@@ -230,6 +230,29 @@ def _complete_request_arguments(
     return arguments
 
 
+def _add_exchange_arguments(
+    workspace: Path,
+    trusted_key: Path,
+    reservation_id: str,
+    request_file: Path,
+    response_file: Path,
+) -> list[str]:
+    return [
+        "evidence",
+        "add-exchange",
+        "--workspace",
+        str(workspace),
+        "--trusted-key",
+        str(trusted_key),
+        "--reservation-id",
+        reservation_id,
+        "--request-file",
+        str(request_file),
+        "--response-file",
+        str(response_file),
+    ]
+
+
 def _module_environment() -> dict[str, str]:
     environment = os.environ.copy()
     existing = environment.get("PYTHONPATH")
@@ -1495,6 +1518,282 @@ def test_manual_evidence_add_streams_file_and_records_digest(
     assert result["evidence_id"] in report
     assert record["sha256"] in report
     assert "example.com" in report
+
+
+def test_manual_evidence_add_exchange_archives_completed_pair_and_finding_selects_it(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(tmp_path)
+    capsys.readouterr()
+    verified = _run_module(
+        _check_request_arguments(workspace, key_path), reject_sockets=True
+    )
+    assert verified.returncode == cli.EXIT_OK
+    reservation_id = json.loads(verified.stdout)["reservation_id"]
+    request_path = workspace / "request.raw"
+    response_path = workspace / "response.raw"
+    response_path.write_bytes(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+    completed = _run_module(
+        _complete_request_arguments(
+            workspace,
+            key_path,
+            reservation_id,
+            str(len(response_path.read_bytes())),
+            request_file=request_path,
+            response_file=response_path,
+        ),
+        reject_sockets=True,
+    )
+    assert completed.returncode == cli.EXIT_OK
+
+    archived = _run_module(
+        _add_exchange_arguments(
+            workspace, key_path, reservation_id, request_path, response_path
+        ),
+        reject_sockets=True,
+    )
+    assert archived.returncode == cli.EXIT_OK
+    result = json.loads(archived.stdout)
+    record = json.loads(Path(result["record"]).read_text(encoding="utf-8"))
+    assert Path(result["request_stored_file"]).read_bytes() == request_path.read_bytes()
+    assert Path(result["response_stored_file"]).read_bytes() == response_path.read_bytes()
+    assert record["schema"] == "faultloom.manual-evidence.v1"
+    assert record["reservation_id"] == reservation_id
+    assert record["request"]["sha256"] == hashlib.sha256(request_path.read_bytes()).hexdigest()
+    assert record["response"]["sha256"] == hashlib.sha256(response_path.read_bytes()).hexdigest()
+    assert record["request"]["size_bytes"] == len(request_path.read_bytes())
+    assert record["response"]["size_bytes"] == len(response_path.read_bytes())
+
+    assert cli.main(
+        [
+            "finding",
+            "new",
+            "--workspace",
+            str(workspace),
+            "--title",
+            "Archived exchange",
+            "--severity",
+            "low",
+            "--evidence",
+            result["evidence_id"],
+        ]
+    ) == cli.EXIT_OK
+    assert result["evidence_id"] in Path(
+        json.loads(capsys.readouterr().out)["finding"]
+    ).read_text(encoding="utf-8")
+
+
+def test_manual_evidence_add_exchange_allows_post_window_archival(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    authority_path, key_path = _authority_files(
+        tmp_path / "grant",
+        hostnames=("example.com",),
+        ports=(443,),
+        paths=("/api/*",),
+        methods=("GET",),
+        protocols=("https",),
+        now=NOW,
+    )
+    workspace = tmp_path / "manual-run"
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW)
+    assert (
+        cli.main(_run_arguments(authority_path, key_path) + ["--workspace", str(workspace)])
+        == cli.EXIT_OK
+    )
+    capsys.readouterr()
+    assert cli.main(_check_request_arguments(workspace, key_path)) == cli.EXIT_OK
+    reservation_id = json.loads(capsys.readouterr().out)["reservation_id"]
+    request_path = workspace / "request.raw"
+    response_path = workspace / "response.raw"
+    response_path.write_bytes(b"recorded response")
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW + timedelta(minutes=1))
+    assert cli.main(
+        _complete_request_arguments(
+            workspace,
+            key_path,
+            reservation_id,
+            str(len(response_path.read_bytes())),
+            response_file=response_path,
+        )
+    ) == cli.EXIT_OK
+    capsys.readouterr()
+
+    monkeypatch.setattr(cli, "_utc_now", lambda: NOW + timedelta(hours=3))
+    assert cli.main(
+        _add_exchange_arguments(
+            workspace, key_path, reservation_id, request_path, response_path
+        )
+    ) == cli.EXIT_OK
+
+
+def test_manual_evidence_add_exchange_cleans_partial_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(tmp_path)
+    request_path = workspace / "request.raw"
+    response_path = workspace / "response.raw"
+    response_path.write_bytes(b"recorded response")
+    capsys.readouterr()
+    assert cli.main(_check_request_arguments(workspace, key_path)) == cli.EXIT_OK
+    reservation_id = json.loads(capsys.readouterr().out)["reservation_id"]
+    assert cli.main(
+        _complete_request_arguments(
+            workspace,
+            key_path,
+            reservation_id,
+            str(len(response_path.read_bytes())),
+            response_file=response_path,
+        )
+    ) == cli.EXIT_OK
+    capsys.readouterr()
+    original_write = cli._write_new_file
+
+    def fail_record_write(path: Path, content: bytes, *, mode: int) -> None:
+        if path.suffix == ".json":
+            raise cli.CliError("injected record failure", exit_code=cli.EXIT_USAGE)
+        original_write(path, content, mode=mode)
+
+    monkeypatch.setattr(cli, "_write_new_file", fail_record_write)
+    assert cli.main(
+        _add_exchange_arguments(
+            workspace, key_path, reservation_id, request_path, response_path
+        )
+    ) == cli.EXIT_USAGE
+    assert list((workspace / "evidence" / "raw").glob("evidence.*")) == []
+    assert "injected record failure" in capsys.readouterr().err
+
+
+def test_manual_evidence_add_exchange_rejects_unknown_or_incomplete_reservation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(tmp_path)
+    request_path = workspace / "request.raw"
+    response_path = workspace / "response.raw"
+    response_path.write_bytes(b"response")
+    capsys.readouterr()
+
+    assert cli.main(
+        _add_exchange_arguments(
+            workspace, key_path, "reservation.unknown", request_path, response_path
+        )
+    ) == cli.EXIT_AUTHORITY
+    assert "unknown request reservation" in capsys.readouterr().err
+
+    assert cli.main(_check_request_arguments(workspace, key_path)) == cli.EXIT_OK
+    reservation_id = json.loads(capsys.readouterr().out)["reservation_id"]
+    assert cli.main(
+        _add_exchange_arguments(
+            workspace, key_path, reservation_id, request_path, response_path
+        )
+    ) == cli.EXIT_AUTHORITY
+    assert "reservation is not complete" in capsys.readouterr().err
+
+
+def test_manual_evidence_add_exchange_rejects_count_only_completion(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(tmp_path)
+    request_path = workspace / "request.raw"
+    response_path = workspace / "response.raw"
+    response_path.write_bytes(b"response")
+    capsys.readouterr()
+    assert cli.main(_check_request_arguments(workspace, key_path)) == cli.EXIT_OK
+    reservation_id = json.loads(capsys.readouterr().out)["reservation_id"]
+    assert cli.main(
+        _complete_request_arguments(workspace, key_path, reservation_id, "8")
+    ) == cli.EXIT_OK
+    capsys.readouterr()
+
+    assert cli.main(
+        _add_exchange_arguments(
+            workspace, key_path, reservation_id, request_path, response_path
+        )
+    ) == cli.EXIT_AUTHORITY
+    assert "without an exact response file" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("changed", "expected_error"),
+    (("request", "request file digest"), ("response", "response file size")),
+)
+def test_manual_evidence_add_exchange_rejects_changed_files(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    changed: str,
+    expected_error: str,
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(tmp_path)
+    request_path = workspace / "request.raw"
+    response_path = workspace / "response.raw"
+    response_path.write_bytes(b"original response")
+    capsys.readouterr()
+    assert cli.main(_check_request_arguments(workspace, key_path)) == cli.EXIT_OK
+    reservation_id = json.loads(capsys.readouterr().out)["reservation_id"]
+    assert cli.main(
+        _complete_request_arguments(
+            workspace,
+            key_path,
+            reservation_id,
+            str(len(response_path.read_bytes())),
+            response_file=response_path,
+        )
+    ) == cli.EXIT_OK
+    capsys.readouterr()
+    if changed == "request":
+        request_path.write_bytes(request_path.read_bytes().replace(b"Pad: a", b"Pad: b"))
+    else:
+        response_path.write_bytes(b"short")
+
+    assert cli.main(
+        _add_exchange_arguments(
+            workspace, key_path, reservation_id, request_path, response_path
+        )
+    ) == cli.EXIT_AUTHORITY
+    assert expected_error in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("source", ("request", "response"))
+def test_manual_evidence_add_exchange_rejects_symlink_input(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    source: str,
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(tmp_path)
+    request_path = workspace / "request.raw"
+    response_path = workspace / "response.raw"
+    response_path.write_bytes(b"original response")
+    capsys.readouterr()
+    assert cli.main(_check_request_arguments(workspace, key_path)) == cli.EXIT_OK
+    reservation_id = json.loads(capsys.readouterr().out)["reservation_id"]
+    assert cli.main(
+        _complete_request_arguments(
+            workspace,
+            key_path,
+            reservation_id,
+            str(len(response_path.read_bytes())),
+            response_file=response_path,
+        )
+    ) == cli.EXIT_OK
+    capsys.readouterr()
+    linked = tmp_path / f"{source}-link.raw"
+    linked.symlink_to(request_path if source == "request" else response_path)
+
+    assert cli.main(
+        _add_exchange_arguments(
+            workspace,
+            key_path,
+            reservation_id,
+            linked if source == "request" else request_path,
+            linked if source == "response" else response_path,
+        )
+    ) == cli.EXIT_AUTHORITY
+    assert "regular non-symlink" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(

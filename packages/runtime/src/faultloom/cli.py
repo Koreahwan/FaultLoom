@@ -723,6 +723,10 @@ def _write_new_file(path: Path, content: bytes, *, mode: int) -> None:
     try:
         os.chmod(path, mode)
     except OSError as exc:
+        try:
+            path.unlink()
+        except OSError:
+            pass
         raise CliError(f"cannot set permissions on {path}: {exc}", exit_code=EXIT_USAGE) from exc
 
 
@@ -1231,6 +1235,158 @@ def _evidence_add(arguments: argparse.Namespace) -> int:
             "record": str(record_path),
             "sha256": record["sha256"],
             "stored_file": str(destination),
+        }
+    )
+    return EXIT_OK
+
+
+def _evidence_file_suffix(source: Path) -> str:
+    suffix = source.suffix.lower()
+    if (
+        1 < len(suffix) <= 10
+        and suffix.startswith(".")
+        and suffix[1:].isalnum()
+        and suffix.isascii()
+    ):
+        return suffix
+    return ".bin"
+
+
+def _evidence_add_exchange(arguments: argparse.Namespace) -> int:
+    """Archive one completed, digest-bound manual request/response exchange."""
+    manifest, _, _, _ = _verified_request_workspace(
+        arguments.workspace, _trusted_key_path(arguments), require_active=False
+    )
+    connection = _request_accounting_connection(arguments.workspace)
+    try:
+        _prepare_request_accounting(connection, manifest)
+        row = connection.execute(
+            """SELECT request_bytes, request_sha256, observed_response_bytes,
+                      response_sha256, completed_at
+               FROM reservations WHERE reservation_id = ?""",
+            (arguments.reservation_id,),
+        ).fetchone()
+    except CliError:
+        connection.rollback()
+        raise
+    except sqlite3.Error as exc:
+        connection.rollback()
+        raise CliError(
+            f"cannot read request reservation: {exc}", exit_code=EXIT_AUTHORITY
+        ) from exc
+    finally:
+        connection.close()
+
+    if row is None:
+        raise CliError("unknown request reservation", exit_code=EXIT_AUTHORITY)
+    request_bytes, request_sha256, response_bytes, response_sha256, completed_at = row
+    if completed_at is None:
+        raise CliError("request reservation is not complete", exit_code=EXIT_AUTHORITY)
+    if not isinstance(response_sha256, str):
+        raise CliError(
+            "request reservation was completed without an exact response file",
+            exit_code=EXIT_AUTHORITY,
+        )
+    if (
+        not isinstance(request_sha256, str)
+        or len(request_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in request_sha256)
+        or not isinstance(request_bytes, int)
+        or request_bytes < 0
+    ):
+        raise CliError("request reservation is invalid", exit_code=EXIT_AUTHORITY)
+    if (
+        len(response_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in response_sha256)
+        or not isinstance(response_bytes, int)
+        or response_bytes < 0
+    ):
+        raise CliError("request reservation response is invalid", exit_code=EXIT_AUTHORITY)
+
+    request_content = _capture_bounded_local_file(
+        arguments.request_file, maximum_bytes=request_bytes, label="request"
+    )
+    response_content = _capture_bounded_local_file(
+        arguments.response_file, maximum_bytes=response_bytes, label="response"
+    )
+    if len(request_content) != request_bytes:
+        raise CliError(
+            "request file size does not match the reservation", exit_code=EXIT_AUTHORITY
+        )
+    if len(response_content) != response_bytes:
+        raise CliError(
+            "response file size does not match the reservation", exit_code=EXIT_AUTHORITY
+        )
+    if hashlib.sha256(request_content).hexdigest() != request_sha256:
+        raise CliError(
+            "request file digest does not match the reservation", exit_code=EXIT_AUTHORITY
+        )
+    if hashlib.sha256(response_content).hexdigest() != response_sha256:
+        raise CliError(
+            "response file digest does not match the reservation", exit_code=EXIT_AUTHORITY
+        )
+
+    now = _utc_now()
+    evidence_id = f"evidence.{now:%Y%m%dT%H%M%SZ}.{secrets.token_hex(4)}"
+    raw_directory = arguments.workspace / "evidence" / "raw"
+    request_destination = raw_directory / (
+        f"{evidence_id}.request.data{_evidence_file_suffix(arguments.request_file)}"
+    )
+    response_destination = raw_directory / (
+        f"{evidence_id}.response.data{_evidence_file_suffix(arguments.response_file)}"
+    )
+    record_path = raw_directory / f"{evidence_id}.json"
+    record = {
+        "schema": "faultloom.manual-evidence.v1",
+        "evidence_id": evidence_id,
+        "run_id": manifest["run_id"],
+        "created_at": now.isoformat().replace("+00:00", "Z"),
+        "kind": "http",
+        "title": arguments.title or "Completed reserved request/response exchange",
+        "reservation_id": arguments.reservation_id,
+        # Keep these summary fields so existing finding new output remains useful.
+        "original_name": arguments.request_file.name,
+        "stored_file": request_destination.name,
+        "size_bytes": len(request_content),
+        "sha256": request_sha256,
+        "request": {
+            "original_name": arguments.request_file.name,
+            "stored_file": request_destination.name,
+            "size_bytes": len(request_content),
+            "sha256": request_sha256,
+        },
+        "response": {
+            "original_name": arguments.response_file.name,
+            "stored_file": response_destination.name,
+            "size_bytes": len(response_content),
+            "sha256": response_sha256,
+        },
+    }
+    created_paths: list[Path] = []
+    try:
+        _write_new_file(request_destination, request_content, mode=0o600)
+        created_paths.append(request_destination)
+        _write_new_file(response_destination, response_content, mode=0o600)
+        created_paths.append(response_destination)
+        _write_new_file(
+            record_path,
+            (json.dumps(record, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+            mode=0o600,
+        )
+        created_paths.append(record_path)
+    except CliError:
+        for path in reversed(created_paths):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        raise
+    _emit_json(
+        {
+            "evidence_id": evidence_id,
+            "record": str(record_path),
+            "request_stored_file": str(request_destination),
+            "response_stored_file": str(response_destination),
         }
     )
     return EXIT_OK
@@ -2638,6 +2794,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     evidence_add.add_argument("--title")
     evidence_add.set_defaults(handler=_evidence_add)
+    evidence_add_exchange = evidence_commands.add_parser(
+        "add-exchange",
+        help="archive one completed request/response reservation as evidence",
+    )
+    evidence_add_exchange.add_argument("--workspace", type=Path, required=True)
+    evidence_add_exchange.add_argument("--trusted-key", type=Path)
+    evidence_add_exchange.add_argument("--reservation-id", required=True)
+    evidence_add_exchange.add_argument("--request-file", type=Path, required=True)
+    evidence_add_exchange.add_argument("--response-file", type=Path, required=True)
+    evidence_add_exchange.add_argument("--title")
+    evidence_add_exchange.set_defaults(handler=_evidence_add_exchange)
 
     finding = commands.add_parser("finding", help="prepare manual finding drafts")
     finding_commands = finding.add_subparsers(dest="finding_command", required=True)

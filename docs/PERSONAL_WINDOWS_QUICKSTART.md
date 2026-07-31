@@ -131,7 +131,28 @@ This accounting begins with RC6. A workspace created by RC5 predates it and
 must not be reused: create a fresh signed run workspace instead. There is
 intentionally no reset or migration command.
 
-## 6. Add exported evidence
+## 6. Archive the completed request/response exchange
+
+When `scope complete-request` used `--response-file`, preserve that exact
+request and response pair with the completed reservation:
+
+```powershell
+& $FaultLoom evidence add-exchange `
+  --workspace "$Job\run-01" `
+  --trusted-key "$Root\authority\authority-public-key.json" `
+  --reservation-id 'reservation.from-verify-request' `
+  --request-file 'C:\path\to\burp-request.raw' `
+  --response-file 'C:\path\to\burp-response.raw'
+```
+
+This is offline archival only. It re-verifies the signed workspace (including
+after the execution window for archival), reloads the completed reservation,
+and requires the exact stored request and response SHA-256 values and lengths.
+It rejects symlinks, changed files, incomplete or count-only completions, then
+copies both files to `evidence\raw` and writes one evidence record. It does not
+send a request, invoke Burp, verify a finding, or invent a vulnerability.
+
+## 7. Add other exported evidence
 
 Export requests/responses, notes, or screenshots from your tool, then record
 each file:
@@ -148,7 +169,7 @@ Evidence is copied into `evidence\raw` with a SHA-256 sidecar. Review exports
 for passwords, cookies, tokens, API keys, and unnecessary personal data before
 sharing them.
 
-## 7. Create a submission draft
+## 8. Create a submission draft
 
 Put exact reproduction steps in a UTF-8 text file, then run:
 
@@ -167,7 +188,7 @@ The Markdown file in `findings\` is a draft. Reproduce the issue, remove
 secrets, match the program's severity rubric, and submit it yourself through
 the customer's or bounty program's official channel.
 
-## 8. Optional offline model-turn compilation
+## 9. Optional offline model-turn compilation
 
 If Codex or another model client has already produced an exact FaultLoom
 `AutomationRequest` and structured `ModelTurn` JSON file, compile them inside

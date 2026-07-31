@@ -166,6 +166,18 @@ socket, invokes Burp, or prints request/response contents. This is an
 owner-local preflight and audit guard, not an enforcement hook inside Burp
 itself.
 
+`faultloom evidence add-exchange --workspace <run> --trusted-key <public-key>
+--reservation-id <id> --request-file <request.raw> --response-file
+<response.raw>` is the separate offline archival handoff. It re-verifies the
+signed workspace even after its execution window has closed, reloads the
+completed SQLite reservation, and accepts only the exact request and response
+files whose sizes and SHA-256 values match the recorded completion. It rejects
+symlinks, unknown or incomplete reservations, and count-only completions. It
+then creates immutable request/response copies plus a
+`faultloom.manual-evidence.v1` record in `evidence/raw`; that evidence ID can
+be passed to `faultloom finding new --evidence <id>`. It opens no network
+socket, does not call Burp, make a verification claim, or infer a hypothesis.
+
 The normal runtime is fail-closed and live mode is off by default. A POSIX
 `run --live` process is supported only when an external controller provisions
 the signed Gateway bootstrap, authenticated journal descriptors, channel
