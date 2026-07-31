@@ -4,12 +4,26 @@ from faultloom_protocol.base import MAX_INT64
 
 from .adapter_classify import _ProviderAdapterClassify
 from .adapter_helpers import _ceil_cost
-from .common import FailureCode
+from .common import FailureCode, ProviderPolicyError
 from .intent import ProviderCallIntent
 from .metadata import ProviderModelProfile
 from .proxy import ProviderProxyRequest, ProviderProxyResult
 
 class ProviderAdapter(_ProviderAdapterClassify):
+    def configured_profile(self, profile_id: str) -> ProviderModelProfile:
+        """Return a revalidated copy of one configured provider profile.
+
+        Higher-level authority boundaries use this lookup to reject a provider
+        or model snapshot before any prompt can cross the proxy boundary.
+        """
+
+        if type(profile_id) is not str or not profile_id:
+            raise ProviderPolicyError("provider profile ID must be non-empty")
+        profile = self._profiles.get(profile_id)
+        if profile is None:
+            raise ProviderPolicyError("provider profile is not configured")
+        return ProviderModelProfile.model_validate(profile.model_dump(mode="python"))
+
     def _completed_response_failure(
         self,
         intent: ProviderCallIntent,

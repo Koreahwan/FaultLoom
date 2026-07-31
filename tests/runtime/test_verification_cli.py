@@ -7,7 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from faultloom import cli
+from faultloom import cli, verification_cli
+from faultloom.verification import (
+    ReportFormat,
+    render_finding_report,
+    verify_result_artifact,
+)
 from tests.runtime.verification_support import (
     ReplayFixtureOptions,
     VerificationFixture,
@@ -125,9 +130,202 @@ def test_verify_and_report_cli_are_offline_and_fail_closed(
         ),
     ]
     assert cli.main(report_args) == cli.EXIT_OK
-    report = json.loads(capsys.readouterr().out)
+    report_output = capsys.readouterr().out
+    expected_report = render_finding_report(
+        verify_result_artifact(
+            fixture.signed_result,
+            fixture.result_signer.public_key_record,
+            fixture.expectations,
+        ),
+        fixture.candidate.candidate_id,
+        ReportFormat.JSON,
+    )
+    assert report_output == expected_report.content + "\n"
+    report = json.loads(report_output)
     assert report["candidate_id"] == fixture.candidate.candidate_id
     assert report["verdict"] == "verified"
+
+
+def test_report_cli_writes_verified_report_and_canonical_manual_review_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fixture = build_verification_fixture()
+    paths = _write_artifact_inputs(tmp_path, fixture)
+    monkeypatch.setattr(cli, "_utc_now", lambda: fixture.expectations.verification_time)
+    monkeypatch.setattr(
+        socket,
+        "socket",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("report outbox opened a network socket")
+        ),
+    )
+    out_dir = tmp_path / "outbox"
+    arguments = [
+        "report",
+        fixture.candidate.candidate_id,
+        "--format",
+        "json",
+        "--out-dir",
+        str(out_dir),
+        *_common_arguments(fixture, paths),
+    ]
+
+    assert cli.main(arguments) == cli.EXIT_OK
+    report = render_finding_report(
+        verify_result_artifact(
+            fixture.signed_result,
+            fixture.result_signer.public_key_record,
+            fixture.expectations,
+        ),
+        fixture.candidate.candidate_id,
+        ReportFormat.JSON,
+    )
+    entry_dir = out_dir / fixture.candidate.candidate_id
+    assert capsys.readouterr().out == report.content + "\n"
+    assert (entry_dir / "report.json").read_text(
+        encoding="utf-8"
+    ) == report.content
+    assert (entry_dir / "receipt.json").read_text(
+        encoding="utf-8"
+    ) == json.dumps(
+        {
+            "automatic_submission_performed": False,
+            "candidate_id": fixture.candidate.candidate_id,
+            "claim_id": fixture.claim.claim_id,
+            "finding_id": fixture.candidate.candidate_id,
+            "network_access": "none",
+            "report_digest": report.receipt.report_digest,
+            "report_format": "json",
+            "result_artifact_digest": report.receipt.result_artifact_digest,
+            "schema": "faultloom.report_outbox.receipt.v1",
+            "status": "draft_manual_review",
+            "verdict_id": fixture.verdict.verdict_id,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def test_report_cli_recovers_after_interruption_before_outbox_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fixture = build_verification_fixture()
+    paths = _write_artifact_inputs(tmp_path, fixture)
+    monkeypatch.setattr(cli, "_utc_now", lambda: fixture.expectations.verification_time)
+    out_dir = tmp_path / "outbox"
+    arguments = [
+        "report",
+        fixture.candidate.candidate_id,
+        "--format",
+        "json",
+        "--out-dir",
+        str(out_dir),
+        *_common_arguments(fixture, paths),
+    ]
+    original = verification_cli._create_file_once
+    calls = 0
+
+    def interrupt_second_file(path: Path, content: str) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise KeyboardInterrupt
+        original(path, content)
+
+    with monkeypatch.context() as interrupted:
+        interrupted.setattr(
+            verification_cli,
+            "_create_file_once",
+            interrupt_second_file,
+        )
+        with pytest.raises(KeyboardInterrupt):
+            cli.main(arguments)
+
+    assert not (out_dir / fixture.candidate.candidate_id).exists()
+    assert not tuple(out_dir.glob(".*.tmp"))
+    assert cli.main(arguments) == cli.EXIT_OK
+    assert (out_dir / fixture.candidate.candidate_id / "receipt.json").is_file()
+    capsys.readouterr()
+
+
+def test_report_cli_refuses_to_overwrite_an_outbox_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fixture = build_verification_fixture()
+    paths = _write_artifact_inputs(tmp_path, fixture)
+    monkeypatch.setattr(cli, "_utc_now", lambda: fixture.expectations.verification_time)
+    out_dir = tmp_path / "outbox"
+    arguments = [
+        "report",
+        fixture.candidate.candidate_id,
+        "--format",
+        "md",
+        "--out-dir",
+        str(out_dir),
+        *_common_arguments(fixture, paths),
+    ]
+
+    assert cli.main(arguments) == cli.EXIT_OK
+    capsys.readouterr()
+    entry_dir = out_dir / fixture.candidate.candidate_id
+    written_report = (entry_dir / "report.md").read_text(
+        encoding="utf-8"
+    )
+    written_receipt = (entry_dir / "receipt.json").read_text(
+        encoding="utf-8"
+    )
+
+    assert cli.main(arguments) == cli.EXIT_AUTHORITY
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "report outbox entry already exists" in captured.err
+    assert (entry_dir / "report.md").read_text(
+        encoding="utf-8"
+    ) == written_report
+    assert (entry_dir / "receipt.json").read_text(
+        encoding="utf-8"
+    ) == written_receipt
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ReplayFixtureOptions(positive_passed=False),
+        ReplayFixtureOptions(include_negative_control=False),
+    ],
+)
+def test_report_cli_does_not_create_outbox_for_unreportable_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    options: ReplayFixtureOptions,
+) -> None:
+    fixture = build_verification_fixture(options)
+    paths = _write_artifact_inputs(tmp_path, fixture)
+    monkeypatch.setattr(cli, "_utc_now", lambda: fixture.expectations.verification_time)
+    out_dir = tmp_path / "outbox"
+    arguments = [
+        "report",
+        fixture.candidate.candidate_id,
+        "--format",
+        "md",
+        "--out-dir",
+        str(out_dir),
+        *_common_arguments(fixture, paths),
+    ]
+
+    assert cli.main(arguments) == cli.EXIT_AUTHORITY
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "independently verified" in captured.err
+    assert not out_dir.exists()
 
 
 def test_report_cli_refuses_a_signed_rejected_verdict(

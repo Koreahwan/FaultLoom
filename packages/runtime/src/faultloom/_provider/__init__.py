@@ -38,6 +38,7 @@ from .metadata import (
 )
 from .openai_compatible import (
     BoundEnvironmentCredentialResolver,
+    OPENAI_COMPATIBLE_MAX_TOOL_ARGUMENT_BYTES,
     OpenAICompatibleChatPayload,
     OpenAICompatibleCredentialBinding,
     OpenAICompatibleEndpointConfig,
@@ -72,6 +73,7 @@ __all__ = [
     "MetadataProvenance",
     "MetadataSourceKind",
     "BoundEnvironmentCredentialResolver",
+    "OPENAI_COMPATIBLE_MAX_TOOL_ARGUMENT_BYTES",
     "OpenAICompatibleChatPayload",
     "OpenAICompatibleCredentialBinding",
     "OpenAICompatibleEndpointConfig",

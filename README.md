@@ -26,6 +26,13 @@ mediated by the Gateway. Installation of a pack never grants authority.
 
 See [SECURITY.md](SECURITY.md) and [ETHICAL_USE.md](ETHICAL_USE.md) before use.
 
+The practical authorized automation flow is documented in
+[`docs/AUTHORIZED_AUTOMATION.md`](docs/AUTHORIZED_AUTOMATION.md). It covers
+signed redacted evidence disclosure, provider-only reasoning, candidate
+admission, optional one-shot Gateway dispatch, independent verification, and
+manual report outboxes. Live mode remains off by default and no automatic
+submission is provided.
+
 ## Build verification
 
 The clean-checkout build is offline and byte-reproducible. With the pinned

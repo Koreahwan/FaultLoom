@@ -95,3 +95,20 @@ stale stage, or unrelated observation cannot self-authenticate resolution.
 checkpoint likewise remains
 non-dispatch-ready, exposes its exact `FailoverIntent`, and accepts only the
 immediate successor manifest whose model is the intent's exact target.
+
+## Authorized automation
+
+The provider-facing automation APIs are documented in
+[`../../docs/AUTHORIZED_AUTOMATION.md`](../../docs/AUTHORIZED_AUTOMATION.md).
+In brief, `run_provider_automation_turn()` verifies signed, redacted evidence
+disclosure and a pinned provider receipt before
+`AuthorizedAutomationCoordinator` performs pure candidate admission.
+`persist_automation_turn()` and `write_candidate_outbox()` then create local,
+encrypted/create-once artifacts for manual review. An operator may separately
+pass one exact admitted plan to `execute_admitted_tool_plan()`; that function
+first verifies a short-lived `SignedAutomationAdmission` against the trusted
+issuer registry and runtime clock, then uses only an existing signed/leased
+Gateway command, presents it once, and never submits a report. Dispatch
+evidence is raw and unapproved for provider
+disclosure until separately redacted and signed. Independent replay and
+`faultloom report` verification remain separate gates.
