@@ -1579,9 +1579,31 @@ def test_manual_evidence_add_exchange_archives_completed_pair_and_finding_select
             result["evidence_id"],
         ]
     ) == cli.EXIT_OK
-    assert result["evidence_id"] in Path(
-        json.loads(capsys.readouterr().out)["finding"]
-    ).read_text(encoding="utf-8")
+    finding = Path(json.loads(capsys.readouterr().out)["finding"])
+    report = finding.read_text(encoding="utf-8")
+    assert result["evidence_id"] in report
+    for component in (record["request"], record["response"]):
+        assert component["stored_file"] in report
+        assert str(component["size_bytes"]) in report
+        assert component["sha256"] in report
+
+    record["response"]["sha256"] = "not-a-digest"
+    Path(result["record"]).write_text(json.dumps(record), encoding="utf-8")
+    assert cli.main(
+        [
+            "finding",
+            "new",
+            "--workspace",
+            str(workspace),
+            "--title",
+            "Malformed exchange",
+            "--severity",
+            "low",
+            "--evidence",
+            result["evidence_id"],
+        ]
+    ) == cli.EXIT_USAGE
+    assert "invalid archived exchange evidence summary" in capsys.readouterr().err
 
 
 def test_manual_evidence_add_exchange_allows_post_window_archival(

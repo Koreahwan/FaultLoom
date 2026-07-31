@@ -1443,6 +1443,52 @@ def _workspace_evidence(
     return [records[evidence_id] for evidence_id in wanted]
 
 
+def _exchange_evidence_component_line(component: object, *, label: str) -> str:
+    if not isinstance(component, dict):
+        raise CliError("invalid archived exchange evidence summary", exit_code=EXIT_USAGE)
+    stored_file = component.get("stored_file")
+    size_bytes = component.get("size_bytes")
+    sha256 = component.get("sha256")
+    if (
+        not isinstance(stored_file, str)
+        or not stored_file
+        or stored_file != Path(stored_file).name
+        or type(size_bytes) is not int
+        or size_bytes < 0
+        or not isinstance(sha256, str)
+        or len(sha256) != 64
+        or any(character not in "0123456789abcdef" for character in sha256)
+    ):
+        raise CliError("invalid archived exchange evidence summary", exit_code=EXIT_USAGE)
+    return (
+        f"  - {label}: `{stored_file}` — {size_bytes} bytes — SHA-256 `{sha256}`"
+    )
+
+
+def _finding_evidence_lines(item: dict[str, object]) -> list[str]:
+    exchange_fields = {"reservation_id", "request", "response"}
+    if not any(field in item for field in exchange_fields):
+        return [
+            "- `{evidence_id}` — {kind} — SHA-256 `{sha256}` — `{stored_file}`".format(
+                evidence_id=item.get("evidence_id", "unknown"),
+                kind=item.get("kind", "other"),
+                sha256=item.get("sha256", "unknown"),
+                stored_file=item.get("stored_file", "unknown"),
+            )
+        ]
+    if not isinstance(item.get("reservation_id"), str):
+        raise CliError("invalid archived exchange evidence summary", exit_code=EXIT_USAGE)
+    return [
+        "- `{evidence_id}` — {kind} exchange — reservation `{reservation_id}`".format(
+            evidence_id=item.get("evidence_id", "unknown"),
+            kind=item.get("kind", "other"),
+            reservation_id=item["reservation_id"],
+        ),
+        _exchange_evidence_component_line(item.get("request"), label="Request"),
+        _exchange_evidence_component_line(item.get("response"), label="Response"),
+    ]
+
+
 def _finding_new(arguments: argparse.Namespace) -> int:
     manifest = _load_manual_workspace(arguments.workspace)
     run_id = str(manifest["run_id"])
@@ -1461,13 +1507,7 @@ def _finding_new(arguments: argparse.Namespace) -> int:
     target = manifest.get("target")
     target_text = json.dumps(target, indent=2, sort_keys=True)
     evidence_lines = [
-        "- `{evidence_id}` — {kind} — SHA-256 `{sha256}` — `{stored_file}`".format(
-            evidence_id=item.get("evidence_id", "unknown"),
-            kind=item.get("kind", "other"),
-            sha256=item.get("sha256", "unknown"),
-            stored_file=item.get("stored_file", "unknown"),
-        )
-        for item in evidence
+        line for item in evidence for line in _finding_evidence_lines(item)
     ]
     if not evidence_lines:
         evidence_lines.append("- [Add evidence with `faultloom evidence add`.]")
