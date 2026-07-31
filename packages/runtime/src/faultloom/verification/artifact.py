@@ -26,6 +26,12 @@ from .authority import (
     authorize_verifier,
 )
 from .engine import VERIFIER_ACTOR_MARKER, VERIFIER_AUTHORITY_MARKER
+from .provenance import (
+    AutomationDispatchProvenance,
+    AutomationDispatchProvenanceError,
+    automation_dispatch_provenance_marker,
+    validate_automation_dispatch_provenance,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +39,7 @@ class _ArtifactProof:
     envelope_digest: str
     payload_digest: str
     verifier: VerifierBinding
+    automation_dispatch_provenance: AutomationDispatchProvenance | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +55,7 @@ class VerifiedResultArtifact:
     envelope: SignedRunResultBundle
     payload: RunResultBundle
     verifier: VerifierBinding
+    automation_dispatch_provenance: AutomationDispatchProvenance | None
     _proof: _ArtifactProof
 
 
@@ -59,6 +67,11 @@ def _collect_evidence(draft: ResultArtifactDraft) -> tuple[EvidenceRef, ...]:
         *draft.claim.evidence_refs,
         *draft.claim.negative_control_refs,
         *draft.verdict.evidence_refs,
+        *(
+            (draft.automation_dispatch_provenance.dispatch.evidence_ref,)
+            if draft.automation_dispatch_provenance is not None
+            else ()
+        ),
     )
     for reference in references:
         previous = seen.get(reference.evidence_id)
@@ -81,6 +94,34 @@ def sign_verification_result(
         raise ArtifactVerificationError(reason="verdict belongs to a different claim")
     if draft.verdict.verified_at > context.generated_at:
         raise ArtifactVerificationError(reason="result generation predates its verdict")
+    provenance = draft.automation_dispatch_provenance
+    provenance_markers = _provenance_markers((draft.verdict,))
+    if provenance is None and provenance_markers:
+        raise ArtifactVerificationError(
+            reason="verification verdict contains unbound automation dispatch provenance"
+        )
+    if provenance is not None:
+        try:
+            validate_automation_dispatch_provenance(provenance)
+        except AutomationDispatchProvenanceError as exc:
+            raise ArtifactVerificationError(reason=str(exc)) from exc
+        record = provenance.dispatch.envelope.record
+        if record.run_id != draft.candidate.run_id:
+            raise ArtifactVerificationError(
+                reason="automation dispatch provenance belongs to a different candidate run"
+            )
+        if record.candidate_id != draft.candidate.candidate_id:
+            raise ArtifactVerificationError(
+                reason="automation dispatch provenance belongs to a different candidate"
+            )
+        marker = automation_dispatch_provenance_marker(provenance)
+        if (
+            provenance_markers != (marker,)
+            or provenance.dispatch.evidence_ref not in draft.verdict.evidence_refs
+        ):
+            raise ArtifactVerificationError(
+                reason="verification verdict does not bind automation dispatch provenance"
+            )
     bundle = RunResultBundle(
         schema_version=SCHEMA_VERSION,
         bundle_id=context.bundle_id,
@@ -158,6 +199,33 @@ def verify_result_artifact(
         raise ArtifactVerificationError(
             reason="result verifier binding does not match expectations"
         )
+    provenance = expectations.automation_dispatch_provenance
+    provenance_markers = _provenance_markers(payload.verification_verdicts)
+    if provenance is None and provenance_markers:
+        raise ArtifactVerificationError(
+            reason="result automation dispatch provenance is missing from expectations"
+        )
+    if provenance is not None:
+        try:
+            validate_automation_dispatch_provenance(provenance)
+        except AutomationDispatchProvenanceError as exc:
+            raise ArtifactVerificationError(reason=str(exc)) from exc
+        marker = automation_dispatch_provenance_marker(provenance)
+        evidence = provenance.dispatch.evidence_ref
+        candidate_id = provenance.dispatch.envelope.record.candidate_id
+        if (
+            len(payload.finding_candidates) != 1
+            or payload.finding_candidates[0].candidate_id != candidate_id
+            or provenance_markers != (marker,)
+            or evidence not in payload.evidence_refs
+            or any(
+                marker not in verdict.reasons or evidence not in verdict.evidence_refs
+                for verdict in payload.verification_verdicts
+            )
+        ):
+            raise ArtifactVerificationError(
+                reason="result automation dispatch provenance does not match expectations"
+            )
     return VerifiedResultArtifact(
         envelope=envelope,
         payload=payload,
@@ -165,6 +233,7 @@ def verify_result_artifact(
             actor_id=authorized_verifier.verifier_actor_id,
             authority_digest=authorized_verifier.authority_digest,
         ),
+        automation_dispatch_provenance=provenance,
         _proof=_ArtifactProof(
             envelope_digest=sha256_digest(envelope),
             payload_digest=sha256_digest(payload),
@@ -172,6 +241,7 @@ def verify_result_artifact(
                 actor_id=authorized_verifier.verifier_actor_id,
                 authority_digest=authorized_verifier.authority_digest,
             ),
+            automation_dispatch_provenance=provenance,
         ),
     )
 
@@ -183,6 +253,16 @@ def require_verified_result(artifact: VerifiedResultArtifact) -> VerifiedResultA
         or sha256_digest(artifact.payload) != proof.payload_digest
         or artifact.payload != artifact.envelope.payload
         or artifact.verifier != proof.verifier
+        or artifact.automation_dispatch_provenance != proof.automation_dispatch_provenance
     ):
         raise ArtifactVerificationError(reason="result artifact proof is invalid")
     return artifact
+
+
+def _provenance_markers(verdicts: tuple[object, ...]) -> tuple[str, ...]:
+    return tuple(
+        reason
+        for verdict in verdicts
+        for reason in verdict.reasons
+        if reason.startswith("faultloom:automation_dispatch_provenance=")
+    )

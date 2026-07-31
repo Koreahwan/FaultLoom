@@ -100,6 +100,7 @@ _EXECUTION_BRIDGE_EXPORTS = frozenset(
         "AutomationDispatchRecord",
         "execute_admitted_tool_plan",
         "load_automation_dispatch",
+        "load_authenticated_automation_dispatch",
         "persist_automation_dispatch",
     }
 )
@@ -198,6 +199,7 @@ __all__ = [
     "extract_provider_tool_arguments",
     "execute_admitted_tool_plan",
     "load_automation_dispatch",
+    "load_authenticated_automation_dispatch",
     "load_automation_turn",
     "persist_automation_turn",
     "persist_automation_dispatch",

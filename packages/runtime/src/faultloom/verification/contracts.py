@@ -17,6 +17,7 @@ from faultloom_protocol import (
 )
 
 from .authority import AuthorizedVerifier
+from .provenance import AutomationDispatchProvenance
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +70,7 @@ class VerificationCase:
     source_authority_digest: str
     verifier: AuthorizedVerifier
     verified_at: datetime
+    automation_dispatch_provenance: AutomationDispatchProvenance | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +92,7 @@ class ResultArtifactDraft:
     claim: ClaimPacket
     verdict: VerificationVerdict
     cleanup_receipt_digests: tuple[str, ...]
+    automation_dispatch_provenance: AutomationDispatchProvenance | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +108,7 @@ class ResultExpectations:
     trusted_verifier_authority_key: Ed25519PublicKeyRecord
     verification_time: datetime
     minimum_bundle_version: int = 1
+    automation_dispatch_provenance: AutomationDispatchProvenance | None = None
 
 
 @dataclass(frozen=True, slots=True)

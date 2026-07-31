@@ -277,6 +277,80 @@ def load_automation_dispatch(
     return _load_envelope(store, event, _spec("placeholder.run", "placeholder.dispatch"))
 
 
+def load_authenticated_automation_dispatch(
+    store: StateStore,
+    *,
+    dispatch_id: str,
+    command: GatewayDispatchCommand,
+    trusted_admission_keys: dict[str, Ed25519PublicKeyRecord],
+) -> AutomationDispatchPersistence:
+    """Load one ledger-backed dispatch authenticated at its Gateway receipt time."""
+
+    if type(store) is not StateStore:
+        raise TypeError("dispatch provenance requires an exact state store")
+    if type(dispatch_id) is not str:
+        raise TypeError("dispatch provenance requires a dispatch ID")
+    if type(command) is not GatewayDispatchCommand:
+        raise TypeError("dispatch provenance requires an exact Gateway command")
+    matches: list[tuple[EventRecord, AutomationDispatchEnvelope]] = []
+    with store.serialized():
+        for event in durable_events(store):
+            if (
+                event.actor_stream != AUTOMATION_DISPATCH_ACTOR_STREAM
+                or event.event_type != AUTOMATION_DISPATCH_EVENT_TYPE
+            ):
+                continue
+            envelope = _load_envelope(store, event, _spec("placeholder.run", "placeholder"))
+            if envelope.dispatch_id == dispatch_id:
+                matches.append((event, envelope))
+    if len(matches) != 1:
+        raise StorageError("dispatch provenance must resolve to exactly one ledger event")
+    event, envelope = matches[0]
+    record = envelope.record
+    if record.command_digest != _command_digest(command):
+        raise AutomationDispatchError("dispatch provenance command digest differs from exact command")
+    receipt_time = _completed_receipt_time(record, command)
+    admitted = verify_automation_admission(
+        record.admission,
+        trusted_admission_keys,
+        verification_time=receipt_time,
+    )
+    if admitted != record.admission.payload or admitted.result != record.admission.payload.result:
+        raise AutomationDispatchError("dispatch provenance admission payload is not exact")
+    return _persistence(event, envelope)
+
+
+def _completed_receipt_time(
+    record: AutomationDispatchRecord,
+    command: GatewayDispatchCommand,
+) -> datetime:
+    gateway_result = record.gateway_result
+    if (
+        record.status != "completed"
+        or record.target_dispatch_performed is not True
+        or type(gateway_result) is not GatewayDispatchResult
+    ):
+        raise AutomationDispatchError(
+            "dispatch provenance requires a completed Gateway receipt"
+        )
+    receipt = gateway_result.receipt
+    if (
+        receipt.action_id != command.intent.action_id
+        or receipt.lease_id != command.lease.lease_id
+        or receipt.intent_digest != command.intent_digest
+        or receipt.decision_digest != command.decision_digest
+        or receipt.scope_epoch != command.lease.scope_epoch
+    ):
+        raise AutomationDispatchError(
+            "dispatch provenance Gateway receipt is not bound to the exact command"
+        )
+    if not command.lease.issued_at <= receipt.dispatched_at < command.lease.expires_at:
+        raise AutomationDispatchError(
+            "dispatch provenance Gateway receipt is outside the command lease window"
+        )
+    return receipt.dispatched_at
+
+
 def _validate_inputs(
     admission: SignedAutomationAdmission,
     command: GatewayDispatchCommand,
@@ -471,5 +545,6 @@ __all__ = [
     "AutomationDispatchRecord",
     "execute_admitted_tool_plan",
     "load_automation_dispatch",
+    "load_authenticated_automation_dispatch",
     "persist_automation_dispatch",
 ]

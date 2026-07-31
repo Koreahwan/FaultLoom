@@ -6,6 +6,7 @@ from datetime import timedelta
 from faultloom.verification import (
     ClaimDraft,
     ControlResult,
+    AutomationDispatchProvenance,
     ReplayExecutionRequest,
     ReplayExecutionResult,
     ResultArtifactContext,
@@ -64,6 +65,9 @@ class VerificationFixture:
 
 def build_verification_fixture(
     options: ReplayFixtureOptions = ReplayFixtureOptions(),
+    *,
+    candidate_id: str | None = None,
+    automation_dispatch_provenance: AutomationDispatchProvenance | None = None,
 ) -> VerificationFixture:
     values = sample_models()
     candidate = values["FindingCandidate"]
@@ -73,6 +77,8 @@ def build_verification_fixture(
         raise AssertionError("protocol fixture returned the wrong candidate type")
     if not isinstance(replay_plan, ReplayPlan):
         raise AssertionError("protocol fixture returned the wrong replay type")
+    if candidate_id is not None:
+        candidate = candidate.model_copy(update={"candidate_id": candidate_id})
 
     if options.include_secret_text:
         candidate = candidate.model_copy(
@@ -172,6 +178,7 @@ def build_verification_fixture(
             source_authority_digest=source_result.authority_digest,
             verifier=authorized_verifier,
             verified_at=NOW + timedelta(seconds=2),
+            automation_dispatch_provenance=automation_dispatch_provenance,
         ),
         executor,
     )
@@ -194,6 +201,7 @@ def build_verification_fixture(
             claim=claim,
             verdict=verdict,
             cleanup_receipt_digests=replay_result.cleanup_receipt_digests,
+            automation_dispatch_provenance=automation_dispatch_provenance,
         ),
         result_signer,
     )
@@ -209,6 +217,7 @@ def build_verification_fixture(
         trusted_verifier_authority_key=authority_signer.public_key_record,
         verification_time=NOW + timedelta(seconds=4),
         minimum_bundle_version=3,
+        automation_dispatch_provenance=automation_dispatch_provenance,
     )
     return VerificationFixture(
         candidate=candidate,

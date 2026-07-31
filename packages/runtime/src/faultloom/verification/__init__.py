@@ -27,6 +27,14 @@ from .contracts import (
     VerificationSummary,
 )
 from .engine import VerificationInputError, verify_candidate
+from .provenance import (
+    AutomationDispatchProvenance,
+    AutomationDispatchProvenanceError,
+    automation_dispatch_provenance_digest,
+    automation_dispatch_provenance_marker,
+    load_automation_dispatch_provenance,
+    validate_automation_dispatch_provenance,
+)
 from .reporting import (
     ReportGateError,
     render_finding_report,
@@ -35,6 +43,8 @@ from .reporting import (
 
 __all__ = [
     "ArtifactVerificationError",
+    "AutomationDispatchProvenance",
+    "AutomationDispatchProvenanceError",
     "AuthorizedVerifier",
     "ClaimAssemblyError",
     "ClaimDraft",
@@ -56,10 +66,14 @@ __all__ = [
     "VerifierAuthorizationError",
     "VerifierAuthorizationRequest",
     "assemble_claim_packet",
+    "automation_dispatch_provenance_digest",
+    "automation_dispatch_provenance_marker",
     "authorize_verifier",
+    "load_automation_dispatch_provenance",
     "render_finding_report",
     "sign_verification_result",
     "verification_summary",
     "verify_candidate",
     "verify_result_artifact",
+    "validate_automation_dispatch_provenance",
 ]

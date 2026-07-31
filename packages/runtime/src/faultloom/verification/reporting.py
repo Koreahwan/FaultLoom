@@ -23,6 +23,11 @@ from .contracts import (
     ReportReceipt,
     VerificationSummary,
 )
+from .provenance import (
+    AutomationDispatchProvenanceError,
+    automation_dispatch_provenance_marker,
+    validate_automation_dispatch_provenance,
+)
 
 
 _SECRET_URI = re.compile(r"secret://[A-Za-z0-9][A-Za-z0-9._/-]*")
@@ -132,6 +137,25 @@ def _select_verified(
         raise ReportGateError(reason="verdict does not bind the selected claim")
     if not verdict.evidence_refs or not claim.negative_control_refs:
         raise ReportGateError(reason="verified report lacks replay or negative-control evidence")
+    provenance = artifact.automation_dispatch_provenance
+    if provenance is not None:
+        try:
+            validate_automation_dispatch_provenance(provenance)
+        except AutomationDispatchProvenanceError as exc:
+            raise ReportGateError(reason=str(exc)) from exc
+        if (
+            provenance.dispatch.envelope.record.candidate_id != candidate.candidate_id
+            or tuple(
+                reason
+                for reason in verdict.reasons
+                if reason.startswith("faultloom:automation_dispatch_provenance=")
+            )
+            != (automation_dispatch_provenance_marker(provenance),)
+            or provenance.dispatch.evidence_ref not in verdict.evidence_refs
+        ):
+            raise ReportGateError(
+                reason="verified report does not bind automation dispatch provenance"
+            )
     return selected
 
 
@@ -166,34 +190,45 @@ def _json_report(
     claim = selected.claim
     verdict = selected.verdict
     classification, classification_scope = _classification(candidate.finding_class)
+    document: dict[str, object] = {
+        "candidate_id": candidate.candidate_id,
+        "claim": _scrub(claim.claim),
+        "claim_id": claim.claim_id,
+        "classification": classification,
+        "classification_scope": classification_scope,
+        "evidence": [
+            _evidence_document(reference)
+            for reference in sorted(verdict.evidence_refs, key=lambda item: item.evidence_id)
+        ],
+        "negative_control_evidence": [
+            _evidence_document(reference)
+            for reference in sorted(
+                claim.negative_control_refs,
+                key=lambda item: item.evidence_id,
+            )
+        ],
+        "prerequisites": [_scrub(value) for value in claim.prerequisites],
+        "reasons": [_scrub(value) for value in verdict.reasons],
+        "title": _scrub(candidate.title),
+        "verdict": verdict.outcome.value,
+        "verdict_id": verdict.verdict_id,
+        "verified_at": verdict.verified_at.isoformat(),
+        "verifier_actor_id": artifact.verifier.actor_id,
+        "verifier_authority_digest": artifact.verifier.authority_digest,
+        "verifier_run_id": verdict.verifier_run_id,
+    }
+    provenance = artifact.automation_dispatch_provenance
+    if provenance is not None:
+        document["automation_dispatch_provenance_digest"] = (
+            automation_dispatch_provenance_marker(provenance).removeprefix(
+                "faultloom:automation_dispatch_provenance="
+            )
+        )
+        document["automation_dispatch_evidence_id"] = (
+            provenance.dispatch.evidence_ref.evidence_id
+        )
     return json.dumps(
-        {
-            "candidate_id": candidate.candidate_id,
-            "claim": _scrub(claim.claim),
-            "claim_id": claim.claim_id,
-            "classification": classification,
-            "classification_scope": classification_scope,
-            "evidence": [
-                _evidence_document(reference)
-                for reference in sorted(verdict.evidence_refs, key=lambda item: item.evidence_id)
-            ],
-            "negative_control_evidence": [
-                _evidence_document(reference)
-                for reference in sorted(
-                    claim.negative_control_refs,
-                    key=lambda item: item.evidence_id,
-                )
-            ],
-            "prerequisites": [_scrub(value) for value in claim.prerequisites],
-            "reasons": [_scrub(value) for value in verdict.reasons],
-            "title": _scrub(candidate.title),
-            "verdict": verdict.outcome.value,
-            "verdict_id": verdict.verdict_id,
-            "verified_at": verdict.verified_at.isoformat(),
-            "verifier_actor_id": artifact.verifier.actor_id,
-            "verifier_authority_digest": artifact.verifier.authority_digest,
-            "verifier_run_id": verdict.verifier_run_id,
-        },
+        document,
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
@@ -218,6 +253,17 @@ def _markdown_report(
         for reference in sorted(claim.negative_control_refs, key=lambda item: item.evidence_id)
     )
     reasons = "\n".join(f"- `{_markdown(value)}`" for value in verdict.reasons)
+    provenance = artifact.automation_dispatch_provenance
+    provenance_section = ""
+    if provenance is not None:
+        provenance_digest = automation_dispatch_provenance_marker(provenance).removeprefix(
+            "faultloom:automation_dispatch_provenance="
+        )
+        provenance_section = (
+            "\n## Automation dispatch provenance\n\n"
+            f"- Digest: `{provenance_digest}`\n"
+            f"- Evidence: `{provenance.dispatch.evidence_ref.evidence_id}`\n"
+        )
     return (
         f"# {_markdown(candidate.title)}\n\n"
         f"- Candidate: `{candidate.candidate_id}`\n"
@@ -229,7 +275,7 @@ def _markdown_report(
         f"## Prerequisites\n\n{prerequisites}\n\n"
         f"## Independent replay evidence\n\n{evidence}\n\n"
         f"## Negative controls\n\n{negative}\n\n"
-        f"## Verification reasons\n\n{reasons}\n"
+        f"## Verification reasons\n\n{reasons}\n{provenance_section}"
     )
 
 

@@ -17,6 +17,11 @@ from .contracts import (
     ReplayExecutor,
     VerificationCase,
 )
+from .provenance import (
+    AutomationDispatchProvenanceError,
+    automation_dispatch_provenance_marker,
+    validate_automation_dispatch_provenance,
+)
 
 
 VERIFIER_ACTOR_MARKER = "faultloom:verifier_actor="
@@ -64,6 +69,21 @@ def _validate_case(case: VerificationCase) -> None:
         raise VerificationInputError(reason="replay plan has no clean reset state")
     if not case.replay_plan.edge_ids or not case.replay_plan.negative_control_edge_ids:
         raise VerificationInputError(reason="replay plan is missing a control class")
+    provenance = case.automation_dispatch_provenance
+    if provenance is not None:
+        try:
+            validate_automation_dispatch_provenance(provenance)
+        except AutomationDispatchProvenanceError as exc:
+            raise VerificationInputError(reason=str(exc)) from exc
+        record = provenance.dispatch.envelope.record
+        if record.run_id != case.candidate.run_id:
+            raise VerificationInputError(
+                reason="automation dispatch provenance belongs to a different candidate run"
+            )
+        if record.candidate_id != case.candidate.candidate_id:
+            raise VerificationInputError(
+                reason="automation dispatch provenance belongs to a different candidate"
+            )
 
 
 def _control_ids(controls: tuple[ControlResult, ...]) -> tuple[str, ...]:
@@ -105,6 +125,9 @@ def verify_candidate(
     )
     controls = (*execution.positive_controls, *execution.negative_controls)
     evidence, evidence_consistent = _replay_evidence(controls)
+    provenance = case.automation_dispatch_provenance
+    if provenance is not None:
+        evidence = (*evidence, provenance.dispatch.evidence_ref)
     source_evidence_ids = {
         reference.evidence_id
         for reference in (*case.claim.evidence_refs, *case.claim.negative_control_refs)
@@ -155,6 +178,11 @@ def verify_candidate(
             verifier.verifier_actor_id,
             verifier.authority_digest,
             replay_digest,
+        ),
+        *(
+            (automation_dispatch_provenance_marker(provenance),)
+            if provenance is not None
+            else ()
         ),
     )
     verdict_digest = sha256_digest(
