@@ -42,6 +42,9 @@ foreach ($path in @(
     $arguments += @('--paths', (Join-Path $repository $path))
 }
 $arguments += @(
+    '--add-data',
+    ((Join-Path $repository 'packages\sdk\src\faultloom_sdk\reference_worker.py') +
+        ';faultloom_sdk'),
     '--hidden-import', 'faultloom_web',
     '--hidden-import', 'faultloom_web.web_api',
     '--hidden-import', 'faultloom_web.web_api.manifest',
