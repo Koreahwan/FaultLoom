@@ -73,13 +73,14 @@ Read `run-01\README.md`, then use Burp Suite or a browser manually within the
 signed host, port, path, method, budget, and time window. Do not use `--live`;
 automatic Gateway dispatch is not part of this personal Windows beta.
 
-## 5. Check a request before Burp sends it
+## 5. Bind the exact request before Burp sends it
 
-Before a model or operator sends a request through Burp, validate the exact
-request metadata against the signed workspace:
+Export the single raw HTTP/1.1 request from Burp to a local file, then bind its
+exact bytes before the manual handoff. Run this immediately before sending; it
+does not send anything itself:
 
 ```powershell
-& $FaultLoom scope check-request `
+& $FaultLoom scope verify-request `
   --workspace "$Job\run-01" `
   --trusted-key "$Root\authority\authority-public-key.json" `
   --hostname example.com `
@@ -87,29 +88,37 @@ request metadata against the signed workspace:
   --scheme https `
   --method GET `
   --path '/api/profile' `
-  --request-bytes 2048 `
+  --request-file 'C:\path\to\burp-request.raw' `
   --response-bytes 1048576
 ```
 
 Continue only when the JSON result says `"authorized": true`. This command
 rechecks the workspace's signed authority against the public key kept outside
 that workspace, plus its target, `safe_probe` action policy, explicit denies,
-execution window, and per-request byte limits. It atomically creates an
-owner-local request reservation and returns its `reservation_id`, expiry, and
-remaining signed action, rate, and concurrency budgets. It opens no socket and
-does not call Burp.
+execution window, and per-request byte limits. It accepts only one regular,
+non-symlink raw HTTP/1.1 file with canonical CRLF framing, one `Host` header,
+and no transfer encoding; its request line and Host must match the supplied
+signed endpoint metadata. It atomically records the SHA-256 and byte length in
+an owner-local request reservation and returns its `reservation_id`, expiry,
+and remaining budgets. It opens no socket and does not call Burp.
 
-After Burp has sent the request, record the observed response size and release
-the reservation's concurrency slot. Use the returned `reservation_id` and do
-not include a request or response body in this command:
+After Burp has sent the request, provide the same raw request file again. The
+completion re-hashes it before releasing the reservation's concurrency slot;
+any method, path, Host, header, or body change fails closed. A response file is
+optional, but binds the recorded response length and SHA-256 without printing
+its contents:
 
 ```powershell
 & $FaultLoom scope complete-request `
   --workspace "$Job\run-01" `
   --trusted-key "$Root\authority\authority-public-key.json" `
-  --reservation-id 'reservation.from-check-request' `
-  --observed-response-bytes 12345
+  --reservation-id 'reservation.from-verify-request' `
+  --request-file 'C:\path\to\burp-request.raw' `
+  --response-file 'C:\path\to\burp-response.raw'
 ```
+
+If the response is not available as a file, replace `--response-file` with
+`--observed-response-bytes 12345`. Expired reservations cannot be completed.
 
 This is advisory owner-local accounting, not tamper-resistant enforcement: any
 process able to modify the workspace can reset or replace its accounting state.
@@ -180,16 +189,17 @@ finding or submitted automatically.
 ## Current boundary
 
 Ready now: signed scopes, manual authorized workspaces, bounded evidence
-ingestion, SHA-256 records, metadata checks for Web, LLM, and the registered
-candidate packs, offline Burp request scope checks, and finding drafts.
+ingestion, SHA-256 records, exact raw-request binding for offline Burp
+handoffs, and finding drafts.
 An already-produced structured model turn can also be compiled offline into a
 private candidate bundle with no provider or target access.
 Within an intact workspace, request checks persist advisory owner-local
 reservations and reject additional reservations that exceed the recorded signed
 total, 60-second rate, active concurrency, or per-request byte budgets. A
-completion records only the operator-observed response byte count and releases
-concurrency. If the observed response exceeds its reserved budget, FaultLoom
-records that fact and returns an authorization failure after emitting the
+completion rechecks the reserved request digest and records either the
+operator-observed response byte count or a locally captured response digest,
+then releases concurrency. If the observed response exceeds its reserved budget,
+FaultLoom records that fact and returns an authorization failure after emitting the
 result.
 Linux-only durable resume, automatic
 Gateway target dispatch, automatic exploitation, and automatic external

@@ -148,9 +148,23 @@ def _check_request_arguments(
         "response_bytes": "200",
     }
     values.update(overrides)
+    request_bytes = int(str(values["request_bytes"]))
+    hostname = str(values["hostname"])
+    port = int(str(values["port"]))
+    scheme = str(values["scheme"])
+    host_header = hostname if (scheme, port) in {("https", 443), ("http", 80)} else f"{hostname}:{port}"
+    prefix = (
+        f"{str(values['method']).upper()} {values['path']} HTTP/1.1\r\n"
+        f"Host: {host_header}\r\n"
+        "X-FaultLoom-Pad: "
+    ).encode("ascii")
+    suffix = b"\r\n\r\n"
+    assert request_bytes >= len(prefix) + len(suffix)
+    request_file = workspace / "request.raw"
+    request_file.write_bytes(prefix + b"a" * (request_bytes - len(prefix) - len(suffix)) + suffix)
     return [
         "scope",
-        "check-request",
+        "verify-request",
         "--workspace",
         str(workspace),
         "--trusted-key",
@@ -165,15 +179,20 @@ def _check_request_arguments(
         str(values["method"]),
         "--path",
         str(values["path"]),
-        "--request-bytes",
-        str(values["request_bytes"]),
+        "--request-file",
+        str(request_file),
         "--response-bytes",
         str(values["response_bytes"]),
     ]
 
 
 def _complete_request_arguments(
-    workspace: Path, trusted_key: Path, reservation_id: str, observed_response_bytes: str
+    workspace: Path,
+    trusted_key: Path,
+    reservation_id: str,
+    observed_response_bytes: str,
+    *,
+    request_file: Path | None = None,
 ) -> list[str]:
     return [
         "scope",
@@ -184,6 +203,8 @@ def _complete_request_arguments(
         str(trusted_key),
         "--reservation-id",
         reservation_id,
+        "--request-file",
+        str(request_file or workspace / "request.raw"),
         "--observed-response-bytes",
         observed_response_bytes,
     ]
@@ -621,6 +642,9 @@ def test_scope_check_request_is_offline_and_returns_signed_scope(
     assert result["pack_id"] == "pack.web"
     assert result["budget_accounting"] == "operator_local_reservation"
     assert result["reservation_id"].startswith("reservation.")
+    assert result["request_sha256"] == hashlib.sha256(
+        (workspace / "request.raw").read_bytes()
+    ).hexdigest()
     assert result["remaining_budget"] == {
         "max_concurrency": 1,
         "rate_per_minute": 9,
@@ -641,6 +665,165 @@ def test_scope_check_request_is_offline_and_returns_signed_scope(
     )
     assert completion.returncode == cli.EXIT_OK
     assert json.loads(completion.stdout)["observed_response_bytes"] == 200
+
+
+@pytest.mark.parametrize(
+    ("replacement", "expected_error"),
+    (
+        (b"PUT /api/items HTTP/1.1", "signed method and path"),
+        (b"GET /api/other HTTP/1.1", "signed method and path"),
+        (b"Host: evil.example", "Host header does not match"),
+    ),
+)
+def test_scope_verify_request_rejects_raw_endpoint_mutations_before_authorizing(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    replacement: bytes,
+    expected_error: str,
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(tmp_path)
+    capsys.readouterr()
+    arguments = _check_request_arguments(workspace, key_path)
+    request_path = workspace / "request.raw"
+    content = request_path.read_bytes()
+    if replacement.startswith(b"Host:"):
+        content = content.replace(b"Host: example.com", replacement)
+    else:
+        content = content.replace(b"GET /api/items HTTP/1.1", replacement)
+    request_path.write_bytes(content)
+
+    assert cli.main(arguments) == cli.EXIT_AUTHORITY
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert expected_error in captured.err
+
+
+@pytest.mark.parametrize("mutation", ("header", "body"))
+def test_scope_complete_request_rejects_changed_exact_request_digest(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    mutation: str,
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(tmp_path)
+    capsys.readouterr()
+    if mutation == "body":
+        arguments = _check_request_arguments(workspace, key_path)
+        request_path = workspace / "request.raw"
+        request_path.write_bytes(
+            b"GET /api/items HTTP/1.1\r\nHost: example.com\r\n"
+            b"Content-Length: 1\r\n\r\na"
+        )
+    else:
+        arguments = _check_request_arguments(workspace, key_path)
+        request_path = workspace / "request.raw"
+    assert cli.main(arguments) == cli.EXIT_OK
+    reservation_id = json.loads(capsys.readouterr().out)["reservation_id"]
+    if mutation == "body":
+        request_path.write_bytes(request_path.read_bytes().replace(b"\r\n\r\na", b"\r\n\r\nb"))
+    else:
+        request_path.write_bytes(
+            request_path.read_bytes().replace(b"X-FaultLoom-Pad: a", b"X-FaultLoom-Pad: b")
+        )
+
+    assert (
+        cli.main(
+            _complete_request_arguments(
+                workspace, key_path, reservation_id, "200", request_file=request_path
+            )
+        )
+        == cli.EXIT_AUTHORITY
+    )
+    assert "digest does not match" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_error"),
+    (
+        (
+            b"GET /api/items HTTP/1.1\r\nHost: example.com\r\nHost: example.com\r\n\r\n",
+            "exactly one Host",
+        ),
+        (
+            b"GET /api/items HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+            "duplicate Content-Length",
+        ),
+        (
+            b"GET /api/items HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "transfer-encoding",
+        ),
+        (b"GET /api/items HTTP/1.1\nHost: example.com\n\n", "CRLF"),
+    ),
+)
+def test_scope_verify_request_rejects_ambiguous_raw_framing(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    raw: bytes,
+    expected_error: str,
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(tmp_path)
+    capsys.readouterr()
+    arguments = _check_request_arguments(workspace, key_path)
+    (workspace / "request.raw").write_bytes(raw)
+
+    assert cli.main(arguments) == cli.EXIT_AUTHORITY
+    assert expected_error in capsys.readouterr().err
+
+
+def test_scope_verify_request_rejects_symlink_and_nonregular_raw_files(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(tmp_path)
+    capsys.readouterr()
+    arguments = _check_request_arguments(workspace, key_path)
+    request_path = workspace / "request.raw"
+    request_path.unlink()
+    request_path.mkdir()
+    assert cli.main(arguments) == cli.EXIT_AUTHORITY
+    assert "regular non-symlink" in capsys.readouterr().err
+
+    request_path.rmdir()
+    source = tmp_path / "raw-source"
+    source.write_bytes(b"GET /api/items HTTP/1.1\r\nHost: example.com\r\n\r\n")
+    try:
+        request_path.symlink_to(source)
+    except OSError:
+        pytest.skip("symlink creation is unavailable in this environment")
+    assert cli.main(arguments) == cli.EXIT_AUTHORITY
+    assert "regular non-symlink" in capsys.readouterr().err
+
+
+def test_scope_complete_request_binds_local_response_digest_without_network(
+    tmp_path: Path,
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(tmp_path)
+    verified = _run_module(
+        _check_request_arguments(workspace, key_path), reject_sockets=True
+    )
+    assert verified.returncode == cli.EXIT_OK
+    reservation_id = json.loads(verified.stdout)["reservation_id"]
+    response_path = workspace / "response.raw"
+    response_path.write_bytes(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+    completed = _run_module(
+        [
+            "scope",
+            "complete-request",
+            "--workspace",
+            str(workspace),
+            "--trusted-key",
+            str(key_path),
+            "--reservation-id",
+            reservation_id,
+            "--request-file",
+            str(workspace / "request.raw"),
+            "--response-file",
+            str(response_path),
+        ],
+        reject_sockets=True,
+    )
+    assert completed.returncode == cli.EXIT_OK
+    result = json.loads(completed.stdout)
+    assert result["observed_response_bytes"] == len(response_path.read_bytes())
+    assert result["response_sha256"] == hashlib.sha256(response_path.read_bytes()).hexdigest()
 
 
 def test_manual_workspace_rolls_back_if_accounting_initialization_fails(
@@ -755,7 +938,7 @@ def test_expired_request_reservations_release_concurrency_but_keep_total_and_rat
     }
 
 
-def test_expired_request_reservation_can_still_be_completed(
+def test_expired_request_reservation_cannot_be_completed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     workspace, key_path = _manual_workspace_for_request_check(
@@ -770,8 +953,9 @@ def test_expired_request_reservation_can_still_be_completed(
 
     assert (
         cli.main(_complete_request_arguments(workspace, key_path, reservation_id, "200"))
-        == cli.EXIT_OK
+        == cli.EXIT_AUTHORITY
     )
+    assert "reservation has expired" in capsys.readouterr().err
 
 
 def test_scope_request_completion_records_oversized_then_rejects_duplicate_and_unknown(
@@ -843,6 +1027,35 @@ def test_scope_request_accounting_rejects_pre_accounting_workspace(
 
     assert cli.main(_check_request_arguments(workspace, key_path)) == cli.EXIT_AUTHORITY
     assert "predates request accounting" in capsys.readouterr().err
+
+
+def test_scope_verify_request_requires_the_revised_exact_binding_schema(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workspace, key_path = _manual_workspace_for_request_check(tmp_path)
+    capsys.readouterr()
+    state_path = workspace / cli.REQUEST_ACCOUNTING_FILENAME
+    connection = sqlite3.connect(state_path)
+    try:
+        connection.execute("DROP TABLE reservations")
+        connection.execute(
+            """CREATE TABLE reservations (
+                reservation_id TEXT PRIMARY KEY,
+                created_at REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                request_bytes INTEGER NOT NULL,
+                response_limit INTEGER NOT NULL,
+                completed_at REAL,
+                observed_response_bytes INTEGER
+            )"""
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert cli.main(_check_request_arguments(workspace, key_path)) == cli.EXIT_AUTHORITY
+    assert "unsupported schema; create a new run workspace" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("tamper", ("missing", "blank", "extra_table"))
@@ -1017,7 +1230,7 @@ def test_scope_check_request_enforces_signed_byte_limits(
         )
         == cli.EXIT_AUTHORITY
     )
-    assert "signed byte budget" in capsys.readouterr().err
+    assert "signed byte" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("tamper_kind", ("authority", "trusted_key", "digest", "binding"))

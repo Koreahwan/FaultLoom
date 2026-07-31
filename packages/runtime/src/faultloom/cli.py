@@ -1449,6 +1449,126 @@ def _request_byte_count(value: str, *, label: str) -> int:
     return count
 
 
+def _capture_bounded_local_file(path: Path, *, maximum_bytes: int, label: str) -> bytes:
+    """Capture one immutable local file without reading beyond its signed budget."""
+    if maximum_bytes < 0:
+        raise CliError(f"{label} byte limit is invalid", exit_code=EXIT_AUTHORITY)
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise CliError(
+            f"cannot inspect {label} file {path}: {exc}", exit_code=EXIT_AUTHORITY
+        ) from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise CliError(
+            f"{label} file is not a regular non-symlink file", exit_code=EXIT_AUTHORITY
+        )
+    if metadata.st_size > maximum_bytes:
+        raise CliError(
+            f"{label} file exceeds the signed byte limit", exit_code=EXIT_AUTHORITY
+        )
+    # The protocol-file capture pins every path component and the opened inode.  Its
+    # global cap is a second, stricter ceiling; the size check above makes its read
+    # bound no larger than this request/response's signed budget.
+    return _capture_single_protocol_file(path)
+
+
+def _parse_raw_http11_request(
+    content: bytes,
+    *,
+    hostname: str,
+    port: int,
+    scheme: str,
+    method: str,
+    path: str,
+) -> None:
+    """Fail closed unless a raw file is one unambiguous HTTP/1.1 request."""
+    if not content or b"\r\n\r\n" not in content:
+        raise CliError("raw request is missing a CRLF header terminator", exit_code=EXIT_AUTHORITY)
+    header_block, body = content.split(b"\r\n\r\n", 1)
+    if b"\n" in header_block.replace(b"\r\n", b"") or b"\r" in header_block.replace(
+        b"\r\n", b""
+    ):
+        raise CliError("raw request uses malformed CRLF framing", exit_code=EXIT_AUTHORITY)
+    lines = header_block.split(b"\r\n")
+    if not lines or not lines[0]:
+        raise CliError("raw request has no request line", exit_code=EXIT_AUTHORITY)
+    try:
+        request_line = lines[0].decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise CliError("raw request line is not ASCII", exit_code=EXIT_AUTHORITY) from exc
+    expected_line = f"{method} {path} HTTP/1.1"
+    if request_line != expected_line:
+        raise CliError(
+            "raw request line does not match the signed method and path",
+            exit_code=EXIT_AUTHORITY,
+        )
+
+    host_values: list[str] = []
+    content_lengths: list[str] = []
+    for line in lines[1:]:
+        if not line or line[:1] in {b" ", b"\t"} or b":" not in line:
+            raise CliError("raw request has malformed header framing", exit_code=EXIT_AUTHORITY)
+        name, value = line.split(b":", 1)
+        if not name or any(
+            character not in b"!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+            for character in name
+        ):
+            raise CliError("raw request has an invalid header name", exit_code=EXIT_AUTHORITY)
+        if any(character < 32 and character not in {9} or character == 127 for character in value):
+            raise CliError("raw request has an invalid header value", exit_code=EXIT_AUTHORITY)
+        lowered = name.lower()
+        try:
+            normalized_value = value.strip(b" \t").decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise CliError("raw request header is not ASCII", exit_code=EXIT_AUTHORITY) from exc
+        if lowered == b"host":
+            host_values.append(normalized_value)
+        elif lowered == b"content-length":
+            content_lengths.append(normalized_value)
+        elif lowered == b"transfer-encoding":
+            raise CliError("raw request transfer-encoding is not permitted", exit_code=EXIT_AUTHORITY)
+
+    if len(host_values) != 1:
+        raise CliError("raw request must contain exactly one Host header", exit_code=EXIT_AUTHORITY)
+    default_port = (scheme == "https" and port == 443) or (scheme == "http" and port == 80)
+    expected_host = hostname if default_port else f"{hostname}:{port}"
+    if host_values[0].lower() != expected_host.lower():
+        raise CliError("raw request Host header does not match the signed endpoint", exit_code=EXIT_AUTHORITY)
+    if len(content_lengths) > 1:
+        raise CliError("raw request has duplicate Content-Length headers", exit_code=EXIT_AUTHORITY)
+    if content_lengths:
+        value = content_lengths[0]
+        if not value.isascii() or not value.isdecimal() or str(int(value)) != value:
+            raise CliError("raw request has an invalid Content-Length header", exit_code=EXIT_AUTHORITY)
+        if int(value) != len(body):
+            raise CliError("raw request body does not match Content-Length", exit_code=EXIT_AUTHORITY)
+    elif body:
+        raise CliError("raw request body requires exactly one Content-Length header", exit_code=EXIT_AUTHORITY)
+
+
+def _capture_verified_raw_request(
+    path: Path,
+    *,
+    maximum_bytes: int,
+    hostname: str,
+    port: int,
+    scheme: str,
+    method: str,
+    request_path: str,
+) -> tuple[bytes, str]:
+    content = _capture_bounded_local_file(path, maximum_bytes=maximum_bytes, label="request")
+    _parse_raw_http11_request(
+        content,
+        hostname=hostname,
+        port=port,
+        scheme=scheme,
+        method=method,
+        path=request_path,
+    )
+    return content, hashlib.sha256(content).hexdigest()
+
+
 def _verified_request_workspace(
     workspace: Path,
     trusted_key_path: Path,
@@ -1629,9 +1749,11 @@ def _prepare_request_accounting(
                     expires_at REAL NOT NULL,
                     request_fingerprint TEXT NOT NULL,
                     request_bytes INTEGER NOT NULL,
+                    request_sha256 TEXT NOT NULL,
                     response_limit INTEGER NOT NULL,
                     completed_at REAL,
-                    observed_response_bytes INTEGER
+                    observed_response_bytes INTEGER,
+                    response_sha256 TEXT
                 )"""
             )
         objects = dict(
@@ -1654,9 +1776,11 @@ def _prepare_request_accounting(
             ("expires_at", "REAL", 1, 0),
             ("request_fingerprint", "TEXT", 1, 0),
             ("request_bytes", "INTEGER", 1, 0),
+            ("request_sha256", "TEXT", 1, 0),
             ("response_limit", "INTEGER", 1, 0),
             ("completed_at", "REAL", 0, 0),
             ("observed_response_bytes", "INTEGER", 0, 0),
+            ("response_sha256", "TEXT", 0, 0),
         )
         if (
             objects != expected_objects
@@ -1664,7 +1788,8 @@ def _prepare_request_accounting(
             or columns != expected_columns
         ):
             raise CliError(
-                "request accounting state has an invalid schema", exit_code=EXIT_AUTHORITY
+                "request accounting state uses an unsupported schema; create a new run workspace",
+                exit_code=EXIT_AUTHORITY,
             )
         rows = dict(connection.execute("SELECT key, value FROM metadata"))
         if initialize:
@@ -1714,6 +1839,7 @@ def _request_fingerprint(
     method: str,
     path: str,
     request_bytes: int,
+    request_sha256: str,
     response_bytes: int,
 ) -> str:
     metadata = {
@@ -1722,6 +1848,7 @@ def _request_fingerprint(
         "path": path,
         "port": port,
         "request_bytes": request_bytes,
+        "request_sha256": request_sha256,
         "response_bytes": response_bytes,
         "scheme": scheme,
     }
@@ -1733,6 +1860,20 @@ def _active_reservation_count(connection: sqlite3.Connection, now: float) -> int
     return connection.execute(
         "SELECT COUNT(*) FROM reservations WHERE completed_at IS NULL AND expires_at > ?", (now,)
     ).fetchone()[0]
+
+
+def _response_file_size(path: Path) -> int:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise CliError(
+            f"cannot inspect response file {path}: {exc}", exit_code=EXIT_AUTHORITY
+        ) from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise CliError(
+            "response file is not a regular non-symlink file", exit_code=EXIT_AUTHORITY
+        )
+    return metadata.st_size
 
 
 def _reserve_request(
@@ -1747,6 +1888,7 @@ def _reserve_request(
     method: str,
     path: str,
     request_bytes: int,
+    request_sha256: str,
     response_bytes: int,
 ) -> dict[str, object]:
     now_seconds = now.timestamp()
@@ -1776,8 +1918,8 @@ def _reserve_request(
         connection.execute(
             """INSERT INTO reservations(
                 reservation_id, created_at, expires_at, request_fingerprint,
-                request_bytes, response_limit
-            ) VALUES (?, ?, ?, ?, ?, ?)""",
+                request_bytes, request_sha256, response_limit
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (
                 reservation_id,
                 now_seconds,
@@ -1789,9 +1931,11 @@ def _reserve_request(
                     method=method,
                     path=path,
                     request_bytes=request_bytes,
+                    request_sha256=request_sha256,
                     response_bytes=response_bytes,
                 ),
                 request_bytes,
+                request_sha256,
                 response_bytes,
             ),
         )
@@ -1822,24 +1966,60 @@ def _complete_request(
     workspace: Path,
     manifest: dict[str, object],
     reservation_id: str,
+    request_file: Path,
     observed_response_bytes: int,
+    response_file: Path | None,
 ) -> dict[str, object]:
     connection = _request_accounting_connection(workspace)
     try:
         _prepare_request_accounting(connection, manifest)
         row = connection.execute(
-            "SELECT response_limit, completed_at FROM reservations WHERE reservation_id = ?",
+            """SELECT expires_at, request_bytes, request_sha256, response_limit, completed_at
+               FROM reservations WHERE reservation_id = ?""",
             (reservation_id,),
         ).fetchone()
         if row is None:
             raise CliError("unknown request reservation", exit_code=EXIT_AUTHORITY)
-        if row[1] is not None:
+        if row[4] is not None:
             raise CliError("request reservation is already complete", exit_code=EXIT_AUTHORITY)
-        within_reserved_response_budget = observed_response_bytes <= row[0]
+        if _utc_now().timestamp() >= row[0]:
+            raise CliError("request reservation has expired", exit_code=EXIT_AUTHORITY)
+        request_content = _capture_bounded_local_file(
+            request_file,
+            maximum_bytes=row[1],
+            label="request",
+        )
+        request_sha256 = hashlib.sha256(request_content).hexdigest()
+        if request_sha256 != row[2]:
+            raise CliError(
+                "request file digest does not match the reservation",
+                exit_code=EXIT_AUTHORITY,
+            )
+        response_sha256: str | None = None
+        if response_file is not None:
+            response_size = _response_file_size(response_file)
+            if response_size != observed_response_bytes:
+                raise CliError(
+                    "response file length changed while being inspected",
+                    exit_code=EXIT_AUTHORITY,
+                )
+            if response_size <= row[3]:
+                response_content = _capture_bounded_local_file(
+                    response_file,
+                    maximum_bytes=row[3],
+                    label="response",
+                )
+                if len(response_content) != observed_response_bytes:
+                    raise CliError(
+                        "response file length changed while being read",
+                        exit_code=EXIT_AUTHORITY,
+                    )
+                response_sha256 = hashlib.sha256(response_content).hexdigest()
+        within_reserved_response_budget = observed_response_bytes <= row[3]
         connection.execute(
-            "UPDATE reservations SET completed_at = ?, observed_response_bytes = ? "
+            "UPDATE reservations SET completed_at = ?, observed_response_bytes = ?, response_sha256 = ? "
             "WHERE reservation_id = ?",
-            (_utc_now().timestamp(), observed_response_bytes, reservation_id),
+            (_utc_now().timestamp(), observed_response_bytes, response_sha256, reservation_id),
         )
         connection.commit()
     except CliError:
@@ -1857,12 +2037,14 @@ def _complete_request(
         "completed": True,
         "dispatch_performed": False,
         "network_access": "none",
+        "request_sha256": request_sha256,
         "reservation_id": reservation_id,
+        "response_sha256": response_sha256,
         "within_reserved_response_budget": within_reserved_response_budget,
     }
 
 
-def _scope_check_request(arguments: argparse.Namespace) -> int:
+def _scope_verify_request(arguments: argparse.Namespace) -> int:
     workspace: Path = arguments.workspace
     trusted_key_path = _trusted_key_path(arguments)
     manifest, grant, target, now = _verified_request_workspace(workspace, trusted_key_path)
@@ -1871,8 +2053,17 @@ def _scope_check_request(arguments: argparse.Namespace) -> int:
     path = arguments.path
     if not path.startswith("/"):
         raise CliError("request path must start with '/'", exit_code=EXIT_AUTHORITY)
-    request_bytes = _request_byte_count(arguments.request_bytes, label="request bytes")
     response_bytes = _request_byte_count(arguments.response_bytes, label="response bytes")
+    request_content, request_sha256 = _capture_verified_raw_request(
+        arguments.request_file,
+        maximum_bytes=grant.budget.max_request_bytes,
+        hostname=arguments.hostname,
+        port=arguments.port,
+        scheme=arguments.scheme,
+        method=method,
+        request_path=path,
+    )
+    request_bytes = len(request_content)
     if (
         not _request_hostname_matches_target(arguments.hostname, target)
         or (target.ports and arguments.port not in target.ports)
@@ -1925,6 +2116,7 @@ def _scope_check_request(arguments: argparse.Namespace) -> int:
         method=method,
         path=path,
         request_bytes=request_bytes,
+        request_sha256=request_sha256,
         response_bytes=response_bytes,
     )
     _emit_json(
@@ -1942,6 +2134,7 @@ def _scope_check_request(arguments: argparse.Namespace) -> int:
             "path": path,
             "port": arguments.port,
             "request_bytes": request_bytes,
+            "request_sha256": request_sha256,
             "response_bytes": response_bytes,
             "scheme": arguments.scheme,
             "target_id": target.target_id,
@@ -1960,9 +2153,13 @@ def _scope_complete_request(arguments: argparse.Namespace) -> int:
         workspace=arguments.workspace,
         manifest=manifest,
         reservation_id=arguments.reservation_id,
-        observed_response_bytes=_request_byte_count(
-            arguments.observed_response_bytes, label="observed response bytes"
+        request_file=arguments.request_file,
+        observed_response_bytes=(
+            _request_byte_count(arguments.observed_response_bytes, label="observed response bytes")
+            if arguments.response_file is None
+            else _response_file_size(arguments.response_file)
         ),
+        response_file=arguments.response_file,
     )
     _emit_json(completion)
     return EXIT_OK if completion["within_reserved_response_budget"] else EXIT_AUTHORITY
@@ -2365,20 +2562,28 @@ def build_parser() -> argparse.ArgumentParser:
     scope_revoke = scope_commands.add_parser("revoke", help="revoke an authority grant")
     scope_revoke.add_argument("grant_id")
     _set_unavailable(scope_revoke, "scope revoke")
+    def configure_verify_request(command: argparse.ArgumentParser) -> None:
+        command.add_argument("--workspace", type=Path, required=True)
+        command.add_argument("--trusted-key", type=Path)
+        command.add_argument("--hostname", required=True)
+        command.add_argument("--port", type=_port, required=True)
+        command.add_argument("--scheme", choices=("http", "https"), required=True)
+        command.add_argument("--method", required=True)
+        command.add_argument("--path", required=True)
+        command.add_argument("--request-file", type=Path, required=True)
+        command.add_argument("--response-bytes", required=True)
+        command.set_defaults(handler=_scope_verify_request)
+
+    scope_verify_request = scope_commands.add_parser(
+        "verify-request",
+        help="bind one exact local raw HTTP/1.1 request to a signed manual workspace",
+    )
+    configure_verify_request(scope_verify_request)
     scope_check_request = scope_commands.add_parser(
         "check-request",
-        help="offline-check a Burp request against a signed manual workspace",
+        help="deprecated alias for verify-request; exact raw request file required",
     )
-    scope_check_request.add_argument("--workspace", type=Path, required=True)
-    scope_check_request.add_argument("--trusted-key", type=Path)
-    scope_check_request.add_argument("--hostname", required=True)
-    scope_check_request.add_argument("--port", type=_port, required=True)
-    scope_check_request.add_argument("--scheme", choices=("http", "https"), required=True)
-    scope_check_request.add_argument("--method", required=True)
-    scope_check_request.add_argument("--path", required=True)
-    scope_check_request.add_argument("--request-bytes", required=True)
-    scope_check_request.add_argument("--response-bytes", required=True)
-    scope_check_request.set_defaults(handler=_scope_check_request)
+    configure_verify_request(scope_check_request)
     scope_complete_request = scope_commands.add_parser(
         "complete-request",
         help="record an offline Burp request reservation completion",
@@ -2386,7 +2591,10 @@ def build_parser() -> argparse.ArgumentParser:
     scope_complete_request.add_argument("--workspace", type=Path, required=True)
     scope_complete_request.add_argument("--trusted-key", type=Path)
     scope_complete_request.add_argument("--reservation-id", required=True)
-    scope_complete_request.add_argument("--observed-response-bytes", required=True)
+    scope_complete_request.add_argument("--request-file", type=Path, required=True)
+    response_source = scope_complete_request.add_mutually_exclusive_group(required=True)
+    response_source.add_argument("--observed-response-bytes")
+    response_source.add_argument("--response-file", type=Path)
     scope_complete_request.set_defaults(handler=_scope_complete_request)
 
     run = commands.add_parser("run", help="start an authorized research run")
