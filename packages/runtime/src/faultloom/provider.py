@@ -1,28 +1,15 @@
 """Fail-closed model provider contracts and adapter public surface."""
 
 from ._provider import (
-    AnchoredProviderReceiptJournal,
     FailureCode,
     FailoverProvenance,
     GenerationConfig,
     MemoryProviderReceiptJournal,
     MetadataProvenance,
     MetadataSourceKind,
-    BoundEnvironmentCredentialResolver,
     OPENAI_COMPATIBLE_MAX_TOOL_ARGUMENT_BYTES,
     OpenAICompatibleChatPayload,
-    OpenAICompatibleCredentialBinding,
-    OpenAICompatibleEndpointConfig,
-    OpenAICompatibleEgressTransport,
-    OpenAICompatibleFunctionSchema,
-    OpenAICompatibleHttpPort,
-    OpenAICompatibleHttpResponse,
     OpenAICompatibleMessage,
-    OpenAICompatiblePayloadStore,
-    OpenAICompatiblePreset,
-    OpenAICompatibleProviderProxy,
-    PinnedHttpsGatewayPort,
-    ProviderAdapter,
     ProviderAdapterError,
     ProviderBudgetError,
     ProviderCallBudget,
@@ -54,8 +41,35 @@ from ._provider import (
     provider_proxy_result_attestation_bytes,
     provider_sha256_digest,
     provider_tool_schema_digest,
-    openai_compatible_preset,
 )
+from . import _provider as _provider
+
+_LAZY_EXPORTS = frozenset(
+    {
+        "AnchoredProviderReceiptJournal",
+        "ProviderAdapter",
+        "BoundEnvironmentCredentialResolver",
+        "OpenAICompatibleCredentialBinding",
+        "OpenAICompatibleEndpointConfig",
+        "OpenAICompatibleEgressTransport",
+        "OpenAICompatibleFunctionSchema",
+        "OpenAICompatibleHttpPort",
+        "OpenAICompatibleHttpResponse",
+        "OpenAICompatiblePayloadStore",
+        "OpenAICompatiblePreset",
+        "OpenAICompatibleProviderProxy",
+        "PinnedHttpsGatewayPort",
+        "openai_compatible_preset",
+    }
+)
+
+
+def __getattr__(name: str) -> object:
+    if name not in _LAZY_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(_provider, name)
+    globals()[name] = value
+    return value
 
 __all__ = [
     "AnchoredProviderReceiptJournal",

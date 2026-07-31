@@ -1,5 +1,5 @@
-from .adapter import ProviderAdapter
-from .anchored_journal import AnchoredProviderReceiptJournal
+from faultloom._provider_constants import OPENAI_COMPATIBLE_MAX_TOOL_ARGUMENT_BYTES
+from .chat_payload import OpenAICompatibleChatPayload, OpenAICompatibleMessage
 from .common import (
     FailureCode,
     MetadataSourceKind,
@@ -36,23 +36,6 @@ from .metadata import (
     ProviderToolSpec,
     provider_tool_schema_digest,
 )
-from .openai_compatible import (
-    BoundEnvironmentCredentialResolver,
-    OPENAI_COMPATIBLE_MAX_TOOL_ARGUMENT_BYTES,
-    OpenAICompatibleChatPayload,
-    OpenAICompatibleCredentialBinding,
-    OpenAICompatibleEndpointConfig,
-    OpenAICompatibleEgressTransport,
-    OpenAICompatibleFunctionSchema,
-    OpenAICompatibleHttpPort,
-    OpenAICompatibleHttpResponse,
-    OpenAICompatibleMessage,
-    OpenAICompatiblePayloadStore,
-    OpenAICompatiblePreset,
-    OpenAICompatibleProviderProxy,
-    PinnedHttpsGatewayPort,
-    openai_compatible_preset,
-)
 from .proxy import (
     ProviderProxyPort,
     ProviderProxyRequest,
@@ -63,6 +46,44 @@ from .proxy import (
 )
 from .receipt import ProviderCallReceipt
 from .wire_catalog import PROVIDER_WIRE as _PROVIDER_WIRE
+
+_LAZY_EXPORTS = frozenset(
+    {
+        "AnchoredProviderReceiptJournal",
+        "ProviderAdapter",
+        "BoundEnvironmentCredentialResolver",
+        "OpenAICompatibleCredentialBinding",
+        "OpenAICompatibleEndpointConfig",
+        "OpenAICompatibleEgressTransport",
+        "OpenAICompatibleFunctionSchema",
+        "OpenAICompatibleHttpPort",
+        "OpenAICompatibleHttpResponse",
+        "OpenAICompatiblePayloadStore",
+        "OpenAICompatiblePreset",
+        "OpenAICompatibleProviderProxy",
+        "PinnedHttpsGatewayPort",
+        "openai_compatible_preset",
+    }
+)
+
+
+def __getattr__(name: str) -> object:
+    if name == "ProviderAdapter":
+        from .adapter import ProviderAdapter
+
+        value = ProviderAdapter
+    elif name == "AnchoredProviderReceiptJournal":
+        from .anchored_journal import AnchoredProviderReceiptJournal
+
+        value = AnchoredProviderReceiptJournal
+    elif name in _LAZY_EXPORTS:
+        from . import openai_compatible
+
+        value = getattr(openai_compatible, name)
+    else:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    globals()[name] = value
+    return value
 
 __all__ = [
     "AnchoredProviderReceiptJournal",

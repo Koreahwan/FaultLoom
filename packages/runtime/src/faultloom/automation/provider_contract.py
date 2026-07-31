@@ -8,14 +8,13 @@ remain coordinator-side checks.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from faultloom.egress_wire import WireValue
-from faultloom.provider import (
-    OpenAICompatibleFunctionSchema,
-    ProviderToolKind,
-    ProviderToolSpec,
-    provider_canonical_json_bytes,
-    provider_sha256_digest,
-)
+from faultloom.provider import ProviderToolKind, ProviderToolSpec, provider_canonical_json_bytes, provider_sha256_digest
+
+if TYPE_CHECKING:
+    from faultloom.provider import OpenAICompatibleFunctionSchema
 
 
 # This identifier is intentionally valid both for the provider tool contract
@@ -230,6 +229,8 @@ def model_turn_provider_tool_spec() -> ProviderToolSpec:
 
 def model_turn_openai_function_schema() -> OpenAICompatibleFunctionSchema:
     """Build an admitted OpenAI-compatible function schema with no transport."""
+
+    from faultloom.provider import OpenAICompatibleFunctionSchema
 
     return OpenAICompatibleFunctionSchema(
         tool=model_turn_provider_tool_spec(),

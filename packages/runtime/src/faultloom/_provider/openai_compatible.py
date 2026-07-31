@@ -41,7 +41,7 @@ from .common import (
     provider_canonical_json_bytes,
     provider_sha256_digest as sha256_digest,
 )
-from .intent import GenerationConfig
+from .chat_payload import OpenAICompatibleChatPayload, OpenAICompatibleMessage
 from .metadata import (
     ProviderObservedMetadata,
     ProviderToolSpec,
@@ -302,34 +302,6 @@ class OpenAICompatibleEndpointConfig(_RuntimeModel):
     def api_path(self) -> str:
         prefix = urlsplit(self.base_url).path.rstrip("/")
         return (prefix or "") + self.chat_completions_path
-
-
-class OpenAICompatibleMessage(_RuntimeModel):
-    role: Literal["system", "user", "assistant"]
-    content: NonEmptyStr
-
-    def as_wire(self) -> dict[str, str]:
-        return {"role": self.role, "content": self.content}
-
-
-class OpenAICompatibleChatPayload(_RuntimeModel):
-    messages: tuple[OpenAICompatibleMessage, ...]
-    generation: GenerationConfig
-
-    @model_validator(mode="after")
-    def _requires_message(self) -> Self:
-        if not self.messages:
-            raise ValueError("OpenAI-compatible chat payload requires one or more messages")
-        return self
-
-    def prompt_material(self) -> dict[str, tuple[dict[str, str], ...]]:
-        return {"messages": tuple(message.as_wire() for message in self.messages)}
-
-    def prompt_digest(self) -> str:
-        return sha256_digest(cast(Any, self.prompt_material()))
-
-    def prompt_bytes(self) -> int:
-        return len(provider_canonical_json_bytes(cast(Any, self.prompt_material())))
 
 
 PromptResolver = Callable[[ProviderProxyRequest], OpenAICompatibleChatPayload]
