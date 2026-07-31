@@ -45,6 +45,11 @@ from faultloom_protocol.signing import SignatureVerificationError
 
 from . import __version__
 from .adapter_cli import configure_adapter_parser
+from .automation_cli import (
+    AutomationCompileDependencies,
+    AutomationCompileError,
+    compile_automation,
+)
 from .verification_cli import (
     VerificationCliDependencies,
     VerificationCliError,
@@ -1543,6 +1548,23 @@ def _verified_request_workspace(
     return manifest, grant, target, now
 
 
+def _automation_compile(arguments: argparse.Namespace) -> int:
+    try:
+        return compile_automation(
+            arguments,
+            dependencies=AutomationCompileDependencies(
+                verify_workspace=_verified_request_workspace,
+                capture_file=_capture_single_protocol_file,
+                emit_json=_emit_json,
+            ),
+        )
+    except AutomationCompileError as exc:
+        raise CliError(
+            str(exc),
+            exit_code=EXIT_AUTHORITY if exc.authority else EXIT_USAGE,
+        ) from exc
+
+
 def _request_accounting_connection(workspace: Path) -> sqlite3.Connection:
     path = workspace / REQUEST_ACCOUNTING_FILENAME
     try:
@@ -2412,6 +2434,24 @@ def build_parser() -> argparse.ArgumentParser:
     finding_new.add_argument("--remediation")
     finding_new.add_argument("--evidence", action="append")
     finding_new.set_defaults(handler=_finding_new)
+
+    automation = commands.add_parser(
+        "automation", help="compile offline automation candidates"
+    )
+    automation_commands = automation.add_subparsers(
+        dest="automation_command", required=True
+    )
+    automation_compile = automation_commands.add_parser(
+        "compile", help="compile one local model turn without provider or target access"
+    )
+    automation_compile.add_argument("--workspace", type=Path, required=True)
+    automation_compile.add_argument("--trusted-key", type=Path, required=True)
+    automation_compile.add_argument(
+        "--minimum-grant-version", type=_positive_int, default=1
+    )
+    automation_compile.add_argument("--request", type=Path, required=True)
+    automation_compile.add_argument("--model-turn", type=Path, required=True)
+    automation_compile.set_defaults(handler=_automation_compile)
 
     resume = commands.add_parser("resume", help="resume a durable run")
     _configure_resume_command(resume, operation_name="resume")

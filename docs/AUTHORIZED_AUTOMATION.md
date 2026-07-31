@@ -77,6 +77,35 @@ The candidate outbox records `automatic_submission=false`,
 `independent_verification=false`, and `target_dispatch=false`. A candidate
 draft must go through the independent verifier before it can become a report.
 
+### 4. Offline operator compilation
+
+The personal CLI can compile one already-produced, untrusted structured model
+turn without calling a provider or a target:
+
+```text
+faultloom automation compile \
+  --workspace <signed-manual-workspace> \
+  --trusted-key <public-key-outside-workspace> \
+  --request <automation-request.json> \
+  --model-turn <model-turn.json>
+```
+
+Both JSON arguments are regular-file paths. The command re-verifies the
+workspace's current signed authority, exact run, target, pack, grant version,
+execution window, and trusted key. The request must contain the identical
+signed grant payload, must not be future-dated, and must set
+`provider_network_access` to `none`. Any action proposal fails closed because
+this offline command has no admitted live adapter.
+
+On success it atomically creates a private, create-once directory under
+`<workspace>/automation/` containing canonical `result.json`, canonical
+`receipt.json`, and, when present, a secret-scrubbed `candidate.md`. The result
+is suitable as input to a later trusted `AutomationAdmission`, but this command
+does not sign that admission, perform independent verification, dispatch a
+request, or submit a report. A model CLI or API adapter that produced the input
+turn remains responsible for its own provider provenance; offline compilation
+does not retroactively attest which model produced the file.
+
 ## Optional authorized target dispatch
 
 Dispatch is a separate, explicit operator/controller step. It does not happen

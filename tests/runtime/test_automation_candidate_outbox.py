@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
 from faultloom.automation.candidate_outbox import (
     CandidateOutboxError,
+    write_automation_result_bundle,
     write_candidate_outbox,
 )
 from faultloom.automation.models import (
@@ -191,3 +194,410 @@ def test_candidate_outbox_interruption_has_no_visible_entry_and_can_retry(
     publication = write_candidate_outbox(result, out_dir)
     assert publication.candidate_path.is_file()
     assert publication.receipt_path.is_file()
+
+
+def test_result_bundle_refuses_output_root_replacement_without_external_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import faultloom.automation.candidate_outbox as outbox_module
+
+    out_dir = tmp_path / "outbox"
+    external = tmp_path / "external"
+    external.mkdir()
+    moved = tmp_path / "outbox-original"
+    original_mkdir = outbox_module.os.mkdir
+    replacement_done = False
+    external_stage: Path | None = None
+
+    def replace_output_root_after_staging(
+        path: str | Path,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal replacement_done, external_stage
+        original_mkdir(path, mode, dir_fd=dir_fd)
+        name = Path(path).name
+        if (
+            not replacement_done
+            and dir_fd is not None
+            and name.startswith(".result.")
+            and name.endswith(".tmp")
+        ):
+            replacement_done = True
+            out_dir.rename(moved)
+            out_dir.symlink_to(external, target_is_directory=True)
+            external_stage = external / name
+            original_mkdir(external_stage, 0o700)
+            (external_stage / "sentinel.txt").write_text("untouched", encoding="utf-8")
+
+    monkeypatch.setattr(outbox_module.os, "mkdir", replace_output_root_after_staging)
+    with pytest.raises(CandidateOutboxError, match="outbox path changed"):
+        write_automation_result_bundle(_result(), out_dir)
+
+    assert replacement_done
+    assert external_stage is not None
+    assert (external_stage / "sentinel.txt").read_text(encoding="utf-8") == "untouched"
+    assert sorted(path.name for path in external_stage.iterdir()) == ["sentinel.txt"]
+
+
+def test_result_bundle_posix_commit_never_replaces_raced_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import faultloom.automation.candidate_outbox as outbox_module
+
+    out_dir = tmp_path / "outbox"
+    original_rename_no_replace = outbox_module._rename_no_replace_at
+    original_mkdir = outbox_module.os.mkdir
+    raced_destination: Path | None = None
+
+    def create_destination_at_commit(
+        source_directory_fd: int,
+        source_name: str,
+        destination_directory_fd: int,
+        destination_name: str,
+    ) -> None:
+        nonlocal raced_destination
+        original_mkdir(destination_name, 0o700, dir_fd=destination_directory_fd)
+        raced_destination = out_dir / destination_name
+        original_rename_no_replace(
+            source_directory_fd,
+            source_name,
+            destination_directory_fd,
+            destination_name,
+        )
+
+    monkeypatch.setattr(
+        outbox_module, "_rename_no_replace_at", create_destination_at_commit
+    )
+    with pytest.raises(CandidateOutboxError, match="File exists"):
+        write_automation_result_bundle(_result(), out_dir)
+
+    assert raced_destination is not None
+    assert raced_destination.is_dir()
+    assert list(raced_destination.iterdir()) == []
+
+
+def test_result_bundle_windows_path_holds_directory_lock_through_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import faultloom.automation.candidate_outbox as outbox_module
+
+    out_dir = tmp_path / "outbox"
+
+    class FakeLock:
+        def __init__(self, directory: Path) -> None:
+            self.directory = directory
+            self.stat = directory.lstat()
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    out_dir.mkdir()
+    lock = FakeLock(out_dir)
+    staging_locks: list[FakeLock] = []
+    original = outbox_module._create_file_once
+
+    def require_lock(path: Path, content: str) -> None:
+        assert not lock.closed
+        original(path, content)
+
+    def lock_staging(directory: Path, *, access: int) -> FakeLock:
+        assert access == 0x00010080
+        staging_lock = FakeLock(directory)
+        staging_locks.append(staging_lock)
+        return staging_lock
+
+    def move_no_replace(staging_lock: FakeLock, destination: Path) -> None:
+        assert not lock.closed
+        assert not staging_lock.closed
+        os.rename(staging_lock.directory, destination)
+
+    monkeypatch.setattr(outbox_module, "_lock_windows_output_directory", lambda _: lock)
+    monkeypatch.setattr(outbox_module, "_lock_windows_directory", lock_staging)
+    monkeypatch.setattr(outbox_module, "_windows_move_no_replace", move_no_replace)
+    monkeypatch.setattr(outbox_module, "_create_file_once", require_lock)
+    entry_dir = outbox_module._publish_windows_create_once_bundle(
+        out_dir=out_dir,
+        entry_id="result.windows-lock-test",
+        files=(("result.json", "{}"), ("receipt.json", "{}")),
+        error_label="automation result bundle",
+    )
+
+    assert lock.closed
+    assert len(staging_locks) == 1
+    assert staging_locks[0].closed
+    assert (entry_dir / "result.json").is_file()
+
+
+def test_result_bundle_windows_staging_lock_blocks_junction_swap_before_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import faultloom.automation.candidate_outbox as outbox_module
+
+    out_dir = tmp_path / "outbox"
+    out_dir.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    sentinel = external / "sentinel.txt"
+    sentinel.write_text("untouched", encoding="utf-8")
+
+    class FakeLock:
+        def __init__(self, directory: Path) -> None:
+            self.directory = directory
+            self.stat = directory.lstat()
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    root_lock = FakeLock(out_dir)
+    staging_locks: list[FakeLock] = []
+    junction_swap_attempted = False
+
+    def lock_staging(directory: Path, *, access: int) -> FakeLock:
+        assert access == 0x00010080
+        staging_lock = FakeLock(directory)
+        staging_locks.append(staging_lock)
+        return staging_lock
+
+    def reject_junction_swap(staging_lock: FakeLock, _destination: Path) -> None:
+        nonlocal junction_swap_attempted
+        junction_swap_attempted = True
+        # Windows denies delete/rename while this handle omits FILE_SHARE_DELETE;
+        # model the attacker's attempted staging-to-junction replacement here.
+        if not staging_lock.closed:
+            raise PermissionError("staging directory is handle-locked")
+        raise AssertionError("staging handle was released before commit")
+
+    monkeypatch.setattr(
+        outbox_module, "_lock_windows_output_directory", lambda _: root_lock
+    )
+    monkeypatch.setattr(outbox_module, "_lock_windows_directory", lock_staging)
+    monkeypatch.setattr(outbox_module, "_windows_move_no_replace", reject_junction_swap)
+    monkeypatch.setattr(outbox_module, "_windows_mark_directory_for_delete", lambda _: None)
+
+    with pytest.raises(CandidateOutboxError, match="handle-locked"):
+        outbox_module._publish_windows_create_once_bundle(
+            out_dir=out_dir,
+            entry_id="result.windows-junction-race",
+            files=(("result.json", "{}"), ("receipt.json", "{}")),
+            error_label="automation result bundle",
+        )
+
+    assert junction_swap_attempted
+    assert len(staging_locks) == 1
+    assert staging_locks[0].closed
+    assert root_lock.closed
+    assert sentinel.read_text(encoding="utf-8") == "untouched"
+    assert not (out_dir / "result.windows-junction-race").exists()
+
+
+def test_result_bundle_windows_commit_failure_cleans_staging_sensitive_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import faultloom.automation.candidate_outbox as outbox_module
+
+    out_dir = tmp_path / "outbox"
+    out_dir.mkdir()
+    sensitive = "sensitive-staging-marker-1234567890"
+    real_rmdir = os.rmdir
+
+    class FakeLock:
+        def __init__(self, directory: Path) -> None:
+            self.directory = directory
+            self.stat = directory.lstat()
+            self.handle = 0x100000001
+            self.closed = False
+            self.delete_on_close = False
+
+        def close(self) -> None:
+            if self.delete_on_close:
+                real_rmdir(self.directory)
+            self.closed = True
+
+    root_lock = FakeLock(out_dir)
+    staging_locks: list[FakeLock] = []
+
+    def lock_staging(directory: Path, *, access: int) -> FakeLock:
+        assert access == 0x00010080
+        staging_lock = FakeLock(directory)
+        staging_locks.append(staging_lock)
+        return staging_lock
+
+    def reject_commit(_staging_lock: FakeLock, _destination: Path) -> None:
+        raise PermissionError("commit denied")
+
+    disposition_handles: list[int] = []
+
+    def mark_for_delete(staging_lock: FakeLock) -> None:
+        disposition_handles.append(staging_lock.handle)
+        staging_lock.delete_on_close = True
+
+    def reject_path_rmdir(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("Windows cleanup must not call path rmdir")
+
+    monkeypatch.setattr(
+        outbox_module, "_lock_windows_output_directory", lambda _: root_lock
+    )
+    monkeypatch.setattr(outbox_module, "_lock_windows_directory", lock_staging)
+    monkeypatch.setattr(outbox_module, "_windows_move_no_replace", reject_commit)
+    monkeypatch.setattr(outbox_module, "_windows_mark_directory_for_delete", mark_for_delete)
+    monkeypatch.setattr(outbox_module.os, "rmdir", reject_path_rmdir)
+
+    with pytest.raises(CandidateOutboxError, match="commit denied"):
+        outbox_module._publish_windows_create_once_bundle(
+            out_dir=out_dir,
+            entry_id="result.windows-cleanup",
+            files=(("result.json", sensitive), ("receipt.json", "{}")),
+            error_label="automation result bundle",
+        )
+
+    assert root_lock.closed
+    assert len(staging_locks) == 1
+    assert staging_locks[0].closed
+    assert disposition_handles == [0x100000001]
+    assert list(out_dir.iterdir()) == []
+    assert not any(
+        sensitive in path.read_text(encoding="utf-8")
+        for path in out_dir.rglob("*")
+        if path.is_file()
+    )
+
+
+def test_windows_move_uses_handle_no_replace_rename_information(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ctypes
+    import faultloom.automation.candidate_outbox as outbox_module
+
+    class FakeSetFileInformationByHandle:
+        def __init__(self) -> None:
+            self.argtypes: object | None = None
+            self.restype: object | None = None
+            self.call: tuple[object, ...] | None = None
+
+        def __call__(self, *args: object) -> int:
+            self.call = args
+            return 1
+
+    class FakeKernel32:
+        def __init__(self) -> None:
+            self.SetFileInformationByHandle = FakeSetFileInformationByHandle()
+
+    kernel32 = FakeKernel32()
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *_args, **_kwargs: kernel32, raising=False)
+    destination = tmp_path / "result.native-handle-rename"
+    staging_lock = outbox_module._WindowsDirectoryLock(
+        handle=0x100000001,
+        stat=tmp_path.stat(),
+    )
+
+    outbox_module._windows_move_no_replace(staging_lock, destination)
+
+    call = kernel32.SetFileInformationByHandle.call
+    assert call is not None
+    handle, information_class, rename_info, buffer_size = cast(
+        tuple[Any, Any, Any, int], call
+    )
+    assert isinstance(handle, ctypes.c_void_p)
+    assert handle.value == 0x100000001
+    assert information_class == 22
+    assert isinstance(buffer_size, int)
+    info_value = cast(Any, rename_info)._obj
+    assert info_value.flags == 0
+    assert info_value.filename_length == len(
+        str(destination.absolute()).encode("utf-16-le")
+    )
+    raw_info = ctypes.string_at(ctypes.addressof(info_value), buffer_size)
+    destination_bytes = str(destination.absolute()).encode("utf-16-le")
+    filename_offset = type(info_value).filename.offset
+    filename_end = filename_offset + len(destination_bytes)
+    assert buffer_size == filename_end + 2
+    assert raw_info[filename_offset:filename_end] == destination_bytes
+    assert raw_info[filename_end:] == b"\x00\x00"
+
+
+def test_windows_cleanup_marks_full_width_staging_handle_for_disposition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ctypes
+    import faultloom.automation.candidate_outbox as outbox_module
+
+    class FakeSetFileInformationByHandle:
+        def __init__(self) -> None:
+            self.argtypes: object | None = None
+            self.restype: object | None = None
+            self.call: tuple[object, ...] | None = None
+
+        def __call__(self, *args: object) -> int:
+            self.call = args
+            return 1
+
+    class FakeKernel32:
+        def __init__(self) -> None:
+            self.SetFileInformationByHandle = FakeSetFileInformationByHandle()
+
+    kernel32 = FakeKernel32()
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *_args, **_kwargs: kernel32, raising=False)
+    staging_lock = outbox_module._WindowsDirectoryLock(
+        handle=0x100000001,
+        stat=tmp_path.stat(),
+    )
+
+    outbox_module._windows_mark_directory_for_delete(staging_lock)
+
+    call = kernel32.SetFileInformationByHandle.call
+    assert call is not None
+    handle, information_class, disposition_info, buffer_size = cast(
+        tuple[Any, Any, Any, int], call
+    )
+    assert isinstance(handle, ctypes.c_void_p)
+    assert handle.value == 0x100000001
+    assert information_class == 4
+    assert buffer_size == 1
+    assert cast(Any, disposition_info)._obj.delete_file == 1
+
+
+def test_windows_cleanup_reports_disposition_failure_without_path_rmdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import faultloom.automation.candidate_outbox as outbox_module
+
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    (staging_dir / "result.json").write_text("sensitive", encoding="utf-8")
+    staging_lock = outbox_module._WindowsDirectoryLock(
+        handle=0x100000001,
+        stat=staging_dir.stat(),
+    )
+
+    def reject_disposition(_staging_lock: object) -> None:
+        raise OSError("delete disposition denied")
+
+    def reject_path_rmdir(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("Windows cleanup must not call path rmdir")
+
+    monkeypatch.setattr(
+        outbox_module, "_windows_mark_directory_for_delete", reject_disposition
+    )
+    monkeypatch.setattr(outbox_module.os, "rmdir", reject_path_rmdir)
+
+    with pytest.raises(CandidateOutboxError, match="mark empty directory for deletion"):
+        outbox_module._cleanup_windows_staging_directory(
+            staging_dir,
+            staging_lock,
+            ("result.json",),
+        )
+
+    assert not (staging_dir / "result.json").exists()
+    assert staging_dir.is_dir()

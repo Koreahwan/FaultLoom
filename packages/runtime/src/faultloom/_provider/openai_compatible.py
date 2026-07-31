@@ -17,6 +17,7 @@ from types import MappingProxyType
 from typing import Any, Literal, NamedTuple, Protocol, Self, cast
 from urllib.parse import urlsplit
 
+from faultloom._provider_constants import OPENAI_COMPATIBLE_MAX_TOOL_ARGUMENT_BYTES
 from faultloom.egress import (
     CompiledProviderRequest,
     EgressOutcome,
@@ -83,7 +84,6 @@ _SHA256_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _FUNCTION_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _MAX_TOOL_SCHEMA_BYTES = 16_384
 _MAX_TOOL_CALLS = 16
-OPENAI_COMPATIBLE_MAX_TOOL_ARGUMENT_BYTES = 4_096
 _MAX_TOOL_SCHEMA_DEPTH = 16
 _MAX_TOOL_SCHEMA_NODES = 256
 _SUPPORTED_SCHEMA_TYPES = frozenset(

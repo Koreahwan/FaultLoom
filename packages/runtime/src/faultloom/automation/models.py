@@ -5,7 +5,7 @@ from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from faultloom.provider import OPENAI_COMPATIBLE_MAX_TOOL_ARGUMENT_BYTES
+from faultloom._provider_constants import OPENAI_COMPATIBLE_MAX_TOOL_ARGUMENT_BYTES
 from faultloom.patch_variant import AdaptationResult
 from faultloom_protocol import (
     ActionClass,

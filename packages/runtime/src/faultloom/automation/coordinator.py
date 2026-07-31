@@ -6,7 +6,7 @@ from fnmatch import fnmatchcase
 
 from pydantic import ValidationError
 
-from faultloom.hypothesis import HypothesisSeed, NegativeResultSeed
+from faultloom.hypothesis.models import HypothesisSeed, NegativeResultSeed
 from faultloom.patch_variant import (
     AdaptationResult,
     AdaptationRequest,

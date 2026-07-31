@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import re
-import shutil
+import secrets
+import stat
 import tempfile
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar, final, override
@@ -50,6 +53,9 @@ _COMMON_TOKEN = re.compile(
         )
     )
 )
+_ACTIVE_DIRECTORY_FD: ContextVar[int | None] = ContextVar(
+    "candidate_outbox_active_directory_fd", default=None
+)
 
 
 @final
@@ -73,6 +79,40 @@ class CandidateOutboxPublication:
     receipt_path: Path
     candidate_digest: str
     source_result_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class AutomationResultBundlePublication:
+    """One create-once, offline-only automation compilation bundle."""
+
+    entry_id: str
+    entry_dir: Path
+    result_path: Path
+    receipt_path: Path
+    candidate_path: Path | None
+    result_digest: str
+    candidate_digest: str | None
+
+
+@dataclass(slots=True)
+class _WindowsDirectoryLock:
+    handle: int
+    stat: os.stat_result
+    closed: bool = False
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        # This is cleanup after the write/commit decision. A failed close cannot
+        # make another path safe, so do not mask the original publication result.
+        _ = kernel32.CloseHandle(ctypes.c_void_p(self.handle))
 
 
 def _scrub_candidate_text(value: str) -> str:
@@ -148,6 +188,12 @@ def _content_digest(content: str) -> str:
 
 
 def _create_file_once(path: Path, content: str) -> None:
+    directory_fd = _ACTIVE_DIRECTORY_FD.get()
+    if directory_fd is not None:
+        if path.name != str(path):
+            raise CandidateOutboxError("candidate bundle filename is not a leaf")
+        _create_file_once_at(directory_fd, path.name, content)
+        return
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
@@ -158,11 +204,34 @@ def _create_file_once(path: Path, content: str) -> None:
             _ = output.write(content)
             output.flush()
             os.fsync(output.fileno())
+        os.chmod(path, 0o600)
     except BaseException:
         if descriptor >= 0:
             os.close(descriptor)
         try:
             path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _create_file_once_at(directory_fd: int, name: str, content: str) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as output:
+            descriptor = -1
+            _ = output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(name, 0o600, dir_fd=directory_fd, follow_symlinks=False)
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(name, dir_fd=directory_fd)
         except OSError:
             pass
         raise
@@ -179,6 +248,515 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _fsync_descriptor(descriptor: int) -> None:
+    os.fsync(descriptor)
+
+
+def _same_directory(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        stat.S_ISDIR(left.st_mode)
+        and stat.S_ISDIR(right.st_mode)
+        and left.st_dev == right.st_dev
+        and left.st_ino == right.st_ino
+    )
+
+
+def _open_output_directory(out_dir: Path) -> tuple[int, os.stat_result]:
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        expected = out_dir.lstat()
+        if stat.S_ISLNK(expected.st_mode) or not stat.S_ISDIR(expected.st_mode):
+            raise OSError("outbox path is not a directory")
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        descriptor = os.open(out_dir, flags)
+        opened = os.fstat(descriptor)
+        current = out_dir.lstat()
+        if not _same_directory(expected, opened) or not _same_directory(expected, current):
+            os.close(descriptor)
+            raise OSError("outbox path changed while opening")
+        return descriptor, opened
+    except CandidateOutboxError:
+        raise
+    except OSError as exc:
+        raise CandidateOutboxError(f"unable to create automation result bundle: {exc}") from exc
+
+
+def _lock_windows_directory(
+    directory: Path,
+    *,
+    access: int,
+) -> _WindowsDirectoryLock:
+    """Open a non-reparse directory without sharing delete access."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    file_share_read_write = 0x00000003
+    open_existing = 3
+    file_flag_backup_semantics = 0x02000000
+    file_flag_open_reparse_point = 0x00200000
+    file_attribute_reparse_point = 0x00000400
+    invalid_handle_value = ctypes.c_void_p(-1).value
+    kernel32: object | None = None
+    handle: int | None = None
+    try:
+        expected = directory.lstat()
+        if (
+            not stat.S_ISDIR(expected.st_mode)
+            or getattr(expected, "st_file_attributes", 0) & file_attribute_reparse_point
+        ):
+            raise OSError("outbox path is not a non-reparse directory")
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+        ]
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        raw_handle = kernel32.CreateFileW(
+            str(directory.absolute()),
+            access,
+            file_share_read_write,
+            None,
+            open_existing,
+            file_flag_backup_semantics | file_flag_open_reparse_point,
+            None,
+        )
+        if raw_handle is None or raw_handle == invalid_handle_value:
+            raise OSError(ctypes.get_last_error(), "CreateFileW failed")
+        handle = int(raw_handle)
+        opened = directory.lstat()
+        if (
+            not _same_directory(expected, opened)
+            or getattr(opened, "st_file_attributes", 0) & file_attribute_reparse_point
+        ):
+            raise OSError("outbox path changed while opening")
+        lock = _WindowsDirectoryLock(handle=handle, stat=opened)
+        handle = None
+        return lock
+    except CandidateOutboxError:
+        raise
+    except OSError as exc:
+        if handle is not None and kernel32 is not None:
+            _ = kernel32.CloseHandle(ctypes.c_void_p(handle))  # type: ignore[union-attr]
+        raise CandidateOutboxError(f"unable to create automation result bundle: {exc}") from exc
+
+
+def _lock_windows_output_directory(out_dir: Path) -> _WindowsDirectoryLock:
+    """Lock the output root against delete/rename through the commit window."""
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return _lock_windows_directory(out_dir, access=0x00000080)
+
+
+def _output_directory_is_current(out_dir: Path, expected: os.stat_result) -> bool:
+    try:
+        current = out_dir.lstat()
+    except OSError:
+        return False
+    return not stat.S_ISLNK(current.st_mode) and _same_directory(expected, current)
+
+
+def _windows_directory_is_current(directory: Path, expected: os.stat_result) -> bool:
+    file_attribute_reparse_point = 0x00000400
+    try:
+        current = directory.lstat()
+    except OSError:
+        return False
+    return (
+        _output_directory_is_current(directory, expected)
+        and not getattr(current, "st_file_attributes", 0) & file_attribute_reparse_point
+    )
+
+
+def _windows_move_no_replace(
+    staging_lock: _WindowsDirectoryLock,
+    destination: Path,
+) -> None:
+    """Rename an opened staging directory without replacing an existing entry."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    file_rename_info_ex = 22
+
+    class FileRenameInfoEx(ctypes.Structure):
+        _fields_ = [
+            ("flags", wintypes.DWORD),
+            ("root_directory", ctypes.c_void_p),
+            ("filename_length", wintypes.DWORD),
+            ("filename", wintypes.WCHAR * 1),
+        ]
+
+    destination_bytes = str(destination.absolute()).encode("utf-16-le")
+    # FileNameLength deliberately excludes the required trailing UTF-16 NUL.
+    # Native Windows otherwise can read one uninitialized WCHAR past the name.
+    buffer_size = FileRenameInfoEx.filename.offset + len(destination_bytes) + 2
+    buffer = ctypes.create_string_buffer(buffer_size)
+    rename_info = ctypes.cast(buffer, ctypes.POINTER(FileRenameInfoEx)).contents
+    rename_info.flags = 0  # Deliberately omit FILE_RENAME_FLAG_REPLACE_IF_EXISTS.
+    rename_info.root_directory = None
+    rename_info.filename_length = len(destination_bytes)
+    ctypes.memmove(
+        ctypes.addressof(rename_info) + FileRenameInfoEx.filename.offset,
+        destination_bytes,
+        len(destination_bytes),
+    )
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetFileInformationByHandle.argtypes = [
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+    if not kernel32.SetFileInformationByHandle(
+        ctypes.c_void_p(staging_lock.handle),
+        file_rename_info_ex,
+        ctypes.byref(rename_info),
+        buffer_size,
+    ):
+        raise OSError(ctypes.get_last_error(), "SetFileInformationByHandle failed")
+
+
+def _windows_mark_directory_for_delete(staging_lock: _WindowsDirectoryLock) -> None:
+    """Delete the exact opened staging directory when its handle closes."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    file_disposition_info = 4
+
+    class FileDispositionInfo(ctypes.Structure):
+        _fields_ = [("delete_file", ctypes.c_ubyte)]
+
+    disposition_info = FileDispositionInfo(delete_file=1)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetFileInformationByHandle.argtypes = [
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+    if not kernel32.SetFileInformationByHandle(
+        ctypes.c_void_p(staging_lock.handle),
+        file_disposition_info,
+        ctypes.byref(disposition_info),
+        ctypes.sizeof(disposition_info),
+    ):
+        raise OSError(ctypes.get_last_error(), "SetFileInformationByHandle failed")
+
+
+def _rename_no_replace_at(
+    source_directory_fd: int,
+    source_name: str,
+    destination_directory_fd: int,
+    destination_name: str,
+) -> None:
+    """Use Linux renameat2(RENAME_NOREPLACE); never emulate it unsafely."""
+
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = libc.renameat2
+    except (AttributeError, OSError) as exc:
+        raise CandidateOutboxError("atomic no-replace rename is unavailable") from exc
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    if renameat2(
+        source_directory_fd,
+        os.fsencode(source_name),
+        destination_directory_fd,
+        os.fsencode(destination_name),
+        1,  # RENAME_NOREPLACE
+    ) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number or errno.EIO, os.strerror(error_number or errno.EIO))
+
+
+def _remove_staging_directory(
+    output_fd: int,
+    staging_name: str,
+    staging_fd: int,
+) -> None:
+    try:
+        current = os.stat(staging_name, dir_fd=output_fd, follow_symlinks=False)
+        if not _same_directory(os.fstat(staging_fd), current):
+            return
+        for name in os.listdir(staging_fd):
+            os.unlink(name, dir_fd=staging_fd)
+        _fsync_descriptor(staging_fd)
+        os.rmdir(staging_name, dir_fd=output_fd)
+    except OSError:
+        pass
+
+
+def _cleanup_windows_staging_directory(
+    staging_dir: Path,
+    staging_lock: _WindowsDirectoryLock,
+    written_filenames: tuple[str, ...],
+) -> None:
+    """Remove known staged content without trusting a path after lock failure."""
+
+    if not _windows_directory_is_current(staging_dir, staging_lock.stat):
+        raise CandidateOutboxError("staging cleanup could not verify directory identity")
+    for filename in written_filenames:
+        if Path(filename).name != filename:
+            raise CandidateOutboxError("staging cleanup received a non-leaf filename")
+        try:
+            # unlink removes a reparse-point file itself; it never follows it.
+            os.unlink(staging_dir / filename)
+        except OSError as exc:
+            raise CandidateOutboxError(
+                f"staging cleanup could not remove {filename}: {exc}"
+            ) from exc
+    try:
+        if os.listdir(staging_dir):
+            raise CandidateOutboxError("staging cleanup found unexpected entries")
+    except CandidateOutboxError:
+        raise
+    except OSError as exc:
+        raise CandidateOutboxError(
+            f"staging cleanup could not inspect directory: {exc}"
+        ) from exc
+
+    try:
+        # FILE_DISPOSITION_INFO binds deletion to the opened DELETE-access
+        # staging handle. Closing that handle in the caller deletes this exact
+        # directory; no post-close path resolution occurs.
+        _windows_mark_directory_for_delete(staging_lock)
+    except OSError as exc:
+        raise CandidateOutboxError(
+            f"staging cleanup could not mark empty directory for deletion: {exc}"
+        ) from exc
+
+
+def _publish_windows_create_once_bundle(
+    *,
+    out_dir: Path,
+    entry_id: str,
+    files: tuple[tuple[str, str], ...],
+    error_label: str,
+) -> Path:
+    entry_dir = out_dir / entry_id
+    root_lock = _lock_windows_output_directory(out_dir)
+    staging_dir: Path | None = None
+    staging_lock: _WindowsDirectoryLock | None = None
+    written_filenames: list[str] = []
+    committed = False
+    try:
+        if os.path.lexists(entry_dir):
+            raise FileExistsError(f"{error_label} entry already exists")
+        staging_dir = Path(
+            tempfile.mkdtemp(prefix=f".{entry_id}.", suffix=".tmp", dir=out_dir)
+        )
+        # DELETE access plus no FILE_SHARE_DELETE means the staging directory
+        # cannot be replaced by a junction while its paths are used below.
+        staging_lock = _lock_windows_directory(
+            staging_dir,
+            access=0x00010080,  # DELETE | FILE_READ_ATTRIBUTES
+        )
+        for filename, content in files:
+            _create_file_once(staging_dir / filename, content)
+            written_filenames.append(filename)
+        _fsync_directory(staging_dir)
+        if not _windows_directory_is_current(out_dir, root_lock.stat):
+            raise CandidateOutboxError("outbox path changed during publication")
+        if not _windows_directory_is_current(staging_dir, staging_lock.stat):
+            raise CandidateOutboxError("staging path changed during publication")
+        _windows_move_no_replace(staging_lock, entry_dir)
+        committed = True
+        _fsync_directory(out_dir)
+        if not _windows_directory_is_current(out_dir, root_lock.stat):
+            raise CandidateOutboxError("outbox path changed during publication")
+    except BaseException as exc:
+        if not committed and staging_dir is not None and staging_lock is not None:
+            try:
+                _cleanup_windows_staging_directory(
+                    staging_dir,
+                    staging_lock,
+                    tuple(written_filenames),
+                )
+            except CandidateOutboxError as cleanup_error:
+                raise CandidateOutboxError(
+                    f"unable to clean failed {error_label} staging: {cleanup_error}"
+                ) from cleanup_error
+        if isinstance(exc, OSError):
+            raise CandidateOutboxError(
+                f"unable to create {error_label}: {exc}"
+            ) from exc
+        raise
+    finally:
+        if staging_lock is not None and not staging_lock.closed:
+            staging_lock.close()
+        root_lock.close()
+    return entry_dir
+
+
+def _publish_posix_create_once_bundle(
+    *,
+    out_dir: Path,
+    entry_id: str,
+    files: tuple[tuple[str, str], ...],
+    error_label: str,
+) -> Path:
+    entry_dir = out_dir / entry_id
+    output_fd, output_stat = _open_output_directory(out_dir)
+    staging_fd: int | None = None
+    staging_name = ""
+    committed = False
+    try:
+        try:
+            os.stat(entry_id, dir_fd=output_fd, follow_symlinks=False)
+            raise FileExistsError(f"{error_label} entry already exists")
+        except FileNotFoundError:
+            pass
+        for _ in range(32):
+            staging_name = f".{entry_id}.{secrets.token_hex(8)}.tmp"
+            try:
+                os.mkdir(staging_name, mode=0o700, dir_fd=output_fd)
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise OSError("unable to allocate a unique staging directory")
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            directory_flags |= os.O_CLOEXEC
+        staging_fd = os.open(staging_name, directory_flags, dir_fd=output_fd)
+        token = _ACTIVE_DIRECTORY_FD.set(staging_fd)
+        try:
+            for filename, content in files:
+                _create_file_once(Path(filename), content)
+        finally:
+            _ACTIVE_DIRECTORY_FD.reset(token)
+        _fsync_descriptor(staging_fd)
+        try:
+            os.stat(entry_id, dir_fd=output_fd, follow_symlinks=False)
+            raise FileExistsError(f"{error_label} entry already exists")
+        except FileNotFoundError:
+            pass
+        _rename_no_replace_at(
+            output_fd,
+            staging_name,
+            output_fd,
+            entry_id,
+        )
+        committed = True
+        _fsync_descriptor(output_fd)
+        if not _output_directory_is_current(out_dir, output_stat):
+            raise CandidateOutboxError("outbox path changed during publication")
+    except BaseException as exc:
+        if not committed and staging_fd is not None:
+            _remove_staging_directory(output_fd, staging_name, staging_fd)
+        if isinstance(exc, OSError):
+            raise CandidateOutboxError(
+                f"unable to create {error_label}: {exc}"
+            ) from exc
+        raise
+    finally:
+        if staging_fd is not None:
+            os.close(staging_fd)
+        os.close(output_fd)
+    return entry_dir
+
+
+def _publish_create_once_bundle(
+    *,
+    out_dir: Path,
+    entry_id: str,
+    files: tuple[tuple[str, str], ...],
+    error_label: str,
+) -> Path:
+    if os.name == "nt":
+        return _publish_windows_create_once_bundle(
+            out_dir=out_dir,
+            entry_id=entry_id,
+            files=files,
+            error_label=error_label,
+        )
+    return _publish_posix_create_once_bundle(
+        out_dir=out_dir,
+        entry_id=entry_id,
+        files=files,
+        error_label=error_label,
+    )
+
+
+def write_automation_result_bundle(
+    result: AuthorizedAutomationResult,
+    out_dir: Path,
+) -> AutomationResultBundlePublication:
+    """Atomically publish one offline candidate-only compilation result bundle."""
+
+    if type(result) is not AuthorizedAutomationResult:
+        raise CandidateOutboxError("automation result bundle requires an exact automation result")
+    try:
+        validated = AuthorizedAutomationResult.model_validate(result)
+    except ValidationError as exc:
+        raise CandidateOutboxError("automation result bundle received an invalid result") from exc
+
+    result_value = validated.model_dump(mode="json")
+    result_content = canonical_json(result_value)
+    result_digest = sha256_digest(result_value)
+    entry_id = f"result.{result_digest.removeprefix('sha256:')[:32]}"
+    candidate_content: str | None = None
+    candidate_digest: str | None = None
+    if validated.finding_draft is not None:
+        candidate_content = _candidate_markdown(validated, validated.finding_draft)
+        candidate_digest = _content_digest(candidate_content)
+
+    receipt_content = canonical_json(
+        {
+            "automatic_submission": False,
+            "candidate_digest": candidate_digest,
+            "candidate_only": True,
+            "entry_id": entry_id,
+            "evidence_existence_independently_verified": False,
+            "independent_verification": False,
+            "network_access": "none",
+            "result_digest": result_digest,
+            "schema": "faultloom.automation.result.receipt.v1",
+            "target_dispatch": False,
+        }
+    )
+    files: list[tuple[str, str]] = [("result.json", result_content)]
+    if candidate_content is not None:
+        files.append(("candidate.md", candidate_content))
+    files.append(("receipt.json", receipt_content))
+    entry_dir = _publish_create_once_bundle(
+        out_dir=out_dir,
+        entry_id=entry_id,
+        files=tuple(files),
+        error_label="automation result bundle",
+    )
+    return AutomationResultBundlePublication(
+        entry_id=entry_id,
+        entry_dir=entry_dir,
+        result_path=entry_dir / "result.json",
+        receipt_path=entry_dir / "receipt.json",
+        candidate_path=(entry_dir / "candidate.md") if candidate_content is not None else None,
+        result_digest=result_digest,
+        candidate_digest=candidate_digest,
+    )
 
 
 def write_candidate_outbox(
@@ -230,36 +808,12 @@ def write_candidate_outbox(
         }
     )
 
-    try:
-        out_dir.mkdir(parents=True, exist_ok=True)
-        if not out_dir.is_dir():
-            raise OSError("outbox path is not a directory")
-        if os.path.lexists(entry_dir):
-            raise FileExistsError("candidate outbox entry already exists")
-        staging_dir = Path(
-            tempfile.mkdtemp(prefix=f".{entry_id}.", suffix=".tmp", dir=out_dir)
-        )
-    except OSError as exc:
-        raise CandidateOutboxError(f"unable to create candidate outbox: {exc}") from exc
-
-    committed = False
-    try:
-        _create_file_once(staging_dir / "candidate.md", candidate_content)
-        _create_file_once(staging_dir / "receipt.json", receipt_content)
-        _fsync_directory(staging_dir)
-        if os.path.lexists(entry_dir):
-            raise FileExistsError("candidate outbox entry already exists")
-        os.rename(staging_dir, entry_dir)
-        committed = True
-        _fsync_directory(out_dir)
-    except BaseException as exc:
-        if not committed:
-            shutil.rmtree(staging_dir, ignore_errors=True)
-        if isinstance(exc, OSError):
-            raise CandidateOutboxError(
-                f"unable to create candidate outbox: {exc}"
-            ) from exc
-        raise
+    _ = _publish_create_once_bundle(
+        out_dir=out_dir,
+        entry_id=entry_id,
+        files=(("candidate.md", candidate_content), ("receipt.json", receipt_content)),
+        error_label="candidate outbox",
+    )
 
     return CandidateOutboxPublication(
         entry_id=entry_id,

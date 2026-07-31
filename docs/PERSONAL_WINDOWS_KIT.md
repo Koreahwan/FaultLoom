@@ -4,7 +4,9 @@ This kit contains two independent, non-installing components:
 
 - `faultloom.exe`: signed engagement scopes, offline manual workspaces,
   offline Burp request scope checks with owner-local reservation records,
-  evidence ingestion, and unverified finding drafts.
+  evidence ingestion, unverified finding drafts, and offline compilation of
+  an already-produced structured model turn into a create-once candidate
+  bundle.
 - `windows-authority/`: the native `faultloom_ctl.exe` -> broker -> independent
   reviewer boundary for bounded local host checks.
 
@@ -38,9 +40,11 @@ available with `faultloom.exe --help`.
 
 ## Current boundary
 
-The kit is usable for manual Burp/browser work within a signed scope. Automatic
-Gateway target dispatch (`run --live`), automatic exploitation, remote host
-management, and automatic submission remain disabled.
+The kit is usable for manual Burp/browser work within a signed scope. Its
+`automation compile` command performs no model, provider, Burp, Gateway, or
+target call; it only validates local JSON and writes a candidate-only bundle.
+Automatic Gateway target dispatch (`run --live`), automatic exploitation,
+remote host management, and automatic submission remain disabled.
 
 Request reservations are an advisory guard against accidental budget overruns
 while their workspace remains intact. They are not a tamper-resistant boundary;

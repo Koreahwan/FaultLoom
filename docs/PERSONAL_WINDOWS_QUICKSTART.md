@@ -20,6 +20,9 @@ $Root = Join-Path $env:USERPROFILE 'FaultLoom'
 & $FaultLoom pack list
 ```
 
+Keep the kit and engagement workspace on a local Windows drive such as `C:`.
+The native Windows CLI does not support `\\wsl.localhost\...` output paths.
+
 `web` and `llm` are the established metadata packs. The following aliases are
 also available when you need a signed, manual workspace to organize candidate
 research: `advanced-web`, `cloud`, `mobile`, and `web3`. They only record the
@@ -154,11 +157,33 @@ The Markdown file in `findings\` is a draft. Reproduce the issue, remove
 secrets, match the program's severity rubric, and submit it yourself through
 the customer's or bounty program's official channel.
 
+## 8. Optional offline model-turn compilation
+
+If Codex or another model client has already produced an exact FaultLoom
+`AutomationRequest` and structured `ModelTurn` JSON file, compile them inside
+the same signed workspace:
+
+```powershell
+& $FaultLoom automation compile `
+  --workspace "$Job\run-01" `
+  --trusted-key "$Root\authority\authority-public-key.json" `
+  --request 'C:\path\to\automation-request.json' `
+  --model-turn 'C:\path\to\model-turn.json'
+```
+
+This command requires `provider_network_access` to be `none`. It does not call
+the model, Burp, a Gateway, or the target. It rechecks the current signed scope
+and writes a create-once result bundle under `run-01\automation`. A generated
+`candidate.md` is still unverified and cannot be treated as a confirmed
+finding or submitted automatically.
+
 ## Current boundary
 
 Ready now: signed scopes, manual authorized workspaces, bounded evidence
 ingestion, SHA-256 records, metadata checks for Web, LLM, and the registered
 candidate packs, offline Burp request scope checks, and finding drafts.
+An already-produced structured model turn can also be compiled offline into a
+private candidate bundle with no provider or target access.
 Within an intact workspace, request checks persist advisory owner-local
 reservations and reject additional reservations that exceed the recorded signed
 total, 60-second rate, active concurrency, or per-request byte budgets. A
