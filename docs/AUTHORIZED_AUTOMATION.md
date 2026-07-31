@@ -117,20 +117,28 @@ faultloom automation export-handoff \
   --workspace <signed-manual-workspace> \
   --trusted-key <public-key-outside-workspace> \
   --request <automation-request.json> \
+  --provider-id <grant-approved-provider-id> \
+  --trusted-disclosure-key <disclosure-approver-public-key.json> \
   --out <model-handoff.json>
 ```
 
 The export repeats the exact workspace, grant, run, target, pack, and request
 binding checks used by `automation compile`, and requires
-`provider_network_access=none`. It creates one private, create-once canonical
-JSON file (mode `0600`) and makes no network, provider, Gateway, target,
-dispatch, submission, or verification call. The bundle is deliberately marked
-`unattested_manual_handoff`: it contains no credentials, cookies, or endpoints,
-and export does not verify provider disclosure or attest what model will use it.
+`provider_network_access=none`. The selected provider must be in the signed
+grant and every excerpt's signed disclosure approval is verified against one or
+more supplied trusted disclosure public keys at the active workspace time. It
+creates one private, create-once canonical JSON file (mode `0600`) and makes no
+network, provider, Gateway, target, dispatch, submission, or verification call.
+The bundle is deliberately marked `unattested_manual_handoff`: export verifies
+the disclosure authorization, but does not attest which model actually uses it.
+It contains no credentials, cookies, or provider connection configuration.
 
-Give the bundle to the selected model, save exactly its one function-arguments
-object as `model-turn.json`, then run the existing `automation compile` command.
-The resulting artifact remains a candidate requiring independent verification.
+Give the bundle only to the selected approved provider/service, save exactly its
+one function-arguments object as `model-turn.json`, then run the existing
+`automation compile` command. The resulting artifact remains a candidate
+requiring independent verification. Approved redacted evidence may contain a
+target URL or other target detail; that is precisely why disclosure is
+provider-specific and signature-verified before export.
 
 ## Optional authorized target dispatch
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -17,10 +18,11 @@ from faultloom.automation import (
     AutomationRequest,
     CandidateOutboxError,
     parse_model_turn,
+    verify_model_disclosure_approval,
     write_automation_result_bundle,
 )
 from faultloom.tool_planner import ToolPlanner
-from faultloom_protocol import AuthorityGrant, TargetAsset, sha256_digest
+from faultloom_protocol import AuthorityGrant, Ed25519PublicKeyRecord, TargetAsset, sha256_digest
 from faultloom_sdk import AdapterAdmissionRegistry, reference_registry
 
 
@@ -47,6 +49,7 @@ class AutomationExportHandoffDependencies:
         [Path, Path], tuple[dict[str, object], AuthorityGrant, TargetAsset, datetime]
     ]
     capture_file: Callable[[Path], bytes]
+    parse_disclosure_key: Callable[[Path, bytes], Ed25519PublicKeyRecord]
     write_new_file: Callable[[Path, bytes], None]
     emit_json: Callable[[object], None]
 
@@ -82,11 +85,17 @@ def _validate_json_depth(text: str, *, maximum: int = 128) -> None:
             depth -= 1
 
 
-def _parse_request(path: Path, content: bytes) -> AutomationRequest:
+def _parse_request(
+    path: Path,
+    content: bytes,
+    *,
+    missing_disclosure_is_authority: bool = False,
+) -> AutomationRequest:
+    raw_value: object = None
     try:
         text = content.decode("utf-8")
         _validate_json_depth(text)
-        _ = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+        raw_value = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
         return AutomationRequest.model_validate_json(text)
     except (
         UnicodeDecodeError,
@@ -95,9 +104,25 @@ def _parse_request(path: Path, content: bytes) -> AutomationRequest:
         ValidationError,
         ValueError,
     ) as exc:
+        if missing_disclosure_is_authority and _request_has_missing_disclosure(raw_value):
+            raise AutomationCompileError(
+                "handoff evidence lacks a model disclosure approval", authority=True
+            ) from exc
         raise AutomationCompileError(
             f"invalid automation request file {path}: {exc}", authority=False
         ) from exc
+
+
+def _request_has_missing_disclosure(value: object) -> bool:
+    if type(value) is not dict:
+        return False
+    observations = value.get("observations")
+    if type(observations) is not dict:
+        return False
+    excerpts = observations.get("excerpts")
+    return type(excerpts) is list and any(
+        type(excerpt) is dict and "approval" not in excerpt for excerpt in excerpts
+    )
 
 
 def _validate_request_binding(
@@ -155,7 +180,7 @@ def _handoff_generation() -> object:
     )
 
 
-def _model_handoff_bytes(request: AutomationRequest) -> bytes:
+def _model_handoff_bytes(request: AutomationRequest, *, provider_id: str) -> bytes:
     """Build the canonical offline bundle given to an operator-selected model."""
 
     from faultloom.automation import (
@@ -180,7 +205,7 @@ def _model_handoff_bytes(request: AutomationRequest) -> bytes:
         },
         "generation": payload.generation.model_dump(mode="json"),
         "instructions": [
-            "Give this bundle to any model UI, CLI, or official API.",
+            f"Give this bundle only to the approved provider/service {provider_id}.",
             "Save exactly the one function-arguments object as model-turn.json.",
             "Run faultloom automation compile with this request and model-turn.json.",
         ],
@@ -188,13 +213,86 @@ def _model_handoff_bytes(request: AutomationRequest) -> bytes:
         "model_provenance": "unattested_manual_handoff",
         "network_access": "none",
         "output_schema_digest": model_turn_schema_digest(),
-        "provider_disclosure_verification": "not_performed_by_export",
+        "approved_provider_id": provider_id,
+        "provider_disclosure_verification": "verified",
         "request_digest": sha256_digest(request.model_dump(mode="json")),
         "run_id": context.run_id,
         "schema": "faultloom.model-handoff.v1",
         "tool_schema_digest": tool.input_schema_digest,
     }
     return provider_canonical_json_bytes(document) + b"\n"
+
+
+def _trusted_disclosure_keys(
+    paths: object,
+    *,
+    dependencies: AutomationExportHandoffDependencies,
+) -> dict[str, Ed25519PublicKeyRecord]:
+    if (
+        type(paths) is not list
+        or not paths
+        or any(not isinstance(path, Path) for path in paths)
+    ):
+        raise AutomationCompileError(
+            "automation export-handoff requires one or more trusted disclosure keys",
+            authority=False,
+        )
+    registry: dict[str, Ed25519PublicKeyRecord] = {}
+    seen_paths: set[str] = set()
+    for path in paths:
+        normalized_path = os.path.normcase(os.path.abspath(path))
+        if normalized_path in seen_paths:
+            raise AutomationCompileError(
+                "trusted disclosure-key path is repeated", authority=True
+            )
+        seen_paths.add(normalized_path)
+        record = dependencies.parse_disclosure_key(
+            path, dependencies.capture_file(path)
+        )
+        if type(record) is not Ed25519PublicKeyRecord:
+            raise AutomationCompileError(
+                "trusted disclosure-key record has the wrong type", authority=True
+            )
+        if record.key_id in registry:
+            raise AutomationCompileError(
+                "trusted disclosure-key ID is duplicated", authority=True
+            )
+        registry[record.key_id] = record
+    return registry
+
+
+def _verify_handoff_disclosures(
+    request: AutomationRequest,
+    *,
+    provider_id: str,
+    trusted_disclosure_keys: dict[str, Ed25519PublicKeyRecord],
+    verification_time: datetime,
+) -> None:
+    evidence_refs = {
+        item.evidence_id: item for item in request.observations.evidence_refs
+    }
+    try:
+        for excerpt in request.observations.excerpts:
+            reference = evidence_refs.get(excerpt.evidence_id)
+            if reference is None or reference.redaction_digest is None:
+                raise ValueError("handoff evidence lacks a redaction digest")
+            _ = verify_model_disclosure_approval(
+                excerpt.approval,
+                trusted_disclosure_keys,
+                expected_run_id=request.observations.run_id,
+                expected_evidence_id=excerpt.evidence_id,
+                expected_source_cas_digest=reference.cas_digest,
+                expected_redaction_digest=reference.redaction_digest,
+                expected_content_digest=excerpt.content_digest,
+                expected_media_type=excerpt.media_type,
+                expected_data_policy_id=request.authority_grant.provider_policy.data_policy_id,
+                expected_provider_id=provider_id,
+                verification_time=verification_time,
+            )
+    except (TypeError, ValueError) as exc:
+        raise AutomationCompileError(
+            "handoff evidence lacks a trusted model disclosure approval", authority=True
+        ) from exc
 
 
 def export_automation_handoff(
@@ -208,18 +306,26 @@ def export_automation_handoff(
     trusted_key = getattr(arguments, "trusted_key")
     request_path = getattr(arguments, "request")
     out_path = getattr(arguments, "out")
+    provider_id = getattr(arguments, "provider_id")
+    disclosure_key_paths = getattr(arguments, "trusted_disclosure_key")
     minimum_grant_version = getattr(arguments, "minimum_grant_version")
     if (
         not isinstance(workspace, Path)
         or not isinstance(trusted_key, Path)
         or not isinstance(request_path, Path)
         or not isinstance(out_path, Path)
+        or type(provider_id) is not str
+        or not provider_id
         or type(minimum_grant_version) is not int
     ):
         raise AutomationCompileError("automation export-handoff arguments are invalid", authority=False)
 
     manifest, grant, target, now = dependencies.verify_workspace(workspace, trusted_key)
-    request = _parse_request(request_path, dependencies.capture_file(request_path))
+    request = _parse_request(
+        request_path,
+        dependencies.capture_file(request_path),
+        missing_disclosure_is_authority=True,
+    )
     _validate_request_binding(
         manifest=manifest,
         grant=grant,
@@ -228,7 +334,21 @@ def export_automation_handoff(
         minimum_grant_version=minimum_grant_version,
         request=request,
     )
-    content = _model_handoff_bytes(request)
+    if provider_id not in grant.provider_policy.allowed_providers:
+        raise AutomationCompileError(
+            "selected handoff provider is outside the signed authority grant",
+            authority=True,
+        )
+    trusted_disclosure_keys = _trusted_disclosure_keys(
+        disclosure_key_paths, dependencies=dependencies
+    )
+    _verify_handoff_disclosures(
+        request,
+        provider_id=provider_id,
+        trusted_disclosure_keys=trusted_disclosure_keys,
+        verification_time=now,
+    )
+    content = _model_handoff_bytes(request, provider_id=provider_id)
     dependencies.write_new_file(out_path, content)
     dependencies.emit_json(
         {

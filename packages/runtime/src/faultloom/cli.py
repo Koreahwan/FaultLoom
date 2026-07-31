@@ -1899,6 +1899,9 @@ def _automation_export_handoff(arguments: argparse.Namespace) -> int:
             dependencies=AutomationExportHandoffDependencies(
                 verify_workspace=_verified_request_workspace,
                 capture_file=_capture_single_protocol_file,
+                parse_disclosure_key=lambda path, content: _parse_protocol_file(
+                    path, content, Ed25519PublicKeyRecord
+                ),
                 write_new_file=lambda path, content: _write_new_file(
                     path, content, mode=0o600
                 ),
@@ -2912,6 +2915,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--minimum-grant-version", type=_positive_int, default=1
     )
     automation_export_handoff.add_argument("--request", type=Path, required=True)
+    automation_export_handoff.add_argument("--provider-id", required=True)
+    automation_export_handoff.add_argument(
+        "--trusted-disclosure-key", type=Path, action="append", required=True
+    )
     automation_export_handoff.add_argument("--out", type=Path, required=True)
     automation_export_handoff.set_defaults(handler=_automation_export_handoff)
 

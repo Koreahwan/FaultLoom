@@ -213,8 +213,21 @@ def _compile_arguments(workspace: Path, trusted_key: Path, request: Path, turn: 
     ]
 
 
-def _export_arguments(workspace: Path, trusted_key: Path, request: Path, out: Path) -> list[str]:
-    return [
+def _disclosure_key(path: Path) -> Path:
+    path.write_text(DISCLOSURE_SIGNER.public_key_record.model_dump_json(), encoding="utf-8")
+    return path
+
+
+def _export_arguments(
+    workspace: Path,
+    trusted_key: Path,
+    request: Path,
+    out: Path,
+    disclosure_keys: tuple[Path, ...],
+    *,
+    provider_id: str = "provider.test",
+) -> list[str]:
+    arguments = [
         "automation",
         "export-handoff",
         "--workspace",
@@ -223,9 +236,20 @@ def _export_arguments(workspace: Path, trusted_key: Path, request: Path, out: Pa
         str(trusted_key),
         "--request",
         str(request),
+        "--provider-id",
+        provider_id,
         "--out",
         str(out),
     ]
+    for disclosure_key in disclosure_keys:
+        arguments.extend(("--trusted-disclosure-key", str(disclosure_key)))
+    return arguments
+
+
+def _request_with_approval(request: AutomationRequest, approval: object) -> AutomationRequest:
+    excerpt = request.observations.excerpts[0].model_copy(update={"approval": approval})
+    observations = request.observations.model_copy(update={"excerpts": (excerpt,)})
+    return request.model_copy(update={"observations": observations})
 
 
 def test_automation_compile_publishes_scrubbed_offline_candidate_bundle(
@@ -413,6 +437,7 @@ def test_automation_export_handoff_is_canonical_offline_and_compilable(
     request_path = tmp_path / "request.json"
     out_path = tmp_path / "model-handoff.json"
     second_out_path = tmp_path / "model-handoff-copy.json"
+    disclosure_key = _disclosure_key(tmp_path / "disclosure-key.json")
     request_path.write_text(request.model_dump_json(), encoding="utf-8")
 
     def reject_network(*_args: object, **_kwargs: object) -> object:
@@ -431,7 +456,14 @@ def test_automation_export_handoff_is_canonical_offline_and_compilable(
     monkeypatch.setattr(
         execution_bridge, "execute_admitted_tool_plan", reject_provider_or_gateway
     )
-    assert cli.main(_export_arguments(workspace, trusted_key, request_path, out_path)) == 0
+    assert (
+        cli.main(
+            _export_arguments(
+                workspace, trusted_key, request_path, out_path, (disclosure_key,)
+            )
+        )
+        == 0
+    )
     receipt = json.loads(capsys.readouterr().out.splitlines()[-1])
     content = out_path.read_bytes()
     document = json.loads(content)
@@ -450,7 +482,8 @@ def test_automation_export_handoff_is_canonical_offline_and_compilable(
     assert document["run_id"] == request.observations.run_id
     assert document["request_digest"] == sha256_digest(request.model_dump(mode="json"))
     assert document["model_provenance"] == "unattested_manual_handoff"
-    assert document["provider_disclosure_verification"] == "not_performed_by_export"
+    assert document["approved_provider_id"] == "provider.test"
+    assert document["provider_disclosure_verification"] == "verified"
     assert document["network_access"] == "none"
     assert document["generation"] == {
         "max_output_tokens": 1024,
@@ -470,7 +503,11 @@ def test_automation_export_handoff_is_canonical_offline_and_compilable(
     assert all("provider.test" not in message["content"] for message in document["messages"])
 
     assert (
-        cli.main(_export_arguments(workspace, trusted_key, request_path, second_out_path))
+        cli.main(
+            _export_arguments(
+                workspace, trusted_key, request_path, second_out_path, (disclosure_key,)
+            )
+        )
         == 0
     )
     assert second_out_path.read_bytes() == content
@@ -495,7 +532,10 @@ def test_automation_export_handoff_is_create_once_and_refuses_symlink_output(
     request_path = tmp_path / "request.json"
     request_path.write_text(_request(workspace, grant).model_dump_json(), encoding="utf-8")
     out_path = tmp_path / "model-handoff.json"
-    arguments = _export_arguments(workspace, trusted_key, request_path, out_path)
+    disclosure_key = _disclosure_key(tmp_path / "disclosure-key.json")
+    arguments = _export_arguments(
+        workspace, trusted_key, request_path, out_path, (disclosure_key,)
+    )
     assert cli.main(arguments) == 0
     original = out_path.read_bytes()
     _ = capsys.readouterr()
@@ -508,7 +548,11 @@ def test_automation_export_handoff_is_create_once_and_refuses_symlink_output(
     symlink_out = tmp_path / "symlink-handoff.json"
     symlink_out.symlink_to(external)
     assert (
-        cli.main(_export_arguments(workspace, trusted_key, request_path, symlink_out))
+        cli.main(
+            _export_arguments(
+                workspace, trusted_key, request_path, symlink_out, (disclosure_key,)
+            )
+        )
         == cli.EXIT_USAGE
     )
     assert external.read_text(encoding="utf-8") == "external"
@@ -533,8 +577,16 @@ def test_automation_export_handoff_rejects_malformed_duplicate_deep_or_oversized
     workspace, trusted_key, _grant = _workspace(tmp_path, monkeypatch)
     request_path = tmp_path / "request.json"
     out_path = tmp_path / "model-handoff.json"
+    disclosure_key = _disclosure_key(tmp_path / "disclosure-key.json")
     request_path.write_bytes(content)
-    assert cli.main(_export_arguments(workspace, trusted_key, request_path, out_path)) == expected_exit
+    assert (
+        cli.main(
+            _export_arguments(
+                workspace, trusted_key, request_path, out_path, (disclosure_key,)
+            )
+        )
+        == expected_exit
+    )
     assert not out_path.exists()
     assert "Traceback" not in capsys.readouterr().err
 
@@ -557,9 +609,103 @@ def test_automation_export_handoff_rejects_provider_or_workspace_drift(
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     request_path = tmp_path / "request.json"
     out_path = tmp_path / "model-handoff.json"
+    disclosure_key = _disclosure_key(tmp_path / "disclosure-key.json")
     request_path.write_text(request.model_dump_json(), encoding="utf-8")
     assert (
-        cli.main(_export_arguments(workspace, trusted_key, request_path, out_path))
+        cli.main(
+            _export_arguments(
+                workspace, trusted_key, request_path, out_path, (disclosure_key,)
+            )
+        )
+        == cli.EXIT_AUTHORITY
+    )
+    assert not out_path.exists()
+    assert "Traceback" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        "provider_other",
+        "wrong_approval",
+        "expired_approval",
+        "missing_approval",
+        "missing_key",
+        "malformed_key",
+        "duplicate_key",
+        "reused_key",
+    ),
+)
+def test_automation_export_handoff_requires_verified_provider_disclosure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure: str,
+) -> None:
+    workspace, trusted_key, grant = _workspace(tmp_path, monkeypatch)
+    request = _request(workspace, grant)
+    primary_key = _disclosure_key(tmp_path / "disclosure-key.json")
+    disclosure_keys = (primary_key,)
+    provider_id = "provider.test"
+    request_content = request.model_dump_json()
+    if failure == "provider_other":
+        provider_id = "provider.other"
+    elif failure == "wrong_approval":
+        approval = sign_model_disclosure_approval(
+            request.observations.excerpts[0].approval.payload.model_copy(
+                update={"allowed_provider_ids": ("provider.other",)}
+            ),
+            DISCLOSURE_SIGNER,
+        )
+        request = _request_with_approval(request, approval)
+    elif failure == "expired_approval":
+        approval = sign_model_disclosure_approval(
+            request.observations.excerpts[0].approval.payload.model_copy(
+                update={
+                    "approved_at": NOW - timedelta(minutes=1),
+                    "expires_at": NOW,
+                }
+            ),
+            DISCLOSURE_SIGNER,
+        )
+        request = _request_with_approval(request, approval)
+        request_content = request.model_dump_json()
+    elif failure == "missing_approval":
+        document = json.loads(request_content)
+        del document["observations"]["excerpts"][0]["approval"]
+        request_content = json.dumps(document)
+    elif failure == "missing_key":
+        other_key = tmp_path / "other-disclosure-key.json"
+        other_key.write_text(
+            AuthoritySigner.from_private_bytes(bytes.fromhex("43" * 32))
+            .public_key_record.model_dump_json(),
+            encoding="utf-8",
+        )
+        disclosure_keys = (other_key,)
+    elif failure == "malformed_key":
+        primary_key.write_text('{"key_id":', encoding="utf-8")
+    elif failure == "duplicate_key":
+        second_key = _disclosure_key(tmp_path / "second-disclosure-key.json")
+        disclosure_keys = (primary_key, second_key)
+    elif failure == "reused_key":
+        disclosure_keys = (primary_key, primary_key)
+    request_path = tmp_path / "request.json"
+    out_path = tmp_path / "model-handoff.json"
+    if failure != "missing_approval":
+        request_content = request.model_dump_json()
+    request_path.write_text(request_content, encoding="utf-8")
+
+    assert (
+        cli.main(
+            _export_arguments(
+                workspace,
+                trusted_key,
+                request_path,
+                out_path,
+                disclosure_keys,
+                provider_id=provider_id,
+            )
+        )
         == cli.EXIT_AUTHORITY
     )
     assert not out_path.exists()

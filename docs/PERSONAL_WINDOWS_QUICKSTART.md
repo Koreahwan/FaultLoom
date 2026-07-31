@@ -199,14 +199,21 @@ request:
   --workspace "$Job\run-01" `
   --trusted-key "$Root\authority\authority-public-key.json" `
   --request 'C:\path\to\automation-request.json' `
+  --provider-id 'provider.approved-by-grant' `
+  --trusted-disclosure-key "$Root\authority\disclosure-approver-public-key.json" `
   --out 'C:\path\to\model-handoff.json'
 ```
 
 The export requires `provider_network_access=none`; it creates the handoff once
 with private permissions and does not contact a provider, Burp, a Gateway, or a
-target. Give that file to the chosen model and save exactly one returned
-function-arguments object as `model-turn.json`. The handoff contains no
-credentials, cookies, or endpoint, and does not attest the model or provider.
+target. The provider ID must be permitted by the signed grant, and the supplied
+disclosure public key(s) must verify every redacted excerpt for that provider at
+the workspace's active time. Give that file only to the approved provider/service
+and save exactly one returned function-arguments object as `model-turn.json`.
+The handoff contains no credentials, cookies, or provider connection
+configuration, and does not attest the model. Redacted evidence can still
+contain a target URL or other target details, so do not send it to a different
+provider.
 
 If Codex or another model client has already produced an exact FaultLoom
 `AutomationRequest` and structured `ModelTurn` JSON file, compile them inside

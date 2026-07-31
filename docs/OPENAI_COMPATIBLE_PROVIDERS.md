@@ -86,9 +86,14 @@ credentials and are not used.
 
 `faultloom automation export-handoff` is outside this provider transport. It
 renders the canonical bounded messages and one restricted function schema for
-manual use with any model UI, CLI, or official API, but opens no provider
-connection and supplies no endpoint, credential, or cookie. Its bundle is
-explicitly `unattested_manual_handoff`; it neither verifies provider disclosure
-nor claims provider/model attestation. The operator saves the returned single
-function-arguments object and submits it to the separate offline
-`faultloom automation compile` command, which remains candidate-only.
+manual use with the specifically grant-approved provider/service, but opens no
+provider connection and supplies no provider connection configuration,
+credential, or cookie. `--provider-id` and one or more
+`--trusted-disclosure-key` records are mandatory: export verifies every signed
+redacted-excerpt disclosure against that provider, the signed data policy, and
+the active workspace time before writing the bundle. Its bundle is explicitly
+`unattested_manual_handoff`; this authorizes disclosure without claiming
+provider/model attestation. An approved redacted excerpt may contain a target
+URL or detail, so it must not be passed to another provider. The operator saves
+the returned single function-arguments object and submits it to the separate
+offline `faultloom automation compile` command, which remains candidate-only.
