@@ -21,17 +21,30 @@ coverage.
 - `labs`: public loopback-only fixtures
 - `tests`: cross-artifact contract and safety tests
 
-None of the Python packs may open target sockets. All target dispatches must be
-mediated by the Gateway. Installation of a pack never grants authority.
+None of the Python packs may open target sockets. Automated target dispatches
+must be mediated by the Gateway; the personal CLI also has a separate,
+owner-directed signed-scope `scope send-request` path for one bounded direct
+HTTP/1.1 `GET`/`HEAD`/`OPTIONS` request. Installation of a pack never grants
+authority.
+
+The direct sender returns no response body preview by default. Its
+`--body-preview-chars 0..3072` option is explicit opt-in only after a
+non-sensitive response expectation and provider/model-processing permission;
+the formal `doctor --json` `network_access` remains separate from the
+`personal_direct_send_*` capability fields.
+
+For the direct sender, hostname-only external targets use `https`; plaintext
+`http` requires an explicitly signed literal numeric IP or signed CIDR. An
+explicitly signed local `127.0.0.1` target remains supported.
 
 See [SECURITY.md](SECURITY.md) and [ETHICAL_USE.md](ETHICAL_USE.md) before use.
 
 The practical authorized automation flow is documented in
 [`docs/AUTHORIZED_AUTOMATION.md`](docs/AUTHORIZED_AUTOMATION.md). It covers
 signed redacted evidence disclosure, provider-only reasoning, candidate
-admission, optional one-shot Gateway dispatch, independent verification, and
-manual report outboxes. Live mode remains off by default and no automatic
-submission is provided.
+admission, the default personal direct sender, optional one-shot Gateway
+dispatch, independent verification, and manual report outboxes. Live mode
+remains off by default and no automatic submission is provided.
 
 ## Build verification
 

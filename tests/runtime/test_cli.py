@@ -325,6 +325,9 @@ def test_doctor_json_reports_posix_controller_provisioned_live_mode(
         "live_dispatch_mode": "controller_provisioned_single_dispatch",
         "network_access": "gateway_only",
         "ok": True,
+        "personal_direct_send_enabled": True,
+        "personal_direct_send_mode": "scope_gated_direct_http1",
+        "personal_direct_send_network_access": "scope_gated_direct_http1",
         "protocol_version": "0.1.0",
         "runtime_version": "0.1.0",
     }
@@ -342,6 +345,9 @@ def test_doctor_json_keeps_windows_personal_runtime_manual_only(
     assert result["live_dispatch_enabled"] is False
     assert result["live_dispatch_mode"] == "manual_only"
     assert result["network_access"] == "none"
+    assert result["personal_direct_send_enabled"] is True
+    assert result["personal_direct_send_mode"] == "scope_gated_direct_http1"
+    assert result["personal_direct_send_network_access"] == "scope_gated_direct_http1"
 
 
 def test_windows_personal_build_includes_registered_candidate_packs() -> None:

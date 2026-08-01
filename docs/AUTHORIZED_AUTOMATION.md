@@ -166,9 +166,11 @@ and a new signed `ModelDisclosureApproval`. The dispatch record always states
 `automatic_submission_performed=false` and
 `independent_verification_performed=false`.
 
-The Gateway remains the only target-I/O authority. Python packs, provider
-adapters, and this automation bridge do not open target sockets. For the
-controller-provisioned POSIX handoff, see
+The Gateway remains the only target-I/O authority for the automated
+controller-provisioned pipeline. Python packs, provider adapters, and this
+automation bridge do not open target sockets. The separate owner-directed
+personal sender below is not Gateway automation. For the controller-provisioned
+POSIX handoff, see
 [`GATEWAY_PROVISIONED_HANDOFF.md`](GATEWAY_PROVISIONED_HANDOFF.md).
 
 ## Verification and reporting remain separate
@@ -180,7 +182,7 @@ can be rendered by `faultloom report` / `render_finding_report()`. The report
 outbox is also local, atomic, and create-once. It produces a draft artifact for
 manual delivery and has no automatic submission connector.
 
-## Burp and live-mode boundary
+## Personal direct sender, optional Burp analysis, and live-mode boundary
 
 The active Burp path is explicitly selected and loopback-only in the current
 adapter. `ActiveBurpGatewayHandoff` accepts one user-selected Burp item and a
@@ -189,16 +191,48 @@ Gateway `dispatch(command)` surface. It has no HTTP client, socket, launcher,
 or request-construction path and rejects non-owned/non-loopback targets. See
 [`ACTIVE_BURP_GATEWAY_HANDOFF.md`](ACTIVE_BURP_GATEWAY_HANDOFF.md).
 
-For the separate personal offline handoff, `faultloom scope verify-request`
-binds exactly one local raw HTTP/1.1 request file to the signed workspace by
-SHA-256 and byte length. It validates the canonical request line and exactly
-one Host header against the signed endpoint metadata before reserving budget.
-`scope complete-request` requires the same request bytes again and can bind a
-local response file digest when that file is within the reserved response
-limit; an oversized response file is rejected. Neither command opens a
-socket, invokes Burp, or prints request/response contents. This is an
-owner-local preflight and audit guard, not an enforcement hook inside Burp
-itself.
+The default personal Windows request path is `faultloom scope send-request`.
+It admits one regular local raw HTTP/1.1 request against the signed workspace,
+then makes one direct owner-local TCP/TLS attempt. It accepts only
+`GET`/`HEAD`/`OPTIONS`, requires exactly `Connection: close`, applies the
+smaller signed budget and fixed 65,536-byte request / 1 MiB response caps, and
+writes its raw response under the workspace. It does not follow redirects, use
+a proxy, retry, or make a second request. A success result uses
+`faultloom.personal-http1-send.v1` and completes the reservation internally.
+Its one absolute deadline includes reservation recheck, DNS, connect, TLS,
+send, and receive. The strict response subset rejects every `Transfer-Encoding`
+and interim `1xx` response; `HEAD`, `204`, `205`, and `304` must have no body
+bytes, while non-empty responses may use matching `Content-Length` or
+close-delimited EOF framing.
+
+For a hostname-only external target, use `https` so TLS supplies the identity
+check. Plaintext `http` is accepted only when the selected numeric IP is
+explicitly signed as a literal hostname or covered by a signed CIDR; an
+authorized CIDR must be added when neither applies. This still permits an
+explicitly signed local `127.0.0.1` target.
+
+The default result contains no response body preview. `--body-preview-chars`
+accepts `0` through `3072` but is explicit opt-in: omit it (default `0`) unless
+the operator has confirmed both a non-sensitive response expectation and
+permission for the selected provider/model to process that response. The
+supervised project skill may request `3072` only after those confirmations.
+Connection/TLS failure or any post-dispatch incomplete, malformed, or
+ambiguous response returns a structured no-dispatch/ambiguous result and leaves
+the reservation unresolved; the operator must not retry or fabricate a
+completion. Before any evidence action, the operator/classifier must delete a
+sensitive response file unless engagement retention requires keeping it.
+
+`doctor --json` reports `personal_direct_send_enabled`,
+`personal_direct_send_mode`, and `personal_direct_send_network_access`
+separately. Those fields do not alter the formal `network_access` value:
+`gateway_only` remains the controller-provisioned POSIX claim and `none` the
+Windows manual-package claim.
+
+`scope verify-request` and `scope complete-request` remain the separate
+offline admission/accounting pair for the optional exact Burp path. They bind
+one local raw HTTP/1.1 request and response digest without opening a socket or
+invoking Burp. Never launch, close, or restart Burp; its exact request tool is
+manual analysis only and retains its separate write approval.
 
 `faultloom evidence add-exchange --workspace <run> --trusted-key <public-key>
 --reservation-id <id> --request-file <request.raw> --response-file

@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 import argparse
-from fnmatch import fnmatchcase
 import hashlib
 import ipaddress
 import json
 import os
+import queue
 import secrets
 import shutil
+import socket
 import sqlite3
+import ssl
 import stat
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import TypeVar
 
@@ -29,8 +34,8 @@ from faultloom_protocol import (
     CallbackPolicy,
     Ed25519PublicKeyRecord,
     ExplicitDeny,
-    ProviderPolicy,
     ProtocolModel,
+    ProviderPolicy,
     RetentionPolicy,
     ScopeContractDraft,
     SignedAuthorityGrant,
@@ -80,6 +85,9 @@ OFFLINE_REQUEST_ACTION_FAMILY = "http.semantic"
 OFFLINE_REQUEST_ACTION_CLASS = ActionClass.SAFE_PROBE
 REQUEST_ACCOUNTING_FILENAME = "request-accounting.sqlite3"
 REQUEST_ACCOUNTING_STATE_KEY = "request_accounting_state_id"
+PERSONAL_HTTP1_MAX_REQUEST_BYTES = 65_536
+PERSONAL_HTTP1_MAX_RESPONSE_BYTES = 1_048_576
+PERSONAL_HTTP1_PREVIEW_CHARS = 3_072
 
 ModelT = TypeVar("ModelT", bound=ProtocolModel)
 
@@ -108,6 +116,10 @@ class CliError(RuntimeError):
         self.exit_code = exit_code
 
 
+class _PersonalPreDispatchError(RuntimeError):
+    """A direct connection/TLS failure before any request byte was attempted."""
+
+
 @dataclass(frozen=True)
 class _BoundProtocolFile:
     path: Path
@@ -129,6 +141,19 @@ class _ProtocolFilePathSnapshot:
     leaf_stat: os.stat_result
 
 
+@dataclass(frozen=True)
+class _AdmittedRawRequest:
+    manifest: dict[str, object]
+    grant: AuthorityGrant
+    target: TargetAsset
+    method: str
+    path: str
+    content: bytes
+    request_sha256: str
+    response_limit: int
+    reservation: dict[str, object]
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -140,6 +165,23 @@ def _positive_int(value: str) -> int:
         raise argparse.ArgumentTypeError("must be a positive integer") from exc
     if parsed < 1:
         raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _personal_timeout_seconds(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed > 30:
+        raise argparse.ArgumentTypeError("must be between 1 and 30 seconds")
+    return parsed
+
+
+def _body_preview_chars(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer between 0 and 3072") from exc
+    if not 0 <= parsed <= PERSONAL_HTTP1_PREVIEW_CHARS:
+        raise argparse.ArgumentTypeError("must be an integer between 0 and 3072")
     return parsed
 
 
@@ -722,6 +764,7 @@ def _write_new_file(path: Path, content: bytes, *, mode: int) -> None:
         raise CliError(f"cannot write {path}: {exc}", exit_code=EXIT_USAGE) from exc
     finally:
         os.close(descriptor)
+
     try:
         os.chmod(path, mode)
     except OSError as exc:
@@ -780,7 +823,7 @@ def _scope_draft(arguments: argparse.Namespace) -> int:
             hostnames=hostnames,
             cidrs=cidrs,
             ports=tuple(arguments.port or (443,)),
-            protocols=("https",),
+            protocols=tuple(arguments.scheme or ("https",)),
             paths=paths,
             methods=methods,
         )
@@ -989,6 +1032,9 @@ def _doctor(arguments: argparse.Namespace) -> int:
         "component": "faultloom",
         "live_dispatch_enabled": live_supported,
         "live_dispatch_mode": live_mode,
+        "personal_direct_send_enabled": True,
+        "personal_direct_send_mode": "scope_gated_direct_http1",
+        "personal_direct_send_network_access": "scope_gated_direct_http1",
         "network_access": network_access,
         "ok": True,
         "protocol_version": PROTOCOL_VERSION,
@@ -1716,6 +1762,7 @@ def _parse_raw_http11_request(
     scheme: str,
     method: str,
     path: str,
+    require_connection_close: bool = False,
 ) -> None:
     """Fail closed unless a raw file is one unambiguous HTTP/1.1 request."""
     if not content or b"\r\n\r\n" not in content:
@@ -1741,6 +1788,7 @@ def _parse_raw_http11_request(
 
     host_values: list[str] = []
     content_lengths: list[str] = []
+    connection_values: list[str] = []
     for line in lines[1:]:
         if not line or line[:1] in {b" ", b"\t"} or b":" not in line:
             raise CliError("raw request has malformed header framing", exit_code=EXIT_AUTHORITY)
@@ -1761,6 +1809,8 @@ def _parse_raw_http11_request(
             host_values.append(normalized_value)
         elif lowered == b"content-length":
             content_lengths.append(normalized_value)
+        elif lowered == b"connection":
+            connection_values.append(normalized_value)
         elif lowered == b"transfer-encoding":
             raise CliError("raw request transfer-encoding is not permitted", exit_code=EXIT_AUTHORITY)
 
@@ -1789,6 +1839,13 @@ def _parse_raw_http11_request(
             raise CliError("raw request body does not match Content-Length", exit_code=EXIT_AUTHORITY)
     elif body:
         raise CliError("raw request body requires exactly one Content-Length header", exit_code=EXIT_AUTHORITY)
+    if require_connection_close and (
+        len(connection_values) != 1 or connection_values[0].lower() != "close"
+    ):
+        raise CliError(
+            "direct personal requests require exactly 'Connection: close'",
+            exit_code=EXIT_AUTHORITY,
+        )
 
 
 def _capture_verified_raw_request(
@@ -1800,6 +1857,7 @@ def _capture_verified_raw_request(
     scheme: str,
     method: str,
     request_path: str,
+    require_connection_close: bool = False,
 ) -> tuple[bytes, str]:
     content = _capture_bounded_local_file(path, maximum_bytes=maximum_bytes, label="request")
     _parse_raw_http11_request(
@@ -1809,6 +1867,7 @@ def _capture_verified_raw_request(
         scheme=scheme,
         method=method,
         path=request_path,
+        require_connection_close=require_connection_close,
     )
     return content, hashlib.sha256(content).hexdigest()
 
@@ -2236,7 +2295,10 @@ def _complete_request(
     request_file: Path,
     observed_response_bytes: int,
     response_file: Path | None,
+    response_content: bytes | None = None,
 ) -> dict[str, object]:
+    if response_file is not None and response_content is not None:
+        raise CliError("response source is ambiguous", exit_code=EXIT_AUTHORITY)
     connection = _request_accounting_connection(workspace)
     try:
         _prepare_request_accounting(connection, manifest)
@@ -2263,7 +2325,19 @@ def _complete_request(
                 exit_code=EXIT_AUTHORITY,
             )
         response_sha256: str | None = None
-        if response_file is not None:
+        if response_content is not None:
+            if len(response_content) != observed_response_bytes:
+                raise CliError(
+                    "response content length does not match the observed response",
+                    exit_code=EXIT_AUTHORITY,
+                )
+            if observed_response_bytes > row[3]:
+                raise CliError(
+                    "response content exceeds the reserved response limit",
+                    exit_code=EXIT_AUTHORITY,
+                )
+            response_sha256 = hashlib.sha256(response_content).hexdigest()
+        elif response_file is not None:
             response_size = _response_file_size(response_file)
             if response_size != observed_response_bytes:
                 raise CliError(
@@ -2315,7 +2389,45 @@ def _complete_request(
     }
 
 
-def _scope_verify_request(arguments: argparse.Namespace) -> int:
+def _recheck_reserved_request_before_send(
+    *,
+    workspace: Path,
+    manifest: dict[str, object],
+    reservation_id: str,
+    request_file: Path,
+) -> None:
+    """Bind the bytes handed to sendall to the still-live local reservation."""
+    connection = _request_accounting_connection(workspace)
+    try:
+        _prepare_request_accounting(connection, manifest)
+        row = connection.execute(
+            "SELECT expires_at, request_bytes, request_sha256, completed_at "
+            "FROM reservations WHERE reservation_id = ?",
+            (reservation_id,),
+        ).fetchone()
+        if row is None or row[3] is not None:
+            raise CliError("request reservation is unavailable for direct send", exit_code=EXIT_AUTHORITY)
+        if _utc_now().timestamp() >= row[0]:
+            raise CliError("request reservation has expired", exit_code=EXIT_AUTHORITY)
+        request_content = _capture_bounded_local_file(
+            request_file, maximum_bytes=row[1], label="request"
+        )
+        if len(request_content) != row[1] or hashlib.sha256(request_content).hexdigest() != row[2]:
+            raise CliError(
+                "request file digest does not match the reservation", exit_code=EXIT_AUTHORITY
+            )
+    finally:
+        connection.close()
+
+
+def _admit_raw_request(
+    arguments: argparse.Namespace,
+    *,
+    response_bytes: int | None = None,
+    request_cap: int | None = None,
+    response_cap: int | None = None,
+    require_connection_close: bool = False,
+) -> _AdmittedRawRequest:
     workspace: Path = arguments.workspace
     trusted_key_path = _trusted_key_path(arguments)
     manifest, grant, target, now = _verified_request_workspace(workspace, trusted_key_path)
@@ -2324,15 +2436,25 @@ def _scope_verify_request(arguments: argparse.Namespace) -> int:
     path = arguments.path
     if not path.startswith("/"):
         raise CliError("request path must start with '/'", exit_code=EXIT_AUTHORITY)
-    response_bytes = _request_byte_count(arguments.response_bytes, label="response bytes")
+    if response_bytes is None:
+        response_bytes = _request_byte_count(arguments.response_bytes, label="response bytes")
+    maximum_request_bytes = min(
+        grant.budget.max_request_bytes,
+        request_cap if request_cap is not None else grant.budget.max_request_bytes,
+    )
+    maximum_response_bytes = min(
+        grant.budget.max_response_bytes,
+        response_cap if response_cap is not None else grant.budget.max_response_bytes,
+    )
     request_content, request_sha256 = _capture_verified_raw_request(
         arguments.request_file,
-        maximum_bytes=grant.budget.max_request_bytes,
+        maximum_bytes=maximum_request_bytes,
         hostname=arguments.hostname,
         port=arguments.port,
         scheme=arguments.scheme,
         method=method,
         request_path=path,
+        require_connection_close=require_connection_close,
     )
     request_bytes = len(request_content)
     if (
@@ -2370,8 +2492,8 @@ def _scope_verify_request(arguments: argparse.Namespace) -> int:
     ):
         raise CliError("request matches an explicit signed deny", exit_code=EXIT_AUTHORITY)
     if (
-        request_bytes > grant.budget.max_request_bytes
-        or response_bytes > grant.budget.max_response_bytes
+        request_bytes > maximum_request_bytes
+        or response_bytes > maximum_response_bytes
     ):
         raise CliError(
             "request exceeds the signed byte budget", exit_code=EXIT_AUTHORITY
@@ -2390,30 +2512,521 @@ def _scope_verify_request(arguments: argparse.Namespace) -> int:
         request_sha256=request_sha256,
         response_bytes=response_bytes,
     )
+    return _AdmittedRawRequest(
+        manifest=manifest,
+        grant=grant,
+        target=target,
+        method=method,
+        path=path,
+        content=request_content,
+        request_sha256=request_sha256,
+        response_limit=response_bytes,
+        reservation=reservation,
+    )
+
+
+def _scope_verify_request(arguments: argparse.Namespace) -> int:
+    admitted = _admit_raw_request(arguments)
     _emit_json(
         {
             "authorized": True,
             "action_class": OFFLINE_REQUEST_ACTION_CLASS.value,
-            "budget": grant.budget.model_dump(mode="json"),
+            "budget": admitted.grant.budget.model_dump(mode="json"),
             "budget_accounting": "operator_local_reservation",
             "dispatch_performed": False,
-            "grant_id": grant.grant_id,
-            "grant_version": grant.grant_version,
-            "method": method,
+            "grant_id": admitted.grant.grant_id,
+            "grant_version": admitted.grant.grant_version,
+            "method": admitted.method,
             "network_access": "none",
-            "pack_id": manifest["pack_id"],
-            "path": path,
+            "pack_id": admitted.manifest["pack_id"],
+            "path": admitted.path,
             "port": arguments.port,
-            "request_bytes": request_bytes,
-            "request_sha256": request_sha256,
-            "response_bytes": response_bytes,
+            "request_bytes": len(admitted.content),
+            "request_sha256": admitted.request_sha256,
+            "response_bytes": admitted.response_limit,
             "scheme": arguments.scheme,
-            "target_id": target.target_id,
+            "target_id": admitted.target.target_id,
             "hostname": arguments.hostname,
-            **reservation,
+            **admitted.reservation,
         }
     )
     return EXIT_OK
+
+
+def _resolved_address_is_explicitly_signed(
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address, target: TargetAsset
+) -> bool:
+    if str(address) in target.hostnames:
+        return True
+    return any(address in ipaddress.ip_network(cidr) for cidr in target.cidrs)
+
+
+def _resolve_direct_address(
+    hostname: str, port: int, target: TargetAsset, *, scheme: str, deadline: float
+) -> tuple[int, tuple[object, ...]]:
+    results: queue.Queue[tuple[object, object]] = queue.Queue(maxsize=1)
+    finished = threading.Event()
+
+    def resolve() -> None:
+        try:
+            results.put(("candidates", socket.getaddrinfo(
+                hostname, port, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM,
+                proto=socket.IPPROTO_TCP,
+            )))
+        except OSError as exc:
+            results.put(("error", exc))
+        finally:
+            finished.set()
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _PersonalPreDispatchError("direct HTTP/1.1 deadline elapsed")
+    threading.Thread(target=resolve, daemon=True).start()
+    if not finished.wait(remaining) or time.monotonic() >= deadline:
+        raise _PersonalPreDispatchError("resolution timed out")
+    try:
+        kind, value = results.get_nowait()
+    except queue.Empty as exc:
+        raise _PersonalPreDispatchError("resolution failed") from exc
+    if kind == "error":
+        if isinstance(value, BaseException):
+            raise _PersonalPreDispatchError("resolution failed") from value
+        raise _PersonalPreDispatchError("resolution failed")
+    if not isinstance(value, list):
+        raise _PersonalPreDispatchError("resolution returned invalid data")
+    for candidate in value:
+        if not isinstance(candidate, tuple) or len(candidate) != 5:
+            continue
+        family, socktype, _, _, sockaddr = candidate
+        if family not in {socket.AF_INET, socket.AF_INET6} or socktype != socket.SOCK_STREAM:
+            continue
+        try:
+            address = ipaddress.ip_address(str(sockaddr[0]))
+        except (ValueError, IndexError, TypeError):
+            continue
+        explicitly_signed = _resolved_address_is_explicitly_signed(address, target)
+        if scheme == "http" and not explicitly_signed:
+            raise _PersonalPreDispatchError("plaintext resolution selected an unsigned address")
+        if not address.is_global and not explicitly_signed:
+            raise _PersonalPreDispatchError("resolution selected a non-global address")
+        return family, tuple(sockaddr)
+    raise _PersonalPreDispatchError("resolution returned no TCP address")
+
+
+def _send_direct_http11_once(
+    *,
+    hostname: str,
+    port: int,
+    scheme: str,
+    target: TargetAsset,
+    request_content: bytes,
+    response_limit: int,
+    deadline: float,
+) -> bytes:
+    raw: socket.socket | None = None
+    stream: socket.socket | ssl.SSLSocket | None = None
+
+    def set_remaining_timeout(value: socket.socket | ssl.SSLSocket) -> None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("direct HTTP/1.1 deadline elapsed")
+        value.settimeout(remaining)
+
+    try:
+        family, sockaddr = _resolve_direct_address(
+            hostname, port, target, scheme=scheme, deadline=deadline
+        )
+        try:
+            if time.monotonic() >= deadline:
+                raise _PersonalPreDispatchError("direct HTTP/1.1 deadline elapsed")
+            raw = socket.socket(family, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+            set_remaining_timeout(raw)
+            raw.connect(sockaddr)
+            stream = raw
+            if scheme == "https":
+                context = ssl.create_default_context()
+                context.set_alpn_protocols(["http/1.1"])
+                set_remaining_timeout(raw)
+                stream = context.wrap_socket(raw, server_hostname=hostname)
+                selected_protocol = stream.selected_alpn_protocol()
+                if selected_protocol not in {None, "http/1.1"}:
+                    raise _PersonalPreDispatchError("TLS selected an unsupported protocol")
+        except _PersonalPreDispatchError:
+            raise
+        except (OSError, ssl.SSLError, ValueError) as exc:
+            raise _PersonalPreDispatchError("connection or TLS setup failed") from exc
+
+        # From this point forward the server may have received some or all bytes.
+        assert stream is not None
+        set_remaining_timeout(stream)
+        if time.monotonic() >= deadline:
+            raise _PersonalPreDispatchError("direct HTTP/1.1 deadline elapsed")
+        stream.sendall(request_content)
+        if time.monotonic() >= deadline:
+            raise TimeoutError("direct HTTP/1.1 deadline elapsed")
+        response = bytearray()
+        while True:
+            set_remaining_timeout(stream)
+            chunk = stream.recv(min(65_536, response_limit - len(response) + 1))
+            if not chunk:
+                break
+            response.extend(chunk)
+            if len(response) > response_limit:
+                raise CliError("direct response exceeds the fixed response limit", exit_code=EXIT_UNAVAILABLE)
+            if time.monotonic() >= deadline:
+                raise TimeoutError("direct HTTP/1.1 deadline elapsed")
+        return bytes(response)
+    finally:
+        if stream is not None:
+            stream.close()
+        elif raw is not None:
+            raw.close()
+
+
+def _parse_personal_http11_response(content: bytes, *, method: str) -> tuple[int, list[str], bytes]:
+    if b"\r\n\r\n" not in content:
+        raise CliError("direct response is incomplete or malformed", exit_code=EXIT_UNAVAILABLE)
+    header_block, body = content.split(b"\r\n\r\n", 1)
+    lines = header_block.split(b"\r\n")
+    try:
+        status_parts = lines[0].decode("ascii").split(" ", 2)
+    except UnicodeDecodeError as exc:
+        raise CliError("direct response is incomplete or malformed", exit_code=EXIT_UNAVAILABLE) from exc
+    if (
+        len(status_parts) < 2
+        or status_parts[0] not in {"HTTP/1.0", "HTTP/1.1"}
+        or len(status_parts[1]) != 3
+        or not status_parts[1].isdigit()
+        or not 200 <= int(status_parts[1]) <= 599
+    ):
+        raise CliError("direct response is incomplete or malformed", exit_code=EXIT_UNAVAILABLE)
+    header_names: list[str] = []
+    content_lengths: list[bytes] = []
+    transfer_encodings: list[bytes] = []
+    for line in lines[1:]:
+        if not line or b":" not in line:
+            raise CliError("direct response is incomplete or malformed", exit_code=EXIT_UNAVAILABLE)
+        name, value = line.split(b":", 1)
+        if not name or any(
+            character not in b"!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+            for character in name
+        ):
+            raise CliError("direct response is incomplete or malformed", exit_code=EXIT_UNAVAILABLE)
+        if any(character < 32 and character not in {9} or character == 127 for character in value):
+            raise CliError("direct response is incomplete or malformed", exit_code=EXIT_UNAVAILABLE)
+        if len(header_names) < 64:
+            header_names.append(name.decode("ascii"))
+        if name.lower() == b"content-length":
+            content_lengths.append(value.strip(b" \t"))
+        elif name.lower() == b"transfer-encoding":
+            transfer_encodings.append(value.strip(b" \t"))
+    status_code = int(status_parts[1])
+    if (
+        100 <= status_code < 200
+        or transfer_encodings
+        or len(content_lengths) > 1
+    ):
+        raise CliError("direct response is incomplete or malformed", exit_code=EXIT_UNAVAILABLE)
+    no_body = method == "HEAD" or status_code in {204, 205, 304}
+    if (
+        (
+            content_lengths
+            and (
+                not content_lengths[0].isdigit()
+                or (not no_body and int(content_lengths[0]) != len(body))
+            )
+        )
+        or (no_body and body)
+    ):
+        raise CliError("direct response is incomplete or malformed", exit_code=EXIT_UNAVAILABLE)
+    return status_code, header_names, body
+
+
+def _open_windows_response_directory_guard(responses: Path) -> int:
+    import ctypes
+    from ctypes import wintypes
+
+    class FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [("file_attributes", wintypes.DWORD), ("reparse_tag", wintypes.DWORD)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    get_information = kernel32.GetFileInformationByHandleEx
+    get_information.argtypes = (
+        wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+    )
+    get_information.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    handle = create_file(
+        str(responses), 0x80, 0x1 | 0x2, None, 3, 0x02000000 | 0x00200000, None,
+    )
+    if handle is None or handle == ctypes.c_void_p(-1).value:
+        raise CliError("direct response directory is unsafe", exit_code=EXIT_AUTHORITY)
+    handle_value = int(handle)
+    info = FileAttributeTagInfo()
+    if not get_information(handle_value, 9, ctypes.byref(info), ctypes.sizeof(info)):
+        close_handle(handle_value)
+        raise CliError("direct response directory is unsafe", exit_code=EXIT_AUTHORITY)
+    if info.file_attributes & 0x400:
+        close_handle(handle_value)
+        raise CliError("direct response directory is unsafe", exit_code=EXIT_AUTHORITY)
+    return handle_value
+
+
+def _close_windows_response_directory_guard(handle: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle(wintypes.HANDLE(handle))
+
+
+def _write_personal_response_file(workspace: Path, reservation_id: str, content: bytes) -> Path:
+    responses = workspace / "responses"
+    filename = f"{reservation_id}.personal-http1.raw"
+    try:
+        if responses.exists():
+            metadata = responses.lstat()
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISDIR(metadata.st_mode)
+                or responses.is_junction()
+            ):
+                raise CliError("direct response directory is unsafe", exit_code=EXIT_AUTHORITY)
+        else:
+            responses.mkdir(mode=0o700)
+            metadata = responses.lstat()
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISDIR(metadata.st_mode)
+                or responses.is_junction()
+            ):
+                raise CliError("direct response directory is unsafe", exit_code=EXIT_AUTHORITY)
+    except CliError:
+        raise
+    except OSError as exc:
+        raise CliError("cannot create direct response file", exit_code=EXIT_USAGE) from exc
+    path = responses / filename
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    directory_descriptor: int | None = None
+    windows_directory_guard: int | None = None
+    try:
+        if os.name != "nt":
+            directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            if hasattr(os, "O_CLOEXEC"):
+                directory_flags |= os.O_CLOEXEC
+            directory_descriptor = os.open(responses, directory_flags)
+            directory_stat = os.fstat(directory_descriptor)
+            if not stat.S_ISDIR(directory_stat.st_mode):
+                raise CliError("direct response directory is unsafe", exit_code=EXIT_AUTHORITY)
+            descriptor = os.open(filename, flags, 0o600, dir_fd=directory_descriptor)
+        else:
+            windows_directory_guard = _open_windows_response_directory_guard(responses)
+            descriptor = os.open(path, flags, 0o600)
+    except CliError:
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
+        if windows_directory_guard is not None:
+            _close_windows_response_directory_guard(windows_directory_guard)
+        raise
+    except OSError as exc:
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
+        if windows_directory_guard is not None:
+            _close_windows_response_directory_guard(windows_directory_guard)
+        raise CliError("cannot create direct response file", exit_code=EXIT_USAGE) from exc
+    try:
+        offset = 0
+        while offset < len(content):
+            offset += os.write(descriptor, content[offset:])
+        if os.name != "nt":
+            os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+        opened = os.fstat(descriptor)
+    except OSError as exc:
+        try:
+            if directory_descriptor is None:
+                path.unlink()
+            else:
+                os.unlink(filename, dir_fd=directory_descriptor)
+        except OSError:
+            pass
+        if windows_directory_guard is not None:
+            _close_windows_response_directory_guard(windows_directory_guard)
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
+        raise CliError("cannot write direct response file", exit_code=EXIT_USAGE) from exc
+    finally:
+        os.close(descriptor)
+
+    def remove_unverified_file() -> None:
+        try:
+            if directory_descriptor is None:
+                path.unlink()
+            else:
+                os.unlink(filename, dir_fd=directory_descriptor)
+        except OSError:
+            pass
+
+    try:
+        observed = (
+            os.stat(filename, dir_fd=directory_descriptor, follow_symlinks=False)
+            if directory_descriptor is not None
+            else path.lstat()
+        )
+        if (
+            stat.S_ISLNK(observed.st_mode)
+            or not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or observed.st_size != len(content)
+            or not _stat_matches(opened, observed, _WINDOWS_FILE_STAT_FIELDS if os.name == "nt" else _FILE_STAT_FIELDS)
+        ):
+            raise CliError("direct response file changed while being created", exit_code=EXIT_AUTHORITY)
+    except CliError:
+        remove_unverified_file()
+        raise
+    except OSError as exc:
+        remove_unverified_file()
+        raise CliError("cannot finalize direct response file", exit_code=EXIT_USAGE) from exc
+    finally:
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
+        if windows_directory_guard is not None:
+            _close_windows_response_directory_guard(windows_directory_guard)
+    return path
+
+
+def _emit_personal_send_ambiguity(
+    reservation_id: str, code: str, response_path: Path | None = None
+) -> int:
+    result: dict[str, object] = {
+        "schema": "faultloom.personal-http1-send.v1",
+        "reservation": reservation_id,
+        "dispatchPerformed": True,
+        "networkAccess": "direct_owner_local",
+        "reservationState": "unresolved_no_retry",
+        "error": code,
+    }
+    if response_path is not None:
+        result["responseFile"] = str(response_path)
+    _emit_json(result)
+    return EXIT_UNAVAILABLE
+
+
+def _emit_personal_send_no_dispatch(reservation_id: str) -> int:
+    _emit_json(
+        {
+            "schema": "faultloom.personal-http1-send.v1",
+            "reservation": reservation_id,
+            "dispatchPerformed": False,
+            "networkAccess": "direct_owner_local",
+            "reservationState": "unresolved_no_retry",
+            "error": "no_dispatch_connection_or_tls_failure",
+        }
+    )
+    return EXIT_UNAVAILABLE
+
+
+def _scope_send_request(arguments: argparse.Namespace) -> int:
+    method = arguments.method.upper()
+    if method not in {"GET", "HEAD", "OPTIONS"}:
+        raise CliError("direct personal sender permits GET, HEAD, or OPTIONS only", exit_code=EXIT_AUTHORITY)
+    admitted = _admit_raw_request(
+        arguments,
+        request_cap=PERSONAL_HTTP1_MAX_REQUEST_BYTES,
+        response_cap=PERSONAL_HTTP1_MAX_RESPONSE_BYTES,
+        require_connection_close=True,
+    )
+    response_path = (
+        arguments.workspace
+        / "responses"
+        / f"{admitted.reservation['reservation_id']}.personal-http1.raw"
+    )
+    request_attempted = False
+    response_stored = False
+    try:
+        expires_at = datetime.fromisoformat(
+            str(admitted.reservation["reservation_expires_at"])
+        )
+        timeout_seconds = min(
+            float(arguments.timeout_seconds),
+            (expires_at - _utc_now()).total_seconds() - 1,
+        )
+        if timeout_seconds <= 0:
+            raise _PersonalPreDispatchError("reservation has expired")
+        deadline = time.monotonic() + timeout_seconds
+        _recheck_reserved_request_before_send(
+            workspace=arguments.workspace,
+            manifest=admitted.manifest,
+            reservation_id=str(admitted.reservation["reservation_id"]),
+            request_file=arguments.request_file,
+        )
+        request_attempted = True
+        response_content = _send_direct_http11_once(
+            hostname=arguments.hostname,
+            port=arguments.port,
+            scheme=arguments.scheme,
+            target=admitted.target,
+            request_content=admitted.content,
+            response_limit=admitted.response_limit,
+            deadline=deadline,
+        )
+        status_code, header_names, body = _parse_personal_http11_response(
+            response_content, method=admitted.method
+        )
+        response_path = _write_personal_response_file(
+            arguments.workspace,
+            str(admitted.reservation["reservation_id"]),
+            response_content,
+        )
+        response_stored = True
+        completion = _complete_request(
+            workspace=arguments.workspace,
+            manifest=admitted.manifest,
+            reservation_id=str(admitted.reservation["reservation_id"]),
+            request_file=arguments.request_file,
+            observed_response_bytes=len(response_content),
+            response_file=None,
+            response_content=response_content,
+        )
+        result: dict[str, object] = {
+            "schema": "faultloom.personal-http1-send.v1",
+            "reservation": admitted.reservation["reservation_id"],
+            "request": {"size": len(admitted.content), "sha256": admitted.request_sha256},
+            "response": {"size": len(response_content), "sha256": completion["response_sha256"]},
+            "responseFile": str(response_path),
+            "statusCode": status_code,
+            "headerNames": header_names,
+            "dispatchPerformed": True,
+            "networkAccess": "direct_owner_local",
+        }
+        if arguments.body_preview_chars:
+            preview = body.decode("utf-8", errors="replace")
+            result["bodyPreview"] = preview[: arguments.body_preview_chars]
+            result["previewTruncated"] = len(preview) > arguments.body_preview_chars
+        _emit_json(result)
+        return EXIT_OK
+    except _PersonalPreDispatchError:
+        return _emit_personal_send_no_dispatch(str(admitted.reservation["reservation_id"]))
+    except (CliError, OSError):
+        if not request_attempted:
+            return _emit_personal_send_no_dispatch(str(admitted.reservation["reservation_id"]))
+        return _emit_personal_send_ambiguity(
+            str(admitted.reservation["reservation_id"]),
+            "response_incomplete_or_ambiguous",
+            response_path if response_stored else None,
+        )
 
 
 def _scope_complete_request(arguments: argparse.Namespace) -> int:
@@ -2657,8 +3270,8 @@ def _run(arguments: argparse.Namespace) -> int:
             GatewayDeniedResult,
             GatewayDispatchCommand,
             GatewayLaunchBundle,
-            GatewayLaunchError,
             GatewayLauncher,
+            GatewayLaunchError,
         )
         from .execution.http_validation import ExecutionContractError
 
@@ -2814,6 +3427,7 @@ def build_parser() -> argparse.ArgumentParser:
     target_location.add_argument("--hostname", action="append")
     target_location.add_argument("--cidr", action="append")
     scope_draft.add_argument("--port", action="append", type=_port)
+    scope_draft.add_argument("--scheme", action="append", choices=("http", "https"))
     scope_draft.add_argument("--method", action="append")
     scope_draft.add_argument("--path", action="append")
     scope_draft.add_argument("--pack", choices=tuple(PACK_IDS), default="web")
@@ -2855,6 +3469,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="deprecated alias for verify-request; exact raw request file required",
     )
     configure_verify_request(scope_check_request)
+    scope_send_request = scope_commands.add_parser(
+        "send-request",
+        help="send one scope-gated direct HTTP/1.1 request from a manual workspace",
+    )
+    scope_send_request.add_argument("--workspace", type=Path, required=True)
+    scope_send_request.add_argument("--trusted-key", type=Path)
+    scope_send_request.add_argument("--hostname", required=True)
+    scope_send_request.add_argument("--port", type=_port, required=True)
+    scope_send_request.add_argument("--scheme", choices=("http", "https"), required=True)
+    scope_send_request.add_argument("--method", required=True)
+    scope_send_request.add_argument("--path", required=True)
+    scope_send_request.add_argument("--request-file", type=Path, required=True)
+    scope_send_request.add_argument("--response-bytes", required=True)
+    scope_send_request.add_argument(
+        "--timeout-seconds", type=_personal_timeout_seconds, default=10
+    )
+    scope_send_request.add_argument(
+        "--body-preview-chars", type=_body_preview_chars, default=0
+    )
+    scope_send_request.set_defaults(handler=_scope_send_request)
     scope_complete_request = scope_commands.add_parser(
         "complete-request",
         help="record an offline Burp request reservation completion",
