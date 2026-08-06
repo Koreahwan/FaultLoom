@@ -261,6 +261,13 @@ and writes a create-once result bundle under `run-01\automation`. A generated
 `candidate.md` is still unverified and cannot be treated as a confirmed
 finding or submitted automatically.
 
+The command help also lists `automation provider-turn`. That direct official
+API path is intentionally POSIX-only because its durable receipt and state
+files rely on no-follow opens, owner-only permissions, file locking, and
+directory sync. Use the signed workflow documented in
+`docs/OPENAI_COMPATIBLE_PROVIDERS.md` from WSL/Linux. Native Windows fails
+closed; use the offline handoff and compilation flow above there instead.
+
 ## Current boundary
 
 Ready now: signed scopes, manual authorized workspaces, bounded evidence
