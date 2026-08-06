@@ -47,6 +47,10 @@ CONFIG_SUFFIXES = {
 PUBLIC_EMAIL_DOMAINS = {"example.com", "example.net", "example.org"}
 ABSOLUTE_PATH_PATTERNS = (
     re.compile(r"/mnt/[a-z]/users/", re.IGNORECASE),
+    re.compile(
+        r"(?<![A-Za-z0-9:/])/(?:home|Users)/[A-Za-z0-9._-]+/",
+        re.IGNORECASE,
+    ),
     re.compile(r"[a-z]:\\\\users\\\\", re.IGNORECASE),
 )
 MUTABLE_REFERENCE_PATTERNS = (

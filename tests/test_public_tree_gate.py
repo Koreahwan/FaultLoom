@@ -45,6 +45,28 @@ def test_private_absolute_mutable_and_sibling_inputs_fail(tmp_path: Path) -> Non
     } <= rules
 
 
+def test_posix_home_paths_are_rejected_without_matching_urls(tmp_path: Path) -> None:
+    make_policies(tmp_path)
+    (tmp_path / "linux.txt").write_text(
+        'path = "/home/operator/private/file"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "macos.txt").write_text(
+        'path = "/Users/operator/private/file"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "url.txt").write_text(
+        'url = "https://example.test/home/operator/public"\n',
+        encoding="utf-8",
+    )
+
+    violations = [
+        item for item in scan(tmp_path) if item.rule == "absolute_user_path"
+    ]
+
+    assert {item.path for item in violations} == {"linux.txt", "macos.txt"}
+
+
 def test_symlink_is_rejected_without_following(tmp_path: Path) -> None:
     make_policies(tmp_path)
     outside = tmp_path.parent / "outside-secret"
