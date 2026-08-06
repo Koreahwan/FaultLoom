@@ -401,6 +401,56 @@ submission call. Repeating the exact export revalidates sources and returns
 the existing manifest digest without rewriting it; changed sources or any
 different pre-existing output fail closed.
 
+### Independent HTTP/1 verification bridge
+
+Create a second manual workspace from a separately signed verifier grant, with
+a different actor and signing key but the exact same target. The source may be
+historical; the verifier grant and execution window must be active. Then prepare
+an explicit case without opening a socket:
+
+```bash
+faultloom campaign prepare-verification-http1 \
+  --source-workspace <source-workspace> --source-trusted-key <source-key> \
+  --handoff <source-workspace>/verification-handoff.json \
+  --verifier-workspace <verifier-workspace> --verifier-trusted-key <verifier-key> \
+  --campaign-id <campaign-id> --finding-class <class> \
+  --claim <operator-claim> --prerequisite <operator-prerequisite> \
+  --out <verifier-workspace>/verification-triad.json
+```
+
+The first slice accepts only bodyless `GET` or `OPTIONS` requests with exactly
+`Host` and `Connection: close`. `HEAD`, authorization or other headers, request
+bodies, same/nested workspaces, same actors or keys, different targets, and an
+expired verifier grant are rejected. The generated case and v1 triad are
+private, create-once files. Run that triad with the existing
+`campaign run-http1-triad`, review the three fresh responses, and finalize it
+with the existing `campaign finalize-http1-triad`; there is no second sender.
+
+Compile the finalized transcript offline:
+
+```bash
+faultloom campaign compile-verification-http1 \
+  --source-workspace <source-workspace> --source-trusted-key <source-key> \
+  --handoff <source-workspace>/verification-handoff.json \
+  --verifier-workspace <verifier-workspace> --verifier-trusted-key <verifier-key> \
+  --campaign-id <campaign-id> \
+  --case <verifier-workspace>/<campaign-id>.verification-case.json \
+  --private-key <0600-verifier-key-outside-both-workspaces> \
+  --result-out <verifier-workspace>/verified-result.json \
+  --receipt-out <verifier-workspace>/verification-compile-receipt.json
+```
+
+Compilation makes no request. It requires the verifier effect and reproduction
+digests to equal the source effect digest, the verifier control to equal the
+source control, and effect to differ from control. It emits a signed
+verifier-run result, a new verifier-run imported-handoff evidence reference,
+and exact arguments for the existing `faultloom verify` and `faultloom report`
+gates. Only `VERIFIED` reaches the report gate. The report command creates a
+`draft_manual_review` outbox; neither command submits it.
+The canonical case-semantics digest is embedded in the finalized request
+filenames. A coordinated edit of the unsigned local case and its prepare
+receipt therefore cannot change what gets signed.
+
 The normal runtime is fail-closed and live mode is off by default. A POSIX
 `run --live` process is supported only when an external controller provisions
 the signed Gateway bootstrap, authenticated journal descriptors, channel

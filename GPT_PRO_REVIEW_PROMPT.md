@@ -42,6 +42,20 @@ FaultLoom은 한 명의 소유자가 실제 허가를 받은 유료 보안 업�
   들어가거나 target/provider/Burp/submission I/O가 발생해서는 안 됩니다.
   검증 뒤 파일 교체와 출력 부모 symlink/junction 교체도 fail-closed인지
   테스트와 구현 양쪽에서 점검하세요.
+- 독립 reviewer 경계는 `campaign prepare-verification-http1` → 기존의 유일한
+  송신기 `campaign run-http1-triad` → `campaign finalize-http1-triad` → 오프라인
+  `campaign compile-verification-http1` 순서입니다. source와 verifier의 workspace,
+  actor, 서명 키, authority가 서로 다르고 target은 정확히 같은지 확인하세요.
+  source 권한은 과거 실행을 검증할 수 있도록 만료돼도 허용하지만 verifier
+  권한은 현재 유효해야 하며, 결과 키는 두 workspace 밖의 owner-only 파일이어야
+  합니다. compile 단계가 handoff·case semantics·prepare receipt·finalized spec·raw
+  request·response 파일의 경로, 크기, SHA-256과 검증 시점 이후 byte equality를
+  모두 확인하고, source evidence를 verifier evidence로 재라벨하지 않는지
+  점검하세요. 최종 산출물은 conservative verifier verdict와 별도 provenance를
+  가진 새 evidence여야 하며, 이후 `faultloom verify`와 `faultloom report`가 만드는
+  것은 사람이 검토할 `draft_manual_review` 보고서 초안뿐이어야 합니다. 이 경로가
+  자동 제출, 임의 재시도, 두 번째 네트워크 executor 또는 독립성 없는 self-review로
+  변질되지 않았는지도 확인하세요.
 - Burp는 선택적인 수동 분석 경로입니다. 사용자가 직접 열어 둔 경우에만 선택된 정확한 경로를 검토하고, FaultLoom이 Burp를 자동 실행·종료·재시작한다고 가정하지 마세요.
 - GPT뿐 아니라 Kimi/Kimi K3 계열, GLM, Grok 및 향후의 미지 모델도 공식 API, 공식 CLI, 공식 OAuth/SDK 또는 합법적인 구독형 인터페이스로 연결할 수 있어야 합니다. 실제 모델 설치나 로그인이 완료됐다고 가정하지 말고, OpenAI-compatible 경로와 비호환 공식 인터페이스용 thin adapter 경계를 분리해 평가하세요.
 - 모델 중립성은 최저 공통분모에 기능을 맞춘다는 뜻이 아닙니다. 공통 권한·증거 계약은 유지하면서 native tool schema, 구조화 출력, context/token budget, reasoning 옵션, capability negotiation이 모델별 장점을 보존하는지 확인하세요.

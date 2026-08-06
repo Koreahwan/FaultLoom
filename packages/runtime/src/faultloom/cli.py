@@ -40,12 +40,17 @@ from faultloom_protocol import (
     AuthoritySigner,
     CallbackPolicy,
     Ed25519PublicKeyRecord,
+    EvidenceRef,
     ExplicitDeny,
+    FindingCandidate,
+    FindingClass,
     ProtocolModel,
     ProviderPolicy,
+    ReplayPlan,
     RetentionPolicy,
     ScopeContractDraft,
     SignedAuthorityGrant,
+    StateRef,
     StateChangePolicy,
     TargetAsset,
     TimeWindow,
@@ -86,6 +91,28 @@ from .verification_cli import (
     VerificationCliDependencies,
     VerificationCliError,
     configure_verification_parsers,
+)
+from .verification import (
+    ArtifactVerificationError,
+    ClaimAssemblyError,
+    ClaimDraft,
+    ResultArtifactContext,
+    ResultArtifactDraft,
+    VerificationCase,
+    VerificationInputError,
+    VerifierAuthorizationError,
+    VerifierAuthorizationRequest,
+    assemble_claim_packet,
+    authorize_verifier,
+    sign_verification_result,
+    verify_candidate,
+)
+from .verification.http1_triad import (
+    FinalizedTriadReplayExecutor,
+    Http1TriadVerificationError,
+    parse_strict_http1_request,
+    require_independent_identity,
+    require_separate_workspaces,
 )
 
 EXIT_OK = 0
@@ -5282,6 +5309,801 @@ def _campaign_export_verification_handoff(arguments: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+@dataclass(frozen=True)
+class _IndependentHttp1Context:
+    source_workspace: Path
+    verifier_workspace: Path
+    source_manifest: dict[str, object]
+    source_grant: AuthorityGrant
+    source_target: TargetAsset
+    source_authority: SignedAuthorityGrant
+    verifier_manifest: dict[str, object]
+    verifier_grant: AuthorityGrant
+    verifier_target: TargetAsset
+    verifier_authority: SignedAuthorityGrant
+    handoff: dict[str, object]
+    handoff_content: bytes
+
+
+def _verification_handoff_document(arguments: argparse.Namespace) -> _IndependentHttp1Context:
+    """Rebuild the source handoff and prove a separate active verifier boundary."""
+    try:
+        require_separate_workspaces(arguments.source_workspace, arguments.verifier_workspace)
+    except Http1TriadVerificationError as exc:
+        raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+    source_manifest, source_grant, source_target, _ = _verified_request_workspace(
+        arguments.source_workspace, arguments.source_trusted_key, require_active=False
+    )
+    verifier_manifest, verifier_grant, verifier_target, _ = _verified_request_workspace(
+        arguments.verifier_workspace, arguments.verifier_trusted_key
+    )
+    source_authority_path = arguments.source_workspace / "authority.json"
+    verifier_authority_path = arguments.verifier_workspace / "authority.json"
+    source_authority = _parse_protocol_file(
+        source_authority_path,
+        _capture_single_protocol_file(source_authority_path),
+        SignedAuthorityGrant,
+    )
+    verifier_authority = _parse_protocol_file(
+        verifier_authority_path,
+        _capture_single_protocol_file(verifier_authority_path),
+        SignedAuthorityGrant,
+    )
+    try:
+        require_independent_identity(
+            source_actor=source_grant.issued_to,
+            verifier_actor=verifier_grant.issued_to,
+            source_key_id=source_authority.signature.key_id,
+            verifier_key_id=verifier_authority.signature.key_id,
+            source_authority_digest=sha256_digest(source_authority),
+            verifier_authority_digest=sha256_digest(verifier_authority),
+        )
+    except Http1TriadVerificationError as exc:
+        raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+    if source_target != verifier_target:
+        raise CliError("verifier target must exactly match the source target", exit_code=EXIT_AUTHORITY)
+
+    expected = _campaign_verification_handoff_bytes(
+        argparse.Namespace(
+            workspace=arguments.source_workspace,
+            trusted_key=arguments.source_trusted_key,
+            campaign_id=arguments.campaign_id,
+        )
+    )
+    handoff_content = _capture_bounded_local_file(
+        arguments.handoff, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="verification handoff"
+    )
+    if handoff_content != expected:
+        raise CliError("verification handoff differs from the validated source campaign", exit_code=EXIT_AUTHORITY)
+    handoff = _parse_campaign_json_content(handoff_content, label="verification handoff")
+    return _IndependentHttp1Context(
+        source_workspace=arguments.source_workspace,
+        verifier_workspace=arguments.verifier_workspace,
+        source_manifest=source_manifest,
+        source_grant=source_grant,
+        source_target=source_target,
+        source_authority=source_authority,
+        verifier_manifest=verifier_manifest,
+        verifier_grant=verifier_grant,
+        verifier_target=verifier_target,
+        verifier_authority=verifier_authority,
+        handoff=handoff,
+        handoff_content=handoff_content,
+    )
+
+
+def _handoff_ref_path(
+    workspace: Path, reference: object, *, label: str, maximum_bytes: int
+) -> tuple[Path, bytes]:
+    if not isinstance(reference, dict):
+        raise CliError(f"{label} reference is invalid", exit_code=EXIT_AUTHORITY)
+    path_value = reference.get("path")
+    size = reference.get("sizeBytes")
+    digest = reference.get("sha256")
+    if not isinstance(path_value, str) or not isinstance(size, int) or not isinstance(digest, str):
+        raise CliError(f"{label} reference is invalid", exit_code=EXIT_AUTHORITY)
+    path = workspace / path_value
+    relative, captured = _handoff_workspace_file(
+        workspace, path, label=label, maximum_bytes=maximum_bytes
+    )
+    content = _capture_bounded_local_file(path, maximum_bytes=maximum_bytes, label=label)
+    if relative != path_value or captured != reference or len(content) != size or sha256_hex(content) != digest:
+        raise CliError(f"{label} reference digest differs", exit_code=EXIT_AUTHORITY)
+    return path, content
+
+
+def _source_verification_requests(
+    context: _IndependentHttp1Context,
+) -> tuple[PersonalHttp1TriadSpec, bytes, bytes, dict[str, str]]:
+    references = context.handoff.get("references")
+    if not isinstance(references, dict):
+        raise CliError("verification handoff references are invalid", exit_code=EXIT_AUTHORITY)
+    _, spec_content = _handoff_ref_path(
+        context.source_workspace,
+        references.get("spec"),
+        label="source campaign spec",
+        maximum_bytes=MAX_PROTOCOL_FILE_BYTES,
+    )
+    try:
+        spec = parse_personal_http1_triad_spec(spec_content)
+    except PersonalCampaignError as exc:
+        raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+    if spec.effect.method not in {"GET", "OPTIONS"}:
+        raise CliError("verification method must be GET or OPTIONS", exit_code=EXIT_AUTHORITY)
+    evidence = context.handoff.get("evidence")
+    if not isinstance(evidence, list) or len(evidence) != 3:
+        raise CliError("verification handoff evidence is invalid", exit_code=EXIT_AUTHORITY)
+    by_role = {
+        item.get("role"): item for item in evidence
+        if isinstance(item, dict) and isinstance(item.get("role"), str)
+    }
+    if set(by_role) != {"effect", "reproduction", "negative_control"}:
+        raise CliError("verification handoff evidence roles are invalid", exit_code=EXIT_AUTHORITY)
+    requests: dict[str, bytes] = {}
+    body_digests: dict[str, str] = {}
+    for role in ("effect", "reproduction", "negative_control"):
+        item = by_role[role]
+        _, content = _handoff_ref_path(
+            context.source_workspace,
+            item.get("request"),
+            label=f"source {role} request",
+            maximum_bytes=PERSONAL_HTTP1_MAX_REQUEST_BYTES,
+        )
+        expected_request = item.get("requestSha256")
+        body_digest = item.get("bodySha256")
+        if sha256_hex(content) != expected_request or not isinstance(body_digest, str):
+            raise CliError("source verification evidence digest differs", exit_code=EXIT_AUTHORITY)
+        request = spec.effect if role != "negative_control" else spec.negative_control
+        _parse_raw_http11_request(
+            content,
+            hostname=spec.hostname,
+            port=spec.port,
+            scheme=spec.scheme,
+            method=request.method,
+            path=request.path,
+            require_connection_close=True,
+        )
+        try:
+            strict = parse_strict_http1_request(content)
+        except Http1TriadVerificationError as exc:
+            raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+        if strict.method != request.method or strict.path != request.path:
+            raise CliError("source verification request differs from its spec", exit_code=EXIT_AUTHORITY)
+        requests[role] = content
+        body_digests[role] = body_digest
+    if requests["effect"] != requests["reproduction"]:
+        raise CliError("source reproduction request differs from source effect request", exit_code=EXIT_AUTHORITY)
+    effect_line, effect_headers = requests["effect"].split(b"\r\n", 1)
+    control_line, control_headers = requests["negative_control"].split(b"\r\n", 1)
+    if effect_headers != control_headers or effect_line == control_line:
+        raise CliError("source requests must differ only by request target", exit_code=EXIT_AUTHORITY)
+    return spec, requests["effect"], requests["negative_control"], body_digests
+
+
+def _campaign_prepare_verification_http1(arguments: argparse.Namespace) -> int:
+    context = _verification_handoff_document(arguments)
+    source_spec, effect_request, control_request, body_digests = _source_verification_requests(context)
+    if not arguments.prerequisite or any(not value.strip() for value in arguments.prerequisite):
+        raise CliError("at least one explicit prerequisite is required", exit_code=EXIT_USAGE)
+    semantics_value = {
+        "findingClass": arguments.finding_class,
+        "claim": arguments.claim,
+        "prerequisites": list(arguments.prerequisite),
+    }
+    semantics_digest = sha256_digest(semantics_value)
+    semantics_tag = semantics_digest.removeprefix("sha256:")
+    campaign_tag = sha256_hex(arguments.campaign_id.encode())[:16]
+    references = context.handoff.get("references")
+    finding_ref = references.get("finding") if isinstance(references, dict) else None
+    record_ref = finding_ref.get("record") if isinstance(finding_ref, dict) else None
+    _, finding_content = _handoff_ref_path(
+        context.source_workspace,
+        record_ref,
+        label="source finding record",
+        maximum_bytes=MAX_PROTOCOL_FILE_BYTES,
+    )
+    finding = _parse_campaign_json_content(finding_content, label="source finding record")
+    required_finding = {
+        name: finding.get(name) for name in ("title", "severity", "summary", "impact", "remediation")
+    }
+    if not all(isinstance(value, str) and value for value in required_finding.values()):
+        raise CliError("source finding prose is incomplete", exit_code=EXIT_AUTHORITY)
+
+    output, output_relative = _handoff_output_path(context.verifier_workspace, arguments.out)
+    effect_name = f"verify-{campaign_tag}-effect-{semantics_tag}.raw"
+    control_name = f"verify-{campaign_tag}-negative-{semantics_tag}.raw"
+    case_name = f"{arguments.campaign_id}.verification-case.json"
+    prepare_receipt_name = f"{arguments.campaign_id}.verification-prepare-receipt.json"
+    for name in (effect_name, control_name, case_name, prepare_receipt_name):
+        if not _is_safe_handoff_filename(name):
+            raise CliError("verification output filename is unsafe", exit_code=EXIT_AUTHORITY)
+    triad = {
+        "schema": PERSONAL_HTTP1_TRIAD_SCHEMA,
+        "campaign_id": arguments.campaign_id,
+        "authorization_reference": "authority.json",
+        "authorization_document_sha256": context.verifier_manifest["authority_sha256"],
+        "hostname": source_spec.hostname,
+        "port": source_spec.port,
+        "scheme": source_spec.scheme,
+        "timeout_seconds": source_spec.timeout_seconds,
+        "requests": [
+            {
+                "role": "effect",
+                "method": source_spec.effect.method,
+                "path": source_spec.effect.path,
+                "request_file": effect_name,
+                "response_bytes": source_spec.effect.response_bytes,
+            },
+            {
+                "role": "negative_control",
+                "method": source_spec.negative_control.method,
+                "path": source_spec.negative_control.path,
+                "request_file": control_name,
+                "response_bytes": source_spec.negative_control.response_bytes,
+            },
+        ],
+        "finding": required_finding,
+    }
+    triad_content = (json.dumps(triad, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    try:
+        _ = parse_personal_http1_triad_spec(triad_content)
+        FindingClass(arguments.finding_class)
+    except (PersonalCampaignError, ValueError) as exc:
+        raise CliError(f"invalid verification case: {exc}", exit_code=EXIT_USAGE) from exc
+    case = {
+        "schema": "faultloom.independent-http1-case.v1",
+        "campaignId": arguments.campaign_id,
+        "source": {
+            "actor": context.source_grant.issued_to,
+            "authorityDigest": sha256_digest(context.source_authority),
+            "handoffSha256": sha256_hex(context.handoff_content),
+            "runId": context.source_manifest["run_id"],
+            "effectBodySha256": body_digests["effect"],
+            "negativeControlBodySha256": body_digests["negative_control"],
+        },
+        "verifier": {
+            "actor": context.verifier_grant.issued_to,
+            "authorityDigest": sha256_digest(context.verifier_authority),
+            "runId": context.verifier_manifest["run_id"],
+        },
+        "semantics": semantics_value,
+        "semanticsDigest": semantics_digest,
+        "triad": {
+            "spec": {"path": output_relative, "sizeBytes": len(triad_content), "sha256": sha256_hex(triad_content)},
+            "effectRequest": {"path": effect_name, "sizeBytes": len(effect_request), "sha256": sha256_hex(effect_request)},
+            "negativeControlRequest": {"path": control_name, "sizeBytes": len(control_request), "sha256": sha256_hex(control_request)},
+        },
+        "networkAccess": False,
+        "automaticSubmission": False,
+    }
+    case_content = (json.dumps(case, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    prepare_receipt = {
+        "schema": "faultloom.independent-http1-prepare-receipt.v1",
+        "campaignId": arguments.campaign_id,
+        "sourceHandoffSha256": sha256_hex(context.handoff_content),
+        "sourceAuthorityDigest": sha256_digest(context.source_authority),
+        "sourceRunId": context.source_manifest["run_id"],
+        "verifierAuthorityDigest": sha256_digest(context.verifier_authority),
+        "verifierRunId": context.verifier_manifest["run_id"],
+        "semanticsDigest": semantics_digest,
+        "case": {"path": case_name, "sizeBytes": len(case_content), "sha256": sha256_hex(case_content)},
+        "spec": {"path": output_relative, "sizeBytes": len(triad_content), "sha256": sha256_hex(triad_content)},
+        "effectRequest": {"path": effect_name, "sizeBytes": len(effect_request), "sha256": sha256_hex(effect_request)},
+        "negativeControlRequest": {"path": control_name, "sizeBytes": len(control_request), "sha256": sha256_hex(control_request)},
+        "networkAccess": False,
+        "automaticSubmission": False,
+    }
+    prepare_receipt_content = (
+        json.dumps(prepare_receipt, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
+    _write_or_verify_handoff_output(
+        context.verifier_workspace, context.verifier_workspace / effect_name, effect_request
+    )
+    _write_or_verify_handoff_output(
+        context.verifier_workspace, context.verifier_workspace / control_name, control_request
+    )
+    _write_or_verify_handoff_output(context.verifier_workspace, output, triad_content)
+    _write_or_verify_handoff_output(
+        context.verifier_workspace, context.verifier_workspace / case_name, case_content
+    )
+    _write_or_verify_handoff_output(
+        context.verifier_workspace,
+        context.verifier_workspace / prepare_receipt_name,
+        prepare_receipt_content,
+    )
+    _emit_json({
+        "schema": "faultloom.independent-http1-prepare.v1",
+        "campaignId": arguments.campaign_id,
+        "case": case_name,
+        "receipt": prepare_receipt_name,
+        "triad": output_relative,
+        "status": "ready_for_existing_triad_runner",
+        "networkAccess": False,
+        "automaticSubmission": False,
+    })
+    return EXIT_OK
+
+
+def _verification_case_document(
+    arguments: argparse.Namespace, context: _IndependentHttp1Context
+) -> dict[str, object]:
+    try:
+        case_path = arguments.case.resolve(strict=True)
+        if case_path.parent != context.verifier_workspace.resolve(strict=True):
+            raise ValueError("not a direct verifier-workspace child")
+    except (OSError, ValueError) as exc:
+        raise CliError("verification case path is unsafe", exit_code=EXIT_AUTHORITY) from exc
+    case_content = _capture_bounded_local_file(
+        case_path, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="verification case"
+    )
+    case = _parse_campaign_json_content(case_content, label="verification case")
+    source = case.get("source")
+    verifier = case.get("verifier")
+    semantics = case.get("semantics")
+    triad = case.get("triad")
+    if (
+        case.get("schema") != "faultloom.independent-http1-case.v1"
+        or case.get("campaignId") != arguments.campaign_id
+        or case.get("networkAccess") is not False
+        or case.get("automaticSubmission") is not False
+        or not isinstance(source, dict)
+        or not isinstance(verifier, dict)
+        or not isinstance(semantics, dict)
+        or not isinstance(triad, dict)
+        or case.get("semanticsDigest") != sha256_digest(semantics)
+        or source.get("actor") != context.source_grant.issued_to
+        or source.get("authorityDigest") != sha256_digest(context.source_authority)
+        or source.get("handoffSha256") != sha256_hex(context.handoff_content)
+        or source.get("runId") != context.source_manifest["run_id"]
+        or verifier.get("actor") != context.verifier_grant.issued_to
+        or verifier.get("authorityDigest") != sha256_digest(context.verifier_authority)
+        or verifier.get("runId") != context.verifier_manifest["run_id"]
+    ):
+        raise CliError("verification case boundary differs", exit_code=EXIT_AUTHORITY)
+    claim = semantics.get("claim")
+    prerequisites = semantics.get("prerequisites")
+    try:
+        FindingClass(semantics.get("findingClass"))
+    except ValueError as exc:
+        raise CliError("verification finding class is invalid", exit_code=EXIT_AUTHORITY) from exc
+    if (
+        not isinstance(claim, str)
+        or not claim.strip()
+        or not isinstance(prerequisites, list)
+        or not prerequisites
+        or not all(isinstance(value, str) and value.strip() for value in prerequisites)
+    ):
+        raise CliError("verification case semantics are incomplete", exit_code=EXIT_AUTHORITY)
+    return case
+
+
+def _verification_prepare_receipt(
+    arguments: argparse.Namespace, context: _IndependentHttp1Context
+) -> dict[str, object]:
+    path = context.verifier_workspace / f"{arguments.campaign_id}.verification-prepare-receipt.json"
+    content = _capture_bounded_local_file(
+        path, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="verification prepare receipt"
+    )
+    receipt = _parse_campaign_json_content(content, label="verification prepare receipt")
+    if (
+        receipt.get("schema") != "faultloom.independent-http1-prepare-receipt.v1"
+        or receipt.get("campaignId") != arguments.campaign_id
+        or receipt.get("sourceHandoffSha256") != sha256_hex(context.handoff_content)
+        or receipt.get("sourceAuthorityDigest") != sha256_digest(context.source_authority)
+        or receipt.get("sourceRunId") != context.source_manifest["run_id"]
+        or receipt.get("verifierAuthorityDigest") != sha256_digest(context.verifier_authority)
+        or receipt.get("verifierRunId") != context.verifier_manifest["run_id"]
+        or receipt.get("networkAccess") is not False
+        or receipt.get("automaticSubmission") is not False
+    ):
+        raise CliError("verification prepare receipt boundary differs", exit_code=EXIT_AUTHORITY)
+    case_path, _ = _handoff_ref_path(
+        context.verifier_workspace,
+        receipt.get("case"),
+        label="prepared verification case",
+        maximum_bytes=MAX_PROTOCOL_FILE_BYTES,
+    )
+    try:
+        if case_path.resolve(strict=True) != arguments.case.resolve(strict=True):
+            raise CliError("verification case differs from its prepare receipt", exit_code=EXIT_AUTHORITY)
+    except OSError as exc:
+        raise CliError("verification case is unavailable", exit_code=EXIT_AUTHORITY) from exc
+    return receipt
+
+
+def _verification_evidence_refs(
+    *, records: list[dict[str, object]], run_id: str, created_at: datetime
+) -> tuple[EvidenceRef, EvidenceRef, EvidenceRef]:
+    if len(records) != 3:
+        raise CliError("verifier evidence ids are invalid", exit_code=EXIT_AUTHORITY)
+    references: list[EvidenceRef] = []
+    for record in records:
+        evidence_id = record.get("evidence_id")
+        request = record.get("request")
+        response = record.get("response")
+        if (
+            not isinstance(evidence_id, str)
+            or not isinstance(request, dict)
+            or not isinstance(response, dict)
+            or not isinstance(request.get("sha256"), str)
+            or not isinstance(response.get("sha256"), str)
+        ):
+            raise CliError("verifier evidence record is invalid", exit_code=EXIT_AUTHORITY)
+        references.append(EvidenceRef(
+            schema_version=SCHEMA_VERSION,
+            evidence_id=evidence_id,
+            run_id=run_id,
+            cas_digest=f"sha256:{response['sha256']}",
+            observation_ids=(),
+            redaction_digest=None,
+            created_at=created_at,
+        ))
+    return cast(tuple[EvidenceRef, EvidenceRef, EvidenceRef], tuple(references))
+
+
+def _campaign_compile_verification_http1(arguments: argparse.Namespace) -> int:
+    context = _verification_handoff_document(arguments)
+    try:
+        private_path = arguments.private_key.resolve(strict=True)
+        for workspace in (context.source_workspace, context.verifier_workspace):
+            try:
+                private_path.relative_to(workspace.resolve(strict=True))
+            except ValueError:
+                continue
+            raise CliError(
+                "verifier private key must remain outside both workspaces",
+                exit_code=EXIT_AUTHORITY,
+            )
+        _, private_content = _capture_protocol_file_pair(
+            arguments.verifier_trusted_key,
+            arguments.private_key,
+            private_second=True,
+        )
+        if arguments.private_key.resolve(strict=True) != private_path:
+            raise CliError("verifier private key path changed during capture", exit_code=EXIT_AUTHORITY)
+        for workspace in (context.source_workspace, context.verifier_workspace):
+            try:
+                private_path.relative_to(workspace.resolve(strict=True))
+            except ValueError:
+                continue
+            raise CliError(
+                "verifier private key must remain outside both workspaces",
+                exit_code=EXIT_AUTHORITY,
+            )
+    except OSError as exc:
+        raise CliError("verifier private key is unavailable", exit_code=EXIT_AUTHORITY) from exc
+    prepare_receipt = _verification_prepare_receipt(arguments, context)
+    case = _verification_case_document(arguments, context)
+    if case.get("semanticsDigest") != prepare_receipt.get("semanticsDigest"):
+        raise CliError("verification semantics digest differs from prepare receipt", exit_code=EXIT_AUTHORITY)
+    source_spec, source_effect_request, source_control_request, source_body = (
+        _source_verification_requests(context)
+    )
+    _ = source_effect_request, source_control_request
+    triad_refs = case["triad"]
+    if not isinstance(triad_refs, dict):
+        raise CliError("verification triad reference is invalid", exit_code=EXIT_AUTHORITY)
+    spec_ref = triad_refs.get("spec")
+    if spec_ref != prepare_receipt.get("spec"):
+        raise CliError("verification spec differs from its prepare receipt", exit_code=EXIT_AUTHORITY)
+    _, verifier_spec_content = _handoff_ref_path(
+        context.verifier_workspace,
+        spec_ref,
+        label="verifier triad spec",
+        maximum_bytes=MAX_PROTOCOL_FILE_BYTES,
+    )
+    try:
+        verifier_spec = parse_personal_http1_triad_spec(verifier_spec_content)
+    except PersonalCampaignError as exc:
+        raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+    if (
+        verifier_spec.schema_ != PERSONAL_HTTP1_TRIAD_SCHEMA
+        or verifier_spec.campaign_id != arguments.campaign_id
+        or verifier_spec.hostname != source_spec.hostname
+        or verifier_spec.port != source_spec.port
+        or verifier_spec.scheme != source_spec.scheme
+        or verifier_spec.timeout_seconds != source_spec.timeout_seconds
+        or verifier_spec.effect.method not in {"GET", "OPTIONS"}
+        or verifier_spec.effect.method != source_spec.effect.method
+        or verifier_spec.effect.path != source_spec.effect.path
+        or verifier_spec.effect.response_bytes != source_spec.effect.response_bytes
+        or verifier_spec.negative_control.method != source_spec.negative_control.method
+        or verifier_spec.negative_control.path != source_spec.negative_control.path
+        or verifier_spec.negative_control.response_bytes != source_spec.negative_control.response_bytes
+        or verifier_spec.finding != source_spec.finding
+        or verifier_spec.authorization_reference != "authority.json"
+        or verifier_spec.authorization_document_sha256
+        != context.verifier_manifest.get("authority_sha256")
+    ):
+        raise CliError("verifier triad differs from source target", exit_code=EXIT_AUTHORITY)
+    semantics_digest = case.get("semanticsDigest")
+    if not isinstance(semantics_digest, str):
+        raise CliError("verification semantics digest is invalid", exit_code=EXIT_AUTHORITY)
+    semantics_tag = semantics_digest.removeprefix("sha256:")
+    campaign_tag = sha256_hex(arguments.campaign_id.encode())[:16]
+    if (
+        verifier_spec.effect.request_file
+        != f"verify-{campaign_tag}-effect-{semantics_tag}.raw"
+        or verifier_spec.negative_control.request_file
+        != f"verify-{campaign_tag}-negative-{semantics_tag}.raw"
+    ):
+        raise CliError("finalized verifier triad is not bound to case semantics", exit_code=EXIT_AUTHORITY)
+    effect_case = triad_refs.get("effectRequest")
+    control_case = triad_refs.get("negativeControlRequest")
+    if (
+        not isinstance(effect_case, dict)
+        or not isinstance(control_case, dict)
+        or effect_case.get("path") != verifier_spec.effect.request_file
+        or control_case.get("path") != verifier_spec.negative_control.request_file
+        or effect_case != prepare_receipt.get("effectRequest")
+        or control_case != prepare_receipt.get("negativeControlRequest")
+    ):
+        raise CliError("verification case request references differ from its spec", exit_code=EXIT_AUTHORITY)
+    _, verifier_effect_request = _handoff_ref_path(
+        context.verifier_workspace,
+        effect_case,
+        label="verifier effect request",
+        maximum_bytes=PERSONAL_HTTP1_MAX_REQUEST_BYTES,
+    )
+    _, verifier_control_request = _handoff_ref_path(
+        context.verifier_workspace,
+        control_case,
+        label="verifier negative-control request",
+        maximum_bytes=PERSONAL_HTTP1_MAX_REQUEST_BYTES,
+    )
+    if verifier_effect_request != source_effect_request or verifier_control_request != source_control_request:
+        raise CliError("verifier request templates differ from source requests", exit_code=EXIT_AUTHORITY)
+
+    final_receipt_path = _campaign_record(
+        _campaign_records_directory(context.verifier_workspace),
+        arguments.campaign_id,
+        "final-receipt",
+    )
+    final_arguments = argparse.Namespace(
+        workspace=context.verifier_workspace,
+        trusted_key=arguments.verifier_trusted_key,
+        campaign_id=arguments.campaign_id,
+    )
+    snapshots: dict[Path, bytes] = {}
+    token = _HANDOFF_VALIDATION_SNAPSHOTS.set(snapshots)
+    try:
+        status, _ = _validate_completed_campaign_finalization(final_arguments, final_receipt_path)
+        inputs = _validated_campaign_finalization_inputs(final_arguments)
+        receipt_content = snapshots.get(final_receipt_path.resolve(strict=True))
+        if receipt_content is None:
+            raise CliError("verifier receipt was not captured during validation", exit_code=EXIT_AUTHORITY)
+        receipt = _parse_campaign_json_content(receipt_content, label="verifier final receipt")
+        evidence_ids = receipt.get("evidence_ids")
+        if not isinstance(evidence_ids, list) or not all(isinstance(value, str) for value in evidence_ids):
+            raise CliError("verifier evidence ids are invalid", exit_code=EXIT_AUTHORITY)
+        _validated_campaign_evidence(inputs=inputs, evidence_ids=evidence_ids)
+        verifier_body, _, _ = _campaign_finalization_digests(inputs)
+    finally:
+        _HANDOFF_VALIDATION_SNAPSHOTS.reset(token)
+    if status != "draft_unverified":
+        raise CliError("verifier triad did not reproduce the source effect", exit_code=EXIT_AUTHORITY)
+    evidence_records: list[dict[str, object]] = []
+    raw_directory = context.verifier_workspace / "evidence" / "raw"
+    def validated_snapshot(path: Path, *, label: str, maximum_bytes: int) -> bytes:
+        try:
+            expected = snapshots[path.resolve(strict=True)]
+        except (KeyError, OSError) as exc:
+            raise CliError(f"{label} was not captured during validation", exit_code=EXIT_AUTHORITY) from exc
+        _handoff_workspace_file(
+            context.verifier_workspace,
+            path,
+            label=label,
+            maximum_bytes=maximum_bytes,
+            expected=expected,
+        )
+        return expected
+
+    receipt_content = validated_snapshot(
+        final_receipt_path, label="verifier final receipt", maximum_bytes=MAX_PROTOCOL_FILE_BYTES
+    )
+    for evidence_id in evidence_ids:
+        record_path = raw_directory / f"{evidence_id}.json"
+        record_content = validated_snapshot(
+            record_path, label="verifier evidence record", maximum_bytes=MAX_PROTOCOL_FILE_BYTES
+        )
+        evidence_records.append(
+            _parse_campaign_json_content(record_content, label="verifier evidence record")
+        )
+    source_case = case.get("source")
+    if (
+        not isinstance(source_case, dict)
+        or source_case.get("effectBodySha256") != source_body["effect"]
+        or source_case.get("negativeControlBodySha256") != source_body["negative_control"]
+        or verifier_body.get("effect") != source_body["effect"]
+        or verifier_body.get("reproduction") != source_body["effect"]
+        or verifier_body.get("negative_control") != source_body["negative_control"]
+        or source_body["effect"] == source_body["negative_control"]
+    ):
+        raise CliError("verifier transcript does not independently reproduce source digests", exit_code=EXIT_AUTHORITY)
+
+    now = _utc_now()
+    verifier_run_id = str(context.verifier_manifest["run_id"])
+    evidence_refs = _verification_evidence_refs(
+        records=evidence_records, run_id=verifier_run_id, created_at=now
+    )
+    semantics = case["semantics"]
+    if not isinstance(semantics, dict):
+        raise CliError("verification semantics are invalid", exit_code=EXIT_AUTHORITY)
+    candidate_id = f"candidate.independent.{arguments.campaign_id}"
+    imported_handoff = EvidenceRef(
+        schema_version=SCHEMA_VERSION,
+        evidence_id=f"evidence.imported-handoff.{sha256_hex(context.handoff_content)[:16]}",
+        run_id=verifier_run_id,
+        cas_digest=f"sha256:{sha256_hex(context.handoff_content)}",
+        observation_ids=(),
+        redaction_digest=None,
+        created_at=now,
+    )
+    candidate = FindingCandidate(
+        schema_version=SCHEMA_VERSION,
+        candidate_id=candidate_id,
+        run_id=verifier_run_id,
+        finding_class=FindingClass(str(semantics["findingClass"])),
+        title=verifier_spec.finding.title,
+        hypothesis_ids=(),
+        primitive_ids=(),
+        effect_ids=(f"effect.independent.{arguments.campaign_id}",),
+        evidence_refs=(*evidence_refs, imported_handoff),
+        created_at=now,
+        confidence_bps=5_000,
+        final_effect_observed=True,
+    )
+    replay_plan = ReplayPlan(
+        schema_version=SCHEMA_VERSION,
+        replay_plan_id=f"replay.independent.{arguments.campaign_id}",
+        chain_plan_id=f"chain.independent.{arguments.campaign_id}",
+        fresh_identity_context_ids=(f"identity.{context.verifier_grant.issued_to}",),
+        reset_state_refs=(StateRef(
+            schema_version=SCHEMA_VERSION,
+            state_id=f"state.independent.{arguments.campaign_id}",
+            state_kind="finalized_http1_triad",
+            state_version=1,
+            state_digest=f"sha256:{sha256_hex(receipt_content)}",
+        ),),
+        edge_ids=(f"edge.independent-positive.{arguments.campaign_id}",),
+        negative_control_edge_ids=(f"edge.independent-negative.{arguments.campaign_id}",),
+        cleanup_plan_ref=None,
+    )
+    try:
+        claim = assemble_claim_packet(candidate, ClaimDraft(
+            claim_id=f"claim.independent.{arguments.campaign_id}",
+            claim=str(semantics["claim"]),
+            prerequisites=tuple(cast(list[str], semantics["prerequisites"])),
+            evidence_refs=(evidence_refs[0], evidence_refs[1]),
+            negative_control_refs=(evidence_refs[2],),
+            replay_plan=replay_plan,
+            cleanup_plan_ref=None,
+            created_at=now,
+        ))
+    except ClaimAssemblyError as exc:
+        raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+    try:
+        verifier = authorize_verifier(VerifierAuthorizationRequest(
+            source_actor_id=context.source_grant.issued_to,
+            verifier_actor_id=context.verifier_grant.issued_to,
+            verifier_run_id=verifier_run_id,
+            signed_authority=context.verifier_authority,
+            trusted_authority_key=_parse_protocol_file(
+                arguments.verifier_trusted_key,
+                _capture_single_protocol_file(arguments.verifier_trusted_key),
+                Ed25519PublicKeyRecord,
+            ),
+            verification_time=now,
+        ))
+    except (VerifierAuthorizationError, ValueError) as exc:
+        raise CliError(f"verifier authorization failed: {exc}", exit_code=EXIT_AUTHORITY) from exc
+    response_by_role = {role: response for role, _, response, _ in inputs.sources}
+    executor = FinalizedTriadReplayExecutor(
+        replay_plan=replay_plan,
+        verifier_run_id=verifier_run_id,
+        effect_response=validated_snapshot(response_by_role["effect"], label="verifier effect response", maximum_bytes=PERSONAL_HTTP1_MAX_RESPONSE_BYTES),
+        reproduction_response=validated_snapshot(response_by_role["reproduction"], label="verifier reproduction response", maximum_bytes=PERSONAL_HTTP1_MAX_RESPONSE_BYTES),
+        negative_response=validated_snapshot(response_by_role["negative_control"], label="verifier negative response", maximum_bytes=PERSONAL_HTTP1_MAX_RESPONSE_BYTES),
+        effect_body_digest=verifier_body["effect"],
+        reproduction_body_digest=verifier_body["reproduction"],
+        negative_body_digest=verifier_body["negative_control"],
+        source_effect_body_digest=source_body["effect"],
+        source_negative_body_digest=source_body["negative_control"],
+        created_at=now,
+        cleanup_receipt_digest=f"sha256:{sha256_hex(receipt_content)}",
+    )
+    try:
+        verdict = verify_candidate(VerificationCase(
+            candidate=candidate,
+            claim=claim,
+            replay_plan=replay_plan,
+            source_authority_digest=sha256_digest(context.source_authority),
+            verifier=verifier,
+            verified_at=now,
+        ), executor)
+    except (VerificationInputError, Http1TriadVerificationError, VerifierAuthorizationError) as exc:
+        raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+    if verdict.outcome.value != "verified":
+        raise CliError("independent verifier verdict is not VERIFIED", exit_code=EXIT_AUTHORITY)
+    verdict = verdict.model_copy(update={
+        "reasons": (*verdict.reasons, f"faultloom:source_handoff=sha256:{sha256_hex(context.handoff_content)}"),
+        "evidence_refs": (*verdict.evidence_refs, imported_handoff),
+    })
+    signer = _private_signer(arguments.private_key, private_content)
+    if signer.key_id != context.verifier_authority.signature.key_id:
+        raise CliError("result signer does not match verifier authority key", exit_code=EXIT_AUTHORITY)
+    run_manifest_digest = sha256_digest(context.verifier_manifest)
+    source_authority_digest = sha256_digest(context.source_authority)
+    try:
+        result = sign_verification_result(ResultArtifactDraft(
+            context=ResultArtifactContext(
+                bundle_id=f"bundle.independent.{arguments.campaign_id}",
+                bundle_version=1,
+                engagement_id=f"engagement.{context.source_grant.grant_id}",
+                run_manifest_digest=run_manifest_digest,
+                source_authority_digest=source_authority_digest,
+                final_checkpoint_digest=f"sha256:{sha256_hex(receipt_content)}",
+                generated_at=now,
+                expires_at=context.verifier_grant.expires_at,
+            ),
+            candidate=candidate,
+            claim=claim,
+            verdict=verdict,
+            cleanup_receipt_digests=(f"sha256:{sha256_hex(receipt_content)}",),
+        ), signer)
+    except ArtifactVerificationError as exc:
+        raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+    result_content = (result.model_dump_json(indent=2) + "\n").encode()
+    result_out, result_relative = _handoff_output_path(context.verifier_workspace, arguments.result_out)
+    receipt_out, receipt_relative = _handoff_output_path(context.verifier_workspace, arguments.receipt_out)
+    common_args = [
+        "--result", result_relative,
+        "--trusted-key", "trusted-key.json",
+        "--run-id", verifier_run_id,
+        "--run-manifest-digest", run_manifest_digest,
+        "--authority-digest", source_authority_digest,
+        "--engagement-id", f"engagement.{context.source_grant.grant_id}",
+        "--source-actor", context.source_grant.issued_to,
+        "--verifier-actor", context.verifier_grant.issued_to,
+        "--verifier-authority-digest", sha256_digest(context.verifier_authority),
+        "--verifier-authority", "authority.json",
+        "--verifier-authority-key", "trusted-key.json",
+    ]
+    compile_receipt = {
+        "schema": "faultloom.independent-http1-compile.v1",
+        "status": "verified",
+        "candidateId": candidate_id,
+        "result": {"path": result_relative, "sha256": sha256_hex(result_content)},
+        "sourceHandoffSha256": sha256_hex(context.handoff_content),
+        "verifyArgs": [candidate_id, *common_args],
+        "reportArgs": [
+            candidate_id,
+            "--format", "md",
+            "--out-dir", "verification-report-outbox",
+            *common_args,
+        ],
+        "networkAccess": False,
+        "automaticReport": False,
+        "automaticSubmission": False,
+    }
+    compile_receipt_content = (
+        json.dumps(compile_receipt, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
+    _write_or_verify_handoff_output(context.verifier_workspace, result_out, result_content)
+    _write_or_verify_handoff_output(context.verifier_workspace, receipt_out, compile_receipt_content)
+    _emit_json({
+        "schema": "faultloom.independent-http1-compile.v1",
+        "status": "verified",
+        "candidateId": candidate_id,
+        "result": result_relative,
+        "receipt": receipt_relative,
+        "networkAccess": False,
+        "automaticReport": False,
+        "automaticSubmission": False,
+    })
+    return EXIT_OK
+
+
 def _campaign_finalize_http1_triad(arguments: argparse.Namespace) -> int:
     if not arguments.confirm_reviewed_non_sensitive:
         raise CliError(
@@ -5935,6 +6757,56 @@ def build_parser() -> argparse.ArgumentParser:
     campaign_export_verification_handoff.add_argument("--campaign-id", type=_campaign_id, required=True)
     campaign_export_verification_handoff.add_argument("--out", type=Path, required=True)
     campaign_export_verification_handoff.set_defaults(handler=_campaign_export_verification_handoff)
+    campaign_prepare_verification_http1 = campaign_commands.add_parser(
+        "prepare-verification-http1",
+        help="prepare an offline independent verifier case for the existing triad runner",
+    )
+    for name, destination in (
+        ("--source-workspace", "source_workspace"),
+        ("--source-trusted-key", "source_trusted_key"),
+        ("--verifier-workspace", "verifier_workspace"),
+        ("--verifier-trusted-key", "verifier_trusted_key"),
+        ("--handoff", "handoff"),
+        ("--out", "out"),
+    ):
+        campaign_prepare_verification_http1.add_argument(name, dest=destination, type=Path, required=True)
+    campaign_prepare_verification_http1.add_argument(
+        "--campaign-id", type=_campaign_id, required=True
+    )
+    campaign_prepare_verification_http1.add_argument(
+        "--finding-class", choices=tuple(item.value for item in FindingClass), required=True
+    )
+    campaign_prepare_verification_http1.add_argument("--claim", required=True)
+    campaign_prepare_verification_http1.add_argument(
+        "--prerequisite", action="append", required=True
+    )
+    campaign_prepare_verification_http1.set_defaults(
+        handler=_campaign_prepare_verification_http1
+    )
+    campaign_compile_verification_http1 = campaign_commands.add_parser(
+        "compile-verification-http1",
+        help="compile a finalized verifier triad into an existing signed verification result",
+    )
+    for name, destination in (
+        ("--source-workspace", "source_workspace"),
+        ("--source-trusted-key", "source_trusted_key"),
+        ("--verifier-workspace", "verifier_workspace"),
+        ("--verifier-trusted-key", "verifier_trusted_key"),
+        ("--handoff", "handoff"),
+        ("--case", "case"),
+        ("--private-key", "private_key"),
+        ("--result-out", "result_out"),
+        ("--receipt-out", "receipt_out"),
+    ):
+        campaign_compile_verification_http1.add_argument(
+            name, dest=destination, type=Path, required=True
+        )
+    campaign_compile_verification_http1.add_argument(
+        "--campaign-id", type=_campaign_id, required=True
+    )
+    campaign_compile_verification_http1.set_defaults(
+        handler=_campaign_compile_verification_http1
+    )
 
     run = commands.add_parser("run", help="start an authorized research run")
     run.add_argument("--authority", type=Path, required=True)
