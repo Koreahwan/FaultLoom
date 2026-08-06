@@ -2011,6 +2011,54 @@ def _automation_export_handoff(arguments: argparse.Namespace) -> int:
         ) from exc
 
 
+def _automation_provider_turn(arguments: argparse.Namespace) -> int:
+    from .live_provider_cli import (
+        LiveProviderTurnDependencies,
+        LiveProviderTurnError,
+        run_live_provider_turn,
+    )
+
+    try:
+        return run_live_provider_turn(
+            arguments,
+            dependencies=LiveProviderTurnDependencies(
+                verify_workspace=_verified_request_workspace,
+                capture_file=_capture_single_protocol_file,
+                emit_json=_emit_json,
+                environment=os.environ,
+            ),
+        )
+    except LiveProviderTurnError as exc:
+        raise CliError(
+            str(exc),
+            exit_code=EXIT_AUTHORITY if exc.authority else EXIT_USAGE,
+        ) from exc
+
+
+def _automation_sign_provider_config(arguments: argparse.Namespace) -> int:
+    from .live_provider_cli import (
+        LiveProviderTurnError,
+        sign_provider_runtime_config_file,
+    )
+
+    try:
+        return sign_provider_runtime_config_file(
+            arguments,
+            capture_file=_capture_single_protocol_file,
+            write_new_file=lambda path, content: _write_new_file(
+                path,
+                content,
+                mode=0o600,
+            ),
+            emit_json=_emit_json,
+        )
+    except LiveProviderTurnError as exc:
+        raise CliError(
+            str(exc),
+            exit_code=EXIT_AUTHORITY if exc.authority else EXIT_USAGE,
+        ) from exc
+
+
 def _request_accounting_connection(workspace: Path) -> sqlite3.Connection:
     path = workspace / REQUEST_ACCOUNTING_FILENAME
     try:
@@ -3592,6 +3640,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     automation_export_handoff.add_argument("--out", type=Path, required=True)
     automation_export_handoff.set_defaults(handler=_automation_export_handoff)
+    automation_provider_turn = automation_commands.add_parser(
+        "provider-turn",
+        help="run one signed provider-only turn and publish a local candidate",
+    )
+    automation_provider_turn.add_argument("--workspace", type=Path, required=True)
+    automation_provider_turn.add_argument("--trusted-key", type=Path, required=True)
+    automation_provider_turn.add_argument(
+        "--minimum-grant-version", type=_positive_int, default=1
+    )
+    automation_provider_turn.add_argument("--request", type=Path, required=True)
+    automation_provider_turn.add_argument("--runtime-config", type=Path, required=True)
+    automation_provider_turn.add_argument("--base-intent", type=Path, required=True)
+    automation_provider_turn.add_argument("--scope-epoch", type=Path, required=True)
+    automation_provider_turn.add_argument("--reconciliation-key", type=Path, required=True)
+    automation_provider_turn.add_argument(
+        "--trusted-disclosure-key", type=Path, action="append", required=True
+    )
+    automation_provider_turn.add_argument("--egress-state-key", type=Path, required=True)
+    automation_provider_turn.add_argument("--provider-state-key", type=Path, required=True)
+    automation_provider_turn.add_argument("--proxy-attestation-key", type=Path, required=True)
+    automation_provider_turn.add_argument("--runtime-dir", type=Path, required=True)
+    automation_provider_turn.set_defaults(handler=_automation_provider_turn)
+    automation_sign_provider_config = automation_commands.add_parser(
+        "sign-provider-config",
+        help="sign all public provider routing facts with the authority key",
+    )
+    automation_sign_provider_config.add_argument("--config", type=Path, required=True)
+    automation_sign_provider_config.add_argument("--authority", type=Path, required=True)
+    automation_sign_provider_config.add_argument("--private-key", type=Path, required=True)
+    automation_sign_provider_config.add_argument("--out", type=Path, required=True)
+    automation_sign_provider_config.set_defaults(
+        handler=_automation_sign_provider_config
+    )
 
     resume = commands.add_parser("resume", help="resume a durable run")
     _configure_resume_command(resume, operation_name="resume")

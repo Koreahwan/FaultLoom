@@ -482,6 +482,60 @@ class DestinationResolver(Protocol):
     def resolve(self, origin: str) -> DestinationResolution: ...
 
 
+@dataclass(frozen=True, slots=True)
+class PinnedDestinationResolver:
+    """Resolve only prevalidated non-target destinations without network I/O."""
+
+    plane: EgressPlane
+    resolver_id: str
+    _snapshots: tuple[DestinationResolution, ...]
+
+    def __init__(self, snapshots: Iterable[DestinationResolution]) -> None:
+        copied: list[DestinationResolution] = []
+        for snapshot in snapshots:
+            if type(snapshot) is not DestinationResolution:
+                raise TypeError("pinned resolver snapshots must be DestinationResolution")
+            copied.append(
+                DestinationResolution.model_validate(snapshot.model_dump(mode="python"))
+            )
+        if not copied:
+            raise ValueError("pinned resolver requires at least one destination resolution")
+
+        plane = copied[0].plane
+        if any(snapshot.plane is not plane for snapshot in copied):
+            raise ValueError("pinned resolver snapshots must belong to one egress plane")
+        origins = tuple(snapshot.origin for snapshot in copied)
+        if len(origins) != len(set(origins)):
+            raise ValueError("pinned resolver snapshot origins must be unique")
+
+        ordered = tuple(sorted(copied, key=lambda snapshot: snapshot.origin))
+        snapshot_digest = sha256_digest(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "plane": plane,
+                "snapshots": tuple(
+                    snapshot.model_copy(
+                        update={"addresses": _compiled_addresses(snapshot)}
+                    ).model_dump(mode="python")
+                    for snapshot in ordered
+                ),
+            }
+        )
+        object.__setattr__(self, "plane", plane)
+        object.__setattr__(self, "resolver_id", f"resolver.pinned.{plane.value}.{snapshot_digest[7:]}")
+        object.__setattr__(self, "_snapshots", ordered)
+
+    def resolve(self, origin: str) -> DestinationResolution:
+        if type(origin) is not str:
+            raise TypeError("pinned resolver origin must be an exact string")
+        for snapshot in self._snapshots:
+            if origin == snapshot.origin:
+                return DestinationResolution.model_validate(
+                    snapshot.model_dump(mode="python")
+                )
+        raise ValueError("origin is not configured for this pinned resolver")
+
+
 class ProviderRequest(_ExactEgressModel):
     request_id: Identifier
     run_id: Identifier
@@ -1356,7 +1410,7 @@ class ProviderProxy:
                 denial=DenialCode.AUTHORITY_VERIFICATION_FAILED,
                 now=now,
             )
-        authority_digest = generation.authority_digest
+        authority_digest = request.authority_digest
         policy_digest = sha256_digest(
             {
                 "schema_version": SCHEMA_VERSION,
@@ -1370,7 +1424,7 @@ class ProviderProxy:
         )
 
         denial = self._provider_denial(
-            request, grant, epoch, authority_digest, endpoint, now
+            request, grant, epoch, generation.authority_digest, endpoint, now
         )
         if denial is not None:
             return self._denied(
@@ -1625,7 +1679,10 @@ class ProviderProxy:
         endpoint: ProtocolModel | None,
         now: datetime,
     ) -> DenialCode | None:
-        if request.authority_digest != authority_digest:
+        if request.authority_digest not in {
+            authority_digest,
+            sha256_digest(grant),
+        }:
             return DenialCode.AUTHORITY_BINDING_MISMATCH
         if request.scope_epoch != epoch.epoch:
             return DenialCode.SCOPE_EPOCH_MISMATCH
@@ -2449,6 +2506,7 @@ __all__ = [
     "KnowledgeFetcher",
     "KnowledgeSource",
     "KnowledgeTransport",
+    "PinnedDestinationResolver",
     "ProviderEndpoint",
     "ProviderProxy",
     "ProviderRequest",

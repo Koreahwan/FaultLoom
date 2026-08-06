@@ -46,6 +46,9 @@ admission, the default personal direct sender, optional one-shot Gateway
 dispatch, independent verification, and manual report outboxes. Live mode
 remains off by default and no automatic submission is provided.
 
+For an independent, read-only review of this public Core and its intended
+personal workflow, see [GPT_PRO_REVIEW_PROMPT.md](GPT_PRO_REVIEW_PROMPT.md).
+
 ## Build verification
 
 The clean-checkout build is offline and byte-reproducible. With the pinned

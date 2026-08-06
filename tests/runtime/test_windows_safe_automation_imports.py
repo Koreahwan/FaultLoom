@@ -27,6 +27,7 @@ sys.modules["fcntl"] = None
 import faultloom.automation as automation
 import faultloom.automation.coordinator as coordinator
 import faultloom.automation_cli as automation_cli
+import faultloom.cli as cli
 import faultloom.hypothesis as hypothesis
 from faultloom.automation.models import (
     AutomationLimits,
