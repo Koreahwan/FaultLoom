@@ -23,6 +23,8 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import TypeVar
 
+from pydantic import ValidationError
+
 from faultloom_protocol import (
     PROTOCOL_VERSION,
     SCHEMA_VERSION,
@@ -59,6 +61,9 @@ from .automation_cli import (
 )
 from .personal_campaign import (
     EXACT_BODY_DIGEST_CLASSIFIER,
+    PERSONAL_HTTP1_TRIAD_AUTOMATION_BINDING_SCHEMA,
+    PERSONAL_HTTP1_TRIAD_BOUND_SCHEMA,
+    PERSONAL_HTTP1_TRIAD_SCHEMA,
     PersonalCampaignError,
     PersonalHttp1TriadSpec,
     classify_exact_body_digest_triad,
@@ -66,6 +71,8 @@ from .personal_campaign import (
     sha256_hex,
     validate_campaign_id,
 )
+from .automation.models import AuthorizedAutomationResult
+from .tool_planner import ToolCandidate
 from .verification_cli import (
     VerificationCliDependencies,
     VerificationCliError,
@@ -3340,6 +3347,220 @@ def _capture_campaign_json(path: Path, *, label: str) -> dict[str, object]:
     return value
 
 
+def _capture_bound_campaign_source(
+    path_value: str, *, digest: str, maximum_bytes: int, label: str
+) -> tuple[Path, bytes]:
+    """Capture one absolute, non-symlink v2 provenance source exactly once."""
+    path = Path(path_value)
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise CliError(f"cannot resolve bound {label}", exit_code=EXIT_AUTHORITY) from exc
+    if not path.is_absolute() or str(resolved) != path_value:
+        raise CliError(f"bound {label} path is not canonical", exit_code=EXIT_AUTHORITY)
+    content = _capture_bounded_local_file(path, maximum_bytes=maximum_bytes, label=label)
+    if sha256_hex(content) != digest:
+        raise CliError(f"bound {label} digest differs", exit_code=EXIT_AUTHORITY)
+    return resolved, content
+
+
+def _parse_bound_automation_result(content: bytes) -> tuple[dict[str, object], AuthorizedAutomationResult]:
+    try:
+        text = content.decode("utf-8")
+        value = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+        if not isinstance(value, dict):
+            raise ValueError("result must be a JSON object")
+        # Validate duplicate keys before JSON-mode conversion: strict pydantic
+        # models intentionally accept JSON arrays for their tuple fields.
+        return value, AuthorizedAutomationResult.model_validate_json(text)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValidationError, ValueError) as exc:
+        raise CliError(f"invalid automation result: {exc}", exit_code=EXIT_AUTHORITY) from exc
+
+
+def _selected_automation_candidate(
+    result: AuthorizedAutomationResult, candidate_id: str
+) -> ToolCandidate:
+    matches = [
+        plan.selected.candidate
+        for plan in result.admitted_plans
+        if plan.selected.candidate.candidate_id == candidate_id
+    ]
+    if len(matches) != 1:
+        raise CliError("automation candidate is absent or ambiguous", exit_code=EXIT_AUTHORITY)
+    return matches[0]
+
+
+def _validate_automation_candidate_for_triad(
+    *,
+    result: AuthorizedAutomationResult,
+    candidate_id: str,
+    spec: PersonalHttp1TriadSpec,
+    effect_request_sha256: str,
+    manifest: dict[str, object],
+    grant: AuthorityGrant,
+    target: TargetAsset,
+) -> str:
+    """Accept only an offline admitted intent that exactly describes the effect request."""
+    if (
+        result.provider_network_access != "none"
+        or result.target_dispatch_performed is not False
+        or result.automatic_submission_performed is not False
+        or result.run_id != manifest.get("run_id")
+        or result.authority_grant_id != grant.grant_id
+        or result.authority_grant_version != grant.grant_version
+        or result.authority_grant_digest != sha256_digest(grant)
+    ):
+        raise CliError("automation result is not bound to the verified workspace", exit_code=EXIT_AUTHORITY)
+    candidate = _selected_automation_candidate(result, candidate_id)
+    intent = candidate.intent
+    if (
+        intent.action_class not in {ActionClass.OBSERVE, ActionClass.SAFE_PROBE}
+        or intent.run_id != result.run_id
+        or intent.target_id != target.target_id
+        or intent.pack_id != manifest.get("pack_id")
+        or intent.protocol != spec.scheme
+        or intent.method != spec.effect.method
+        or intent.path != spec.effect.path
+        or intent.payload_digest != f"sha256:{effect_request_sha256}"
+    ):
+        raise CliError("automation candidate intent does not match the triad template", exit_code=EXIT_AUTHORITY)
+    return sha256_digest(candidate.model_dump(mode="json"))
+
+
+def _validate_automation_result_receipt(
+    receipt: dict[str, object], *, result_digest: str
+) -> None:
+    expected = {
+        "schema",
+        "automatic_submission",
+        "candidate_digest",
+        "candidate_only",
+        "entry_id",
+        "evidence_existence_independently_verified",
+        "independent_verification",
+        "network_access",
+        "result_digest",
+        "target_dispatch",
+    }
+    if (
+        set(receipt) != expected
+        or receipt.get("schema") != "faultloom.automation.result.receipt.v1"
+        or receipt.get("result_digest") != result_digest
+        or receipt.get("candidate_only") is not True
+        or receipt.get("automatic_submission") is not False
+        or receipt.get("evidence_existence_independently_verified") is not False
+        or receipt.get("independent_verification") is not False
+        or receipt.get("network_access") != "none"
+        or receipt.get("target_dispatch") is not False
+        or not isinstance(receipt.get("entry_id"), str)
+        or receipt.get("candidate_digest") is not None and not isinstance(receipt.get("candidate_digest"), str)
+    ):
+        raise CliError("automation result receipt is invalid", exit_code=EXIT_AUTHORITY)
+
+
+def _triad_template_projection(spec: PersonalHttp1TriadSpec) -> dict[str, object]:
+    value = spec.model_dump(by_alias=True, exclude={"automation_binding"}, exclude_none=True)
+    value["schema"] = PERSONAL_HTTP1_TRIAD_SCHEMA
+    return value
+
+
+def _automation_binding_provenance(spec: PersonalHttp1TriadSpec) -> dict[str, object] | None:
+    binding = spec.automation_binding
+    if binding is None:
+        return None
+    value = binding.model_dump(by_alias=True)
+    return {"sha256": sha256_digest(value), "binding": value}
+
+
+def _validate_bound_triad_spec(
+    *,
+    spec: PersonalHttp1TriadSpec,
+    spec_path: Path,
+    manifest: dict[str, object],
+    grant: AuthorityGrant,
+    target: TargetAsset,
+) -> dict[str, object] | None:
+    """Re-read every v2 source before creating a start record or opening a socket."""
+    binding = spec.automation_binding
+    if binding is None:
+        return None
+    template_path, template_content = _capture_bound_campaign_source(
+        binding.template_path,
+        digest=binding.template_sha256,
+        maximum_bytes=MAX_PROTOCOL_FILE_BYTES,
+        label="campaign template",
+    )
+    if template_path == spec_path:
+        raise CliError("bound campaign template cannot be the output spec", exit_code=EXIT_AUTHORITY)
+    try:
+        template = parse_personal_http1_triad_spec(template_content)
+    except PersonalCampaignError as exc:
+        raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+    if template.schema_ != PERSONAL_HTTP1_TRIAD_SCHEMA or _triad_template_projection(spec) != _triad_template_projection(template):
+        raise CliError("bound campaign spec differs from its v1 template", exit_code=EXIT_AUTHORITY)
+    result_path, result_content = _capture_bound_campaign_source(
+        binding.result_path,
+        digest=binding.result_file_sha256,
+        maximum_bytes=MAX_PROTOCOL_FILE_BYTES,
+        label="automation result",
+    )
+    _ = result_path
+    _, result = _parse_bound_automation_result(result_content)
+    result_digest = sha256_digest(result.model_dump(mode="json"))
+    if result_digest != binding.result_digest:
+        raise CliError("bound automation result digest differs", exit_code=EXIT_AUTHORITY)
+    _, receipt_content = _capture_bound_campaign_source(
+        binding.receipt_path,
+        digest=binding.receipt_file_sha256,
+        maximum_bytes=MAX_PROTOCOL_FILE_BYTES,
+        label="automation receipt",
+    )
+    try:
+        receipt = json.loads(receipt_content.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise CliError("invalid automation result receipt", exit_code=EXIT_AUTHORITY) from exc
+    if not isinstance(receipt, dict):
+        raise CliError("invalid automation result receipt", exit_code=EXIT_AUTHORITY)
+    _validate_automation_result_receipt(receipt, result_digest=result_digest)
+    effect_path, effect_content = _capture_bound_campaign_source(
+        binding.effect_request_path,
+        digest=binding.effect_request_sha256,
+        maximum_bytes=PERSONAL_HTTP1_MAX_REQUEST_BYTES,
+        label="effect request",
+    )
+    control_path, control_content = _capture_bound_campaign_source(
+        binding.negative_control_request_path,
+        digest=binding.negative_control_request_sha256,
+        maximum_bytes=PERSONAL_HTTP1_MAX_REQUEST_BYTES,
+        label="negative-control request",
+    )
+    if (
+        effect_path != _campaign_request_file(spec_path, spec.effect.request_file).resolve(strict=True)
+        or control_path != _campaign_request_file(spec_path, spec.negative_control.request_file).resolve(strict=True)
+    ):
+        raise CliError("bound request source path differs from the triad spec", exit_code=EXIT_AUTHORITY)
+    # The strict raw parser is deliberately called again by _prepare_campaign_requests.
+    _ = effect_content, control_content
+    candidate_digest = _validate_automation_candidate_for_triad(
+        result=result,
+        candidate_id=binding.candidate_id,
+        spec=spec,
+        effect_request_sha256=binding.effect_request_sha256,
+        manifest=manifest,
+        grant=grant,
+        target=target,
+    )
+    if (
+        binding.candidate_digest != candidate_digest
+        or binding.run_id != result.run_id
+        or binding.grant_id != grant.grant_id
+        or binding.grant_version != grant.grant_version
+        or binding.grant_digest != sha256_digest(grant)
+    ):
+        raise CliError("automation binding provenance differs", exit_code=EXIT_AUTHORITY)
+    return _automation_binding_provenance(spec)
+
+
 def _record_campaign_binding(
     *,
     workspace: Path,
@@ -3492,8 +3713,9 @@ def _campaign_start_record(
     spec_digest: str,
     manifest: dict[str, object],
     prepared: dict[str, tuple[Path, bytes, str]],
+    automation_binding: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    return {
+    record: dict[str, object] = {
         "schema": "faultloom.personal-http1-triad-start.v1",
         "campaign_id": spec.campaign_id,
         "run_id": manifest["run_id"],
@@ -3521,6 +3743,10 @@ def _campaign_start_record(
             for request in spec.requests
         ],
     }
+    if automation_binding is not None:
+        record["automation_binding"] = automation_binding["binding"]
+        record["automation_binding_digest"] = automation_binding["sha256"]
+    return record
 
 
 def _campaign_unresolved(
@@ -3573,6 +3799,103 @@ def _campaign_unresolved(
     return EXIT_UNAVAILABLE
 
 
+def _campaign_prepare_http1_triad(arguments: argparse.Namespace) -> int:
+    """Bind an offline admitted candidate to an operator-authored v1 triad."""
+    manifest, grant, target, _ = _verified_request_workspace(
+        arguments.workspace, _trusted_key_path(arguments)
+    )
+    template_content = _capture_bounded_local_file(
+        arguments.template, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="campaign template"
+    )
+    try:
+        template_path = arguments.template.resolve(strict=True)
+    except OSError as exc:
+        raise CliError("cannot resolve campaign template", exit_code=EXIT_AUTHORITY) from exc
+    try:
+        template = parse_personal_http1_triad_spec(template_content)
+    except PersonalCampaignError as exc:
+        raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+    if template.schema_ != PERSONAL_HTTP1_TRIAD_SCHEMA:
+        raise CliError("campaign template must be an unbound v1 triad", exit_code=EXIT_AUTHORITY)
+    try:
+        output_parent = arguments.out.parent.resolve(strict=True)
+    except OSError as exc:
+        raise CliError("cannot resolve bound triad output directory", exit_code=EXIT_AUTHORITY) from exc
+    if output_parent != template_path.parent:
+        raise CliError("bound triad output must remain beside its template requests", exit_code=EXIT_AUTHORITY)
+    prepared = _prepare_campaign_requests(template, template_path)
+    result_content = _capture_bounded_local_file(
+        arguments.result, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="automation result"
+    )
+    try:
+        result_path = arguments.result.resolve(strict=True)
+        receipt_path = arguments.receipt.resolve(strict=True)
+    except OSError as exc:
+        raise CliError("cannot resolve automation bundle source", exit_code=EXIT_AUTHORITY) from exc
+    _, result = _parse_bound_automation_result(result_content)
+    result_digest = sha256_digest(result.model_dump(mode="json"))
+    receipt_content = _capture_bounded_local_file(
+        arguments.receipt, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="automation receipt"
+    )
+    try:
+        receipt = json.loads(receipt_content.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise CliError("invalid automation result receipt", exit_code=EXIT_AUTHORITY) from exc
+    if not isinstance(receipt, dict):
+        raise CliError("invalid automation result receipt", exit_code=EXIT_AUTHORITY)
+    _validate_automation_result_receipt(receipt, result_digest=result_digest)
+    candidate_digest = _validate_automation_candidate_for_triad(
+        result=result,
+        candidate_id=arguments.candidate_id,
+        spec=template,
+        effect_request_sha256=prepared["effect"][2],
+        manifest=manifest,
+        grant=grant,
+        target=target,
+    )
+    binding = {
+        "schema": PERSONAL_HTTP1_TRIAD_AUTOMATION_BINDING_SCHEMA,
+        "result_path": str(result_path),
+        "result_file_sha256": sha256_hex(result_content),
+        "result_digest": result_digest,
+        "receipt_path": str(receipt_path),
+        "receipt_file_sha256": sha256_hex(receipt_content),
+        "template_path": str(template_path),
+        "template_sha256": sha256_hex(template_content),
+        "candidate_id": arguments.candidate_id,
+        "candidate_digest": candidate_digest,
+        "effect_request_path": str(prepared["effect"][0].resolve(strict=True)),
+        "effect_request_sha256": prepared["effect"][2],
+        "negative_control_request_path": str(prepared["negative_control"][0].resolve(strict=True)),
+        "negative_control_request_sha256": prepared["negative_control"][2],
+        "run_id": result.run_id,
+        "grant_id": grant.grant_id,
+        "grant_version": grant.grant_version,
+        "grant_digest": sha256_digest(grant),
+    }
+    output = template.model_dump(by_alias=True, exclude_none=True)
+    output["schema"] = PERSONAL_HTTP1_TRIAD_BOUND_SCHEMA
+    output["automation_binding"] = binding
+    _write_new_file(
+        arguments.out,
+        (json.dumps(output, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+        mode=0o600,
+    )
+    _emit_json(
+        {
+            "schema": "faultloom.personal-http1-triad-prepare.v1",
+            "spec": str(arguments.out),
+            "bindingDigest": sha256_digest(binding),
+            "candidateId": arguments.candidate_id,
+            "status": "review_required",
+            "targetDispatch": False,
+            "automaticSubmission": False,
+            "independentVerification": False,
+        }
+    )
+    return EXIT_OK
+
+
 def _campaign_run_http1_triad(arguments: argparse.Namespace) -> int:
     spec_content = _capture_bounded_local_file(
         arguments.spec, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="campaign spec"
@@ -3585,10 +3908,17 @@ def _campaign_run_http1_triad(arguments: argparse.Namespace) -> int:
         spec = parse_personal_http1_triad_spec(spec_content)
     except PersonalCampaignError as exc:
         raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
-    prepared = _prepare_campaign_requests(spec, spec_path)
-    manifest, _, _, _ = _verified_request_workspace(
+    manifest, grant, target, _ = _verified_request_workspace(
         arguments.workspace, _trusted_key_path(arguments)
     )
+    automation_binding = _validate_bound_triad_spec(
+        spec=spec,
+        spec_path=spec_path,
+        manifest=manifest,
+        grant=grant,
+        target=target,
+    )
+    prepared = _prepare_campaign_requests(spec, spec_path)
     records = _campaign_records_directory(arguments.workspace)
     start_record = _campaign_record(records, spec.campaign_id, "start")
     _write_new_campaign_record(
@@ -3601,6 +3931,7 @@ def _campaign_run_http1_triad(arguments: argparse.Namespace) -> int:
                 spec_digest=sha256_hex(spec_content),
                 manifest=manifest,
                 prepared=prepared,
+                automation_binding=automation_binding,
             ),
             indent=2,
             sort_keys=True,
@@ -3700,6 +4031,9 @@ def _campaign_run_http1_triad(arguments: argparse.Namespace) -> int:
         "independent_verification": False,
         "automatic_submission": False,
     }
+    if automation_binding is not None:
+        output["automation_binding"] = automation_binding["binding"]
+        output["automation_binding_digest"] = automation_binding["sha256"]
     _write_new_campaign_record(
         records,
         run_result,
@@ -3811,7 +4145,7 @@ def _campaign_finalize_http1_triad(arguments: argparse.Namespace) -> int:
             "--confirm-reviewed-non-sensitive is required before offline archival",
             exit_code=EXIT_AUTHORITY,
         )
-    manifest, _, _, _ = _verified_request_workspace(
+    manifest, grant, target, _ = _verified_request_workspace(
         arguments.workspace, _trusted_key_path(arguments), require_active=False
     )
     records = _campaign_records_directory(arguments.workspace)
@@ -3859,6 +4193,13 @@ def _campaign_finalize_http1_triad(arguments: argparse.Namespace) -> int:
         or spec.authorization_document_sha256 != start.get("authorization_document_sha256")
     ):
         raise CliError("campaign spec changed after dispatch", exit_code=EXIT_AUTHORITY)
+    _ = _validate_bound_triad_spec(
+        spec=spec,
+        spec_path=Path(spec_path_value).resolve(strict=True),
+        manifest=manifest,
+        grant=grant,
+        target=target,
+    )
     if result.get("start_sha256") != sha256_hex(
         _capture_bounded_local_file(start_path, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="campaign start record")
     ):
@@ -3952,6 +4293,13 @@ def _campaign_finalize_http1_triad(arguments: argparse.Namespace) -> int:
         "manual_review": "confirmed_non_sensitive_response_review",
         "finding": finding,
     }
+    if "automation_binding" in start or "automation_binding_digest" in start:
+        binding = start.get("automation_binding")
+        binding_digest = start.get("automation_binding_digest")
+        if not isinstance(binding, dict) or not isinstance(binding_digest, str):
+            raise CliError("campaign start record has invalid automation provenance", exit_code=EXIT_AUTHORITY)
+        receipt["automation_binding"] = binding
+        receipt["automation_binding_digest"] = binding_digest
     _write_new_campaign_record(
         records,
         receipt_path,
@@ -4457,6 +4805,18 @@ def build_parser() -> argparse.ArgumentParser:
     campaign_run_http1_triad.add_argument("--trusted-key", type=Path, required=True)
     campaign_run_http1_triad.add_argument("--spec", type=Path, required=True)
     campaign_run_http1_triad.set_defaults(handler=_campaign_run_http1_triad)
+    campaign_prepare_http1_triad = campaign_commands.add_parser(
+        "prepare-http1-triad",
+        help="bind one offline admitted candidate to an existing v1 triad template",
+    )
+    campaign_prepare_http1_triad.add_argument("--workspace", type=Path, required=True)
+    campaign_prepare_http1_triad.add_argument("--trusted-key", type=Path, required=True)
+    campaign_prepare_http1_triad.add_argument("--template", type=Path, required=True)
+    campaign_prepare_http1_triad.add_argument("--result", type=Path, required=True)
+    campaign_prepare_http1_triad.add_argument("--receipt", type=Path, required=True)
+    campaign_prepare_http1_triad.add_argument("--candidate-id", required=True)
+    campaign_prepare_http1_triad.add_argument("--out", type=Path, required=True)
+    campaign_prepare_http1_triad.set_defaults(handler=_campaign_prepare_http1_triad)
     campaign_finalize_http1_triad = campaign_commands.add_parser(
         "finalize-http1-triad",
         help="offline archive a reviewed exact-digest triad result",

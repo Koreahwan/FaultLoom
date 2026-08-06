@@ -11,6 +11,10 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 
 PERSONAL_HTTP1_TRIAD_SCHEMA = "faultloom.personal-http1-triad.v1"
+PERSONAL_HTTP1_TRIAD_BOUND_SCHEMA = "faultloom.personal-http1-triad.v2"
+PERSONAL_HTTP1_TRIAD_AUTOMATION_BINDING_SCHEMA = (
+    "faultloom.personal-http1-triad.automation-binding.v1"
+)
 EXACT_BODY_DIGEST_CLASSIFIER = "exact_body_digest_v1"
 _SAFE_CAMPAIGN_ID = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
 _SAFE_FILE_NAME = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
@@ -49,8 +53,35 @@ class FindingMetadata(_StrictFrozenModel):
     remediation: str = Field(min_length=1, max_length=4096)
 
 
+class AutomationBinding(_StrictFrozenModel):
+    """Offline provenance tying a v2 triad to one admitted automation item."""
+
+    schema_: Literal["faultloom.personal-http1-triad.automation-binding.v1"] = Field(
+        alias="schema"
+    )
+    result_path: str = Field(min_length=1)
+    result_file_sha256: str = Field(pattern=_SHA256)
+    result_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    receipt_path: str = Field(min_length=1)
+    receipt_file_sha256: str = Field(pattern=_SHA256)
+    template_path: str = Field(min_length=1)
+    template_sha256: str = Field(pattern=_SHA256)
+    candidate_id: str = Field(min_length=1, max_length=256)
+    candidate_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    effect_request_path: str = Field(min_length=1)
+    effect_request_sha256: str = Field(pattern=_SHA256)
+    negative_control_request_path: str = Field(min_length=1)
+    negative_control_request_sha256: str = Field(pattern=_SHA256)
+    run_id: str = Field(min_length=1, max_length=256)
+    grant_id: str = Field(min_length=1, max_length=256)
+    grant_version: int = Field(ge=1)
+    grant_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+
 class PersonalHttp1TriadSpec(_StrictFrozenModel):
-    schema_: Literal["faultloom.personal-http1-triad.v1"] = Field(alias="schema")
+    schema_: Literal[
+        "faultloom.personal-http1-triad.v1", "faultloom.personal-http1-triad.v2"
+    ] = Field(alias="schema")
     campaign_id: str = Field(pattern=_SAFE_CAMPAIGN_ID)
     authorization_reference: str = Field(min_length=1, max_length=512)
     authorization_document_sha256: str = Field(pattern=_SHA256)
@@ -60,6 +91,7 @@ class PersonalHttp1TriadSpec(_StrictFrozenModel):
     timeout_seconds: int = Field(ge=1, le=30)
     requests: tuple[TriadRequest, TriadRequest]
     finding: FindingMetadata
+    automation_binding: AutomationBinding | None = None
 
     @field_validator("requests", mode="before")
     @classmethod
@@ -84,6 +116,10 @@ class PersonalHttp1TriadSpec(_StrictFrozenModel):
             raise ValueError("effect and negative_control paths must differ")
         if effect.request_file == control.request_file:
             raise ValueError("effect and negative_control request files must differ")
+        if self.schema_ == PERSONAL_HTTP1_TRIAD_BOUND_SCHEMA and self.automation_binding is None:
+            raise ValueError("v2 triad specs require an automation_binding")
+        if self.schema_ == PERSONAL_HTTP1_TRIAD_SCHEMA and self.automation_binding is not None:
+            raise ValueError("v1 triad specs cannot contain an automation_binding")
         return self
 
     @property
