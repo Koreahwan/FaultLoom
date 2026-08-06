@@ -2,8 +2,14 @@
 
 다음 공개 저장소를 실제 코드·테스트·문서·Git 이력·CI 기준으로 리뷰해 주세요.
 
-- Repository: 이 파일이 포함된 공개 FaultLoom Core 저장소
-- 리뷰 시작 시 공개 `main`의 실제 HEAD SHA를 먼저 기록하세요. 공개 브랜치는 이동할 수 있으므로, 이후의 모든 판단이 그 HEAD에 대한 것인지 명시하세요.
+- Repository: https://github.com/Koreahwan/FaultLoom
+- Review branch: `rebuild/r0001`. 공개 `main`은 아직 릴리스 승격 전의 최소
+  브랜치이므로 이번 코드 리뷰 대상이 아닙니다.
+- 리뷰 시작 시 `rebuild/r0001`의 실제 HEAD SHA를 먼저 기록하세요. 이
+  프롬프트를 준비한 기준 SHA는
+  `c1ca65aec33adceb7a888db2eb3604bcc896698c`이지만 공개 브랜치는 이동할 수
+  있으므로, 다르면 그 차이를 먼저 밝히고 이후 판단이 어느 HEAD에 대한
+  것인지 명시하세요.
 - 저장소를 수정하거나 PR을 만들거나 외부 표적에 요청을 보내지 말고 읽기 전용으로 확인하세요.
 
 ## 제품 의도
