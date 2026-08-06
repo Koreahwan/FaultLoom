@@ -226,6 +226,7 @@ def _export_arguments(
     disclosure_keys: tuple[Path, ...],
     *,
     provider_id: str = "provider.test",
+    model_snapshot: str = "frontier-2030-01-01",
 ) -> list[str]:
     arguments = [
         "automation",
@@ -238,6 +239,8 @@ def _export_arguments(
         str(request),
         "--provider-id",
         provider_id,
+        "--model-snapshot",
+        model_snapshot,
         "--out",
         str(out),
     ]
@@ -472,6 +475,7 @@ def test_automation_export_handoff_is_canonical_offline_and_compilable(
         "automatic_submission": False,
         "handoff": str(out_path),
         "independent_verification": False,
+        "model_snapshot": "frontier-2030-01-01",
         "network_access": "none",
         "provider_dispatch": False,
         "sha256": hashlib.sha256(content).hexdigest(),
@@ -482,6 +486,7 @@ def test_automation_export_handoff_is_canonical_offline_and_compilable(
     assert document["run_id"] == request.observations.run_id
     assert document["request_digest"] == sha256_digest(request.model_dump(mode="json"))
     assert document["model_provenance"] == "unattested_manual_handoff"
+    assert document["approved_model_snapshot"] == "frontier-2030-01-01"
     assert document["approved_provider_id"] == "provider.test"
     assert document["provider_disclosure_verification"] == "verified"
     assert document["network_access"] == "none"
@@ -627,6 +632,7 @@ def test_automation_export_handoff_rejects_provider_or_workspace_drift(
     "failure",
     (
         "provider_other",
+        "snapshot_other",
         "wrong_approval",
         "expired_approval",
         "missing_approval",
@@ -647,9 +653,12 @@ def test_automation_export_handoff_requires_verified_provider_disclosure(
     primary_key = _disclosure_key(tmp_path / "disclosure-key.json")
     disclosure_keys = (primary_key,)
     provider_id = "provider.test"
+    model_snapshot = "frontier-2030-01-01"
     request_content = request.model_dump_json()
     if failure == "provider_other":
         provider_id = "provider.other"
+    elif failure == "snapshot_other":
+        model_snapshot = "frontier-floating"
     elif failure == "wrong_approval":
         approval = sign_model_disclosure_approval(
             request.observations.excerpts[0].approval.payload.model_copy(
@@ -704,6 +713,7 @@ def test_automation_export_handoff_requires_verified_provider_disclosure(
                 out_path,
                 disclosure_keys,
                 provider_id=provider_id,
+                model_snapshot=model_snapshot,
             )
         )
         == cli.EXIT_AUTHORITY

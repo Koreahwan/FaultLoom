@@ -203,10 +203,12 @@ output must stay beside `triad.json`, `effect.raw`, and `control.raw`:
 ```
 
 This is offline preparation only. It rechecks the workspace/grant, exact
-result and receipt, admitted-plan authority, candidate intent, template, and
+result and receipt, admitted-plan authority when applicable, candidate intent, template, and
 both request digests. It does not call a model, provider, Burp, or target and
 does not claim verification. Review the output and use `triad.bound.json` for
-the run. If there is no automation result bundle, the original reviewed v1
+the run. The selected ID may name an admitted plan or the result's single
+compiled safe-PoC step; either must be exactly `safe_probe` + `http.semantic`.
+If there is no automation result bundle, the original reviewed v1
 `triad.json` remains valid.
 
 The preferred bound-candidate path combines prepare, run, and offline finalize
@@ -342,6 +344,30 @@ the customer's or bounty program's official channel.
 
 ## 10. Optional offline model-turn handoff and compilation
 
+First create the exact request from the completed exchange archived in step 7.
+The excerpt file must already be operator-redacted and non-sensitive:
+
+```powershell
+# One-time setup; keep this private key outside every run workspace.
+& $FaultLoom key init --out-dir "$Root\disclosure-approver"
+
+& $FaultLoom automation prepare-http1-request `
+  --workspace "$Job\run-01" `
+  --trusted-key "$Root\authority\authority-public-key.json" `
+  --evidence-id 'evidence.from-add-exchange' `
+  --excerpt-file "$Job\run-01\redacted-observation.txt" `
+  --provider-id 'provider.approved-by-grant' `
+  --disclosure-private-key "$Root\disclosure-approver\authority-private.key" `
+  --hostname 'exact.authorized.host' --port 443 --scheme https `
+  --method GET --path '/exact/request-target' `
+  --out "$Job\run-01\automation-request.json" `
+  --confirm-redacted-non-sensitive
+```
+
+This revalidates the exact archived bytes, completed reservation fingerprint,
+active signed window, target, policy, deny list, and provider before creating a
+private file once. It makes no target or provider call.
+
 To prepare an offline prompt for a model UI, local CLI, or official API without
 configuring a FaultLoom provider, export a private handoff from the exact signed
 request:
@@ -352,13 +378,14 @@ request:
   --trusted-key "$Root\authority\authority-public-key.json" `
   --request 'C:\path\to\automation-request.json' `
   --provider-id 'provider.approved-by-grant' `
-  --trusted-disclosure-key "$Root\authority\disclosure-approver-public-key.json" `
+  --model-snapshot 'exact.snapshot.approved-by-grant' `
+  --trusted-disclosure-key "$Root\disclosure-approver\authority-public-key.json" `
   --out 'C:\path\to\model-handoff.json'
 ```
 
 The export requires `provider_network_access=none`; it creates the handoff once
 with private permissions and does not contact a provider, Burp, a Gateway, or a
-target. The provider ID must be permitted by the signed grant, and the supplied
+target. The provider ID and exact model snapshot must be permitted by the signed grant, and the supplied
 disclosure public key(s) must verify every redacted excerpt for that provider at
 the workspace's active time. Give that file only to the approved provider/service
 and save exactly one returned function-arguments object as `model-turn.json`.

@@ -9,7 +9,6 @@ from typing import ClassVar, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-
 PERSONAL_HTTP1_TRIAD_SCHEMA = "faultloom.personal-http1-triad.v1"
 PERSONAL_HTTP1_TRIAD_BOUND_SCHEMA = "faultloom.personal-http1-triad.v2"
 PERSONAL_HTTP1_TRIAD_AUTOMATION_BINDING_SCHEMA = (
@@ -54,7 +53,7 @@ class FindingMetadata(_StrictFrozenModel):
 
 
 class AutomationBinding(_StrictFrozenModel):
-    """Offline provenance tying a v2 triad to one admitted automation item."""
+    """Offline provenance tying a v2 triad to one compiled automation item."""
 
     schema_: Literal["faultloom.personal-http1-triad.automation-binding.v1"] = Field(
         alias="schema"
@@ -67,6 +66,9 @@ class AutomationBinding(_StrictFrozenModel):
     template_path: str = Field(min_length=1)
     template_sha256: str = Field(pattern=_SHA256)
     candidate_id: str = Field(min_length=1, max_length=256)
+    candidate_source: Literal["admitted_plan", "compiled_safe_poc_step"] = (
+        "admitted_plan"
+    )
     candidate_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     effect_request_path: str = Field(min_length=1)
     effect_request_sha256: str = Field(pattern=_SHA256)

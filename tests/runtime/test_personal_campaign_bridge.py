@@ -6,10 +6,10 @@ import socket
 from pathlib import Path
 
 import pytest
-
 from faultloom import cli
 from faultloom.automation.candidate_outbox import write_automation_result_bundle
 from faultloom.automation.models import AuthorizedAutomationResult, CandidateFindingDraft
+from faultloom.patch_variant import AdaptationResult
 from faultloom.tool_planner import (
     PlanningBudget,
     ToolCandidate,
@@ -96,6 +96,126 @@ def _bundle(
     return publication.result_path, publication.receipt_path
 
 
+def _poc_bundle(
+    workspace: Path,
+    key: Path,
+    template: Path,
+    *,
+    mutation: str | None = None,
+) -> tuple[Path, Path]:
+    manifest, grant, target, _ = cli._verified_request_workspace(workspace, key)
+    effect = (template.parent / "effect.raw").read_bytes()
+    source = sample_models()
+    intent = source["ActionIntent"].model_copy(
+        update={
+            "run_id": manifest["run_id"],
+            "target_id": target.target_id,
+            "pack_id": manifest["pack_id"],
+            "action_kind": "http.semantic",
+            "action_class": ActionClass.SAFE_PROBE,
+            "protocol": "http",
+            "method": "GET",
+            "path": "/api/effect",
+            "payload_digest": "sha256:" + hashlib.sha256(effect).hexdigest(),
+            "resource": source["ActionIntent"].resource.model_copy(
+                update={"target_id": target.target_id}
+            ),
+        }
+    )
+    if mutation == "class":
+        intent = intent.model_copy(update={"action_class": ActionClass.OBSERVE})
+    elif mutation == "kind":
+        intent = intent.model_copy(update={"action_kind": "browser.observe"})
+    elif mutation == "path":
+        intent = intent.model_copy(update={"path": "/api/control"})
+    elif mutation == "payload":
+        intent = intent.model_copy(update={"payload_digest": "sha256:" + "1" * 64})
+    elif mutation == "identity":
+        intent = intent.model_copy(
+            update={
+                "subject": intent.subject.model_copy(
+                    update={"identity_id": "identity.outside-grant"}
+                )
+            }
+        )
+    step = source["PoCRecipe"].steps[0].model_copy(
+        update={"step_id": "step.triad", "action_intent": intent}
+    )
+    steps = (step, step.model_copy(update={"step_id": "step.second"})) if mutation == "multi" else (step,)
+    recipe = source["PoCRecipe"].model_copy(
+        update={"recipe_id": "recipe.triad", "adaptation_id": "adaptation.triad", "steps": steps}
+    )
+    adaptation = source["DeploymentAdaptation"].model_copy(
+        update={
+            "adaptation_id": "adaptation.triad",
+            "target_id": target.target_id,
+            "route_ref": intent.resource,
+            "identity_context_id": intent.subject.identity_id,
+            "transport": "http",
+            "removed_unsafe_step_digests": (
+                ("sha256:" + "2" * 64,) if mutation == "removed" else ()
+            ),
+        }
+    )
+    poc = AdaptationResult(
+        adaptation=adaptation,
+        recipe=recipe,
+        omitted_nonessential_step_ids=(),
+    )
+    admitted_plans = ()
+    if mutation == "collision":
+        admitted_result, _ = _bundle(workspace, key, template, 0)
+        admitted = AuthorizedAutomationResult.model_validate_json(
+            admitted_result.read_text(encoding="utf-8")
+        )
+        selected = admitted.admitted_plans[0].selected
+        collision_candidate = selected.candidate.model_copy(update={"candidate_id": "step.triad"})
+        collision_receipt = selected.receipt.model_copy(
+            update={
+                "candidate_id": "step.triad",
+                "candidate_digest": sha256_digest(collision_candidate.model_dump(mode="json")),
+            }
+        )
+        admitted_plans = (
+            admitted.admitted_plans[0].model_copy(
+                update={
+                    "selected": selected.model_copy(
+                        update={"candidate": collision_candidate, "receipt": collision_receipt}
+                    )
+                }
+            ),
+        )
+    result = AuthorizedAutomationResult(
+        run_id=manifest["run_id"],
+        authority_grant_id=grant.grant_id,
+        authority_grant_version=grant.grant_version,
+        authority_grant_digest=sha256_digest(grant),
+        observation_bundle_digest="sha256:" + "7" * 64,
+        action_context_digest="sha256:" + "8" * 64,
+        poc_context_digest="sha256:" + "9" * 64,
+        hypotheses=(),
+        negative_results=(),
+        admitted_plans=admitted_plans,
+        poc=poc,
+        finding_draft=CandidateFindingDraft(
+            hypothesis_id="hypothesis.triad",
+            poc_recipe_id="recipe.triad",
+            title="Owned loopback PoC candidate",
+            severity="low",
+            summary="Requires independent replay.",
+            impact="No impact is verified.",
+            reproduction_steps=("Replay only the compiled safe PoC step.",),
+            remediation="Review before changing the service.",
+        ),
+        stop_reason="Await independent verification.",
+        provider_network_access="none",
+    )
+    publication = write_automation_result_bundle(
+        result, template.parent / f"poc-results-{mutation or 'valid'}"
+    )
+    return publication.result_path, publication.receipt_path
+
+
 def test_prepared_candidate_runs_exactly_three_and_preserves_provenance(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     listener, port = _listener()
     workspace, key = _workspace(tmp_path, port)
@@ -122,6 +242,33 @@ def test_prepared_candidate_runs_exactly_three_and_preserves_provenance(tmp_path
     final = json.loads(Path(json.loads(capsys.readouterr().out)["receipt"]).read_text(encoding="utf-8"))
     assert final["automation_binding_digest"] == start["automation_binding_digest"]
     assert final["automation_binding"] == start["automation_binding"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("collision", "multi", "removed", "class", "kind", "path", "payload", "identity"),
+)
+def test_prepare_rejects_invalid_compiled_poc_candidate(
+    mutation: str, tmp_path: Path
+) -> None:
+    listener, port = _listener()
+    listener.close()
+    workspace, key = _workspace(tmp_path, port)
+    template = _spec(tmp_path, port)
+    result, receipt = _poc_bundle(workspace, key, template, mutation=mutation)
+    bound = tmp_path / "bound.json"
+    assert cli.main(
+        _prepare_arguments(
+            workspace,
+            key,
+            template,
+            result,
+            receipt,
+            bound,
+            candidate_id="step.triad",
+        )
+    ) == cli.EXIT_AUTHORITY
+    assert not bound.exists()
 
 
 @pytest.mark.parametrize("source", ("result", "receipt", "template", "request"))
@@ -182,6 +329,37 @@ def test_prepare_rejects_unknown_candidate_without_writing_spec(tmp_path: Path) 
     bound = tmp_path / "bound.json"
     assert cli.main(_prepare_arguments(workspace, key, template, result, receipt, bound, candidate_id="candidate.unknown")) == cli.EXIT_AUTHORITY
     assert not bound.exists()
+
+
+def test_prepare_rejects_out_of_scope_negative_control_before_writing_spec(
+    tmp_path: Path,
+) -> None:
+    listener, port = _listener()
+    listener.close()
+    workspace, key = _workspace(tmp_path, port)
+    template = _spec(tmp_path, port, control_path="/outside-authority")
+    result, receipt = _bundle(workspace, key, template, port)
+    bound = tmp_path / "bound.json"
+
+    assert cli.main(
+        _prepare_arguments(workspace, key, template, result, receipt, bound)
+    ) == cli.EXIT_AUTHORITY
+    assert not bound.exists()
+
+
+def test_unbound_run_rejects_out_of_scope_negative_control_before_start_or_socket(
+    tmp_path: Path,
+) -> None:
+    listener, port = _listener()
+    workspace, key = _workspace(tmp_path, port)
+    spec = _spec(tmp_path, port, control_path="/outside-authority")
+
+    assert cli.main(_campaign_run_arguments(workspace, key, spec)) == cli.EXIT_AUTHORITY
+    assert not list((workspace / "campaigns").glob("owned-loopback.*"))
+    listener.settimeout(0.1)
+    with pytest.raises(socket.timeout):
+        listener.accept()
+    listener.close()
 
 
 def test_prepare_rejects_malformed_receipt_candidate_digest(tmp_path: Path) -> None:

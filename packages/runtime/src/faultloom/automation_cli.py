@@ -7,23 +7,39 @@ import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
+from faultloom_protocol import (
+    AuthorityGrant,
+    AuthoritySigner,
+    Ed25519PublicKeyRecord,
+    EvidenceRef,
+    ResourceRef,
+    SubjectRef,
+    TargetAsset,
+    sha256_digest,
+)
+from faultloom_sdk import AdapterAdmissionRegistry, reference_registry
 from pydantic import ValidationError
 
 from faultloom.automation import (
+    ActionContext,
     AuthorizedAutomationCoordinator,
     AuthorizedAutomationError,
+    AutomationLimits,
     AutomationRequest,
     CandidateOutboxError,
+    ModelDisclosureApproval,
+    ObservationBundle,
+    ObservationExcerpt,
+    SafePoCContext,
     parse_model_turn,
+    sign_model_disclosure_approval,
     verify_model_disclosure_approval,
     write_automation_result_bundle,
 )
-from faultloom.tool_planner import ToolPlanner
-from faultloom_protocol import AuthorityGrant, Ed25519PublicKeyRecord, TargetAsset, sha256_digest
-from faultloom_sdk import AdapterAdmissionRegistry, reference_registry
+from faultloom.tool_planner import PlanningBudget, ToolPlanner
 
 
 class AutomationCompileError(RuntimeError):
@@ -52,6 +68,63 @@ class AutomationExportHandoffDependencies:
     parse_disclosure_key: Callable[[Path, bytes], Ed25519PublicKeyRecord]
     write_new_file: Callable[[Path, bytes], None]
     emit_json: Callable[[object], None]
+
+
+@dataclass(frozen=True, slots=True)
+class ArchivedHttpExchange:
+    """Strictly revalidated bytes and accounting metadata for one archived exchange."""
+
+    evidence_id: str
+    created_at: datetime
+    request_content: bytes
+    request_sha256: str
+    response_sha256: str
+    response_limit: int
+
+
+@dataclass(frozen=True, slots=True)
+class AutomationPrepareHttp1RequestDependencies:
+    verify_workspace: Callable[
+        [Path, Path], tuple[dict[str, object], AuthorityGrant, TargetAsset, datetime]
+    ]
+    load_exchange: Callable[
+        [
+            Path,
+            dict[str, object],
+            AuthorityGrant,
+            TargetAsset,
+            str,
+            str,
+            int,
+            str,
+            str,
+            str,
+        ],
+        ArchivedHttpExchange,
+    ]
+    capture_file: Callable[[Path], bytes]
+    load_signer: Callable[[Path], AuthoritySigner]
+    write_new_file: Callable[[Path, bytes], None]
+    emit_json: Callable[[object], None]
+
+
+@dataclass(frozen=True, slots=True)
+class AutomationPrepareHttp1RequestArguments:
+    """Typed subset of argparse inputs consumed by the offline request builder."""
+
+    workspace: Path
+    trusted_key: Path
+    evidence_id: str
+    excerpt_file: Path
+    provider_id: str
+    disclosure_private_key: Path
+    hostname: str
+    port: int
+    scheme: str
+    method: str
+    path: str
+    out: Path
+    confirm_redacted_non_sensitive: bool
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -166,6 +239,236 @@ def _validate_request_binding(
         raise AutomationCompileError("automation PoC context target or pack does not match run.json", authority=True)
 
 
+def prepare_automation_http1_request(
+    arguments: AutomationPrepareHttp1RequestArguments,
+    *,
+    dependencies: AutomationPrepareHttp1RequestDependencies,
+) -> int:
+    """Create one signed, offline automation request from a completed HTTP exchange."""
+
+    workspace = arguments.workspace
+    trusted_key = arguments.trusted_key
+    evidence_id = arguments.evidence_id
+    excerpt_file = arguments.excerpt_file
+    provider_id = arguments.provider_id
+    disclosure_private_key = arguments.disclosure_private_key
+    hostname = arguments.hostname
+    port = arguments.port
+    scheme = arguments.scheme
+    method = arguments.method
+    path = arguments.path
+    out_path = arguments.out
+    confirmed = arguments.confirm_redacted_non_sensitive
+    if (
+        not isinstance(workspace, Path)
+        or not isinstance(trusted_key, Path)
+        or type(evidence_id) is not str
+        or not evidence_id
+        or not isinstance(excerpt_file, Path)
+        or type(provider_id) is not str
+        or not provider_id
+        or not isinstance(disclosure_private_key, Path)
+        or type(hostname) is not str
+        or type(port) is not int
+        or type(scheme) is not str
+        or type(method) is not str
+        or type(path) is not str
+        or not isinstance(out_path, Path)
+        or confirmed is not True
+    ):
+        raise AutomationCompileError(
+            "automation prepare-http1-request arguments or confirmation are invalid",
+            authority=False,
+        )
+
+    manifest, grant, target, now = dependencies.verify_workspace(workspace, trusted_key)
+    if provider_id not in grant.provider_policy.allowed_providers:
+        raise AutomationCompileError(
+            "selected provider is outside the signed provider policy", authority=True
+        )
+    exchange = dependencies.load_exchange(
+        workspace,
+        manifest,
+        grant,
+        target,
+        evidence_id,
+        hostname,
+        port,
+        scheme,
+        method,
+        path,
+    )
+    try:
+        excerpt = dependencies.capture_file(excerpt_file).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise AutomationCompileError(
+            "operator-redacted excerpt is not UTF-8", authority=False
+        ) from exc
+    if not excerpt or "\x00" in excerpt:
+        raise AutomationCompileError(
+            "operator-redacted excerpt is empty or contains NUL", authority=False
+        )
+
+    request_digest = f"sha256:{exchange.request_sha256}"
+    response_digest = f"sha256:{exchange.response_sha256}"
+    composite = (
+        "UNTRUSTED OPERATOR-REDACTED HTTP OBSERVATION\n"
+        f"endpoint={scheme}://{hostname}:{port}{path}\n"
+        f"method={method}\n"
+        f"request_sha256={request_digest}\n"
+        f"response_sha256={response_digest}\n"
+        "operator_redacted_excerpt_begin\n"
+        f"{excerpt}\n"
+        "operator_redacted_excerpt_end"
+    )
+    if len(composite) > 3_072:
+        raise AutomationCompileError(
+            "composite redacted observation exceeds 3072 characters", authority=False
+        )
+    content_digest = "sha256:" + hashlib.sha256(composite.encode("utf-8")).hexdigest()
+    token = content_digest.removeprefix("sha256:")[:24]
+    active_window_ends = [
+        window.ends_at
+        for window in grant.execution_windows
+        if window.starts_at <= now < window.ends_at
+    ]
+    if not active_window_ends:
+        raise AutomationCompileError(
+            "current time is outside every signed execution window", authority=True
+        )
+    approval_expires = min(
+        now + timedelta(hours=1), grant.expires_at, min(active_window_ends)
+    )
+    signer = dependencies.load_signer(disclosure_private_key)
+    approval = sign_model_disclosure_approval(
+        ModelDisclosureApproval(
+            approval_id=f"model-disclosure.{token}",
+            run_id=str(manifest["run_id"]),
+            evidence_id=exchange.evidence_id,
+            source_cas_digest=response_digest,
+            redaction_digest=content_digest,
+            content_digest=content_digest,
+            media_type="text/plain",
+            data_policy_id=grant.provider_policy.data_policy_id,
+            allowed_provider_ids=(provider_id,),
+            approved_at=now,
+            expires_at=approval_expires,
+            approver_key_id=signer.key_id,
+        ),
+        signer,
+    )
+    run_id = str(manifest["run_id"])
+    target_id = target.target_id
+    pack_id = str(manifest["pack_id"])
+    subject = SubjectRef(
+        schema_version="0.1.0",
+        subject_id=grant.issued_to,
+        subject_kind="authorized.operator",
+        identity_id=grant.identities[0] if grant.identities else None,
+    )
+    route = ResourceRef(
+        schema_version="0.1.0",
+        resource_id=f"resource.http.{token}",
+        resource_kind="http.route",
+        target_id=target_id,
+    )
+    cleanup_ref = f"cleanup.read-only.{token}"
+    prerequisite_id = f"prerequisite.archived-exchange.{token}"
+    experiment_digest = sha256_digest(
+        {
+            "evidence_id": exchange.evidence_id,
+            "hostname": hostname,
+            "method": method,
+            "path": path,
+            "port": port,
+            "request_sha256": request_digest,
+            "response_sha256": response_digest,
+            "scheme": scheme,
+        }
+    )
+    request = AutomationRequest(
+        observations=ObservationBundle(
+            run_id=run_id,
+            evidence_refs=(
+                EvidenceRef(
+                    schema_version="0.1.0",
+                    evidence_id=exchange.evidence_id,
+                    run_id=run_id,
+                    cas_digest=response_digest,
+                    observation_ids=(f"observation.http.{token}",),
+                    redaction_digest=content_digest,
+                    created_at=exchange.created_at,
+                ),
+            ),
+            excerpts=(
+                ObservationExcerpt(
+                    evidence_id=exchange.evidence_id,
+                    media_type="text/plain",
+                    content=composite,
+                    content_digest=content_digest,
+                    redacted=True,
+                    untrusted=True,
+                    model_disclosure_approved=True,
+                    approval=approval,
+                ),
+            ),
+            observed_experiment_digests=(experiment_digest,),
+        ),
+        issued_at=now,
+        authority_grant=grant,
+        planning_budget=PlanningBudget(
+            rate_slots=1,
+            duration_seconds=min(20, grant.budget.max_duration_seconds),
+            bytes=len(exchange.request_content) + exchange.response_limit,
+            concurrency=1,
+            actions=1,
+            cost_microunits=0,
+        ),
+        action_context=ActionContext(
+            run_id=run_id,
+            target_id=target_id,
+            pack_id=pack_id,
+            subject=subject,
+            resource=route,
+            protocol=scheme,
+            method=method,
+            path=path,
+            payload_digest=request_digest,
+            cleanup_plan_ref=cleanup_ref,
+        ),
+        poc_context=SafePoCContext(
+            run_id=run_id,
+            target_id=target_id,
+            pack_id=pack_id,
+            route_ref=route,
+            route_path=path,
+            subject=subject,
+            transport=scheme,
+            prerequisite_ids=(prerequisite_id,),
+            prerequisites=("Use only the exact operator-authored archived request bytes.",),
+            cleanup_plan_ref=cleanup_ref,
+            advisory_match_id=f"advisory.observed.{token}",
+        ),
+        limits=AutomationLimits(max_actions=0, max_poc_steps=1),
+        provider_network_access="none",
+    )
+    content = request.model_dump_json(indent=2).encode("utf-8") + b"\n"
+    dependencies.write_new_file(out_path, content)
+    dependencies.emit_json(
+        {
+            "automatic_submission": False,
+            "digest": sha256_digest(request.model_dump(mode="json")),
+            "evidence_id": exchange.evidence_id,
+            "network_access": "none",
+            "out": str(out_path),
+            "provider_id": provider_id,
+            "schema": "faultloom.automation-http1-request-prepare.v1",
+            "target_dispatch": False,
+        }
+    )
+    return 0
+
+
 def _handoff_generation() -> object:
     """Return the fixed, provider-neutral settings for a manual model handoff."""
 
@@ -180,7 +483,12 @@ def _handoff_generation() -> object:
     )
 
 
-def _model_handoff_bytes(request: AutomationRequest, *, provider_id: str) -> bytes:
+def _model_handoff_bytes(
+    request: AutomationRequest,
+    *,
+    provider_id: str,
+    model_snapshot: str,
+) -> bytes:
     """Build the canonical offline bundle given to an operator-selected model."""
 
     from faultloom.automation import (
@@ -205,7 +513,10 @@ def _model_handoff_bytes(request: AutomationRequest, *, provider_id: str) -> byt
         },
         "generation": payload.generation.model_dump(mode="json"),
         "instructions": [
-            f"Give this bundle only to the approved provider/service {provider_id}.",
+            (
+                "Give this bundle only to the approved provider/service "
+                f"{provider_id} using exact model snapshot {model_snapshot}."
+            ),
             "Save exactly the one function-arguments object as model-turn.json.",
             "Run faultloom automation compile with this request and model-turn.json.",
         ],
@@ -213,6 +524,7 @@ def _model_handoff_bytes(request: AutomationRequest, *, provider_id: str) -> byt
         "model_provenance": "unattested_manual_handoff",
         "network_access": "none",
         "output_schema_digest": model_turn_schema_digest(),
+        "approved_model_snapshot": model_snapshot,
         "approved_provider_id": provider_id,
         "provider_disclosure_verification": "verified",
         "request_digest": sha256_digest(request.model_dump(mode="json")),
@@ -307,6 +619,7 @@ def export_automation_handoff(
     request_path = getattr(arguments, "request")
     out_path = getattr(arguments, "out")
     provider_id = getattr(arguments, "provider_id")
+    model_snapshot = getattr(arguments, "model_snapshot", None)
     disclosure_key_paths = getattr(arguments, "trusted_disclosure_key")
     minimum_grant_version = getattr(arguments, "minimum_grant_version")
     if (
@@ -316,6 +629,8 @@ def export_automation_handoff(
         or not isinstance(out_path, Path)
         or type(provider_id) is not str
         or not provider_id
+        or type(model_snapshot) is not str
+        or not model_snapshot
         or type(minimum_grant_version) is not int
     ):
         raise AutomationCompileError("automation export-handoff arguments are invalid", authority=False)
@@ -339,6 +654,11 @@ def export_automation_handoff(
             "selected handoff provider is outside the signed authority grant",
             authority=True,
         )
+    if model_snapshot not in grant.provider_policy.allowed_model_snapshots:
+        raise AutomationCompileError(
+            "selected handoff model snapshot is outside the signed authority grant",
+            authority=True,
+        )
     trusted_disclosure_keys = _trusted_disclosure_keys(
         disclosure_key_paths, dependencies=dependencies
     )
@@ -348,7 +668,11 @@ def export_automation_handoff(
         trusted_disclosure_keys=trusted_disclosure_keys,
         verification_time=now,
     )
-    content = _model_handoff_bytes(request, provider_id=provider_id)
+    content = _model_handoff_bytes(
+        request,
+        provider_id=provider_id,
+        model_snapshot=model_snapshot,
+    )
     dependencies.write_new_file(out_path, content)
     dependencies.emit_json(
         {
@@ -356,6 +680,7 @@ def export_automation_handoff(
             "handoff": str(out_path),
             "independent_verification": False,
             "network_access": "none",
+            "model_snapshot": model_snapshot,
             "provider_dispatch": False,
             "sha256": hashlib.sha256(content).hexdigest(),
             "target_dispatch": False,

@@ -108,6 +108,31 @@ does not retroactively attest which model produced the file.
 
 ### 5. Provider-neutral manual model handoff
 
+After `evidence add-exchange` has archived one completed authorized HTTP
+exchange, the CLI can create the previously manual `AutomationRequest` without
+opening a socket:
+
+```text
+faultloom automation prepare-http1-request \
+  --workspace <signed-manual-workspace> \
+  --trusted-key <public-key-outside-workspace> \
+  --evidence-id <archived-exchange-evidence-id> \
+  --excerpt-file <operator-redacted-non-sensitive.txt> \
+  --provider-id <grant-approved-provider-id> \
+  --disclosure-private-key <operator-disclosure-seed> \
+  --hostname <exact-host> --port <exact-port> --scheme <http-or-https> \
+  --method <GET-or-HEAD-or-OPTIONS> --path <exact-request-target> \
+  --out <automation-request.json> \
+  --confirm-redacted-non-sensitive
+```
+
+The command strictly reloads the evidence record, both archived byte files,
+and the completed accounting reservation. It recomputes the original endpoint
+fingerprint and current signed target/policy/deny checks, then signs the whole
+endpoint-and-digest-bound redacted excerpt for only the selected provider. The
+request permits one safe PoC step and zero generic adapter actions. It performs
+no provider, target, Burp, verification, or submission call.
+
 When no configured provider adapter is appropriate, export the same bounded
 prompt and one restricted function contract for a model UI, CLI, or official
 API chosen by the operator:
@@ -118,14 +143,15 @@ faultloom automation export-handoff \
   --trusted-key <public-key-outside-workspace> \
   --request <automation-request.json> \
   --provider-id <grant-approved-provider-id> \
+  --model-snapshot <grant-approved-exact-snapshot> \
   --trusted-disclosure-key <disclosure-approver-public-key.json> \
   --out <model-handoff.json>
 ```
 
 The export repeats the exact workspace, grant, run, target, pack, and request
 binding checks used by `automation compile`, and requires
-`provider_network_access=none`. The selected provider must be in the signed
-grant and every excerpt's signed disclosure approval is verified against one or
+`provider_network_access=none`. The selected provider and exact model snapshot
+must be in the signed grant, and every excerpt's signed disclosure approval is verified against one or
 more supplied trusted disclosure public keys at the active workspace time. It
 creates one private, create-once canonical JSON file (mode `0600`) and makes no
 network, provider, Gateway, target, dispatch, submission, or verification call.
@@ -139,6 +165,11 @@ one function-arguments object as `model-turn.json`, then run the existing
 requiring independent verification. Approved redacted evidence may contain a
 target URL or other target detail; that is precisely why disclosure is
 provider-specific and signature-verified before export.
+
+Compiled PoC prose (expected effect, negative control, prerequisites, and
+finding wording) remains untrusted explanatory material. It never replaces the
+operator-authored, digest-bound effect/control request bytes or finding metadata
+that govern the supervised triad.
 
 ## Optional authorized target dispatch
 
@@ -279,7 +310,7 @@ the exact engagement `authorization_reference` and its
 but do not replace the signed FaultLoom scope.
 
 When `automation compile` has already produced a private result bundle, bind
-one exact admitted candidate to that operator-authored template before the
+one exact compiled candidate to that operator-authored template before the
 run:
 
 ```bash
@@ -295,8 +326,10 @@ faultloom campaign prepare-http1-triad \
 
 The output must remain beside the template and its two raw request files. The
 command re-verifies the current workspace and exact grant, result and receipt,
-selected plan receipt authority, candidate intent/digest, template, and both
-request digests. The candidate must be `observe` or `safe_probe` and must match
+selected-plan receipt authority when applicable, candidate intent/digest,
+template, and both request digests. The candidate may be an admitted plan or
+the single compiled safe-PoC recipe step. Both paths must be exactly
+`safe_probe` + `http.semantic` and must match
 the template's target, pack, scheme, method, effect path, and exact effect
 request payload digest. Model output cannot replace the operator's request
 bytes or negative control. Preparation performs no provider call, target I/O,

@@ -12,7 +12,13 @@ from faultloom import cli
 from tests.runtime.test_cli import _authority_files, _run_arguments
 
 
-def _workspace(tmp_path: Path, port: int) -> tuple[Path, Path]:
+def _workspace(
+    tmp_path: Path,
+    port: int,
+    *,
+    total_actions: int = 3,
+    rate_per_minute: int = 3,
+) -> tuple[Path, Path]:
     authority, key = _authority_files(
         tmp_path / "grant",
         hostnames=("127.0.0.1",),
@@ -20,7 +26,11 @@ def _workspace(tmp_path: Path, port: int) -> tuple[Path, Path]:
         paths=("/api/*",),
         methods=("GET",),
         protocols=("http",),
-        budget_updates={"total_actions": 3, "rate_per_minute": 3, "max_concurrency": 1},
+        budget_updates={
+            "total_actions": total_actions,
+            "rate_per_minute": rate_per_minute,
+            "max_concurrency": 1,
+        },
         now=datetime.now(UTC) - timedelta(minutes=1),
     )
     workspace = tmp_path / "workspace"
@@ -166,16 +176,42 @@ def test_campaign_rerun_refuses_before_any_extra_send(tmp_path: Path, capsys: py
     assert len(captured) == 3
 
 
-def test_campaign_out_of_scope_stops_at_admission_without_send(
+def test_campaign_out_of_scope_stops_at_preflight_without_start_or_send(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     listener, port = _listener()
     workspace, key = _workspace(tmp_path, port)
     capsys.readouterr()
     spec = _spec(tmp_path, port, effect_path="/outside")
-    assert cli.main(_campaign_run_arguments(workspace, key, spec)) == cli.EXIT_UNAVAILABLE
-    result = json.loads(capsys.readouterr().out)
-    assert result["status"] == "unresolved_no_retry"
+    assert cli.main(_campaign_run_arguments(workspace, key, spec)) == cli.EXIT_AUTHORITY
+    assert capsys.readouterr().out == ""
+    assert not list((workspace / "campaigns").glob("owned-loopback.*"))
+    listener.settimeout(0.1)
+    with pytest.raises(socket.timeout):
+        listener.accept()
+    listener.close()
+
+
+@pytest.mark.parametrize(
+    ("total_actions", "rate_per_minute"),
+    ((2, 3), (3, 2)),
+)
+def test_campaign_requires_capacity_for_all_three_sends_before_start(
+    tmp_path: Path,
+    total_actions: int,
+    rate_per_minute: int,
+) -> None:
+    listener, port = _listener()
+    workspace, key = _workspace(
+        tmp_path,
+        port,
+        total_actions=total_actions,
+        rate_per_minute=rate_per_minute,
+    )
+    spec = _spec(tmp_path, port)
+
+    assert cli.main(_campaign_run_arguments(workspace, key, spec)) == cli.EXIT_AUTHORITY
+    assert not list((workspace / "campaigns").glob("owned-loopback.*"))
     listener.settimeout(0.1)
     with pytest.raises(socket.timeout):
         listener.accept()

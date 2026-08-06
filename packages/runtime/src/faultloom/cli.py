@@ -28,8 +28,6 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import TypeVar, cast
 
-from pydantic import ValidationError
-
 from faultloom_protocol import (
     PROTOCOL_VERSION,
     SCHEMA_VERSION,
@@ -44,14 +42,15 @@ from faultloom_protocol import (
     ExplicitDeny,
     FindingCandidate,
     FindingClass,
+    PoCStep,
     ProtocolModel,
     ProviderPolicy,
     ReplayPlan,
     RetentionPolicy,
     ScopeContractDraft,
     SignedAuthorityGrant,
-    StateRef,
     StateChangePolicy,
+    StateRef,
     TargetAsset,
     TimeWindow,
     sha256_digest,
@@ -59,19 +58,25 @@ from faultloom_protocol import (
     verify_authority_grant,
 )
 from faultloom_protocol.signing import SignatureVerificationError
+from pydantic import ValidationError
 
 from . import __version__
 from .adapter_cli import configure_adapter_parser
-from .automation_cli import (
-    AutomationCompileDependencies,
-    AutomationCompileError,
-    AutomationExportHandoffDependencies,
-    compile_automation,
-    export_automation_handoff,
-)
 from .automation.candidate_outbox import (
     CandidateOutboxError,
     automation_result_candidate_digest,
+)
+from .automation.models import AuthorizedAutomationResult
+from .automation_cli import (
+    ArchivedHttpExchange,
+    AutomationCompileDependencies,
+    AutomationCompileError,
+    AutomationExportHandoffDependencies,
+    AutomationPrepareHttp1RequestArguments,
+    AutomationPrepareHttp1RequestDependencies,
+    compile_automation,
+    export_automation_handoff,
+    prepare_automation_http1_request,
 )
 from .personal_campaign import (
     EXACT_BODY_DIGEST_CLASSIFIER,
@@ -85,13 +90,7 @@ from .personal_campaign import (
     sha256_hex,
     validate_campaign_id,
 )
-from .automation.models import AuthorizedAutomationResult
 from .tool_planner import ToolCandidate
-from .verification_cli import (
-    VerificationCliDependencies,
-    VerificationCliError,
-    configure_verification_parsers,
-)
 from .verification import (
     ArtifactVerificationError,
     ClaimAssemblyError,
@@ -113,6 +112,11 @@ from .verification.http1_triad import (
     parse_strict_http1_request,
     require_independent_identity,
     require_separate_workspaces,
+)
+from .verification_cli import (
+    VerificationCliDependencies,
+    VerificationCliError,
+    configure_verification_parsers,
 )
 
 EXIT_OK = 0
@@ -580,6 +584,30 @@ def _capture_protocol_file_pair(
             _close_bound_protocol_file(authority)
     finally:
         _close_bound_protocol_file(key)
+
+
+def _capture_private_protocol_file(path: Path) -> bytes:
+    """Capture one private seed with the same POSIX ownership/mode gate as scope signing."""
+
+    if os.name == "nt":
+        snapshot = _snapshot_windows_protocol_file(path)
+        return _read_windows_protocol_file(path, snapshot)
+
+    snapshot = _snapshot_protocol_file_path(path)
+    mode = stat.S_IMODE(snapshot.leaf_stat.st_mode)
+    owner_id = os.geteuid() if hasattr(os, "geteuid") else snapshot.leaf_stat.st_uid
+    if mode != 0o600 or snapshot.leaf_stat.st_uid != owner_id:
+        raise _protocol_file_error(
+            path,
+            "secret input must be owned by the current user with mode 0600",
+        )
+    bound = _open_bound_protocol_file(snapshot)
+    try:
+        content = _read_bound_protocol_file(bound)
+        _reconcile_bound_protocol_file(bound)
+        return content
+    finally:
+        _close_bound_protocol_file(bound)
 
 
 def _snapshot_windows_protocol_file(path: Path) -> os.stat_result:
@@ -1568,7 +1596,12 @@ def _is_lower_hex(value: str, *, length: int) -> bool:
     )
 
 
-def _is_exchange_stored_filename(value: object, *, component_name: str) -> bool:
+def _is_exchange_stored_filename(
+    value: object,
+    *,
+    component_name: str,
+    evidence_id: str | None = None,
+) -> bool:
     if not isinstance(value, str) or not value.isascii():
         return False
     parts = value.split(".")
@@ -1577,6 +1610,7 @@ def _is_exchange_stored_filename(value: object, *, component_name: str) -> bool:
     _, timestamp, token, component, data, extension = parts
     return (
         parts[0] == "evidence"
+        and (evidence_id is None or ".".join(parts[:3]) == evidence_id)
         and len(timestamp) == 16
         and timestamp[:8].isdigit()
         and timestamp[8] == "T"
@@ -2070,6 +2104,255 @@ def _automation_compile(arguments: argparse.Namespace) -> int:
         ) from exc
 
 
+def _load_archived_http_exchange(
+    workspace: Path,
+    manifest: dict[str, object],
+    grant: AuthorityGrant,
+    target: TargetAsset,
+    evidence_id: str,
+    hostname: str,
+    port: int,
+    scheme: str,
+    method: str,
+    path: str,
+) -> ArchivedHttpExchange:
+    """Strictly bind one archived exchange back to its completed reservation."""
+
+    if re.fullmatch(r"^evidence\.[0-9]{8}T[0-9]{6}Z\.[0-9a-f]{8}$", evidence_id) is None:
+        raise CliError("evidence ID is invalid", exit_code=EXIT_AUTHORITY)
+    record_path = workspace / "evidence" / "raw" / f"{evidence_id}.json"
+    record_content = _capture_single_protocol_file(record_path)
+    try:
+        record = json.loads(
+            record_content.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise CliError("invalid archived exchange record", exit_code=EXIT_AUTHORITY) from exc
+    expected_record_fields = {
+        "schema",
+        "evidence_id",
+        "run_id",
+        "created_at",
+        "kind",
+        "title",
+        "reservation_id",
+        "original_name",
+        "stored_file",
+        "size_bytes",
+        "sha256",
+        "request",
+        "response",
+    }
+    if type(record) is not dict or set(record) != expected_record_fields:
+        raise CliError("invalid archived exchange record", exit_code=EXIT_AUTHORITY)
+    reservation_id = record.get("reservation_id")
+    if (
+        record.get("schema") != "faultloom.manual-evidence.v1"
+        or record.get("evidence_id") != evidence_id
+        or record.get("run_id") != manifest.get("run_id")
+        or record.get("kind") != "http"
+        or not _is_reservation_id(reservation_id)
+    ):
+        raise CliError("archived exchange is not bound to this run", exit_code=EXIT_AUTHORITY)
+
+    components: dict[str, tuple[Path, bytes, int, str]] = {}
+    for component_name in ("request", "response"):
+        component = record.get(component_name)
+        if type(component) is not dict or set(component) != {
+            "original_name",
+            "stored_file",
+            "size_bytes",
+            "sha256",
+        }:
+            raise CliError("invalid archived exchange component", exit_code=EXIT_AUTHORITY)
+        stored_file = component.get("stored_file")
+        size_bytes = component.get("size_bytes")
+        digest = component.get("sha256")
+        if (
+            not _is_exchange_stored_filename(
+                stored_file,
+                component_name=component_name,
+                evidence_id=evidence_id,
+            )
+            or type(size_bytes) is not int
+            or size_bytes < 0
+            or type(digest) is not str
+            or re.fullmatch(r"^[0-9a-f]{64}$", digest) is None
+        ):
+            raise CliError("invalid archived exchange component", exit_code=EXIT_AUTHORITY)
+        stored_filename = cast(str, stored_file)
+        component_path = record_path.parent / stored_filename
+        content = _capture_bounded_local_file(
+            component_path, maximum_bytes=size_bytes, label=f"archived {component_name}"
+        )
+        if len(content) != size_bytes or hashlib.sha256(content).hexdigest() != digest:
+            raise CliError("archived exchange component digest differs", exit_code=EXIT_AUTHORITY)
+        components[component_name] = (component_path, content, size_bytes, digest)
+    if (
+        record.get("stored_file") != record["request"]["stored_file"]
+        or record.get("size_bytes") != record["request"]["size_bytes"]
+        or record.get("sha256") != record["request"]["sha256"]
+    ):
+        raise CliError("archived exchange request summary differs", exit_code=EXIT_AUTHORITY)
+
+    connection = _request_accounting_connection(workspace)
+    try:
+        _prepare_request_accounting(connection, manifest)
+        row = connection.execute(
+            """SELECT request_fingerprint, request_bytes, request_sha256,
+                      response_limit, completed_at, observed_response_bytes,
+                      response_sha256
+                 FROM reservations WHERE reservation_id = ?""",
+            (reservation_id,),
+        ).fetchone()
+    except CliError:
+        connection.rollback()
+        raise
+    except sqlite3.Error as exc:
+        connection.rollback()
+        raise CliError("cannot read archived exchange reservation", exit_code=EXIT_AUTHORITY) from exc
+    finally:
+        connection.close()
+    if row is None:
+        raise CliError("archived exchange reservation is absent", exit_code=EXIT_AUTHORITY)
+    (
+        request_fingerprint,
+        request_bytes,
+        request_sha256,
+        response_limit,
+        completed_at,
+        observed_response_bytes,
+        response_sha256,
+    ) = row
+    request_content = components["request"][1]
+    if (
+        type(request_fingerprint) is not str
+        or type(request_bytes) is not int
+        or type(request_sha256) is not str
+        or type(response_limit) is not int
+        or type(completed_at) not in (int, float)
+        or type(observed_response_bytes) is not int
+        or type(response_sha256) is not str
+        or request_bytes != components["request"][2]
+        or request_sha256 != components["request"][3]
+        or observed_response_bytes != components["response"][2]
+        or response_sha256 != components["response"][3]
+        or response_limit < observed_response_bytes
+        or request_fingerprint
+        != _request_fingerprint(
+            hostname=hostname,
+            port=port,
+            scheme=scheme,
+            method=method,
+            path=path,
+            request_bytes=request_bytes,
+            request_sha256=request_sha256,
+            response_bytes=response_limit,
+        )
+    ):
+        raise CliError(
+            "archived exchange differs from its completed reservation",
+            exit_code=EXIT_AUTHORITY,
+        )
+    _parse_raw_http11_request(
+        request_content,
+        hostname=hostname,
+        port=port,
+        scheme=scheme,
+        method=method,
+        path=path,
+    )
+    policy = grant.action_policy
+    if (
+        method != method.upper()
+        or not path.startswith("/")
+        or not _request_hostname_matches_target(hostname, target)
+        or (target.ports and port not in target.ports)
+        or (target.protocols and scheme not in target.protocols)
+        or (target.methods and method not in target.methods)
+        or (target.paths and not any(_path_matches(pattern, path) for pattern in target.paths))
+        or OFFLINE_REQUEST_ACTION_FAMILY not in policy.allowed_families
+        or OFFLINE_REQUEST_ACTION_CLASS not in policy.allowed_classes
+        or (policy.allowed_methods and method not in policy.allowed_methods)
+        or (
+            policy.allowed_path_patterns
+            and not any(_path_matches(pattern, path) for pattern in policy.allowed_path_patterns)
+        )
+        or request_bytes > grant.budget.max_request_bytes
+        or response_limit > grant.budget.max_response_bytes
+    ):
+        raise CliError("archived exchange is outside signed authority", exit_code=EXIT_AUTHORITY)
+    if any(
+        _request_matches_explicit_deny(
+            deny,
+            target_id=target.target_id,
+            hostname=hostname,
+            method=method,
+            path=path,
+        )
+        for deny in policy.denied
+    ):
+        raise CliError("archived exchange matches an explicit signed deny", exit_code=EXIT_AUTHORITY)
+    created_at_value = record.get("created_at")
+    try:
+        if type(created_at_value) is not str or not created_at_value.endswith("Z"):
+            raise ValueError("created_at is not canonical UTC")
+        _ = datetime.fromisoformat(created_at_value.removesuffix("Z") + "+00:00")
+        created_at = datetime.fromtimestamp(completed_at, UTC)
+    except (OSError, OverflowError, ValueError) as exc:
+        raise CliError("archived exchange timestamp is invalid", exit_code=EXIT_AUTHORITY) from exc
+    return ArchivedHttpExchange(
+        evidence_id=evidence_id,
+        created_at=created_at,
+        request_content=request_content,
+        request_sha256=request_sha256,
+        response_sha256=response_sha256,
+        response_limit=response_limit,
+    )
+
+
+def _automation_prepare_http1_request(arguments: argparse.Namespace) -> int:
+    try:
+        return prepare_automation_http1_request(
+            AutomationPrepareHttp1RequestArguments(
+                workspace=arguments.workspace,
+                trusted_key=arguments.trusted_key,
+                evidence_id=arguments.evidence_id,
+                excerpt_file=arguments.excerpt_file,
+                provider_id=arguments.provider_id,
+                disclosure_private_key=arguments.disclosure_private_key,
+                hostname=arguments.hostname,
+                port=arguments.port,
+                scheme=arguments.scheme,
+                method=arguments.method,
+                path=arguments.path,
+                out=arguments.out,
+                confirm_redacted_non_sensitive=arguments.confirm_redacted_non_sensitive,
+            ),
+            dependencies=AutomationPrepareHttp1RequestDependencies(
+                verify_workspace=_verified_request_workspace,
+                load_exchange=_load_archived_http_exchange,
+                capture_file=_capture_single_protocol_file,
+                load_signer=lambda path: _private_signer(
+                    path, _capture_private_protocol_file(path)
+                ),
+                write_new_file=lambda path, content: _write_new_file(
+                    path, content, mode=0o600
+                ),
+                emit_json=_emit_json,
+            ),
+        )
+    except AutomationCompileError as exc:
+        raise CliError(
+            str(exc),
+            exit_code=EXIT_AUTHORITY if exc.authority else EXIT_USAGE,
+        ) from exc
+    except (TypeError, ValueError, ValidationError) as exc:
+        raise CliError(
+            f"cannot build automation request: {exc}", exit_code=EXIT_AUTHORITY
+        ) from exc
+
+
 def _automation_export_handoff(arguments: argparse.Namespace) -> int:
     try:
         return export_automation_handoff(
@@ -2348,6 +2631,55 @@ def _active_reservation_count(connection: sqlite3.Connection, now: float) -> int
     ).fetchone()[0]
 
 
+def _validate_campaign_accounting_capacity(
+    *,
+    workspace: Path,
+    manifest: dict[str, object],
+    grant: AuthorityGrant,
+    now: datetime,
+    required_actions: int,
+) -> None:
+    """Reject a campaign before start unless all sequential reservations fit now."""
+
+    now_seconds = now.timestamp()
+    connection = _request_accounting_connection(workspace)
+    try:
+        _prepare_request_accounting(connection, manifest)
+        total = connection.execute("SELECT COUNT(*) FROM reservations").fetchone()[0]
+        rate = connection.execute(
+            "SELECT COUNT(*) FROM reservations WHERE created_at > ?",
+            (now_seconds - 60,),
+        ).fetchone()[0]
+        active = _active_reservation_count(connection, now_seconds)
+        if total + required_actions > grant.budget.total_actions:
+            raise CliError(
+                "signed total action budget cannot fit the complete campaign",
+                exit_code=EXIT_AUTHORITY,
+            )
+        if rate + required_actions > grant.budget.rate_per_minute:
+            raise CliError(
+                "signed rate budget cannot fit the complete campaign",
+                exit_code=EXIT_AUTHORITY,
+            )
+        if active >= grant.budget.max_concurrency:
+            raise CliError(
+                "signed concurrency budget cannot start the campaign",
+                exit_code=EXIT_AUTHORITY,
+            )
+        connection.commit()
+    except CliError:
+        connection.rollback()
+        raise
+    except sqlite3.Error as exc:
+        connection.rollback()
+        raise CliError(
+            f"cannot preflight campaign request budget: {exc}",
+            exit_code=EXIT_AUTHORITY,
+        ) from exc
+    finally:
+        connection.close()
+
+
 def _response_file_size(path: Path) -> int:
     try:
         metadata = path.lstat()
@@ -2580,6 +2912,62 @@ def _recheck_reserved_request_before_send(
         connection.close()
 
 
+def _validate_request_authority(
+    *,
+    grant: AuthorityGrant,
+    target: TargetAsset,
+    hostname: str,
+    port: int,
+    scheme: str,
+    method: str,
+    path: str,
+    request_bytes: int,
+    response_bytes: int,
+    maximum_request_bytes: int,
+    maximum_response_bytes: int,
+) -> None:
+    """Apply pure signed target, policy, deny, and byte checks before mutation."""
+
+    if (
+        not _request_hostname_matches_target(hostname, target)
+        or (target.ports and port not in target.ports)
+        or (target.protocols and scheme not in target.protocols)
+        or (target.methods and method not in target.methods)
+        or (target.paths and not any(_path_matches(pattern, path) for pattern in target.paths))
+    ):
+        raise CliError(
+            "request is outside the selected signed target", exit_code=EXIT_AUTHORITY
+        )
+    policy = grant.action_policy
+    if (
+        OFFLINE_REQUEST_ACTION_FAMILY not in policy.allowed_families
+        or OFFLINE_REQUEST_ACTION_CLASS not in policy.allowed_classes
+        or (policy.allowed_methods and method not in policy.allowed_methods)
+        or (
+            policy.allowed_path_patterns
+            and not any(_path_matches(pattern, path) for pattern in policy.allowed_path_patterns)
+        )
+    ):
+        raise CliError(
+            "request is outside the signed action policy", exit_code=EXIT_AUTHORITY
+        )
+    if any(
+        _request_matches_explicit_deny(
+            deny,
+            target_id=target.target_id,
+            hostname=hostname,
+            method=method,
+            path=path,
+        )
+        for deny in policy.denied
+    ):
+        raise CliError("request matches an explicit signed deny", exit_code=EXIT_AUTHORITY)
+    if request_bytes > maximum_request_bytes or response_bytes > maximum_response_bytes:
+        raise CliError(
+            "request exceeds the signed byte budget", exit_code=EXIT_AUTHORITY
+        )
+
+
 def _admit_raw_request(
     arguments: argparse.Namespace,
     *,
@@ -2623,47 +3011,19 @@ def _admit_raw_request(
             exit_code=EXIT_AUTHORITY,
         )
     request_bytes = len(request_content)
-    if (
-        not _request_hostname_matches_target(arguments.hostname, target)
-        or (target.ports and arguments.port not in target.ports)
-        or (target.protocols and arguments.scheme not in target.protocols)
-        or (target.methods and method not in target.methods)
-        or (target.paths and not any(_path_matches(pattern, path) for pattern in target.paths))
-    ):
-        raise CliError(
-            "request is outside the selected signed target", exit_code=EXIT_AUTHORITY
-        )
-    policy = grant.action_policy
-    if (
-        OFFLINE_REQUEST_ACTION_FAMILY not in policy.allowed_families
-        or OFFLINE_REQUEST_ACTION_CLASS not in policy.allowed_classes
-        or (policy.allowed_methods and method not in policy.allowed_methods)
-        or (
-            policy.allowed_path_patterns
-            and not any(_path_matches(pattern, path) for pattern in policy.allowed_path_patterns)
-        )
-    ):
-        raise CliError(
-            "request is outside the signed action policy", exit_code=EXIT_AUTHORITY
-        )
-    if any(
-        _request_matches_explicit_deny(
-            deny,
-            target_id=target.target_id,
-            hostname=arguments.hostname,
-            method=method,
-            path=path,
-        )
-        for deny in policy.denied
-    ):
-        raise CliError("request matches an explicit signed deny", exit_code=EXIT_AUTHORITY)
-    if (
-        request_bytes > maximum_request_bytes
-        or response_bytes > maximum_response_bytes
-    ):
-        raise CliError(
-            "request exceeds the signed byte budget", exit_code=EXIT_AUTHORITY
-        )
+    _validate_request_authority(
+        grant=grant,
+        target=target,
+        hostname=arguments.hostname,
+        port=arguments.port,
+        scheme=arguments.scheme,
+        method=method,
+        path=path,
+        request_bytes=request_bytes,
+        response_bytes=response_bytes,
+        maximum_request_bytes=maximum_request_bytes,
+        maximum_response_bytes=maximum_response_bytes,
+    )
     reservation = _reserve_request(
         workspace=workspace,
         manifest=manifest,
@@ -3496,21 +3856,35 @@ def _parse_bound_automation_result(content: bytes) -> tuple[dict[str, object], A
 
 def _selected_automation_candidate(
     result: AuthorizedAutomationResult, candidate_id: str
-) -> ToolCandidate:
-    matches = [
+) -> tuple[str, ToolCandidate | PoCStep]:
+    admitted_matches = [
         plan.selected
         for plan in result.admitted_plans
         if plan.selected.candidate.candidate_id == candidate_id
     ]
-    if len(matches) != 1:
+    poc_steps = () if result.poc is None else result.poc.recipe.steps
+    poc_matches = [step for step in poc_steps if step.step_id == candidate_id]
+    if len(admitted_matches) + len(poc_matches) != 1:
         raise CliError("automation candidate is absent or ambiguous", exit_code=EXIT_AUTHORITY)
-    selected = matches[0]
-    if selected.receipt.authority_digest != result.authority_grant_digest:
+    if admitted_matches:
+        selected = admitted_matches[0]
+        if selected.receipt.authority_digest != result.authority_grant_digest:
+            raise CliError(
+                "automation candidate admission is bound to another authority",
+                exit_code=EXIT_AUTHORITY,
+            )
+        return "admitted_plan", selected.candidate
+    if (
+        result.poc is None
+        or result.poc_context_digest is None
+        or len(result.poc.recipe.steps) != 1
+        or result.poc.adaptation.removed_unsafe_step_digests
+    ):
         raise CliError(
-            "automation candidate admission is bound to another authority",
+            "compiled safe PoC candidate is incomplete or not a single safe step",
             exit_code=EXIT_AUTHORITY,
         )
-    return selected.candidate
+    return "compiled_safe_poc_step", poc_matches[0]
 
 
 def _validate_automation_candidate_for_triad(
@@ -3522,8 +3896,9 @@ def _validate_automation_candidate_for_triad(
     manifest: dict[str, object],
     grant: AuthorityGrant,
     target: TargetAsset,
-) -> str:
-    """Accept only an offline admitted intent that exactly describes the effect request."""
+    expected_source: str | None = None,
+) -> tuple[str, str]:
+    """Accept only one offline compiled intent that exactly describes the effect request."""
     if (
         result.provider_network_access != "none"
         or result.target_dispatch_performed is not False
@@ -3534,20 +3909,90 @@ def _validate_automation_candidate_for_triad(
         or result.authority_grant_digest != sha256_digest(grant)
     ):
         raise CliError("automation result is not bound to the verified workspace", exit_code=EXIT_AUTHORITY)
-    candidate = _selected_automation_candidate(result, candidate_id)
-    intent = candidate.intent
+    policy = grant.action_policy
+    request_outside_authority = any(
+        (target.methods and request.method not in target.methods)
+        or (
+            target.paths
+            and not any(_path_matches(pattern, request.path) for pattern in target.paths)
+        )
+        or (policy.allowed_methods and request.method not in policy.allowed_methods)
+        or (
+            policy.allowed_path_patterns
+            and not any(
+                _path_matches(pattern, request.path)
+                for pattern in policy.allowed_path_patterns
+            )
+        )
+        or any(
+            _request_matches_explicit_deny(
+                deny,
+                target_id=target.target_id,
+                hostname=spec.hostname,
+                method=request.method,
+                path=request.path,
+            )
+            for deny in policy.denied
+        )
+        for request in spec.requests
+    )
     if (
-        intent.action_class not in {ActionClass.OBSERVE, ActionClass.SAFE_PROBE}
+        not _request_hostname_matches_target(spec.hostname, target)
+        or (target.ports and spec.port not in target.ports)
+        or (target.protocols and spec.scheme not in target.protocols)
+        or OFFLINE_REQUEST_ACTION_FAMILY not in policy.allowed_families
+        or OFFLINE_REQUEST_ACTION_CLASS not in policy.allowed_classes
+        or request_outside_authority
+    ):
+        raise CliError(
+            "automation candidate is outside current signed authority",
+            exit_code=EXIT_AUTHORITY,
+        )
+    candidate_source, candidate = _selected_automation_candidate(result, candidate_id)
+    if expected_source is not None and candidate_source != expected_source:
+        raise CliError("automation candidate source differs", exit_code=EXIT_AUTHORITY)
+    intent = candidate.intent if isinstance(candidate, ToolCandidate) else candidate.action_intent
+    if (
+        intent.action_class is not ActionClass.SAFE_PROBE
+        or intent.action_kind != OFFLINE_REQUEST_ACTION_FAMILY
         or intent.run_id != result.run_id
         or intent.target_id != target.target_id
         or intent.pack_id != manifest.get("pack_id")
+        or intent.resource.target_id != target.target_id
+        or (
+            intent.subject.identity_id is not None
+            and intent.subject.identity_id not in grant.identities
+        )
+        or any(
+            tenant_id is not None and tenant_id not in grant.tenants
+            for tenant_id in (intent.subject.tenant_id, intent.resource.tenant_id)
+        )
         or intent.protocol != spec.scheme
         or intent.method != spec.effect.method
         or intent.path != spec.effect.path
         or intent.payload_digest != f"sha256:{effect_request_sha256}"
     ):
         raise CliError("automation candidate intent does not match the triad template", exit_code=EXIT_AUTHORITY)
-    return sha256_digest(candidate.model_dump(mode="json"))
+    if candidate_source == "compiled_safe_poc_step":
+        poc = result.poc
+        if (
+            poc is None
+            or poc.adaptation.target_id != target.target_id
+            or poc.adaptation.route_ref.target_id != target.target_id
+            or intent.resource != poc.adaptation.route_ref
+            or (
+                poc.adaptation.identity_context_id is not None
+                and poc.adaptation.identity_context_id not in grant.identities
+            )
+            or poc.adaptation.transport != spec.scheme
+            or poc.recipe.adaptation_id != poc.adaptation.adaptation_id
+            or poc.recipe.cleanup_plan_ref != intent.cleanup_plan_ref
+        ):
+            raise CliError(
+                "compiled safe PoC metadata does not match the triad template",
+                exit_code=EXIT_AUTHORITY,
+            )
+    return candidate_source, sha256_digest(candidate.model_dump(mode="json"))
 
 
 def _validate_automation_result_receipt(
@@ -3607,7 +4052,9 @@ def _automation_binding_provenance(spec: PersonalHttp1TriadSpec) -> dict[str, ob
     binding = spec.automation_binding
     if binding is None:
         return None
-    value = binding.model_dump(by_alias=True)
+    # Preserve the digest/serialization of pre-discriminator v1 bindings while
+    # including candidate_source on every newly prepared binding.
+    value = binding.model_dump(by_alias=True, exclude_unset=True)
     return {"sha256": sha256_digest(value), "binding": value}
 
 
@@ -3684,7 +4131,7 @@ def _validate_bound_triad_spec(
         raise CliError("bound request source path differs from the triad spec", exit_code=EXIT_AUTHORITY)
     # The strict raw parser is deliberately called again by _prepare_campaign_requests.
     _ = effect_content, control_content
-    candidate_digest = _validate_automation_candidate_for_triad(
+    candidate_source, candidate_digest = _validate_automation_candidate_for_triad(
         result=result,
         candidate_id=binding.candidate_id,
         spec=spec,
@@ -3692,9 +4139,11 @@ def _validate_bound_triad_spec(
         manifest=manifest,
         grant=grant,
         target=target,
+        expected_source=binding.candidate_source,
     )
     if (
-        binding.candidate_digest != candidate_digest
+        binding.candidate_source != candidate_source
+        or binding.candidate_digest != candidate_digest
         or binding.run_id != result.run_id
         or binding.grant_id != grant.grant_id
         or binding.grant_version != grant.grant_version
@@ -4003,7 +4452,7 @@ def _build_bound_http1_triad_spec(
         result=result,
         result_digest=result_digest,
     )
-    candidate_digest = _validate_automation_candidate_for_triad(
+    candidate_source, candidate_digest = _validate_automation_candidate_for_triad(
         result=result,
         candidate_id=arguments.candidate_id,
         spec=template,
@@ -4022,6 +4471,7 @@ def _build_bound_http1_triad_spec(
         "template_path": str(template_path),
         "template_sha256": sha256_hex(template_content),
         "candidate_id": arguments.candidate_id,
+        "candidate_source": candidate_source,
         "candidate_digest": candidate_digest,
         "effect_request_path": str(prepared["effect"][0].resolve(strict=True)),
         "effect_request_sha256": prepared["effect"][2],
@@ -4039,7 +4489,7 @@ def _build_bound_http1_triad_spec(
 
 
 def _campaign_prepare_http1_triad(arguments: argparse.Namespace) -> int:
-    """Bind an offline admitted candidate to an operator-authored v1 triad."""
+    """Bind one offline compiled candidate to an operator-authored v1 triad."""
     output, binding = _build_bound_http1_triad_spec(arguments)
     _write_new_file(
         arguments.out,
@@ -4798,7 +5248,7 @@ def _campaign_run_http1_triad(arguments: argparse.Namespace) -> int:
         spec = parse_personal_http1_triad_spec(spec_content)
     except PersonalCampaignError as exc:
         raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
-    manifest, grant, target, _ = _verified_request_workspace(
+    manifest, grant, target, now = _verified_request_workspace(
         arguments.workspace, _trusted_key_path(arguments)
     )
     automation_binding = _validate_bound_triad_spec(
@@ -4821,6 +5271,40 @@ def _campaign_run_http1_triad(arguments: argparse.Namespace) -> int:
     )
     records = _campaign_records_directory(arguments.workspace)
     start_record = _campaign_record(records, spec.campaign_id, "start")
+    if _campaign_record_exists(start_record):
+        raise CliError(
+            f"cannot create campaign record {start_record}: already exists",
+            exit_code=EXIT_USAGE,
+        )
+    maximum_request_bytes = min(
+        grant.budget.max_request_bytes,
+        PERSONAL_HTTP1_MAX_REQUEST_BYTES,
+    )
+    maximum_response_bytes = min(
+        grant.budget.max_response_bytes,
+        PERSONAL_HTTP1_MAX_RESPONSE_BYTES,
+    )
+    for request in spec.requests:
+        _validate_request_authority(
+            grant=grant,
+            target=target,
+            hostname=spec.hostname,
+            port=spec.port,
+            scheme=spec.scheme,
+            method=request.method,
+            path=request.path,
+            request_bytes=len(prepared[request.role][1]),
+            response_bytes=request.response_bytes,
+            maximum_request_bytes=maximum_request_bytes,
+            maximum_response_bytes=maximum_response_bytes,
+        )
+    _validate_campaign_accounting_capacity(
+        workspace=arguments.workspace,
+        manifest=manifest,
+        grant=grant,
+        now=now,
+        required_actions=3,
+    )
     _write_new_campaign_record(
         records,
         start_record,
@@ -5520,6 +6004,7 @@ def _campaign_verification_handoff_bytes(arguments: argparse.Namespace) -> bytes
     except PersonalCampaignError as exc:
         raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
     binding = spec.automation_binding
+    binding_provenance = _automation_binding_provenance(spec)
     start_binding = inputs.start.get("automation_binding")
     start_binding_digest = inputs.start.get("automation_binding_digest")
     if (
@@ -5528,7 +6013,8 @@ def _campaign_verification_handoff_bytes(arguments: argparse.Namespace) -> bytes
         or binding.schema_ != PERSONAL_HTTP1_TRIAD_AUTOMATION_BINDING_SCHEMA
         or not isinstance(start_binding, dict)
         or not isinstance(start_binding_digest, str)
-        or start_binding != binding.model_dump(by_alias=True)
+        or binding_provenance is None
+        or start_binding != binding_provenance["binding"]
         or start_binding_digest != sha256_digest(start_binding)
         or receipt.get("automation_binding") != start_binding
         or receipt.get("automation_binding_digest") != start_binding_digest
@@ -5673,7 +6159,14 @@ def _campaign_verification_handoff_bytes(arguments: argparse.Namespace) -> bytes
         "networkAccess": False,
         "automaticSubmission": False,
         "campaign": {"id": arguments.campaign_id, "runId": inputs.manifest["run_id"], "grantId": inputs.manifest["grant_id"], "grantVersion": inputs.manifest["grant_version"]},
-        "automation": {"candidateId": binding.candidate_id, "candidateDigest": binding.candidate_digest, "bindingDigest": start_binding_digest, "signedAuthorityEnvelopeSha256": inputs.manifest.get("authority_sha256"), "references": binding_refs},
+        "automation": {
+            "candidateId": binding.candidate_id,
+            "candidateSource": binding.candidate_source,
+            "candidateDigest": binding.candidate_digest,
+            "bindingDigest": start_binding_digest,
+            "signedAuthorityEnvelopeSha256": inputs.manifest.get("authority_sha256"),
+            "references": binding_refs,
+        },
         "manualFindingId": finding_id,
         "references": refs,
         "evidence": exchanges,
@@ -7112,7 +7605,7 @@ def build_parser() -> argparse.ArgumentParser:
     campaign_run_http1_triad.set_defaults(handler=_campaign_run_http1_triad)
     campaign_prepare_http1_triad = campaign_commands.add_parser(
         "prepare-http1-triad",
-        help="bind one offline admitted candidate to an existing v1 triad template",
+        help="bind one offline compiled candidate to an existing v1 triad template",
     )
     campaign_prepare_http1_triad.add_argument("--workspace", type=Path, required=True)
     campaign_prepare_http1_triad.add_argument("--trusted-key", type=Path, required=True)
@@ -7300,6 +7793,34 @@ def build_parser() -> argparse.ArgumentParser:
     automation_commands = automation.add_subparsers(
         dest="automation_command", required=True
     )
+    automation_prepare_http1_request = automation_commands.add_parser(
+        "prepare-http1-request",
+        help="build one signed offline model request from an archived HTTP exchange",
+    )
+    automation_prepare_http1_request.add_argument("--workspace", type=Path, required=True)
+    automation_prepare_http1_request.add_argument("--trusted-key", type=Path, required=True)
+    automation_prepare_http1_request.add_argument("--evidence-id", required=True)
+    automation_prepare_http1_request.add_argument("--excerpt-file", type=Path, required=True)
+    automation_prepare_http1_request.add_argument("--provider-id", required=True)
+    automation_prepare_http1_request.add_argument(
+        "--disclosure-private-key", type=Path, required=True
+    )
+    automation_prepare_http1_request.add_argument("--hostname", required=True)
+    automation_prepare_http1_request.add_argument("--port", type=_port, required=True)
+    automation_prepare_http1_request.add_argument(
+        "--scheme", choices=("http", "https"), required=True
+    )
+    automation_prepare_http1_request.add_argument(
+        "--method", type=str.upper, choices=("GET", "HEAD", "OPTIONS"), required=True
+    )
+    automation_prepare_http1_request.add_argument("--path", required=True)
+    automation_prepare_http1_request.add_argument("--out", type=Path, required=True)
+    automation_prepare_http1_request.add_argument(
+        "--confirm-redacted-non-sensitive", action="store_true"
+    )
+    automation_prepare_http1_request.set_defaults(
+        handler=_automation_prepare_http1_request
+    )
     automation_compile = automation_commands.add_parser(
         "compile", help="compile one local model turn without provider or target access"
     )
@@ -7322,6 +7843,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     automation_export_handoff.add_argument("--request", type=Path, required=True)
     automation_export_handoff.add_argument("--provider-id", required=True)
+    automation_export_handoff.add_argument("--model-snapshot", required=True)
     automation_export_handoff.add_argument(
         "--trusted-disclosure-key", type=Path, action="append", required=True
     )
