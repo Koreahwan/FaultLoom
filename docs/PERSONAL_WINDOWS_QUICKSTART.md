@@ -392,6 +392,80 @@ directory sync. Use the signed workflow documented in
 `docs/OPENAI_COMPATIBLE_PROVIDERS.md` from WSL/Linux. Native Windows fails
 closed; use the offline handoff and compilation flow above there instead.
 
+## 11. Independent HTTP/1 replay and manual-review report
+
+RC15 can independently replay a finalized `draft_unverified` campaign without
+adding another sender. First export the source handoff, then create a second
+manual workspace from a separately signed verifier grant. The verifier must
+have a different actor, key, authority, and workspace while naming the exact
+same target:
+
+```powershell
+& $FaultLoom campaign export-verification-handoff `
+  --workspace "$Job\run-01" `
+  --trusted-key "$Root\authority\authority-public-key.json" `
+  --campaign-id '<campaign-id>' `
+  --out "$Job\run-01\verification-handoff.json"
+
+& $FaultLoom campaign prepare-verification-http1 `
+  --source-workspace "$Job\run-01" `
+  --source-trusted-key "$Root\authority\authority-public-key.json" `
+  --handoff "$Job\run-01\verification-handoff.json" `
+  --verifier-workspace '<separate-verifier-workspace>' `
+  --verifier-trusted-key '<separate-verifier-public-key>' `
+  --campaign-id '<campaign-id>' `
+  --finding-class '<class>' `
+  --claim '<exact claim>' `
+  --prerequisite '<exact prerequisite>' `
+  --out '<separate-verifier-workspace>\verification-triad.json'
+```
+
+The preferred RC15 path coordinates those existing phases behind the same two
+explicit review pauses:
+
+```powershell
+$Verifier = '<separate-verifier-workspace>'
+$VerifierAuthority = '<separate-verifier-authority-directory>'
+$Campaign = '<campaign-id>'
+
+& $FaultLoom campaign supervise-verification-http1 `
+  --source-workspace "$Job\run-01" `
+  --source-trusted-key "$Root\authority\authority-public-key.json" `
+  --verifier-workspace $Verifier `
+  --verifier-trusted-key "$VerifierAuthority\authority-public-key.json" `
+  --handoff "$Job\run-01\verification-handoff.json" `
+  --out "$Verifier\verification-triad.json" `
+  --case "$Verifier\$Campaign.verification-case.json" `
+  --private-key "$VerifierAuthority\authority-private.key" `
+  --result-out "$Verifier\verified-result.json" `
+  --receipt-out "$Verifier\verification-compile-receipt.json" `
+  --campaign-id $Campaign `
+  --finding-class '<class>' `
+  --claim '<exact claim>' `
+  --prerequisite '<exact prerequisite>'
+```
+
+Review the generated verifier triad and type exactly `RUN <campaign-id>` before
+target I/O. Review the three private response files and type exactly
+`FINALIZE <campaign-id>` before offline compilation. The command then invokes
+the existing verifier and renders a digest-named `draft_manual_review` report
+inside the verifier workspace. It never submits externally. A completed rerun
+does not resend or recompile; an unresolved, start-only, or partially finalized
+state stops for manual reconciliation.
+
+The separate manual controls remain available: run the generated verifier triad
+with the existing `campaign run-http1-triad`, review all three fresh responses,
+and finalize it with `campaign finalize-http1-triad`. The verifier slice accepts
+only bodyless `GET` or `OPTIONS` requests with `Host` and `Connection: close`,
+sends exactly three sequential requests, and never retries.
+
+Then run `campaign compile-verification-http1` using the paths emitted by the
+prepare result. The compile result prints the exact arguments for the existing
+`faultloom verify` and `faultloom report` commands. All three operations are
+offline. A successful verdict still produces only a `draft_manual_review`
+outbox; inspect and submit it yourself through the authorized customer or
+program channel.
+
 ## Current boundary
 
 Ready now: signed scopes, manual authorized workspaces, bounded evidence
@@ -407,6 +481,6 @@ operator-observed response byte count or a locally captured response digest,
 then releases concurrency. If the observed response exceeds its reserved budget,
 FaultLoom records that fact and returns an authorization failure after emitting the
 result.
-Linux-only durable resume, automatic
-Gateway target dispatch, automatic exploitation, and automatic external
-submission are not enabled in this Windows personal beta.
+Linux-only durable resume, automatic Gateway target dispatch, destructive or
+unbounded exploitation, and automatic external submission are not enabled in
+this Windows personal beta.
