@@ -35,6 +35,8 @@ jobs:
 
       - name: Provision the pinned Python runtime
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        env:
+          PIP_NO_INDEX: "0"
         with:
           python-version-file: .python-version
           cache: ""
