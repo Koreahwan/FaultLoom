@@ -46,7 +46,7 @@ from tools.verify_clean_checkout import (
 
 
 EPOCH = 1_700_000_000
-ACTION_SHA = "11bd71901bbe5b1630ceea73d27597364c9af683"
+ACTION_SHA = "de0fac2e4500dabe0009e67214ff5f5447ce83dd"
 
 
 def write(path: Path, value: str) -> None:

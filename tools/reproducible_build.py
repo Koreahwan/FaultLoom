@@ -55,11 +55,14 @@ PINNED_ACTION_REFERENCE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*"
     r"(?:/[A-Za-z0-9][A-Za-z0-9_.-]*)*@[0-9a-f]{40}$"
 )
-CHECKOUT_ACTION = "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683"
+CHECKOUT_ACTION = "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"
 SETUP_PYTHON_ACTION = (
-    "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"
+    "actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405"
 )
-APPROVED_CI_ACTIONS = {CHECKOUT_ACTION, SETUP_PYTHON_ACTION}
+GITLEAKS_ACTION = (
+    "gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e"
+)
+APPROVED_CI_ACTIONS = {CHECKOUT_ACTION, SETUP_PYTHON_ACTION, GITLEAKS_ACTION}
 APPROVED_PRE_GATE_RUNS = {
     'rustup toolchain install "$RUST_VERSION" --profile minimal '
     "--component clippy --component rustfmt --no-self-update",
@@ -177,6 +180,8 @@ jobs:
 
       - name: Provision the pinned Python runtime
         uses: {SETUP_PYTHON_ACTION}
+        env:
+          PIP_NO_INDEX: "0"
         with:
           python-version-file: .python-version
           cache: ""
@@ -191,6 +196,32 @@ jobs:
         env:
           FAULTLOOM_RUST_TOOLCHAIN: "{rust_version}"
         run: python3 tools/verify_clean_checkout.py
+
+  public-history-secret-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the exact revision and complete history
+        uses: {CHECKOUT_ACTION}
+        with:
+          repository: "${{{{ github.repository }}}}"
+          ref: "${{{{ github.sha }}}}"
+          path: .
+          clean: true
+          fetch-depth: 0
+          persist-credentials: false
+          lfs: false
+          submodules: false
+
+      - name: Verify the current public tree
+        run: python3 tools/check_public_tree.py .
+
+      - name: Scan complete public history for secrets
+        uses: {GITLEAKS_ACTION}
+        env:
+          GITHUB_TOKEN: "${{{{ secrets.GITHUB_TOKEN }}}}"
+          GITLEAKS_CONFIG: ".gitleaks.toml"
+          GITLEAKS_VERSION: "8.21.2"
 '''.encode("utf-8")
 
 
