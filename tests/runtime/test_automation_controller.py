@@ -5,6 +5,7 @@ from typing import cast
 
 import pytest
 
+import faultloom.automation as automation
 import faultloom.automation.controller as controller
 from faultloom.automation.admission import (
     AutomationAdmission,
@@ -154,6 +155,11 @@ def _dispatch(
     )
 
 
+def test_campaign_control_exports() -> None:
+    assert automation.CampaignControl is controller.CampaignControl
+    assert automation.revoke_campaign is controller.revoke_campaign
+
+
 def test_controller_presents_once_persists_and_returns_prior_dispatch(tmp_path) -> None:
     approved = command()
     gateway = RecordingGateway(completed_result)
@@ -237,6 +243,112 @@ def test_controller_rejects_untrusted_or_tampered_binding_before_gateway(
 
     assert gateway.calls == []
 
+
+def test_campaign_revocation_survives_reopen_and_blocks_gateway(tmp_path) -> None:
+    approved = command(action_id="action.revoked", lease_id="lease.revoked")
+    admission = _admission(_result(approved))
+    first_gateway = RecordingGateway(completed_result)
+    first_executor = SemanticHttpExecutor._for_test(
+        first_gateway, channel_key=CHANNEL_KEY, now=lambda: NOW
+    )
+
+    with open_store(tmp_path) as store:
+        control = controller.revoke_campaign(
+            store=store,
+            run_id=approved.intent.run_id,
+            epoch=1,
+            reason="operator emergency stop",
+        )
+        assert store.ledger is not None
+        events = tuple(
+            event
+            for event in store.ledger.events(limit=100)
+            if event.event_type == controller.AUTOMATION_CAMPAIGN_CONTROL_EVENT_TYPE
+        )
+
+    replay_gateway = RecordingGateway(completed_result)
+    replay_executor = SemanticHttpExecutor._for_test(
+        replay_gateway, channel_key=CHANNEL_KEY, now=lambda: NOW
+    )
+    with open_store(tmp_path) as store:
+        with pytest.raises(controller.CampaignRevokedError, match="emergency stop"):
+            _dispatch(
+                store=store,
+                admission=admission,
+                command_value=approved,
+                executor=replay_executor,
+            )
+
+    assert control.revoked is True
+    assert len(events) == 1
+    assert first_gateway.calls == []
+    assert replay_gateway.calls == []
+
+
+def test_completed_dispatch_remains_retrievable_after_campaign_revoke(tmp_path) -> None:
+    approved = command(action_id="action.completed", lease_id="lease.completed")
+    admission = _admission(_result(approved))
+    gateway = RecordingGateway(completed_result)
+    executor = SemanticHttpExecutor._for_test(
+        gateway, channel_key=CHANNEL_KEY, now=lambda: NOW
+    )
+
+    with open_store(tmp_path) as store:
+        first = _dispatch(
+            store=store,
+            admission=admission,
+            command_value=approved,
+            executor=executor,
+        )
+        controller.revoke_campaign(
+            store=store,
+            run_id=approved.intent.run_id,
+            epoch=1,
+            reason="stop after completed dispatch",
+        )
+
+    replay_gateway = RecordingGateway(completed_result)
+    replay_executor = SemanticHttpExecutor._for_test(
+        replay_gateway, channel_key=CHANNEL_KEY, now=lambda: NOW
+    )
+    with open_store(tmp_path) as store:
+        second = _dispatch(
+            store=store,
+            admission=admission,
+            command_value=approved,
+            executor=replay_executor,
+        )
+
+    assert first == second
+    assert len(gateway.calls) == 1
+    assert replay_gateway.calls == []
+
+
+def test_campaign_control_rejects_epoch_rollback_and_unrevoke(tmp_path) -> None:
+    approved = command(action_id="action.epoch", lease_id="lease.epoch")
+
+    with open_store(tmp_path) as store:
+        controller.revoke_campaign(
+            store=store,
+            run_id=approved.intent.run_id,
+            epoch=2,
+            reason="first emergency stop",
+        )
+        with pytest.raises(controller.CampaignControlError, match="epoch rollback"):
+            controller.revoke_campaign(
+                store=store,
+                run_id=approved.intent.run_id,
+                epoch=1,
+                reason="older control",
+            )
+        with pytest.raises(controller.CampaignControlError, match="cannot be cleared"):
+            controller.revoke_campaign(
+                store=store,
+                run_id=approved.intent.run_id,
+                epoch=3,
+                reason="attempted unrevoke",
+                revoked=False,
+            )
 
 def test_controller_persists_gateway_denial(tmp_path) -> None:
     approved = command(action_id="action.denied", lease_id="lease.denied")

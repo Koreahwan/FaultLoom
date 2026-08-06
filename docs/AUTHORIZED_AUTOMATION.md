@@ -175,6 +175,12 @@ the dispatch as `unknown_requires_reconciliation`; it never guesses whether the
 earlier process reached the Gateway and never retries. A stored final record is
 reused only when its signed admission and complete dispatch identity exactly
 match the newly verified request.
+`revoke_campaign()` is an operator-local control primitive: StateStore
+possession is its trust boundary. It writes an encrypted, monotonic revocation
+for one run. Revocation is sticky, survives restart, and blocks subsequent/new
+Gateway presentations before their reservation. It does not interrupt an
+already in-progress dispatch holding the engagement lock; Gateway lease
+cancellation remains separate future work.
 
 The Gateway remains the only target-I/O authority for the automated
 controller-provisioned pipeline. Python packs, provider adapters, and this

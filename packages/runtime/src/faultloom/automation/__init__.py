@@ -108,7 +108,15 @@ _EXECUTION_BRIDGE_EXPORTS = frozenset(
         "unknown_automation_dispatch_record",
     }
 )
-_CONTROLLER_EXPORTS = frozenset({"execute_and_persist_admitted_tool_plan"})
+_CONTROLLER_EXPORTS = frozenset(
+    {
+        "CampaignControl",
+        "CampaignControlError",
+        "CampaignRevokedError",
+        "execute_and_persist_admitted_tool_plan",
+        "revoke_campaign",
+    }
+)
 
 
 def __getattr__(name: str) -> object:
@@ -167,6 +175,9 @@ __all__ = [
     "CandidateOutboxError",
     "CandidateOutboxPublication",
     "CandidateFindingDraft",
+    "CampaignControl",
+    "CampaignControlError",
+    "CampaignRevokedError",
     "AutomationLimits",
     "AutomationRequest",
     "AutomationResultBundlePublication",
@@ -217,6 +228,7 @@ __all__ = [
     "persist_automation_dispatch",
     "prepare_admitted_tool_plan",
     "run_provider_automation_turn",
+    "revoke_campaign",
     "sign_model_disclosure_approval",
     "sign_automation_admission",
     "verify_automation_admission",
