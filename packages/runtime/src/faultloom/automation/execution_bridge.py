@@ -120,6 +120,36 @@ class AutomationDispatchRecord(_DispatchModel):
         return self
 
 
+class PreparedAutomationDispatch(_DispatchModel):
+    """The exact admitted command identity required before Gateway presentation."""
+
+    dispatch_id: Identifier
+    run_id: Identifier
+    candidate_id: Identifier
+    action_id: Identifier
+    lease_id: Identifier
+    requested_at: AwareDatetime
+    command_digest: Sha256Digest
+    result_digest: Sha256Digest
+    admission: SignedAutomationAdmission
+
+    @model_validator(mode="after")
+    def _digest_and_identity_are_exact(self) -> Self:
+        result = self.admission.payload.result
+        if self.result_digest != _result_digest(result):
+            raise AutomationDispatchError("prepared result digest mismatch")
+        if self.dispatch_id != _dispatch_id(self.command_digest, self.result_digest):
+            raise AutomationDispatchError("prepared dispatch ID is not command/result bound")
+        selected = _selected_item(result, self.candidate_id)
+        if selected.candidate.intent.action_id != self.action_id:
+            raise AutomationDispatchError("prepared action does not match its selected candidate")
+        if selected.candidate.intent.requested_at != self.requested_at:
+            raise AutomationDispatchError(
+                "prepared timestamp does not match its selected candidate"
+            )
+        return self
+
+
 class AutomationDispatchEnvelope(_DispatchModel):
     dispatch_id: Identifier
     dispatch_digest: Sha256Digest
@@ -177,17 +207,16 @@ def execute_admitted_tool_plan(
     explicit reconciliation.
     """
 
-    _validate_inputs(admission, command, executor, trusted_clock)
-    admitted = verify_automation_admission(
-        admission,
-        trusted_admission_keys,
-        verification_time=trusted_clock(),
+    prepared = prepare_admitted_tool_plan(
+        admission=admission,
+        trusted_admission_keys=trusted_admission_keys,
+        trusted_clock=trusted_clock,
+        candidate_id=candidate_id,
+        command=command,
+        executor=executor,
     )
-    result = admitted.result
+    result = prepared.admission.payload.result
     item = _selected_item(result, candidate_id)
-    _validate_binding(result, item, command)
-    command_digest = _command_digest(command)
-    result_digest = _result_digest(result)
     previous_state = executor.state_for(command.intent.action_id)
     try:
         gateway_result = executor.execute(command)
@@ -199,8 +228,8 @@ def execute_admitted_tool_plan(
             result=result,
             item=item,
             command=command,
-            command_digest=command_digest,
-            result_digest=result_digest,
+            command_digest=prepared.command_digest,
+            result_digest=prepared.result_digest,
             gateway_result=None,
             status="unknown_requires_reconciliation",
         )
@@ -215,8 +244,8 @@ def execute_admitted_tool_plan(
             result=result,
             item=item,
             command=command,
-            command_digest=command_digest,
-            result_digest=result_digest,
+            command_digest=prepared.command_digest,
+            result_digest=prepared.result_digest,
             gateway_result=None,
             status="unknown_requires_reconciliation",
         )
@@ -225,10 +254,70 @@ def execute_admitted_tool_plan(
         result=result,
         item=item,
         command=command,
-        command_digest=command_digest,
-        result_digest=result_digest,
+        command_digest=prepared.command_digest,
+        result_digest=prepared.result_digest,
         gateway_result=gateway_result,
         status=_status_for(gateway_result),
+    )
+
+
+def prepare_admitted_tool_plan(
+    *,
+    admission: SignedAutomationAdmission,
+    trusted_admission_keys: dict[str, Ed25519PublicKeyRecord],
+    trusted_clock: Callable[[], datetime],
+    candidate_id: str,
+    command: GatewayDispatchCommand,
+    executor: SemanticHttpExecutor,
+) -> PreparedAutomationDispatch:
+    """Verify the exact admission and command binding before a presentation."""
+
+    _validate_inputs(admission, command, executor, trusted_clock)
+    admitted = verify_automation_admission(
+        admission,
+        trusted_admission_keys,
+        verification_time=trusted_clock(),
+    )
+    result = admitted.result
+    item = _selected_item(result, candidate_id)
+    _validate_binding(result, item, command)
+    command_digest = _command_digest(command)
+    result_digest = _result_digest(result)
+    return PreparedAutomationDispatch(
+        dispatch_id=_dispatch_id(command_digest, result_digest),
+        run_id=result.run_id,
+        candidate_id=item.candidate.candidate_id,
+        action_id=command.intent.action_id,
+        lease_id=command.lease.lease_id,
+        requested_at=item.candidate.intent.requested_at,
+        command_digest=command_digest,
+        result_digest=result_digest,
+        admission=admission,
+    )
+
+
+def unknown_automation_dispatch_record(
+    prepared: PreparedAutomationDispatch,
+) -> AutomationDispatchRecord:
+    """Seal a pre-presentation reservation as requiring reconciliation."""
+
+    if type(prepared) is not PreparedAutomationDispatch:
+        raise TypeError("unknown dispatch requires an exact prepared dispatch")
+    return AutomationDispatchRecord(
+        dispatch_id=prepared.dispatch_id,
+        run_id=prepared.run_id,
+        candidate_id=prepared.candidate_id,
+        action_id=prepared.action_id,
+        lease_id=prepared.lease_id,
+        requested_at=prepared.requested_at,
+        command_digest=prepared.command_digest,
+        result_digest=prepared.result_digest,
+        admission=prepared.admission,
+        gateway_result=None,
+        status="unknown_requires_reconciliation",
+        target_dispatch_performed=None,
+        automatic_submission_performed=False,
+        independent_verification_performed=False,
     )
 
 
@@ -275,6 +364,16 @@ def load_automation_dispatch(
     if type(store) is not StateStore or type(event) is not EventRecord:
         raise TypeError("dispatch load requires an exact store and event")
     return _load_envelope(store, event, _spec("placeholder.run", "placeholder.dispatch"))
+
+
+def load_automation_dispatch_persistence(
+    store: StateStore,
+    event: EventRecord,
+) -> AutomationDispatchPersistence:
+    """Load one encrypted dispatch aggregate with its raw references."""
+
+    envelope = load_automation_dispatch(store, event)
+    return _persistence(event, envelope)
 
 
 def load_authenticated_automation_dispatch(
@@ -543,8 +642,12 @@ __all__ = [
     "AutomationDispatchError",
     "AutomationDispatchPersistence",
     "AutomationDispatchRecord",
+    "PreparedAutomationDispatch",
     "execute_admitted_tool_plan",
     "load_automation_dispatch",
+    "load_automation_dispatch_persistence",
     "load_authenticated_automation_dispatch",
+    "prepare_admitted_tool_plan",
     "persist_automation_dispatch",
+    "unknown_automation_dispatch_record",
 ]

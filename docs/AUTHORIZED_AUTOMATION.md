@@ -166,6 +166,16 @@ and a new signed `ModelDisclosureApproval`. The dispatch record always states
 `automatic_submission_performed=false` and
 `independent_verification_performed=false`.
 
+`execute_and_persist_admitted_tool_plan()` is the narrow controller-owned
+composition for this boundary. While holding the engagement lock, it writes an
+encrypted, command/result-bound reservation **before** presenting anything to
+the Gateway. A matching completed dispatch is returned without another
+presentation. If a restart finds only the reservation, it conservatively seals
+the dispatch as `unknown_requires_reconciliation`; it never guesses whether the
+earlier process reached the Gateway and never retries. A stored final record is
+reused only when its signed admission and complete dispatch identity exactly
+match the newly verified request.
+
 The Gateway remains the only target-I/O authority for the automated
 controller-provisioned pipeline. Python packs, provider adapters, and this
 automation bridge do not open target sockets. The separate owner-directed

@@ -98,12 +98,17 @@ _EXECUTION_BRIDGE_EXPORTS = frozenset(
         "AutomationDispatchError",
         "AutomationDispatchPersistence",
         "AutomationDispatchRecord",
+        "PreparedAutomationDispatch",
         "execute_admitted_tool_plan",
         "load_automation_dispatch",
+        "load_automation_dispatch_persistence",
         "load_authenticated_automation_dispatch",
+        "prepare_admitted_tool_plan",
         "persist_automation_dispatch",
+        "unknown_automation_dispatch_record",
     }
 )
+_CONTROLLER_EXPORTS = frozenset({"execute_and_persist_admitted_tool_plan"})
 
 
 def __getattr__(name: str) -> object:
@@ -117,6 +122,10 @@ def __getattr__(name: str) -> object:
         from . import execution_bridge
 
         value = getattr(execution_bridge, name)
+    elif name in _CONTROLLER_EXPORTS:
+        from . import controller
+
+        value = getattr(controller, name)
     elif name in _PROVIDER_BRIDGE_EXPORTS:
         from . import provider_bridge
 
@@ -153,6 +162,7 @@ __all__ = [
     "AutomationDispatchError",
     "AutomationDispatchPersistence",
     "AutomationDispatchRecord",
+    "PreparedAutomationDispatch",
     "AutomationTurnEnvelope",
     "CandidateOutboxError",
     "CandidateOutboxPublication",
@@ -198,17 +208,21 @@ __all__ = [
     "build_reasoning_chat_payload",
     "extract_provider_tool_arguments",
     "execute_admitted_tool_plan",
+    "execute_and_persist_admitted_tool_plan",
     "load_automation_dispatch",
+    "load_automation_dispatch_persistence",
     "load_authenticated_automation_dispatch",
     "load_automation_turn",
     "persist_automation_turn",
     "persist_automation_dispatch",
+    "prepare_admitted_tool_plan",
     "run_provider_automation_turn",
     "sign_model_disclosure_approval",
     "sign_automation_admission",
     "verify_automation_admission",
     "verify_model_disclosure_approval",
     "validate_automation_request",
+    "unknown_automation_dispatch_record",
     "write_candidate_outbox",
     "write_automation_result_bundle",
 ]
