@@ -209,6 +209,30 @@ does not claim verification. Review the output and use `triad.bound.json` for
 the run. If there is no automation result bundle, the original reviewed v1
 `triad.json` remains valid.
 
+The preferred bound-candidate path combines prepare, run, and offline finalize
+behind two explicit review pauses:
+
+```powershell
+& $FaultLoom campaign supervise-http1-triad `
+  --workspace "$Job\run-01" `
+  --trusted-key "$Root\authority\authority-public-key.json" `
+  --template "$Job\run-01\triad.json" `
+  --result "$Job\run-01\automation\result.<digest>\result.json" `
+  --receipt "$Job\run-01\automation\result.<digest>\receipt.json" `
+  --candidate-id 'candidate.from-result' `
+  --out "$Job\run-01\triad.bound.json"
+```
+
+After reviewing the bound spec, type exactly `RUN <campaign-id>`. After the
+three private response files are written, inspect them and type exactly
+`FINALIZE <campaign-id>` only when they are non-sensitive. Prompts are on
+stderr; stdout is one JSON result suitable for capture. You may exit and rerun
+the same command at either review checkpoint. Never rerun an unresolved or
+possibly started dispatch: the command reports manual reconciliation instead,
+and reports a start-only crash as dispatch state `unknown`.
+
+The separate commands below are the equivalent manual phase controls.
+
 Run the reviewed v1 or bound v2 spec from the signed workspace:
 
 ```powershell

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import io
 import ipaddress
 import json
 import os
@@ -18,11 +20,12 @@ import stat
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import TypeVar
+from typing import TypeVar, cast
 
 from pydantic import ValidationError
 
@@ -3838,10 +3841,14 @@ def _campaign_unresolved(
     return EXIT_UNAVAILABLE
 
 
-def _campaign_prepare_http1_triad(arguments: argparse.Namespace) -> int:
-    """Bind an offline admitted candidate to an operator-authored v1 triad."""
+def _build_bound_http1_triad_spec(
+    arguments: argparse.Namespace,
+    *,
+    require_active: bool = True,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Validate prepare inputs and return the one permitted v2 spec and binding."""
     manifest, grant, target, _ = _verified_request_workspace(
-        arguments.workspace, _trusted_key_path(arguments)
+        arguments.workspace, _trusted_key_path(arguments), require_active=require_active
     )
     template_content = _capture_bounded_local_file(
         arguments.template, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="campaign template"
@@ -3896,7 +3903,7 @@ def _campaign_prepare_http1_triad(arguments: argparse.Namespace) -> int:
         grant=grant,
         target=target,
     )
-    binding = {
+    binding: dict[str, object] = {
         "schema": PERSONAL_HTTP1_TRIAD_AUTOMATION_BINDING_SCHEMA,
         "result_path": str(result_path),
         "result_file_sha256": sha256_hex(result_content),
@@ -3916,9 +3923,15 @@ def _campaign_prepare_http1_triad(arguments: argparse.Namespace) -> int:
         "grant_version": grant.grant_version,
         "grant_digest": sha256_digest(grant),
     }
-    output = template.model_dump(by_alias=True, exclude_none=True)
+    output = cast(dict[str, object], template.model_dump(by_alias=True, exclude_none=True))
     output["schema"] = PERSONAL_HTTP1_TRIAD_BOUND_SCHEMA
     output["automation_binding"] = binding
+    return output, binding
+
+
+def _campaign_prepare_http1_triad(arguments: argparse.Namespace) -> int:
+    """Bind an offline admitted candidate to an operator-authored v1 triad."""
+    output, binding = _build_bound_http1_triad_spec(arguments)
     _write_new_file(
         arguments.out,
         (json.dumps(output, indent=2, sort_keys=True) + "\n").encode("utf-8"),
@@ -3937,6 +3950,334 @@ def _campaign_prepare_http1_triad(arguments: argparse.Namespace) -> int:
         }
     )
     return EXIT_OK
+
+
+def _supervised_bound_http1_triad_spec(arguments: argparse.Namespace) -> PersonalHttp1TriadSpec:
+    """Create once or verify that ``--out`` is the exact requested v2 binding."""
+    try:
+        output_metadata = arguments.out.lstat()
+    except FileNotFoundError:
+        output, _ = _build_bound_http1_triad_spec(arguments)
+        _write_new_file(
+            arguments.out,
+            (json.dumps(output, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+            mode=0o600,
+        )
+        try:
+            return parse_personal_http1_triad_spec(json.dumps(output).encode("utf-8"))
+        except PersonalCampaignError as exc:  # Defensive: output originated from the typed template.
+            raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+    except OSError as exc:
+        raise CliError("cannot inspect bound triad output", exit_code=EXIT_AUTHORITY) from exc
+    if stat.S_ISLNK(output_metadata.st_mode) or not stat.S_ISREG(output_metadata.st_mode):
+        raise CliError("bound triad output is not a regular non-symlink file", exit_code=EXIT_AUTHORITY)
+    output_content = _capture_bounded_local_file(
+        arguments.out, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="bound triad output"
+    )
+    try:
+        spec = parse_personal_http1_triad_spec(output_content)
+    except PersonalCampaignError as exc:
+        raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+    expected, _ = _build_bound_http1_triad_spec(arguments, require_active=False)
+    if (
+        spec.schema_ != PERSONAL_HTTP1_TRIAD_BOUND_SCHEMA
+        or spec.model_dump(by_alias=True, exclude_none=True) != expected
+    ):
+        raise CliError(
+            "existing bound triad output does not match the supplied sources and candidate",
+            exit_code=EXIT_AUTHORITY,
+        )
+    return spec
+
+
+def _campaign_supervision_acknowledged(campaign_id: str, verb: str) -> bool:
+    """Require one exact, campaign-bound acknowledgement without writing to stdout."""
+    acknowledgement = f"{verb} {campaign_id}"
+    print(
+        f"faultloom: type exactly {acknowledgement!r} then press Enter to continue.",
+        file=sys.stderr,
+        flush=True,
+    )
+    value = sys.stdin.readline()
+    return value.rstrip("\r\n") == acknowledgement and value not in {"", "\n", "\r\n"}
+
+
+def _emit_campaign_supervision(
+    campaign_id: str,
+    *,
+    status: str,
+    next_action: str | None = None,
+    receipt: Path | None = None,
+    final_status: str | None = None,
+    manual_reconciliation_required: bool = False,
+    target_dispatch_performed: bool | None = False,
+    dispatch_count: int | None = 0,
+    dispatch_state: str | None = None,
+    response_review: list[dict[str, str]] | None = None,
+) -> None:
+    output: dict[str, object] = {
+        "schema": "faultloom.personal-http1-triad-supervise.v1",
+        "campaignId": campaign_id,
+        "status": status,
+        "automaticSubmission": False,
+        "independentVerification": False,
+    }
+    if target_dispatch_performed is not None:
+        output["targetDispatchPerformed"] = target_dispatch_performed
+    if dispatch_count is not None:
+        output["dispatchCount"] = dispatch_count
+    if dispatch_state is not None:
+        output["dispatchState"] = dispatch_state
+    elif target_dispatch_performed is not None:
+        output["dispatchState"] = "performed" if target_dispatch_performed else "not_dispatched"
+    if next_action is not None:
+        output["nextAction"] = next_action
+    if receipt is not None:
+        output["receipt"] = str(receipt)
+    if final_status is not None:
+        output["finalStatus"] = final_status
+    if manual_reconciliation_required:
+        output["manualReconciliationRequired"] = True
+    if response_review is not None:
+        output["responseReview"] = response_review
+    _emit_json(output)
+
+
+def _campaign_record_exists(path: Path) -> bool:
+    try:
+        _ = path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise CliError("cannot inspect campaign record", exit_code=EXIT_AUTHORITY) from exc
+    return True
+
+
+def _invoke_campaign_handler(
+    handler: Callable[[argparse.Namespace], int], arguments: argparse.Namespace
+) -> tuple[int, dict[str, object]]:
+    """Reuse a phase handler while preserving the supervisor's one-JSON stdout contract."""
+    captured = io.StringIO()
+    with contextlib.redirect_stdout(captured):
+        exit_code = handler(arguments)
+    try:
+        raw_output = json.loads(
+            captured.getvalue(), object_pairs_hook=_reject_duplicate_keys
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise CliError("campaign phase did not produce one JSON result", exit_code=EXIT_AUTHORITY) from exc
+    if not isinstance(raw_output, dict):
+        raise CliError("campaign phase produced an invalid JSON result", exit_code=EXIT_AUTHORITY)
+    output = cast(dict[str, object], raw_output)
+    return exit_code, output
+
+
+def _campaign_response_review(
+    arguments: argparse.Namespace, run_result: Path
+) -> list[dict[str, str]]:
+    """Return review metadata only after the full read-only campaign validation chain."""
+    inputs = _validated_campaign_finalization_inputs(arguments)
+    try:
+        if run_result.resolve(strict=True) != inputs.result_path.resolve(strict=True):
+            raise CliError("campaign run result path differs from its workspace record", exit_code=EXIT_AUTHORITY)
+    except OSError as exc:
+        raise CliError("campaign run result is unavailable", exit_code=EXIT_AUTHORITY) from exc
+    requests = inputs.result.get("requests")
+    if not isinstance(requests, list) or len(requests) != 3:
+        raise CliError("campaign run result is invalid", exit_code=EXIT_AUTHORITY)
+    review: list[dict[str, str]] = []
+    for (expected_role, _, response_file, body_sha256), item in zip(
+        inputs.sources, requests, strict=True
+    ):
+        response = item.get("response") if isinstance(item, dict) else None
+        if (
+            not isinstance(item, dict)
+            or item.get("role") != expected_role
+            or not isinstance(response, dict)
+            or not isinstance(response.get("sha256"), str)
+        ):
+            raise CliError("campaign run result is incomplete", exit_code=EXIT_AUTHORITY)
+        review.append(
+            {
+                "role": expected_role,
+                "responseFile": str(response_file),
+                "responseSha256": response["sha256"],
+                "bodySha256": body_sha256,
+            }
+        )
+    return review
+
+
+def _campaign_supervise_finalize_http1_triad(
+    arguments: argparse.Namespace, campaign_id: str, run_result: Path
+) -> int:
+    response_review = _campaign_response_review(
+        argparse.Namespace(
+            workspace=arguments.workspace,
+            trusted_key=arguments.trusted_key,
+            campaign_id=campaign_id,
+        ),
+        run_result,
+    )
+    if not _campaign_supervision_acknowledged(campaign_id, "FINALIZE"):
+        _emit_campaign_supervision(
+            campaign_id,
+            status="review_required",
+            next_action=f"review private responses, then acknowledge exactly FINALIZE {campaign_id}",
+            target_dispatch_performed=True,
+            dispatch_count=3,
+            response_review=response_review,
+        )
+        return EXIT_OK
+    exit_code, result = _invoke_campaign_handler(
+        _campaign_finalize_http1_triad,
+        argparse.Namespace(
+            workspace=arguments.workspace,
+            trusted_key=arguments.trusted_key,
+            campaign_id=campaign_id,
+            confirm_reviewed_non_sensitive=True,
+        ),
+    )
+    receipt_value = result.get("receipt")
+    status = result.get("status")
+    if exit_code != EXIT_OK or not isinstance(receipt_value, str) or not isinstance(status, str):
+        raise CliError("campaign finalization did not complete", exit_code=EXIT_AUTHORITY)
+    _emit_campaign_supervision(
+        campaign_id,
+        status="completed",
+        receipt=Path(receipt_value),
+        final_status=status,
+        target_dispatch_performed=True,
+        dispatch_count=3,
+    )
+    return EXIT_OK
+
+
+def _campaign_supervise_http1_triad(arguments: argparse.Namespace) -> int:
+    """Guide one candidate-bound triad through explicit run and finalize checkpoints."""
+    spec = _supervised_bound_http1_triad_spec(arguments)
+    campaign_id = spec.campaign_id
+    try:
+        (arguments.workspace / "campaigns").lstat()
+    except FileNotFoundError:
+        records: _CampaignRecordsDirectory | None = None
+    except OSError as exc:
+        raise CliError("cannot inspect campaign records", exit_code=EXIT_AUTHORITY) from exc
+    else:
+        records = _campaign_records_directory(arguments.workspace)
+    if records is not None:
+        final_receipt = _campaign_record(records, campaign_id, "final-receipt")
+        unresolved = _campaign_record(records, campaign_id, "unresolved")
+        finalize_start = _campaign_record(records, campaign_id, "finalize-start")
+        run_result = _campaign_record(records, campaign_id, "run-result")
+        start_record = _campaign_record(records, campaign_id, "start")
+        has_final = _campaign_record_exists(final_receipt)
+        has_unresolved = _campaign_record_exists(unresolved)
+        has_finalize_start = _campaign_record_exists(finalize_start)
+        has_run_result = _campaign_record_exists(run_result)
+        has_start = _campaign_record_exists(start_record)
+        if has_final and has_unresolved:
+            raise CliError("campaign lifecycle has conflicting terminal records", exit_code=EXIT_AUTHORITY)
+        if has_unresolved and (has_run_result or has_finalize_start):
+            raise CliError("campaign lifecycle conflicts with an unresolved record", exit_code=EXIT_AUTHORITY)
+        if has_run_result and not has_start:
+            raise CliError("campaign run result lacks its start record", exit_code=EXIT_AUTHORITY)
+        if has_finalize_start and (not has_start or not has_run_result):
+            raise CliError("campaign finalization lacks its run topology", exit_code=EXIT_AUTHORITY)
+        if has_final:
+            status, dispatch_count = _validate_completed_campaign_finalization(
+                argparse.Namespace(
+                    workspace=arguments.workspace,
+                    trusted_key=arguments.trusted_key,
+                    campaign_id=campaign_id,
+                ),
+                final_receipt,
+            )
+            _emit_campaign_supervision(
+                campaign_id,
+                status="completed",
+                receipt=final_receipt,
+                final_status=status,
+                target_dispatch_performed=True,
+                dispatch_count=dispatch_count,
+            )
+            return EXIT_OK
+        if has_unresolved:
+            unresolved_record = _capture_campaign_json(unresolved, label="campaign unresolved record")
+            dispatch_count = unresolved_record.get("dispatch_count")
+            if (
+                unresolved_record.get("campaign_id") != campaign_id
+                or not isinstance(dispatch_count, int)
+                or not 0 <= dispatch_count <= 3
+            ):
+                raise CliError("campaign unresolved record is invalid", exit_code=EXIT_AUTHORITY)
+            _emit_campaign_supervision(
+                campaign_id,
+                status="manual_reconciliation_required",
+                next_action="manually reconcile the existing unresolved campaign; do not retry it",
+                manual_reconciliation_required=True,
+                target_dispatch_performed=dispatch_count > 0,
+                dispatch_count=dispatch_count,
+            )
+            return EXIT_UNAVAILABLE
+        if has_finalize_start:
+            _emit_campaign_supervision(
+                campaign_id,
+                status="manual_reconciliation_required",
+                next_action="manually reconcile the started finalization; do not rerun it",
+                manual_reconciliation_required=True,
+                target_dispatch_performed=True,
+                dispatch_count=3,
+            )
+            return EXIT_UNAVAILABLE
+        if has_run_result:
+            return _campaign_supervise_finalize_http1_triad(arguments, campaign_id, run_result)
+        if has_start:
+            _emit_campaign_supervision(
+                campaign_id,
+                status="manual_reconciliation_required",
+                next_action="manually reconcile the started campaign; do not rerun it",
+                manual_reconciliation_required=True,
+                target_dispatch_performed=None,
+                dispatch_count=None,
+                dispatch_state="unknown",
+            )
+            return EXIT_UNAVAILABLE
+    if not _campaign_supervision_acknowledged(campaign_id, "RUN"):
+        _emit_campaign_supervision(
+            campaign_id,
+            status="review_required",
+            next_action=f"review the bound triad, then acknowledge exactly RUN {campaign_id}",
+        )
+        return EXIT_OK
+    if records is None:
+        _ = _campaign_records_directory(arguments.workspace)
+    exit_code, result = _invoke_campaign_handler(
+        _campaign_run_http1_triad,
+        argparse.Namespace(
+            workspace=arguments.workspace,
+            trusted_key=arguments.trusted_key,
+            spec=arguments.out,
+        ),
+    )
+    if exit_code != EXIT_OK:
+        raw_dispatch_count = result.get("dispatchCount")
+        dispatch_count = raw_dispatch_count if type(raw_dispatch_count) is int else 0
+        _emit_campaign_supervision(
+            campaign_id,
+            status="manual_reconciliation_required",
+            next_action="manually reconcile the existing unresolved campaign; do not retry it",
+            manual_reconciliation_required=True,
+            target_dispatch_performed=dispatch_count > 0,
+            dispatch_count=dispatch_count,
+        )
+        return exit_code
+    if result.get("status") != "review_required":
+        raise CliError("campaign run did not reach response review", exit_code=EXIT_AUTHORITY)
+    run_result_value = result.get("runResult")
+    if not isinstance(run_result_value, str):
+        raise CliError("campaign run result path is unavailable", exit_code=EXIT_AUTHORITY)
+    return _campaign_supervise_finalize_http1_triad(arguments, campaign_id, Path(run_result_value))
 
 
 def _campaign_run_http1_triad(arguments: argparse.Namespace) -> int:
@@ -4192,12 +4533,21 @@ def _campaign_exchange_sources(
     return sources
 
 
-def _campaign_finalize_http1_triad(arguments: argparse.Namespace) -> int:
-    if not arguments.confirm_reviewed_non_sensitive:
-        raise CliError(
-            "--confirm-reviewed-non-sensitive is required before offline archival",
-            exit_code=EXIT_AUTHORITY,
-        )
+@dataclass(frozen=True)
+class _CampaignFinalizationInputs:
+    manifest: dict[str, object]
+    records: _CampaignRecordsDirectory
+    start_path: Path
+    result_path: Path
+    start: dict[str, object]
+    result: dict[str, object]
+    sources: list[tuple[str, Path, Path, str]]
+
+
+def _validated_campaign_finalization_inputs(
+    arguments: argparse.Namespace,
+) -> _CampaignFinalizationInputs:
+    """Revalidate every pre-archival campaign input without creating a record."""
     manifest, grant, target, _ = _verified_request_workspace(
         arguments.workspace, _trusted_key_path(arguments), require_active=False
     )
@@ -4263,6 +4613,202 @@ def _campaign_finalize_http1_triad(arguments: argparse.Namespace) -> int:
     sources = _campaign_exchange_sources(
         workspace=arguments.workspace, start=start, result=result, bindings=bindings
     )
+    return _CampaignFinalizationInputs(
+        manifest=manifest,
+        records=records,
+        start_path=start_path,
+        result_path=result_path,
+        start=start,
+        result=result,
+        sources=sources,
+    )
+
+
+def _campaign_finalization_digests(
+    inputs: _CampaignFinalizationInputs,
+) -> tuple[dict[str, str], dict[str, str], str]:
+    dispatched = inputs.result.get("requests")
+    if not isinstance(dispatched, list) or len(dispatched) != 3:
+        raise CliError("campaign run result is invalid", exit_code=EXIT_AUTHORITY)
+    body_digests: dict[str, str] = {}
+    response_digests: dict[str, str] = {}
+    for (role, _, _, body_digest), dispatch in zip(inputs.sources, dispatched, strict=True):
+        response = dispatch.get("response") if isinstance(dispatch, dict) else None
+        if not isinstance(response, dict) or not isinstance(response.get("sha256"), str):
+            raise CliError("campaign run result is invalid", exit_code=EXIT_AUTHORITY)
+        body_digests[role] = body_digest
+        response_digests[role] = response["sha256"]
+    try:
+        outcome = classify_exact_body_digest_triad(
+            effect_body_sha256=body_digests["effect"],
+            reproduction_body_sha256=body_digests["reproduction"],
+            negative_control_body_sha256=body_digests["negative_control"],
+        )
+    except PersonalCampaignError as exc:
+        raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+    return body_digests, response_digests, outcome.status
+
+
+def _validated_campaign_evidence(
+    *, inputs: _CampaignFinalizationInputs, evidence_ids: list[object]
+) -> None:
+    if len(evidence_ids) != 3 or not all(isinstance(value, str) for value in evidence_ids):
+        raise CliError("campaign final receipt has invalid evidence ids", exit_code=EXIT_AUTHORITY)
+    evidence = _workspace_evidence(
+        inputs.records.workspace,
+        run_id=str(inputs.manifest["run_id"]),
+        selected_ids=tuple(cast(str, value) for value in evidence_ids),
+    )
+    dispatched = inputs.result.get("requests")
+    if not isinstance(dispatched, list):
+        raise CliError("campaign run result is invalid", exit_code=EXIT_AUTHORITY)
+    raw_directory = inputs.records.workspace / "evidence" / "raw"
+    for (role, request_file, response_file, _), dispatch, record in zip(
+        inputs.sources, dispatched, evidence, strict=True
+    ):
+        request = dispatch.get("request") if isinstance(dispatch, dict) else None
+        response = dispatch.get("response") if isinstance(dispatch, dict) else None
+        reservation = dispatch.get("reservation") if isinstance(dispatch, dict) else None
+        archived_request = record.get("request")
+        archived_response = record.get("response")
+        if (
+            not isinstance(request, dict)
+            or not isinstance(response, dict)
+            or not isinstance(reservation, str)
+            or record.get("schema") != "faultloom.manual-evidence.v1"
+            or record.get("kind") != "http"
+            or record.get("run_id") != inputs.manifest["run_id"]
+            or record.get("reservation_id") != reservation
+            or not isinstance(archived_request, dict)
+            or not isinstance(archived_response, dict)
+            or archived_request.get("sha256") != request.get("sha256")
+            or archived_response.get("sha256") != response.get("sha256")
+        ):
+            raise CliError("archived campaign evidence is invalid", exit_code=EXIT_AUTHORITY)
+        for archived, source, label in (
+            (archived_request, request_file, "request"),
+            (archived_response, response_file, "response"),
+        ):
+            stored_file = archived.get("stored_file")
+            digest = archived.get("sha256")
+            if not isinstance(stored_file, str) or Path(stored_file).name != stored_file or not isinstance(digest, str):
+                raise CliError("archived campaign evidence is invalid", exit_code=EXIT_AUTHORITY)
+            source_content = _capture_bounded_local_file(
+                source,
+                maximum_bytes=PERSONAL_HTTP1_MAX_RESPONSE_BYTES,
+                label=f"campaign {label}",
+            )
+            archived_content = _capture_bounded_local_file(
+                raw_directory / stored_file,
+                maximum_bytes=PERSONAL_HTTP1_MAX_RESPONSE_BYTES,
+                label=f"archived campaign {label}",
+            )
+            if archived_content != source_content or sha256_hex(archived_content) != digest:
+                raise CliError("archived campaign evidence digest differs", exit_code=EXIT_AUTHORITY)
+
+
+def _validated_campaign_finding(
+    *, inputs: _CampaignFinalizationInputs, receipt: dict[str, object], outcome_status: str, evidence_ids: list[object]
+) -> None:
+    finding = receipt.get("finding")
+    if outcome_status == "negative_campaign":
+        if finding is not None:
+            raise CliError("negative campaign has an unexpected finding", exit_code=EXIT_AUTHORITY)
+        return
+    if not isinstance(finding, dict):
+        raise CliError("draft campaign finding is invalid", exit_code=EXIT_AUTHORITY)
+    finding_id = finding.get("finding_id")
+    finding_path = finding.get("finding")
+    record_path = finding.get("record")
+    if (
+        finding.get("status") != "draft_unverified"
+        or not isinstance(finding_id, str)
+        or not isinstance(finding_path, str)
+        or not isinstance(record_path, str)
+    ):
+        raise CliError("draft campaign finding is invalid", exit_code=EXIT_AUTHORITY)
+    findings = inputs.records.workspace / "findings"
+    expected_markdown = findings / f"{finding_id}.md"
+    expected_record = findings / f"{finding_id}.json"
+    try:
+        if Path(finding_path).resolve(strict=True) != expected_markdown.resolve(strict=True) or Path(record_path).resolve(strict=True) != expected_record.resolve(strict=True):
+            raise CliError("draft campaign finding path is invalid", exit_code=EXIT_AUTHORITY)
+    except OSError as exc:
+        raise CliError("draft campaign finding is unavailable", exit_code=EXIT_AUTHORITY) from exc
+    record = _capture_campaign_json(expected_record, label="draft campaign finding")
+    _ = _capture_bounded_local_file(expected_markdown, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="draft campaign finding")
+    if (
+        record.get("schema") != "faultloom.manual-finding.v1"
+        or record.get("finding_id") != finding_id
+        or record.get("run_id") != inputs.manifest["run_id"]
+        or record.get("status") != "draft_unverified"
+        or record.get("evidence_ids") != evidence_ids
+    ):
+        raise CliError("draft campaign finding does not match its receipt", exit_code=EXIT_AUTHORITY)
+
+
+def _validate_completed_campaign_finalization(
+    arguments: argparse.Namespace, final_receipt: Path
+) -> tuple[str, int]:
+    """Read-only terminal validation shared by finalization resume and supervision."""
+    inputs = _validated_campaign_finalization_inputs(arguments)
+    receipt = _capture_campaign_json(final_receipt, label="campaign final receipt")
+    finalize_start = _campaign_record(inputs.records, arguments.campaign_id, "finalize-start")
+    finalize = _capture_campaign_json(finalize_start, label="campaign finalization start")
+    start_digest = sha256_hex(_capture_bounded_local_file(inputs.start_path, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="campaign start record"))
+    result_digest = sha256_hex(_capture_bounded_local_file(inputs.result_path, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="campaign run result"))
+    if (
+        finalize.get("schema") != "faultloom.personal-http1-triad-finalize-start.v1"
+        or finalize.get("campaign_id") != arguments.campaign_id
+        or finalize.get("start_sha256") != start_digest
+        or finalize.get("run_result_sha256") != result_digest
+        or finalize.get("reviewed_non_sensitive") is not True
+        or finalize.get("classifier") != EXACT_BODY_DIGEST_CLASSIFIER
+    ):
+        raise CliError("campaign finalization start is invalid", exit_code=EXIT_AUTHORITY)
+    body_digests, response_digests, outcome_status = _campaign_finalization_digests(inputs)
+    evidence_ids = receipt.get("evidence_ids")
+    if not isinstance(evidence_ids, list) or (
+        receipt.get("schema") != "faultloom.personal-http1-triad-final-receipt.v1"
+        or receipt.get("campaign_id") != arguments.campaign_id
+        or receipt.get("status") != outcome_status
+        or receipt.get("classifier") != EXACT_BODY_DIGEST_CLASSIFIER
+        or receipt.get("dispatch_count") != 3
+        or receipt.get("response_sha256") != response_digests
+        or receipt.get("body_sha256") != body_digests
+        or receipt.get("automatic_submission") is not False
+        or receipt.get("independent_verification") is not False
+        or receipt.get("manual_review") != "confirmed_non_sensitive_response_review"
+    ):
+        raise CliError("campaign final receipt is invalid", exit_code=EXIT_AUTHORITY)
+    start_binding = inputs.start.get("automation_binding")
+    start_binding_digest = inputs.start.get("automation_binding_digest")
+    if start_binding is None and start_binding_digest is None:
+        if "automation_binding" in receipt or "automation_binding_digest" in receipt:
+            raise CliError("campaign final receipt has unexpected automation provenance", exit_code=EXIT_AUTHORITY)
+    elif receipt.get("automation_binding") != start_binding or receipt.get("automation_binding_digest") != start_binding_digest:
+        raise CliError("campaign final receipt automation provenance differs", exit_code=EXIT_AUTHORITY)
+    _validated_campaign_evidence(inputs=inputs, evidence_ids=evidence_ids)
+    _validated_campaign_finding(
+        inputs=inputs, receipt=receipt, outcome_status=outcome_status, evidence_ids=evidence_ids
+    )
+    return outcome_status, 3
+
+
+def _campaign_finalize_http1_triad(arguments: argparse.Namespace) -> int:
+    if not arguments.confirm_reviewed_non_sensitive:
+        raise CliError(
+            "--confirm-reviewed-non-sensitive is required before offline archival",
+            exit_code=EXIT_AUTHORITY,
+        )
+    inputs = _validated_campaign_finalization_inputs(arguments)
+    manifest = inputs.manifest
+    records = inputs.records
+    start_path = inputs.start_path
+    result_path = inputs.result_path
+    start = inputs.start
+    result = inputs.result
+    sources = inputs.sources
     finalize_start = _campaign_record(records, arguments.campaign_id, "finalize-start")
     _write_new_campaign_record(
         records,
@@ -4870,6 +5416,18 @@ def build_parser() -> argparse.ArgumentParser:
     campaign_prepare_http1_triad.add_argument("--candidate-id", required=True)
     campaign_prepare_http1_triad.add_argument("--out", type=Path, required=True)
     campaign_prepare_http1_triad.set_defaults(handler=_campaign_prepare_http1_triad)
+    campaign_supervise_http1_triad = campaign_commands.add_parser(
+        "supervise-http1-triad",
+        help="prepare or resume one candidate-bound triad through explicit operator checkpoints",
+    )
+    campaign_supervise_http1_triad.add_argument("--workspace", type=Path, required=True)
+    campaign_supervise_http1_triad.add_argument("--trusted-key", type=Path, required=True)
+    campaign_supervise_http1_triad.add_argument("--template", type=Path, required=True)
+    campaign_supervise_http1_triad.add_argument("--result", type=Path, required=True)
+    campaign_supervise_http1_triad.add_argument("--receipt", type=Path, required=True)
+    campaign_supervise_http1_triad.add_argument("--candidate-id", required=True)
+    campaign_supervise_http1_triad.add_argument("--out", type=Path, required=True)
+    campaign_supervise_http1_triad.set_defaults(handler=_campaign_supervise_http1_triad)
     campaign_finalize_http1_triad = campaign_commands.add_parser(
         "finalize-http1-triad",
         help="offline archive a reviewed exact-digest triad result",

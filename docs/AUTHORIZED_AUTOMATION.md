@@ -305,6 +305,35 @@ The resulting v2 spec carries create-once provenance; running or finalizing it
 re-reads all bound sources, and any change fails closed. A manually authored
 v1 spec remains supported.
 
+For the normal owner-supervised path, the same candidate and template inputs
+can be passed to one interactive coordinator instead of invoking all three
+phase commands manually:
+
+```bash
+faultloom campaign supervise-http1-triad \
+  --workspace <signed-manual-workspace> \
+  --trusted-key <public-key-outside-workspace> \
+  --template <triad-v1.json> \
+  --result <automation-result.json> \
+  --receipt <automation-result-receipt.json> \
+  --candidate-id <selected-candidate-id> \
+  --out <triad-v2.json>
+```
+
+The coordinator prints prompts to stderr and exactly one JSON document to
+stdout. It pauses for the exact campaign-bound acknowledgement
+`RUN <campaign-id>`, executes the existing no-retry three-request runner, then
+shows response file paths and digests without response bodies. Only the exact
+`FINALIZE <campaign-id>` acknowledgement continues to the existing offline
+finalizer. Exiting at either prompt is safe to resume from the durable
+checkpoint. An unresolved run, a finalization that may have started, or a
+start record whose dispatch is unknown is never retried automatically and
+requires manual reconciliation. The coordinator adds no provider, Burp,
+independent-verification, or submission capability.
+
+The individual phase commands below remain available for inspection and
+manual operation.
+
 ```bash
 faultloom campaign run-http1-triad \
   --workspace <signed-manual-workspace> \

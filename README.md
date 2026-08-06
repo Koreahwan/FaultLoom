@@ -42,6 +42,15 @@ a review-required v2 spec without provider or target access. The run and
 finalization commands revalidate those sources; changed provenance or request
 bytes fail before a socket is opened.
 
+For the same bound workflow with less command juggling,
+`campaign supervise-http1-triad` prepares or resumes the campaign in one
+interactive invocation. It requires the exact acknowledgements
+`RUN <campaign-id>` before target traffic and `FINALIZE <campaign-id>` after
+the operator privately reviews the three responses. Prompts use stderr and
+stdout remains one JSON result. It never retries an unresolved or possibly
+started campaign; a start-only crash is reported with dispatch state
+`unknown` for manual reconciliation.
+
 For a small supervised comparison, `campaign run-http1-triad` consumes a
 strict local v1 or bound v2 JSON spec and sends exactly three sequential signed-scope
 requests: one effect request, the same effect request again as reproduction,
