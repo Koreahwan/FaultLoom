@@ -278,6 +278,33 @@ the exact engagement `authorization_reference` and its
 `authorization_document_sha256`; these fields document the external approval
 but do not replace the signed FaultLoom scope.
 
+When `automation compile` has already produced a private result bundle, bind
+one exact admitted candidate to that operator-authored template before the
+run:
+
+```bash
+faultloom campaign prepare-http1-triad \
+  --workspace <signed-manual-workspace> \
+  --trusted-key <public-key-outside-workspace> \
+  --template <triad-v1.json> \
+  --result <automation-result.json> \
+  --receipt <automation-result-receipt.json> \
+  --candidate-id <selected-candidate-id> \
+  --out <triad-v2.json>
+```
+
+The output must remain beside the template and its two raw request files. The
+command re-verifies the current workspace and exact grant, result and receipt,
+selected plan receipt authority, candidate intent/digest, template, and both
+request digests. The candidate must be `observe` or `safe_probe` and must match
+the template's target, pack, scheme, method, effect path, and exact effect
+request payload digest. Model output cannot replace the operator's request
+bytes or negative control. Preparation performs no provider call, target I/O,
+Burp operation, verification, or submission and returns `review_required`.
+The resulting v2 spec carries create-once provenance; running or finalizing it
+re-reads all bound sources, and any change fails closed. A manually authored
+v1 spec remains supported.
+
 ```bash
 faultloom campaign run-http1-triad \
   --workspace <signed-manual-workspace> \

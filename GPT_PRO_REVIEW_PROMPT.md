@@ -28,7 +28,7 @@ FaultLoom은 한 명의 소유자가 실제 허가를 받은 유료 보안 업�
 - 개발 작업에 대한 포괄적인 사용자 승인은 실제 표적에 대한 권한이 아닙니다. 모든 engagement에는 별도 signed scope가 필요합니다.
 - 모델이 스스로 범위를 넓히거나 권한을 부여해서는 안 됩니다. 상태 변경·고위험 작업·민감 데이터 처리·외부 제출에는 적절한 operator checkpoint가 필요합니다.
 - exploit/PoC 후보 **생성**과 실행 권한은 분리되어야 합니다. 허가된 검증을 불필요하게 전면 차단하는지와, 반대로 범위 탈출·무제한 재시도·증거 위조·자격증명 유출을 막는지 모두 평가하세요.
-- 공개 Core에는 개인용 supervised HTTP/1.1 triad 경로가 있습니다. `campaign run-http1-triad`의 strict spec, start-before-I/O 기록, effect 재사용(reproduction), request-target만 다른 negative control, 정확히 3회 순차 전송, ambiguous 시 `unresolved_no_retry`를 확인하세요. `campaign finalize-http1-triad`는 명시적인 non-sensitive 응답 검토 확인 뒤에만 오프라인에서 3개 교환을 보관하고 `exact_body_digest_v1`만 적용합니다. effect/reproduction body digest가 같고 control이 다를 때도 결과는 `draft_unverified`일 뿐이며, 그 외에는 `negative_campaign`입니다. 이 경로가 독립 검증·취약점 증명·자동 제출로 과장되지 않았는지 점검하세요.
+- 공개 Core에는 개인용 supervised HTTP/1.1 triad 경로가 있습니다. `campaign prepare-http1-triad`가 오프라인 자동화 result/receipt의 한 admitted candidate를 operator-authored v1 template과 정확한 raw request digest에 묶고, 모델 출력이 path/header/body나 negative control을 바꿀 수 없으며 provider/target I/O 없이 review-required v2 spec만 만드는지 확인하세요. result/receipt/candidate/plan-authority/template/request digest가 정확히 검증되고 run/finalize 전에 다시 검증되는지도 보세요. `campaign run-http1-triad`의 strict spec, start-before-I/O 기록, effect 재사용(reproduction), request-target만 다른 negative control, 정확히 3회 순차 전송, ambiguous 시 `unresolved_no_retry`를 확인하세요. `campaign finalize-http1-triad`는 명시적인 non-sensitive 응답 검토 확인 뒤에만 오프라인에서 3개 교환을 보관하고 `exact_body_digest_v1`만 적용합니다. effect/reproduction body digest가 같고 control이 다를 때도 결과는 `draft_unverified`일 뿐이며, 그 외에는 `negative_campaign`입니다. 이 경로가 독립 검증·취약점 증명·자동 제출로 과장되지 않았는지 점검하세요.
 - Burp는 선택적인 수동 분석 경로입니다. 사용자가 직접 열어 둔 경우에만 선택된 정확한 경로를 검토하고, FaultLoom이 Burp를 자동 실행·종료·재시작한다고 가정하지 마세요.
 - GPT뿐 아니라 Kimi/Kimi K3 계열, GLM, Grok 및 향후의 미지 모델도 공식 API, 공식 CLI, 공식 OAuth/SDK 또는 합법적인 구독형 인터페이스로 연결할 수 있어야 합니다. 실제 모델 설치나 로그인이 완료됐다고 가정하지 말고, OpenAI-compatible 경로와 비호환 공식 인터페이스용 thin adapter 경계를 분리해 평가하세요.
 - 모델 중립성은 최저 공통분모에 기능을 맞춘다는 뜻이 아닙니다. 공통 권한·증거 계약은 유지하면서 native tool schema, 구조화 출력, context/token budget, reasoning 옵션, capability negotiation이 모델별 장점을 보존하는지 확인하세요.
@@ -37,6 +37,8 @@ FaultLoom은 한 명의 소유자가 실제 허가를 받은 유료 보안 업�
 ## 공개 저장소의 한계
 
 이 저장소는 공개 Core만 포함하는 정제본입니다. 비공개 Ops/Eval, 읽기 전용 legacy, targets, submissions, 원본 evidence 및 비공개 formal ledger는 공개 대상이 아닙니다.
+
+예제 식별자, 테스트의 synthetic secret marker, vendored upstream test key는 fixture이며 실제 자격증명이 아닙니다. 문서의 T40 파일 경로와 서비스 경로도 배치된 비공개 Ops 데이터가 아니라 공개 아키텍처 예시입니다.
 
 그러므로 공개 저장소만으로 비공개 Ops/Eval/ledger의 **존재나 부재를 증명할 수 없습니다**. 공개 트리에 없다는 이유만으로 원본 시스템에 없다고 추론하지 말고, 공개 Core가 실제로 보여 주는 범위와 공개만으로 미확인인 범위를 분리해 기록하세요. 반대로 문서의 PASS 주장도 코드·테스트·CI 산출물로 직접 확인하지 않은 이상 사실로 취급하지 마세요.
 

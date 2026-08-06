@@ -33,8 +33,17 @@ non-sensitive response expectation and provider/model-processing permission;
 the formal `doctor --json` `network_access` remains separate from the
 `personal_direct_send_*` capability fields.
 
+An offline automation result can be connected to this personal path with
+`campaign prepare-http1-triad`. The command does not let model output author
+request bytes. It binds one coordinator-admitted `observe`/`safe_probe`
+candidate to an operator-authored v1 triad template, the verified workspace
+and grant, the exact result/receipt, and both raw request digests. It produces
+a review-required v2 spec without provider or target access. The run and
+finalization commands revalidate those sources; changed provenance or request
+bytes fail before a socket is opened.
+
 For a small supervised comparison, `campaign run-http1-triad` consumes a
-strict local JSON spec and sends exactly three sequential signed-scope
+strict local v1 or bound v2 JSON spec and sends exactly three sequential signed-scope
 requests: one effect request, the same effect request again as reproduction,
 and one minimally changed negative control. It has no preview, retry,
 redirect, provider, Burp, evidence, or submission path. If any dispatch is

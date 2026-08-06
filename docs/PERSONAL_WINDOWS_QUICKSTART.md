@@ -187,13 +187,35 @@ FaultLoom scope:
 }
 ```
 
-Run it from the signed workspace:
+If this triad corresponds to a candidate in an existing private
+`automation compile` result bundle, bind that exact candidate first. The
+output must stay beside `triad.json`, `effect.raw`, and `control.raw`:
+
+```powershell
+& $FaultLoom campaign prepare-http1-triad `
+  --workspace "$Job\run-01" `
+  --trusted-key "$Root\authority\authority-public-key.json" `
+  --template "$Job\run-01\triad.json" `
+  --result "$Job\run-01\automation\result.<digest>\result.json" `
+  --receipt "$Job\run-01\automation\result.<digest>\receipt.json" `
+  --candidate-id 'candidate.from-result' `
+  --out "$Job\run-01\triad.bound.json"
+```
+
+This is offline preparation only. It rechecks the workspace/grant, exact
+result and receipt, admitted-plan authority, candidate intent, template, and
+both request digests. It does not call a model, provider, Burp, or target and
+does not claim verification. Review the output and use `triad.bound.json` for
+the run. If there is no automation result bundle, the original reviewed v1
+`triad.json` remains valid.
+
+Run the reviewed v1 or bound v2 spec from the signed workspace:
 
 ```powershell
 & $FaultLoom campaign run-http1-triad `
   --workspace "$Job\run-01" `
   --trusted-key "$Root\authority\authority-public-key.json" `
-  --spec "$Job\run-01\triad.json"
+  --spec "$Job\run-01\triad.bound.json"
 ```
 
 The command creates a start record before target I/O, then sends exactly three
@@ -205,6 +227,10 @@ retry or fabricate a completion. Inspect all private response files before
 continuing. If any contains credentials, tokens, PII, customer data, or other
 sensitive material, stop and delete/quarantine it according to the
 engagement's retention rule.
+
+For a bound v2 spec, all result/receipt/template/request sources are re-read
+before the start record and socket. A changed source fails closed; the exact
+captured request bytes are the bytes admitted and sent.
 
 Only after that review, finalize offline:
 
