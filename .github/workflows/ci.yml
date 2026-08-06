@@ -19,7 +19,7 @@ env:
 jobs:
   offline-build-verification:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - name: Check out the exact revision
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -54,7 +54,7 @@ jobs:
 
   public-history-secret-gate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - name: Check out the exact revision and complete history
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
