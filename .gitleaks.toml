@@ -1,0 +1,59 @@
+title = "FaultLoom public history secret gate"
+
+# Keep the complete upstream rule set.  The scoped exceptions below are only
+# for deterministic third-party fixtures and historical token-budget names.
+[extend]
+useDefault = true
+
+# Gitleaks 8.21.2 scopes historical fixtures through per-rule allowlists.
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
+description = "Historical provider token-budget field names"
+condition = "AND"
+commits = ["2fe575c07693b001649c3b03107b547702b95b6a"]
+paths = [
+  '''^packages/runtime/src/faultloom/provider\.py$''',
+]
+
+[[rules.allowlists]]
+description = "Historical provider adapter metadata fixtures"
+condition = "AND"
+commits = ["5dea3435b4f2d0158b99b85c8a6f9c848da6eab4"]
+paths = [
+  '''^packages/runtime/src/faultloom/_provider/intent\.py$''',
+  '''^packages/runtime/src/faultloom/_provider/metadata\.py$''',
+  '''^packages/runtime/src/faultloom/_provider/proxy\.py$''',
+  '''^packages/runtime/src/faultloom/_provider/receipt\.py$''',
+]
+
+[[rules.allowlists]]
+description = "Historical vendored Cargo checksum fixtures"
+condition = "AND"
+commits = ["b944591423b0e76a0a751bc108237f68dca2a944"]
+paths = [
+  '''^vendor/digest-0\.10\.7/\.cargo-checksum\.json$''',
+  '''^vendor/ed25519-2\.2\.3/\.cargo-checksum\.json$''',
+  '''^vendor/ed25519-dalek-2\.2\.0/\.cargo-checksum\.json$''',
+  '''^vendor/libc-0\.2\.186/\.cargo-checksum\.json$''',
+  '''^vendor/quote-1\.0\.46/\.cargo-checksum\.json$''',
+  '''^vendor/serde_json-1\.0\.150/\.cargo-checksum\.json$''',
+  '''^vendor/sha2-0\.10\.9/\.cargo-checksum\.json$''',
+  '''^vendor/signature-2\.2\.0/\.cargo-checksum\.json$''',
+  '''^vendor/syn-2\.0\.118/\.cargo-checksum\.json$''',
+]
+
+[[rules]]
+id = "private-key"
+
+[[rules.allowlists]]
+description = "Historical vendored Ed25519 PKCS8 fixtures"
+condition = "AND"
+commits = ["b944591423b0e76a0a751bc108237f68dca2a944"]
+paths = [
+  '''^vendor/ed25519-2\.2\.3/src/pkcs8\.rs$''',
+  '''^vendor/ed25519-2\.2\.3/tests/examples/pkcs8-v1\.pem$''',
+  '''^vendor/ed25519-2\.2\.3/tests/examples/pkcs8-v2\.pem$''',
+  '''^vendor/ed25519-dalek-2\.2\.0/src/lib\.rs$''',
+]
