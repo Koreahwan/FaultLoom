@@ -4389,6 +4389,403 @@ def _campaign_supervise_http1_triad(arguments: argparse.Namespace) -> int:
     return _campaign_supervise_finalize_http1_triad(arguments, campaign_id, Path(run_result_value))
 
 
+def _emit_verification_supervision(
+    campaign_id: str,
+    *,
+    status: str,
+    next_action: str | None = None,
+    dispatch_count: int | None = 0,
+    dispatch_state: str | None = None,
+    response_review: list[dict[str, str]] | None = None,
+    verification: dict[str, object] | None = None,
+    manual_reconciliation_required: bool = False,
+) -> None:
+    """Emit the sole public result for the independent-review coordinator."""
+    output: dict[str, object] = {
+        "schema": "faultloom.independent-http1-supervise.v1",
+        "campaignId": campaign_id,
+        "status": status,
+        "automaticSubmission": False,
+        "independentVerification": True,
+    }
+    if dispatch_count is not None:
+        output["targetDispatchPerformed"] = dispatch_count > 0
+        output["dispatchCount"] = dispatch_count
+    if dispatch_state is not None:
+        output["dispatchState"] = dispatch_state
+    elif dispatch_count is not None:
+        output["dispatchState"] = "performed" if dispatch_count else "not_dispatched"
+    if next_action is not None:
+        output["nextAction"] = next_action
+    if response_review is not None:
+        output["responseReview"] = response_review
+    if verification is not None:
+        output["verification"] = verification
+    if manual_reconciliation_required:
+        output["manualReconciliationRequired"] = True
+    _emit_json(output)
+
+
+def _invoke_cli_main_captured(argv: list[str], *, working_directory: Path) -> tuple[int, str]:
+    """Run an existing CLI command without allowing its stdout to escape a coordinator."""
+    previous_directory = Path.cwd()
+    try:
+        os.chdir(working_directory)
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            exit_code = main(argv)
+    except OSError as exc:
+        raise CliError("cannot enter verifier workspace", exit_code=EXIT_AUTHORITY) from exc
+    finally:
+        try:
+            os.chdir(previous_directory)
+        except OSError as exc:
+            raise CliError("cannot restore working directory", exit_code=EXIT_AUTHORITY) from exc
+    return exit_code, captured.getvalue()
+
+
+def _verification_supervisor_prepare(arguments: argparse.Namespace) -> None:
+    exit_code, result = _invoke_campaign_handler(
+        _campaign_prepare_verification_http1,
+        argparse.Namespace(
+            source_workspace=arguments.source_workspace,
+            source_trusted_key=arguments.source_trusted_key,
+            verifier_workspace=arguments.verifier_workspace,
+            verifier_trusted_key=arguments.verifier_trusted_key,
+            handoff=arguments.handoff,
+            campaign_id=arguments.campaign_id,
+            finding_class=arguments.finding_class,
+            claim=arguments.claim,
+            prerequisite=arguments.prerequisite,
+            out=arguments.out,
+        ),
+    )
+    if (
+        exit_code != EXIT_OK
+        or result.get("status") != "ready_for_existing_triad_runner"
+        or result.get("networkAccess") is not False
+    ):
+        raise CliError("independent verifier preparation did not complete", exit_code=EXIT_AUTHORITY)
+
+
+def _verification_supervisor_invocation(
+    arguments: argparse.Namespace,
+) -> tuple[str, list[str]]:
+    """Bind the local verify/report argv to the exact compile artifacts."""
+    context = _verification_handoff_document(arguments)
+    result_path, result_relative = _handoff_output_path(
+        context.verifier_workspace, arguments.result_out
+    )
+    receipt_path, _ = _handoff_output_path(
+        context.verifier_workspace, arguments.receipt_out
+    )
+    result_content = _capture_bounded_local_file(
+        result_path,
+        maximum_bytes=MAX_PROTOCOL_FILE_BYTES,
+        label="verification result",
+    )
+    content = _capture_bounded_local_file(
+        receipt_path,
+        maximum_bytes=MAX_PROTOCOL_FILE_BYTES,
+        label="verification compile receipt",
+    )
+    receipt = _parse_campaign_json_content(content, label="verification compile receipt")
+    candidate_id = f"candidate.independent.{arguments.campaign_id}"
+    verifier_run_id = str(context.verifier_manifest["run_id"])
+    common_args = [
+        "--result", result_relative,
+        "--trusted-key", "trusted-key.json",
+        "--run-id", verifier_run_id,
+        "--run-manifest-digest", sha256_digest(context.verifier_manifest),
+        "--authority-digest", sha256_digest(context.source_authority),
+        "--engagement-id", f"engagement.{context.source_grant.grant_id}",
+        "--source-actor", context.source_grant.issued_to,
+        "--verifier-actor", context.verifier_grant.issued_to,
+        "--verifier-authority-digest", sha256_digest(context.verifier_authority),
+        "--verifier-authority", "authority.json",
+        "--verifier-authority-key", "trusted-key.json",
+    ]
+    expected = {
+        "schema": "faultloom.independent-http1-compile.v1",
+        "status": "verified",
+        "candidateId": candidate_id,
+        "result": {"path": result_relative, "sha256": sha256_hex(result_content)},
+        "sourceHandoffSha256": sha256_hex(context.handoff_content),
+        "verifyArgs": [candidate_id, *common_args],
+        "reportArgs": [
+            candidate_id,
+            "--format", "md",
+            "--out-dir", "verification-report-outbox",
+            *common_args,
+        ],
+        "networkAccess": False,
+        "automaticReport": False,
+        "automaticSubmission": False,
+    }
+    if receipt != expected:
+        raise CliError(
+            "verification compile receipt differs from its exact local invocation",
+            exit_code=EXIT_AUTHORITY,
+        )
+    return candidate_id, common_args
+
+
+def _verification_supervisor_complete(arguments: argparse.Namespace) -> int:
+    """Compile, verify, and locally draft a report after verifier finalization only."""
+    result_path, _ = _handoff_output_path(arguments.verifier_workspace, arguments.result_out)
+    receipt_path, _ = _handoff_output_path(arguments.verifier_workspace, arguments.receipt_out)
+    result_exists = _campaign_record_exists(result_path)
+    receipt_exists = _campaign_record_exists(receipt_path)
+    if result_exists != receipt_exists:
+        raise CliError(
+            "verification compile artifacts require manual reconciliation",
+            exit_code=EXIT_AUTHORITY,
+        )
+    if not result_exists:
+        exit_code, compiled = _invoke_campaign_handler(
+            _campaign_compile_verification_http1,
+            argparse.Namespace(
+                source_workspace=arguments.source_workspace,
+                source_trusted_key=arguments.source_trusted_key,
+                verifier_workspace=arguments.verifier_workspace,
+                verifier_trusted_key=arguments.verifier_trusted_key,
+                handoff=arguments.handoff,
+                campaign_id=arguments.campaign_id,
+                case=arguments.case,
+                private_key=arguments.private_key,
+                result_out=arguments.result_out,
+                receipt_out=arguments.receipt_out,
+            ),
+        )
+        if exit_code != EXIT_OK or compiled.get("status") != "verified":
+            raise CliError(
+                "independent verifier compilation did not complete",
+                exit_code=EXIT_AUTHORITY,
+            )
+    candidate_id, common_args = _verification_supervisor_invocation(arguments)
+    verify_exit, verify_stdout = _invoke_cli_main_captured(
+        ["verify", candidate_id, *common_args], working_directory=arguments.verifier_workspace
+    )
+    try:
+        verified = json.loads(verify_stdout, object_pairs_hook=_reject_duplicate_keys)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise CliError("verification command did not produce one JSON result", exit_code=EXIT_AUTHORITY) from exc
+    if (
+        verify_exit != EXIT_OK
+        or not isinstance(verified, dict)
+        or verified.get("candidate_id") != candidate_id
+        or verified.get("outcome") != "verified"
+        or verified.get("network_access") != "none"
+        or not isinstance(verified.get("claim_id"), str)
+        or not isinstance(verified.get("verdict_id"), str)
+        or not isinstance(verified.get("result_artifact_digest"), str)
+    ):
+        raise CliError("verification command did not complete", exit_code=EXIT_AUTHORITY)
+    report_exit, report_stdout = _invoke_cli_main_captured(
+        ["report", candidate_id, "--format", "md", *common_args],
+        working_directory=arguments.verifier_workspace,
+    )
+    if report_exit != EXIT_OK or not report_stdout.endswith("\n"):
+        raise CliError("verification report did not complete", exit_code=EXIT_AUTHORITY)
+    report_content = report_stdout.removesuffix("\n").encode()
+    report_digest = f"sha256:{hashlib.sha256(report_content).hexdigest()}"
+    report_tag = sha256_hex(candidate_id.encode())[:16]
+    workspace = arguments.verifier_workspace.resolve(strict=True)
+    report_path, _ = _handoff_output_path(
+        workspace, workspace / f"verification-report-{report_tag}.md"
+    )
+    report_receipt, _ = _handoff_output_path(
+        workspace, workspace / f"verification-report-{report_tag}.receipt.json"
+    )
+    report_receipt_document = {
+        "automatic_submission_performed": False,
+        "candidate_id": candidate_id,
+        "claim_id": verified["claim_id"],
+        "finding_id": candidate_id,
+        "network_access": "none",
+        "report_digest": report_digest,
+        "report_format": "md",
+        "result_artifact_digest": verified["result_artifact_digest"],
+        "schema": "faultloom.report_outbox.receipt.v1",
+        "status": "draft_manual_review",
+        "verdict_id": verified["verdict_id"],
+    }
+    report_receipt_content = json.dumps(
+        report_receipt_document, sort_keys=True, separators=(",", ":")
+    ).encode()
+    _write_or_verify_handoff_output(workspace, report_path, report_content)
+    _write_or_verify_handoff_output(
+        workspace, report_receipt, report_receipt_content
+    )
+    if (
+        _capture_bounded_local_file(
+            report_path,
+            maximum_bytes=MAX_PROTOCOL_FILE_BYTES,
+            label="verification report",
+        )
+        != report_content
+        or _parse_campaign_json_content(
+            _capture_bounded_local_file(
+                report_receipt,
+                maximum_bytes=MAX_PROTOCOL_FILE_BYTES,
+                label="verification report receipt",
+            ),
+            label="verification report receipt",
+        )
+        != report_receipt_document
+    ):
+        raise CliError("verification report artifacts differ", exit_code=EXIT_AUTHORITY)
+    _emit_verification_supervision(
+        arguments.campaign_id,
+        status="completed",
+        dispatch_count=3,
+        verification={
+            "status": "verified",
+            "result": str(arguments.result_out),
+            "compileReceipt": str(arguments.receipt_out),
+            "reportStatus": "draft_manual_review",
+            "report": str(report_path),
+            "reportReceipt": str(report_receipt),
+            "automaticSubmission": False,
+        },
+    )
+    return EXIT_OK
+
+
+def _campaign_supervise_verification_http1(arguments: argparse.Namespace) -> int:
+    """Coordinate the existing independent verifier phases without a second sender."""
+    if not getattr(arguments, "_skip_prepare", False):
+        _verification_supervisor_prepare(arguments)
+    records = _campaign_records_directory(arguments.verifier_workspace)
+    campaign_id = arguments.campaign_id
+    final_receipt = _campaign_record(records, campaign_id, "final-receipt")
+    unresolved = _campaign_record(records, campaign_id, "unresolved")
+    finalize_start = _campaign_record(records, campaign_id, "finalize-start")
+    run_result = _campaign_record(records, campaign_id, "run-result")
+    start_record = _campaign_record(records, campaign_id, "start")
+    has_final = _campaign_record_exists(final_receipt)
+    has_unresolved = _campaign_record_exists(unresolved)
+    has_finalize_start = _campaign_record_exists(finalize_start)
+    has_run_result = _campaign_record_exists(run_result)
+    has_start = _campaign_record_exists(start_record)
+    if has_final and has_unresolved:
+        raise CliError("campaign lifecycle has conflicting terminal records", exit_code=EXIT_AUTHORITY)
+    if has_unresolved and (has_run_result or has_finalize_start):
+        raise CliError("campaign lifecycle conflicts with an unresolved record", exit_code=EXIT_AUTHORITY)
+    if has_run_result and not has_start:
+        raise CliError("campaign run result lacks its start record", exit_code=EXIT_AUTHORITY)
+    if has_finalize_start and (not has_start or not has_run_result):
+        raise CliError("campaign finalization lacks its run topology", exit_code=EXIT_AUTHORITY)
+    if has_final:
+        _ = _validate_completed_campaign_finalization(
+            argparse.Namespace(
+                workspace=arguments.verifier_workspace,
+                trusted_key=arguments.verifier_trusted_key,
+                campaign_id=campaign_id,
+            ),
+            final_receipt,
+        )
+        return _verification_supervisor_complete(arguments)
+    if has_unresolved:
+        unresolved_record = _capture_campaign_json(unresolved, label="campaign unresolved record")
+        dispatch_count = unresolved_record.get("dispatch_count")
+        if (
+            unresolved_record.get("campaign_id") != campaign_id
+            or not isinstance(dispatch_count, int)
+            or not 0 <= dispatch_count <= 3
+        ):
+            raise CliError("campaign unresolved record is invalid", exit_code=EXIT_AUTHORITY)
+        _emit_verification_supervision(
+            campaign_id,
+            status="manual_reconciliation_required",
+            next_action="manually reconcile the existing unresolved verifier campaign; do not retry it",
+            dispatch_count=dispatch_count,
+            manual_reconciliation_required=True,
+        )
+        return EXIT_UNAVAILABLE
+    if has_finalize_start:
+        _emit_verification_supervision(
+            campaign_id,
+            status="manual_reconciliation_required",
+            next_action="manually reconcile the started verifier finalization; do not rerun it",
+            dispatch_count=3,
+            manual_reconciliation_required=True,
+        )
+        return EXIT_UNAVAILABLE
+    if has_run_result:
+        response_review = _campaign_response_review(
+            argparse.Namespace(
+                workspace=arguments.verifier_workspace,
+                trusted_key=arguments.verifier_trusted_key,
+                campaign_id=campaign_id,
+            ),
+            run_result,
+        )
+        if not _campaign_supervision_acknowledged(campaign_id, "FINALIZE"):
+            _emit_verification_supervision(
+                campaign_id,
+                status="review_required",
+                next_action=f"review private responses, then acknowledge exactly FINALIZE {campaign_id}",
+                dispatch_count=3,
+                response_review=response_review,
+            )
+            return EXIT_OK
+        exit_code, finalized = _invoke_campaign_handler(
+            _campaign_finalize_http1_triad,
+            argparse.Namespace(
+                workspace=arguments.verifier_workspace,
+                trusted_key=arguments.verifier_trusted_key,
+                campaign_id=campaign_id,
+                confirm_reviewed_non_sensitive=True,
+            ),
+        )
+        if exit_code != EXIT_OK or not isinstance(finalized.get("receipt"), str):
+            raise CliError("verifier campaign finalization did not complete", exit_code=EXIT_AUTHORITY)
+        return _verification_supervisor_complete(arguments)
+    if has_start:
+        _emit_verification_supervision(
+            campaign_id,
+            status="manual_reconciliation_required",
+            next_action="manually reconcile the started verifier campaign; do not rerun it",
+            dispatch_count=None,
+            dispatch_state="unknown",
+            manual_reconciliation_required=True,
+        )
+        return EXIT_UNAVAILABLE
+    if not _campaign_supervision_acknowledged(campaign_id, "RUN"):
+        _emit_verification_supervision(
+            campaign_id,
+            status="review_required",
+            next_action=f"review the independent verifier triad, then acknowledge exactly RUN {campaign_id}",
+        )
+        return EXIT_OK
+    exit_code, run = _invoke_campaign_handler(
+        _campaign_run_http1_triad,
+        argparse.Namespace(
+            workspace=arguments.verifier_workspace,
+            trusted_key=arguments.verifier_trusted_key,
+            spec=arguments.out,
+        ),
+    )
+    if exit_code != EXIT_OK:
+        raw_dispatch_count = run.get("dispatchCount")
+        dispatch_count = raw_dispatch_count if type(raw_dispatch_count) is int else 0
+        _emit_verification_supervision(
+            campaign_id,
+            status="manual_reconciliation_required",
+            next_action="manually reconcile the existing unresolved verifier campaign; do not retry it",
+            dispatch_count=dispatch_count,
+            manual_reconciliation_required=True,
+        )
+        return exit_code
+    run_result_value = run.get("runResult")
+    if run.get("status") != "review_required" or not isinstance(run_result_value, str):
+        raise CliError("verifier campaign did not reach response review", exit_code=EXIT_AUTHORITY)
+    return _campaign_supervise_verification_http1(
+        argparse.Namespace(**vars(arguments), _skip_prepare=True)
+    )
+
+
 def _campaign_run_http1_triad(arguments: argparse.Namespace) -> int:
     spec_content = _capture_bounded_local_file(
         arguments.spec, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="campaign spec"
@@ -6782,6 +7179,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     campaign_prepare_verification_http1.set_defaults(
         handler=_campaign_prepare_verification_http1
+    )
+    campaign_supervise_verification_http1 = campaign_commands.add_parser(
+        "supervise-verification-http1",
+        help="prepare or resume one independent verifier triad through explicit operator checkpoints",
+    )
+    for name, destination in (
+        ("--source-workspace", "source_workspace"),
+        ("--source-trusted-key", "source_trusted_key"),
+        ("--verifier-workspace", "verifier_workspace"),
+        ("--verifier-trusted-key", "verifier_trusted_key"),
+        ("--handoff", "handoff"),
+        ("--out", "out"),
+        ("--case", "case"),
+        ("--private-key", "private_key"),
+        ("--result-out", "result_out"),
+        ("--receipt-out", "receipt_out"),
+    ):
+        campaign_supervise_verification_http1.add_argument(
+            name, dest=destination, type=Path, required=True
+        )
+    campaign_supervise_verification_http1.add_argument(
+        "--campaign-id", type=_campaign_id, required=True
+    )
+    campaign_supervise_verification_http1.add_argument(
+        "--finding-class", choices=tuple(item.value for item in FindingClass), required=True
+    )
+    campaign_supervise_verification_http1.add_argument("--claim", required=True)
+    campaign_supervise_verification_http1.add_argument(
+        "--prerequisite", action="append", required=True
+    )
+    campaign_supervise_verification_http1.set_defaults(
+        handler=_campaign_supervise_verification_http1
     )
     campaign_compile_verification_http1 = campaign_commands.add_parser(
         "compile-verification-http1",

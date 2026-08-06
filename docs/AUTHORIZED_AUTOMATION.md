@@ -451,6 +451,35 @@ The canonical case-semantics digest is embedded in the finalized request
 filenames. A coordinated edit of the unsigned local case and its prepare
 receipt therefore cannot change what gets signed.
 
+For the normal reviewer-operated path, one thin coordinator runs those same
+phases without adding another sender. Preparation is offline. It pauses for
+the exact `RUN <campaign-id>` acknowledgement before the verifier's existing
+three-request triad, and for `FINALIZE <campaign-id>` only after private review
+of the verifier responses:
+
+```bash
+faultloom campaign supervise-verification-http1 \
+  --source-workspace <source-workspace> --source-trusted-key <source-key> \
+  --handoff <source-workspace>/verification-handoff.json \
+  --verifier-workspace <verifier-workspace> --verifier-trusted-key <verifier-key> \
+  --campaign-id <campaign-id> --finding-class <class> \
+  --claim <operator-claim> --prerequisite <operator-prerequisite> \
+  --out <verifier-workspace>/verification-triad.json \
+  --case <verifier-workspace>/<campaign-id>.verification-case.json \
+  --private-key <0600-verifier-key-outside-both-workspaces> \
+  --result-out <verifier-workspace>/verified-result.json \
+  --receipt-out <verifier-workspace>/verification-compile-receipt.json
+```
+
+After verifier finalization only, it invokes the existing compile, verify, and
+report commands locally. The generic report command only renders offline;
+the coordinator stores the Markdown and its `draft_manual_review` receipt as
+fixed create-once direct verifier-workspace files. The single JSON result names
+those paths, and captured Markdown is never mixed into stdout. Resume never
+resends: an unresolved or start-only verifier record stops for manual
+reconciliation, and the source campaign is never run again. It does not call a
+model, provider, Burp, second executor, or external submission path.
+
 The normal runtime is fail-closed and live mode is off by default. A POSIX
 `run --live` process is supported only when an external controller provisions
 the signed Gateway bootstrap, authenticated journal descriptors, channel

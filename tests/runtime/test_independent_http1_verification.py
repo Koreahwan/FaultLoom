@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+import io
 import json
 import socket
 from datetime import UTC, datetime, timedelta
@@ -16,7 +18,7 @@ from faultloom.verification.http1_triad import (
 from faultloom_protocol import AuthoritySigner, SignedAuthorityGrant, sign_authority_grant
 from tests.runtime.test_campaign_verification_handoff import _export_arguments
 from tests.runtime.test_cli import _authority_files, _run_arguments
-from tests.runtime.test_personal_campaign import _campaign_run_arguments, _serve, _spec, _workspace
+from tests.runtime.test_personal_campaign import _campaign_run_arguments, _request, _serve, _spec, _workspace
 from tests.runtime.test_personal_campaign_bridge import _bundle, _prepare_arguments
 
 
@@ -130,6 +132,36 @@ def _compile_args(
     ]
 
 
+def _supervise_args(
+    source: Path,
+    source_key: Path,
+    handoff: Path,
+    verifier: Path,
+    verifier_key: Path,
+    private_key: Path,
+) -> list[str]:
+    return [
+        "campaign", "supervise-verification-http1",
+        "--source-workspace", str(source), "--source-trusted-key", str(source_key),
+        "--handoff", str(handoff),
+        "--verifier-workspace", str(verifier), "--verifier-trusted-key", str(verifier_key),
+        "--campaign-id", "owned-loopback", "--finding-class", "zero_day_like",
+        "--claim", "The owned effect path deterministically differs from its control.",
+        "--prerequisite", "Use the separately authorized verifier identity.",
+        "--out", str(verifier / "verification-triad.json"),
+        "--case", str(verifier / "owned-loopback.verification-case.json"),
+        "--private-key", str(private_key),
+        "--result-out", str(verifier / "verified-result.json"),
+        "--receipt-out", str(verifier / "verification-compile-receipt.json"),
+    ]
+
+
+def _one_json(capsys: pytest.CaptureFixture[str]) -> dict[str, object]:
+    captured = capsys.readouterr()
+    assert captured.out.count("\n") == 1
+    return json.loads(captured.out)
+
+
 def test_independent_http1_bridge_runs_existing_triad_and_existing_verify(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -193,6 +225,238 @@ def test_independent_http1_bridge_runs_existing_triad_and_existing_verify(
     assert report_receipt["status"] == "draft_manual_review"
     assert report_receipt["automatic_submission_performed"] is False
     assert report_receipt["network_access"] == "none"
+
+
+def test_supervise_independent_http1_runs_verifier_triad_then_offline_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source, source_key = _source_campaign(tmp_path / "source", capsys)
+    handoff = source / "verification-handoff.json"
+    assert cli.main(_export_arguments(source, source_key, handoff)) == cli.EXIT_OK
+    capsys.readouterr()
+    port = json.loads((source / "run.json").read_text())["target"]["ports"][0]
+    verifier, verifier_key, private_key = _verifier_workspace(tmp_path, port)
+    capsys.readouterr()
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", port))
+    listener.listen(3)
+    captured: list[bytes] = []
+    thread = _serve(listener, [
+        b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\neffect",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\neffect",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\ncontrol",
+    ], captured)
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO("RUN owned-loopback\nFINALIZE owned-loopback\n"))
+    outside = tmp_path / "outside-report-dir"
+    outside.mkdir()
+    legacy_outbox = verifier / "verification-report-outbox"
+    original_invoke = cli._invoke_cli_main_captured
+
+    def swap_legacy_outbox_before_report(
+        argv: list[str], *, working_directory: Path
+    ) -> tuple[int, str]:
+        if argv[0] == "report" and cli.os.name != "nt" and not legacy_outbox.exists():
+            legacy_outbox.symlink_to(outside, target_is_directory=True)
+        return original_invoke(argv, working_directory=working_directory)
+
+    monkeypatch.setattr(
+        cli, "_invoke_cli_main_captured", swap_legacy_outbox_before_report
+    )
+
+    arguments = _supervise_args(
+        source, source_key, handoff, verifier, verifier_key, private_key
+    )
+    assert cli.main(arguments) == cli.EXIT_OK
+    thread.join(timeout=3)
+    listener.close()
+
+    output = _one_json(capsys)
+    assert output["status"] == "completed"
+    assert output["automaticSubmission"] is False
+    verification = output["verification"]
+    assert isinstance(verification, dict)
+    assert verification["status"] == "verified"
+    assert verification["reportStatus"] == "draft_manual_review"
+    assert captured == [
+        _request(port, "/api/effect"),
+        _request(port, "/api/effect"),
+        _request(port, "/api/control"),
+    ]
+    report_receipt_path = verification["reportReceipt"]
+    assert isinstance(report_receipt_path, str)
+    report_receipt = json.loads(Path(report_receipt_path).read_text())
+    assert report_receipt["status"] == "draft_manual_review"
+    assert report_receipt["network_access"] == "none"
+    assert report_receipt["automatic_submission_performed"] is False
+    assert list(outside.iterdir()) == []
+    if legacy_outbox.is_symlink():
+        legacy_outbox.unlink()
+
+    def unexpected_compile(arguments: argparse.Namespace) -> int:
+        raise AssertionError("completed supervisor resume must not recompile or resend")
+
+    monkeypatch.setattr(cli, "_campaign_compile_verification_http1", unexpected_compile)
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO(""))
+    capsys.readouterr()
+    assert cli.main(arguments) == cli.EXIT_OK
+    assert _one_json(capsys)["status"] == "completed"
+    assert len(captured) == 3
+
+
+def test_supervise_independent_http1_rejects_tampered_compile_argv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source, source_key = _source_campaign(tmp_path / "source", capsys)
+    handoff = source / "verification-handoff.json"
+    assert cli.main(_export_arguments(source, source_key, handoff)) == cli.EXIT_OK
+    capsys.readouterr()
+    port = json.loads((source / "run.json").read_text())["target"]["ports"][0]
+    verifier, verifier_key, private_key = _verifier_workspace(tmp_path, port)
+    capsys.readouterr()
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", port))
+    listener.listen(3)
+    captured: list[bytes] = []
+    thread = _serve(listener, [
+        b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\neffect",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\neffect",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\ncontrol",
+    ], captured)
+    original_compile = cli._campaign_compile_verification_http1
+    redirected = tmp_path / "redirected"
+
+    def tamper_after_compile(arguments: argparse.Namespace) -> int:
+        exit_code = original_compile(arguments)
+        receipt_path = verifier / "verification-compile-receipt.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt["reportArgs"].extend(["--out-dir", str(redirected)])
+        receipt_path.write_text(json.dumps(receipt))
+        return exit_code
+
+    monkeypatch.setattr(cli, "_campaign_compile_verification_http1", tamper_after_compile)
+    monkeypatch.setattr(
+        cli.sys,
+        "stdin",
+        io.StringIO("RUN owned-loopback\nFINALIZE owned-loopback\n"),
+    )
+
+    assert cli.main(
+        _supervise_args(source, source_key, handoff, verifier, verifier_key, private_key)
+    ) == cli.EXIT_AUTHORITY
+    thread.join(timeout=3)
+    listener.close()
+    assert len(captured) == 3
+    assert not redirected.exists()
+
+
+def test_supervise_independent_http1_declined_run_never_sends(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source, source_key = _source_campaign(tmp_path / "source", capsys)
+    handoff = source / "verification-handoff.json"
+    assert cli.main(_export_arguments(source, source_key, handoff)) == cli.EXIT_OK
+    capsys.readouterr()
+    port = json.loads((source / "run.json").read_text())["target"]["ports"][0]
+    verifier, verifier_key, private_key = _verifier_workspace(tmp_path, port)
+    capsys.readouterr()
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", port))
+    listener.listen(1)
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO("no\n"))
+
+    assert cli.main(_supervise_args(source, source_key, handoff, verifier, verifier_key, private_key)) == cli.EXIT_OK
+    output = _one_json(capsys)
+    assert output["status"] == "review_required"
+    assert output["dispatchCount"] == 0
+    listener.settimeout(0.1)
+    with pytest.raises(socket.timeout):
+        listener.accept()
+    listener.close()
+
+
+def test_supervise_independent_http1_finalize_resume_never_resends(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source, source_key = _source_campaign(tmp_path / "source", capsys)
+    handoff = source / "verification-handoff.json"
+    assert cli.main(_export_arguments(source, source_key, handoff)) == cli.EXIT_OK
+    capsys.readouterr()
+    port = json.loads((source / "run.json").read_text())["target"]["ports"][0]
+    verifier, verifier_key, private_key = _verifier_workspace(tmp_path, port)
+    capsys.readouterr()
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", port))
+    listener.listen(3)
+    captured: list[bytes] = []
+    thread = _serve(listener, [
+        b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\neffect",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\neffect",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\ncontrol",
+    ], captured)
+    arguments = _supervise_args(source, source_key, handoff, verifier, verifier_key, private_key)
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO("RUN owned-loopback\nno\n"))
+
+    assert cli.main(arguments) == cli.EXIT_OK
+    thread.join(timeout=3)
+    assert _one_json(capsys)["status"] == "review_required"
+    assert len(captured) == 3
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO("FINALIZE owned-loopback\n"))
+    assert cli.main(arguments) == cli.EXIT_OK
+    output = _one_json(capsys)
+    assert output["status"] == "completed"
+    assert len(captured) == 3
+    listener.settimeout(0.1)
+    with pytest.raises(socket.timeout):
+        listener.accept()
+    listener.close()
+
+
+@pytest.mark.parametrize("record", ("unresolved", "start"))
+def test_supervise_independent_http1_existing_ambiguous_record_never_retries(
+    record: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source, source_key = _source_campaign(tmp_path / "source", capsys)
+    handoff = source / "verification-handoff.json"
+    assert cli.main(_export_arguments(source, source_key, handoff)) == cli.EXIT_OK
+    capsys.readouterr()
+    port = json.loads((source / "run.json").read_text())["target"]["ports"][0]
+    verifier, verifier_key, private_key = _verifier_workspace(tmp_path, port)
+    capsys.readouterr()
+    campaigns = verifier / "campaigns"
+    campaigns.mkdir()
+    value = {"campaign_id": "owned-loopback", "dispatch_count": 1} if record == "unresolved" else {}
+    (campaigns / f"owned-loopback.{record}.json").write_text(json.dumps(value))
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", port))
+    listener.listen(1)
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO("RUN owned-loopback\n"))
+
+    assert cli.main(_supervise_args(source, source_key, handoff, verifier, verifier_key, private_key)) == cli.EXIT_UNAVAILABLE
+    output = _one_json(capsys)
+    assert output["status"] == "manual_reconciliation_required"
+    if record == "start":
+        assert output["dispatchState"] == "unknown"
+        assert "dispatchCount" not in output
+    listener.settimeout(0.1)
+    with pytest.raises(socket.timeout):
+        listener.accept()
+    listener.close()
 
 
 def test_prepare_rejects_same_source_and_verifier_workspace(
