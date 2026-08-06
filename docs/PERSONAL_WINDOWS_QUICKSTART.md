@@ -150,7 +150,81 @@ This accounting begins with RC6. A workspace created by RC5 predates it and
 must not be reused: create a fresh signed run workspace instead. There is
 intentionally no reset or migration command.
 
-## 6. Archive the completed request/response exchange
+## 6. Run a bounded HTTP/1.1 triad (optional)
+
+When one exact request has produced a candidate that needs a minimal
+reproduction check, use the supervised triad. Prepare two raw HTTP/1.1 files
+next to the spec: `effect.raw` and `control.raw`. They must have the same
+method, HTTP version, headers, `Host`, and body; their request-target lines
+must be the only difference. The effect file is intentionally reused for the
+second (reproduction) send.
+
+The spec is strict and binds the engagement's external authorization record;
+the reference and digest are an audit trail, not a substitute for the signed
+FaultLoom scope:
+
+```json
+{
+  "schema": "faultloom.personal-http1-triad.v1",
+  "campaign_id": "example-loopback-triad-01",
+  "authorization_reference": "example-loopback-approval-2026-08",
+  "authorization_document_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "hostname": "127.0.0.1",
+  "port": 8000,
+  "scheme": "http",
+  "timeout_seconds": 10,
+  "requests": [
+    {"role": "effect", "method": "GET", "path": "/example", "request_file": "effect.raw", "response_bytes": 1048576},
+    {"role": "negative_control", "method": "GET", "path": "/example-control", "request_file": "control.raw", "response_bytes": 1048576}
+  ],
+  "finding": {
+    "title": "Example loopback candidate",
+    "severity": "low",
+    "summary": "Example only; replace with an observed candidate.",
+    "impact": "Example only; do not treat this text as a finding.",
+    "remediation": "Example only; replace with a concrete remediation."
+  }
+}
+```
+
+Run it from the signed workspace:
+
+```powershell
+& $FaultLoom campaign run-http1-triad `
+  --workspace "$Job\run-01" `
+  --trusted-key "$Root\authority\authority-public-key.json" `
+  --spec "$Job\run-01\triad.json"
+```
+
+The command creates a start record before target I/O, then sends exactly three
+requests sequentially (effect, the same effect again, control). It performs no
+preview, retry, redirect, proxy, provider/model call, Burp action, evidence
+archival, or submission. A connection/TLS failure, rate limit, partial,
+malformed, or ambiguous response stops with `unresolved_no_retry`; do not
+retry or fabricate a completion. Inspect all private response files before
+continuing. If any contains credentials, tokens, PII, customer data, or other
+sensitive material, stop and delete/quarantine it according to the
+engagement's retention rule.
+
+Only after that review, finalize offline:
+
+```powershell
+& $FaultLoom campaign finalize-http1-triad `
+  --workspace "$Job\run-01" `
+  --trusted-key "$Root\authority\authority-public-key.json" `
+  --campaign-id example-loopback-triad-01 `
+  --confirm-reviewed-non-sensitive
+```
+
+Finalization opens no socket. It verifies the signed workspace and all request,
+response, and body digests, archives exactly three exchanges, and applies only
+`exact_body_digest_v1`. Equal effect/reproduction body digests with a
+different control digest produce an evidence-bound `draft_unverified` finding
+draft; otherwise the durable result is `negative_campaign` and no finding is
+created. Neither outcome is independent verification or proof of a
+vulnerability. Review the draft, reproduce independently, and submit manually.
+
+## 7. Archive the completed request/response exchange
 
 For a confirmed non-sensitive direct result, preserve the exact request and
 response pair with the already-completed reservation:
@@ -180,7 +254,7 @@ owner chooses its exact MCP send path, require the separately documented
 to a generic Burp sender or combine that path with an existing direct-send
 reservation.
 
-## 7. Add other exported evidence
+## 8. Add other exported evidence
 
 Export requests/responses, notes, or screenshots from your tool, then record
 each file:
@@ -197,7 +271,7 @@ Evidence is copied into `evidence\raw` with a SHA-256 sidecar. Review exports
 for passwords, cookies, tokens, API keys, and unnecessary personal data before
 sharing them.
 
-## 8. Create a submission draft
+## 9. Create a submission draft
 
 Put exact reproduction steps in a UTF-8 text file, then run:
 
@@ -216,7 +290,7 @@ The Markdown file in `findings\` is a draft. Reproduce the issue, remove
 secrets, match the program's severity rubric, and submit it yourself through
 the customer's or bounty program's official channel.
 
-## 9. Optional offline model-turn handoff and compilation
+## 10. Optional offline model-turn handoff and compilation
 
 To prepare an offline prompt for a model UI, local CLI, or official API without
 configuring a FaultLoom provider, export a private handoff from the exact signed

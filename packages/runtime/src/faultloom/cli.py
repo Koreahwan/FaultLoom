@@ -57,6 +57,15 @@ from .automation_cli import (
     compile_automation,
     export_automation_handoff,
 )
+from .personal_campaign import (
+    EXACT_BODY_DIGEST_CLASSIFIER,
+    PersonalCampaignError,
+    PersonalHttp1TriadSpec,
+    classify_exact_body_digest_triad,
+    parse_personal_http1_triad_spec,
+    sha256_hex,
+    validate_campaign_id,
+)
 from .verification_cli import (
     VerificationCliDependencies,
     VerificationCliError,
@@ -154,6 +163,14 @@ class _AdmittedRawRequest:
     reservation: dict[str, object]
 
 
+@dataclass(frozen=True)
+class _CampaignRecordsDirectory:
+    workspace: Path
+    campaigns: Path
+    workspace_stat: os.stat_result
+    campaigns_stat: os.stat_result
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -173,6 +190,13 @@ def _personal_timeout_seconds(value: str) -> int:
     if parsed > 30:
         raise argparse.ArgumentTypeError("must be between 1 and 30 seconds")
     return parsed
+
+
+def _campaign_id(value: str) -> str:
+    try:
+        return validate_campaign_id(value)
+    except PersonalCampaignError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _body_preview_chars(value: str) -> int:
@@ -1300,7 +1324,7 @@ def _evidence_file_suffix(source: Path) -> str:
     return ".bin"
 
 
-def _evidence_add_exchange(arguments: argparse.Namespace) -> int:
+def _evidence_add_exchange_result(arguments: argparse.Namespace) -> dict[str, object]:
     """Archive one completed, digest-bound manual request/response exchange."""
     manifest, _, _, _ = _verified_request_workspace(
         arguments.workspace, _trusted_key_path(arguments), require_active=False
@@ -1429,14 +1453,17 @@ def _evidence_add_exchange(arguments: argparse.Namespace) -> int:
             except OSError:
                 pass
         raise
-    _emit_json(
-        {
-            "evidence_id": evidence_id,
-            "record": str(record_path),
-            "request_stored_file": str(request_destination),
-            "response_stored_file": str(response_destination),
-        }
-    )
+    return {
+        "evidence_id": evidence_id,
+        "record": str(record_path),
+        "request_stored_file": str(request_destination),
+        "response_stored_file": str(response_destination),
+    }
+
+
+def _evidence_add_exchange(arguments: argparse.Namespace) -> int:
+    """Archive one completed, digest-bound manual request/response exchange."""
+    _emit_json(_evidence_add_exchange_result(arguments))
     return EXIT_OK
 
 
@@ -1572,7 +1599,7 @@ def _finding_evidence_lines(item: dict[str, object]) -> list[str]:
     ]
 
 
-def _finding_new(arguments: argparse.Namespace) -> int:
+def _finding_new_result(arguments: argparse.Namespace) -> dict[str, object]:
     manifest = _load_manual_workspace(arguments.workspace)
     run_id = str(manifest["run_id"])
     evidence = _workspace_evidence(
@@ -1659,14 +1686,16 @@ This draft does not claim independent verification or automatic exploit executio
         (json.dumps(record, indent=2, sort_keys=True) + "\n").encode("utf-8"),
         mode=0o600,
     )
-    _emit_json(
-        {
-            "finding": str(markdown_path),
-            "finding_id": finding_id,
-            "record": str(record_path),
-            "status": "draft_unverified",
-        }
-    )
+    return {
+        "finding": str(markdown_path),
+        "finding_id": finding_id,
+        "record": str(record_path),
+        "status": "draft_unverified",
+    }
+
+
+def _finding_new(arguments: argparse.Namespace) -> int:
+    _emit_json(_finding_new_result(arguments))
     return EXIT_OK
 
 
@@ -2108,6 +2137,7 @@ def _prepare_request_accounting(
     manifest: dict[str, object],
     *,
     initialize: bool = False,
+    campaign_bindings: bool = False,
 ) -> None:
     expected = _accounting_metadata(manifest)
     try:
@@ -2128,6 +2158,19 @@ def _prepare_request_accounting(
                     completed_at REAL,
                     observed_response_bytes INTEGER,
                     response_sha256 TEXT
+                )"""
+            )
+        if campaign_bindings:
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS campaign_bindings (
+                    campaign_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    reservation_id TEXT NOT NULL UNIQUE,
+                    request_sha256 TEXT NOT NULL,
+                    response_sha256 TEXT NOT NULL,
+                    body_sha256 TEXT NOT NULL,
+                    response_file TEXT NOT NULL,
+                    PRIMARY KEY(campaign_id, role)
                 )"""
             )
         objects = dict(
@@ -2156,10 +2199,26 @@ def _prepare_request_accounting(
             ("observed_response_bytes", "INTEGER", 0, 0),
             ("response_sha256", "TEXT", 0, 0),
         )
+        binding_columns = tuple(
+            (row[1], row[2], row[3], row[5])
+            for row in connection.execute("PRAGMA table_info(campaign_bindings)")
+        )
+        expected_binding_columns = (
+            ("campaign_id", "TEXT", 1, 1),
+            ("role", "TEXT", 1, 2),
+            ("reservation_id", "TEXT", 1, 0),
+            ("request_sha256", "TEXT", 1, 0),
+            ("response_sha256", "TEXT", 1, 0),
+            ("body_sha256", "TEXT", 1, 0),
+            ("response_file", "TEXT", 1, 0),
+        )
+        objects_with_bindings = {**expected_objects, "campaign_bindings": "table"}
         if (
-            objects != expected_objects
+            objects not in (expected_objects, objects_with_bindings)
             or metadata_columns != (("key", "TEXT", 0, 1), ("value", "TEXT", 1, 0))
             or columns != expected_columns
+            or ("campaign_bindings" in objects and binding_columns != expected_binding_columns)
+            or (campaign_bindings and "campaign_bindings" not in objects)
         ):
             raise CliError(
                 "request accounting state uses an unsupported schema; create a new run workspace",
@@ -2475,6 +2534,7 @@ def _admit_raw_request(
     request_cap: int | None = None,
     response_cap: int | None = None,
     require_connection_close: bool = False,
+    expected_request_sha256: str | None = None,
 ) -> _AdmittedRawRequest:
     workspace: Path = arguments.workspace
     trusted_key_path = _trusted_key_path(arguments)
@@ -2504,6 +2564,11 @@ def _admit_raw_request(
         request_path=path,
         require_connection_close=require_connection_close,
     )
+    if expected_request_sha256 is not None and request_sha256 != expected_request_sha256:
+        raise CliError(
+            "request file digest differs from the campaign start binding",
+            exit_code=EXIT_AUTHORITY,
+        )
     request_bytes = len(request_content)
     if (
         not _request_hostname_matches_target(arguments.hostname, target)
@@ -2986,7 +3051,7 @@ def _emit_personal_send_no_dispatch(reservation_id: str) -> int:
     return EXIT_UNAVAILABLE
 
 
-def _scope_send_request(arguments: argparse.Namespace) -> int:
+def _scope_send_request_result(arguments: argparse.Namespace) -> tuple[int, dict[str, object]]:
     method = arguments.method.upper()
     if method not in {"GET", "HEAD", "OPTIONS"}:
         raise CliError("direct personal sender permits GET, HEAD, or OPTIONS only", exit_code=EXIT_AUTHORITY)
@@ -2995,6 +3060,7 @@ def _scope_send_request(arguments: argparse.Namespace) -> int:
         request_cap=PERSONAL_HTTP1_MAX_REQUEST_BYTES,
         response_cap=PERSONAL_HTTP1_MAX_RESPONSE_BYTES,
         require_connection_close=True,
+        expected_request_sha256=getattr(arguments, "expected_request_sha256", None),
     )
     response_path = (
         arguments.workspace
@@ -3054,6 +3120,7 @@ def _scope_send_request(arguments: argparse.Namespace) -> int:
             "request": {"size": len(admitted.content), "sha256": admitted.request_sha256},
             "response": {"size": len(response_content), "sha256": completion["response_sha256"]},
             "responseFile": str(response_path),
+            "bodySha256": hashlib.sha256(body).hexdigest(),
             "statusCode": status_code,
             "headerNames": header_names,
             "dispatchPerformed": True,
@@ -3063,18 +3130,846 @@ def _scope_send_request(arguments: argparse.Namespace) -> int:
             preview = body.decode("utf-8", errors="replace")
             result["bodyPreview"] = preview[: arguments.body_preview_chars]
             result["previewTruncated"] = len(preview) > arguments.body_preview_chars
-        _emit_json(result)
-        return EXIT_OK
+        return EXIT_OK, result
     except _PersonalPreDispatchError:
-        return _emit_personal_send_no_dispatch(str(admitted.reservation["reservation_id"]))
+        return EXIT_UNAVAILABLE, {
+            "schema": "faultloom.personal-http1-send.v1",
+            "reservation": admitted.reservation["reservation_id"],
+            "dispatchPerformed": False,
+            "networkAccess": "direct_owner_local",
+            "reservationState": "unresolved_no_retry",
+            "error": "no_dispatch_connection_or_tls_failure",
+        }
     except (CliError, OSError):
         if not request_attempted:
-            return _emit_personal_send_no_dispatch(str(admitted.reservation["reservation_id"]))
-        return _emit_personal_send_ambiguity(
-            str(admitted.reservation["reservation_id"]),
-            "response_incomplete_or_ambiguous",
-            response_path if response_stored else None,
+            return EXIT_UNAVAILABLE, {
+                "schema": "faultloom.personal-http1-send.v1",
+                "reservation": admitted.reservation["reservation_id"],
+                "dispatchPerformed": False,
+                "networkAccess": "direct_owner_local",
+                "reservationState": "unresolved_no_retry",
+                "error": "no_dispatch_connection_or_tls_failure",
+            }
+        result = {
+            "schema": "faultloom.personal-http1-send.v1",
+            "reservation": admitted.reservation["reservation_id"],
+            "dispatchPerformed": True,
+            "networkAccess": "direct_owner_local",
+            "reservationState": "unresolved_no_retry",
+            "error": "response_incomplete_or_ambiguous",
+        }
+        if response_stored:
+            result["responseFile"] = str(response_path)
+        return EXIT_UNAVAILABLE, result
+
+
+def _scope_send_request(arguments: argparse.Namespace) -> int:
+    exit_code, result = _scope_send_request_result(arguments)
+    _emit_json(result)
+    return exit_code
+
+
+def _campaign_records_directory(workspace: Path) -> _CampaignRecordsDirectory:
+    """Return stable workspace/campaign directory identities for record creation."""
+    try:
+        workspace_metadata = workspace.lstat()
+        if (
+            stat.S_ISLNK(workspace_metadata.st_mode)
+            or not stat.S_ISDIR(workspace_metadata.st_mode)
+            or workspace.is_junction()
+        ):
+            raise CliError("manual workspace is not a directory", exit_code=EXIT_AUTHORITY)
+        directory = workspace / "campaigns"
+        if os.name != "nt":
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            workspace_descriptor = os.open(workspace, flags)
+            try:
+                pinned_workspace = os.fstat(workspace_descriptor)
+                if not _stat_matches(workspace_metadata, pinned_workspace, _DIRECTORY_STAT_FIELDS):
+                    raise CliError("manual workspace changed while being opened", exit_code=EXIT_AUTHORITY)
+                created = False
+                try:
+                    os.mkdir("campaigns", 0o700, dir_fd=workspace_descriptor)
+                    created = True
+                except FileExistsError:
+                    pass
+                metadata = os.stat("campaigns", dir_fd=workspace_descriptor, follow_symlinks=False)
+                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                    raise CliError("campaign records directory is unsafe", exit_code=EXIT_AUTHORITY)
+                campaign_descriptor = os.open("campaigns", flags, dir_fd=workspace_descriptor)
+                try:
+                    pinned_campaign = os.fstat(campaign_descriptor)
+                    if not _stat_matches(metadata, pinned_campaign, _DIRECTORY_STAT_FIELDS):
+                        raise CliError("campaign records directory changed while being opened", exit_code=EXIT_AUTHORITY)
+                finally:
+                    os.close(campaign_descriptor)
+                if created:
+                    os.fsync(workspace_descriptor)
+            finally:
+                os.close(workspace_descriptor)
+        else:
+            workspace_guard = _open_windows_response_directory_guard(workspace)
+            try:
+                pinned_workspace = workspace.lstat()
+                if not _stat_matches(workspace_metadata, pinned_workspace, _DIRECTORY_STAT_FIELDS):
+                    raise CliError("manual workspace changed while being opened", exit_code=EXIT_AUTHORITY)
+                try:
+                    os.mkdir(directory, 0o700)
+                except FileExistsError:
+                    pass
+                metadata = directory.lstat()
+                if (
+                    stat.S_ISLNK(metadata.st_mode)
+                    or not stat.S_ISDIR(metadata.st_mode)
+                    or directory.is_junction()
+                ):
+                    raise CliError("campaign records directory is unsafe", exit_code=EXIT_AUTHORITY)
+                campaign_guard = _open_windows_response_directory_guard(directory)
+                try:
+                    pinned_campaign = directory.lstat()
+                    if not _stat_matches(metadata, pinned_campaign, _DIRECTORY_STAT_FIELDS):
+                        raise CliError("campaign records directory changed while being opened", exit_code=EXIT_AUTHORITY)
+                finally:
+                    _close_windows_response_directory_guard(campaign_guard)
+            finally:
+                _close_windows_response_directory_guard(workspace_guard)
+    except OSError as exc:
+        raise CliError(f"cannot prepare campaign records: {exc}", exit_code=EXIT_USAGE) from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode) or directory.is_junction():
+        raise CliError("campaign records directory is unsafe", exit_code=EXIT_AUTHORITY)
+    return _CampaignRecordsDirectory(
+        workspace=workspace,
+        campaigns=directory,
+        workspace_stat=pinned_workspace,
+        campaigns_stat=pinned_campaign,
+    )
+
+
+def _campaign_record(records: _CampaignRecordsDirectory, campaign_id: str, suffix: str) -> Path:
+    return records.campaigns / f"{campaign_id}.{suffix}.json"
+
+
+def _write_new_campaign_record(
+    records: _CampaignRecordsDirectory, path: Path, content: bytes, *, mode: int = 0o600
+) -> None:
+    """Create one durable campaign record beneath a checked, pinned directory."""
+    directory = records.campaigns
+    filename = path.name
+    if (
+        path.parent != directory
+        or not filename
+        or filename in {".", ".."}
+        or "/" in filename
+        or "\\" in filename
+    ):
+        raise CliError("campaign record name is unsafe", exit_code=EXIT_AUTHORITY)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    workspace_descriptor: int | None = None
+    directory_descriptor: int | None = None
+    windows_workspace_guard: int | None = None
+    windows_directory_guard: int | None = None
+    descriptor: int | None = None
+    try:
+        if os.name != "nt":
+            directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            if hasattr(os, "O_CLOEXEC"):
+                directory_flags |= os.O_CLOEXEC
+            workspace_descriptor = os.open(records.workspace, directory_flags)
+            if not _stat_matches(
+                os.fstat(workspace_descriptor), records.workspace_stat, _DIRECTORY_STAT_FIELDS
+            ):
+                raise CliError("manual workspace changed before campaign record creation", exit_code=EXIT_AUTHORITY)
+            directory_descriptor = os.open("campaigns", directory_flags, dir_fd=workspace_descriptor)
+            if not _stat_matches(
+                os.fstat(directory_descriptor), records.campaigns_stat, _DIRECTORY_STAT_FIELDS
+            ):
+                raise CliError("campaign records directory is unsafe", exit_code=EXIT_AUTHORITY)
+            descriptor = os.open(filename, flags, mode, dir_fd=directory_descriptor)
+        else:
+            windows_workspace_guard = _open_windows_response_directory_guard(records.workspace)
+            workspace_metadata = records.workspace.lstat()
+            if not _stat_matches(workspace_metadata, records.workspace_stat, _DIRECTORY_STAT_FIELDS):
+                raise CliError("manual workspace changed before campaign record creation", exit_code=EXIT_AUTHORITY)
+            windows_directory_guard = _open_windows_response_directory_guard(directory)
+            directory_metadata = directory.lstat()
+            if (
+                directory.is_junction()
+                or not _stat_matches(directory_metadata, records.campaigns_stat, _DIRECTORY_STAT_FIELDS)
+            ):
+                raise CliError("campaign records directory is unsafe", exit_code=EXIT_AUTHORITY)
+            descriptor = os.open(path, flags, mode)
+        offset = 0
+        while offset < len(content):
+            offset += os.write(descriptor, content[offset:])
+        if os.name != "nt":
+            os.fchmod(descriptor, mode)
+        os.fsync(descriptor)
+        if directory_descriptor is not None:
+            os.fsync(directory_descriptor)
+    except CliError:
+        raise
+    except OSError as exc:
+        raise CliError(f"cannot create campaign record {path}: {exc}", exit_code=EXIT_USAGE) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
+        if workspace_descriptor is not None:
+            os.close(workspace_descriptor)
+        if windows_directory_guard is not None:
+            _close_windows_response_directory_guard(windows_directory_guard)
+        if windows_workspace_guard is not None:
+            _close_windows_response_directory_guard(windows_workspace_guard)
+
+
+def _capture_campaign_json(path: Path, *, label: str) -> dict[str, object]:
+    content = _capture_bounded_local_file(path, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label=label)
+    try:
+        value = json.loads(content.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise CliError(f"invalid {label}: {exc}", exit_code=EXIT_AUTHORITY) from exc
+    if not isinstance(value, dict):
+        raise CliError(f"invalid {label}", exit_code=EXIT_AUTHORITY)
+    return value
+
+
+def _record_campaign_binding(
+    *,
+    workspace: Path,
+    manifest: dict[str, object],
+    campaign_id: str,
+    role: str,
+    result: dict[str, object],
+) -> None:
+    reservation = result.get("reservation")
+    request = result.get("request")
+    response = result.get("response")
+    body_sha256 = result.get("bodySha256")
+    response_file = result.get("responseFile")
+    if (
+        not _is_reservation_id(reservation)
+        or not isinstance(request, dict)
+        or not isinstance(request.get("sha256"), str)
+        or not isinstance(response, dict)
+        or not isinstance(response.get("sha256"), str)
+        or not isinstance(body_sha256, str)
+        or not isinstance(response_file, str)
+    ):
+        raise CliError("successful campaign send is missing exact bindings", exit_code=EXIT_AUTHORITY)
+    connection = _request_accounting_connection(workspace)
+    try:
+        _prepare_request_accounting(connection, manifest, campaign_bindings=True)
+        row = connection.execute(
+            "SELECT request_sha256, response_sha256, completed_at FROM reservations WHERE reservation_id = ?",
+            (reservation,),
+        ).fetchone()
+        if (
+            row is None
+            or row[2] is None
+            or row[0] != request["sha256"]
+            or row[1] != response["sha256"]
+        ):
+            raise CliError("request accounting does not match completed campaign send", exit_code=EXIT_AUTHORITY)
+        connection.execute(
+            """INSERT INTO campaign_bindings(
+                campaign_id, role, reservation_id, request_sha256, response_sha256,
+                body_sha256, response_file
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                campaign_id,
+                role,
+                reservation,
+                request["sha256"],
+                response["sha256"],
+                body_sha256,
+                response_file,
+            ),
         )
+        connection.commit()
+    except CliError:
+        connection.rollback()
+        raise
+    except sqlite3.Error as exc:
+        connection.rollback()
+        raise CliError("cannot bind completed campaign request", exit_code=EXIT_AUTHORITY) from exc
+    finally:
+        connection.close()
+
+
+def _campaign_bindings(
+    *, workspace: Path, manifest: dict[str, object], campaign_id: str
+) -> dict[str, dict[str, str]]:
+    connection = _request_accounting_connection(workspace)
+    try:
+        _prepare_request_accounting(connection, manifest)
+        rows = connection.execute(
+            """SELECT b.role, b.reservation_id, b.request_sha256, b.response_sha256,
+                      b.body_sha256, b.response_file, r.request_sha256, r.response_sha256,
+                      r.completed_at
+               FROM campaign_bindings AS b
+               LEFT JOIN reservations AS r ON r.reservation_id = b.reservation_id
+               WHERE b.campaign_id = ?""",
+            (campaign_id,),
+        ).fetchall()
+    except CliError:
+        connection.rollback()
+        raise
+    except sqlite3.Error as exc:
+        connection.rollback()
+        raise CliError("cannot read campaign request bindings", exit_code=EXIT_AUTHORITY) from exc
+    finally:
+        connection.close()
+    expected_roles = {"effect", "reproduction", "negative_control"}
+    if len(rows) != 3 or {row[0] for row in rows} != expected_roles:
+        raise CliError("campaign accounting lacks exactly three bound requests", exit_code=EXIT_AUTHORITY)
+    if len({row[1] for row in rows}) != 3 or len({row[5] for row in rows}) != 3:
+        raise CliError("campaign accounting reuses a reservation or response file", exit_code=EXIT_AUTHORITY)
+    bindings: dict[str, dict[str, str]] = {}
+    for row in rows:
+        role, reservation, request_digest, response_digest, body_digest, response_file, account_request, account_response, completed = row
+        if (
+            completed is None
+            or request_digest != account_request
+            or response_digest != account_response
+            or not all(isinstance(value, str) for value in row[:6])
+        ):
+            raise CliError("campaign accounting binding is invalid", exit_code=EXIT_AUTHORITY)
+        bindings[role] = {
+            "reservation": reservation,
+            "request_sha256": request_digest,
+            "response_sha256": response_digest,
+            "body_sha256": body_digest,
+            "response_file": response_file,
+        }
+    return bindings
+
+
+def _campaign_request_file(spec_path: Path, name: str) -> Path:
+    # ``name`` has already passed the strict basename-only model validation.
+    return spec_path.parent / name
+
+
+def _prepare_campaign_requests(
+    spec: PersonalHttp1TriadSpec, spec_path: Path
+) -> dict[str, tuple[Path, bytes, str]]:
+    prepared: dict[str, tuple[Path, bytes, str]] = {}
+    for request in spec.requests:
+        request_file = _campaign_request_file(spec_path, request.request_file)
+        content, digest = _capture_verified_raw_request(
+            request_file,
+            maximum_bytes=PERSONAL_HTTP1_MAX_REQUEST_BYTES,
+            hostname=spec.hostname,
+            port=spec.port,
+            scheme=spec.scheme,
+            method=request.method,
+            request_path=request.path,
+            require_connection_close=True,
+        )
+        prepared[request.role] = (request_file, content, digest)
+    effect_content = prepared["effect"][1]
+    control_content = prepared["negative_control"][1]
+    effect_line, effect_remainder = effect_content.split(b"\r\n", 1)
+    control_line, control_remainder = control_content.split(b"\r\n", 1)
+    if effect_remainder != control_remainder or effect_line == control_line:
+        raise CliError(
+            "effect and negative-control raw requests must differ only by request target",
+            exit_code=EXIT_AUTHORITY,
+        )
+    return prepared
+
+
+def _campaign_start_record(
+    *,
+    spec: PersonalHttp1TriadSpec,
+    spec_path: Path,
+    spec_digest: str,
+    manifest: dict[str, object],
+    prepared: dict[str, tuple[Path, bytes, str]],
+) -> dict[str, object]:
+    return {
+        "schema": "faultloom.personal-http1-triad-start.v1",
+        "campaign_id": spec.campaign_id,
+        "run_id": manifest["run_id"],
+        "grant_id": manifest["grant_id"],
+        "grant_version": manifest["grant_version"],
+        "authorization_reference": spec.authorization_reference,
+        "authorization_document_sha256": spec.authorization_document_sha256,
+        "spec_path": str(spec_path),
+        "spec_sha256": spec_digest,
+        "endpoint": {"hostname": spec.hostname, "port": spec.port, "scheme": spec.scheme},
+        "timeout_seconds": spec.timeout_seconds,
+        "classifier": EXACT_BODY_DIGEST_CLASSIFIER,
+        "runtime_version": __version__,
+        "finding": spec.finding.model_dump(mode="json"),
+        "requests": [
+            {
+                "role": request.role,
+                "method": request.method,
+                "path": request.path,
+                "request_file": str(prepared[request.role][0]),
+                "request_sha256": prepared[request.role][2],
+                "request_bytes": len(prepared[request.role][1]),
+                "response_bytes": request.response_bytes,
+            }
+            for request in spec.requests
+        ],
+    }
+
+
+def _campaign_unresolved(
+    *,
+    records: _CampaignRecordsDirectory,
+    campaign_id: str,
+    start_record: Path,
+    dispatch_count: int,
+    error: str,
+    completed: list[dict[str, object]],
+    current: dict[str, object] | None = None,
+) -> int:
+    summaries: list[dict[str, object]] = []
+    for item in [*completed, *( [current] if current is not None else [])]:
+        summary = {key: item[key] for key in ("role", "reservation", "statusCode", "dispatchPerformed", "error") if key in item}
+        summaries.append(summary)
+    unresolved_record = _campaign_record(records, campaign_id, "unresolved")
+    _write_new_campaign_record(
+        records,
+        unresolved_record,
+        (json.dumps(
+            {
+                "schema": "faultloom.personal-http1-triad-unresolved.v1",
+                "campaign_id": campaign_id,
+                "start_record": str(start_record),
+                "dispatch_count": dispatch_count,
+                "error": error,
+                "completed_requests": summaries,
+                "manual_reconciliation_required": True,
+                "automatic_submission": False,
+            },
+            indent=2,
+            sort_keys=True,
+        ) + "\n").encode("utf-8"),
+        mode=0o600,
+    )
+    _emit_json(
+        {
+            "schema": "faultloom.personal-http1-triad-run.v1",
+            "campaignId": campaign_id,
+            "status": "unresolved_no_retry",
+            "classifier": EXACT_BODY_DIGEST_CLASSIFIER,
+            "dispatchCount": dispatch_count,
+            "startRecord": str(start_record),
+            "error": error,
+            "unresolvedRecord": str(unresolved_record),
+            "manualReconciliationRequired": True,
+        }
+    )
+    return EXIT_UNAVAILABLE
+
+
+def _campaign_run_http1_triad(arguments: argparse.Namespace) -> int:
+    spec_content = _capture_bounded_local_file(
+        arguments.spec, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="campaign spec"
+    )
+    try:
+        spec_path = arguments.spec.resolve(strict=True)
+    except OSError as exc:
+        raise CliError("cannot resolve campaign spec", exit_code=EXIT_AUTHORITY) from exc
+    try:
+        spec = parse_personal_http1_triad_spec(spec_content)
+    except PersonalCampaignError as exc:
+        raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+    prepared = _prepare_campaign_requests(spec, spec_path)
+    manifest, _, _, _ = _verified_request_workspace(
+        arguments.workspace, _trusted_key_path(arguments)
+    )
+    records = _campaign_records_directory(arguments.workspace)
+    start_record = _campaign_record(records, spec.campaign_id, "start")
+    _write_new_campaign_record(
+        records,
+        start_record,
+        (json.dumps(
+            _campaign_start_record(
+                spec=spec,
+                spec_path=spec_path,
+                spec_digest=sha256_hex(spec_content),
+                manifest=manifest,
+                prepared=prepared,
+            ),
+            indent=2,
+            sort_keys=True,
+        ) + "\n").encode("utf-8"),
+        mode=0o600,
+    )
+
+    dispatches = (
+        ("effect", spec.effect),
+        ("reproduction", spec.effect),
+        ("negative_control", spec.negative_control),
+    )
+    results: list[dict[str, object]] = []
+    for role, request in dispatches:
+        request_file = prepared[request.role][0]
+        send_arguments = argparse.Namespace(
+            workspace=arguments.workspace,
+            trusted_key=arguments.trusted_key,
+            hostname=spec.hostname,
+            port=spec.port,
+            scheme=spec.scheme,
+            method=request.method,
+            path=request.path,
+            request_file=request_file,
+            response_bytes=str(request.response_bytes),
+            timeout_seconds=spec.timeout_seconds,
+            body_preview_chars=0,
+            expected_request_sha256=prepared[request.role][2],
+        )
+        try:
+            exit_code, result = _scope_send_request_result(send_arguments)
+        except CliError as exc:
+            return _campaign_unresolved(
+                campaign_id=spec.campaign_id,
+                records=records,
+                start_record=start_record,
+                dispatch_count=len(results),
+                error=str(exc),
+                completed=results,
+            )
+        dispatch_count = len(results) + (1 if result.get("dispatchPerformed") else 0)
+        if exit_code != EXIT_OK:
+            return _campaign_unresolved(
+                campaign_id=spec.campaign_id,
+                records=records,
+                start_record=start_record,
+                dispatch_count=dispatch_count,
+                error=str(result.get("error", "request_failed")),
+                completed=results,
+                current={"role": role, **result},
+            )
+        completed_result = {"role": role, **result}
+        try:
+            _record_campaign_binding(
+                workspace=arguments.workspace,
+                manifest=manifest,
+                campaign_id=spec.campaign_id,
+                role=role,
+                result=completed_result,
+            )
+        except CliError as exc:
+            return _campaign_unresolved(
+                campaign_id=spec.campaign_id,
+                records=records,
+                start_record=start_record,
+                dispatch_count=dispatch_count,
+                error=str(exc),
+                completed=results,
+                current=completed_result,
+            )
+        if result.get("statusCode") == 429:
+            return _campaign_unresolved(
+                campaign_id=spec.campaign_id,
+                records=records,
+                start_record=start_record,
+                dispatch_count=dispatch_count,
+                error="rate_limited_429",
+                completed=results,
+                current=completed_result,
+            )
+        results.append(completed_result)
+
+    run_result = _campaign_record(records, spec.campaign_id, "run-result")
+    output = {
+        "schema": "faultloom.personal-http1-triad-run-result.v1",
+        "campaign_id": spec.campaign_id,
+        "start_record": str(start_record),
+        "start_sha256": sha256_hex(_capture_bounded_local_file(start_record, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="campaign start record")),
+        "run_id": manifest["run_id"],
+        "grant_id": manifest["grant_id"],
+        "grant_version": manifest["grant_version"],
+        "classifier": EXACT_BODY_DIGEST_CLASSIFIER,
+        "runtime_version": __version__,
+        "dispatch_count": 3,
+        "requests": results,
+        "review_required": True,
+        "independent_verification": False,
+        "automatic_submission": False,
+    }
+    _write_new_campaign_record(
+        records,
+        run_result,
+        (json.dumps(output, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+        mode=0o600,
+    )
+    _emit_json(
+        {
+            "schema": "faultloom.personal-http1-triad-run.v1",
+            "campaignId": spec.campaign_id,
+            "status": "review_required",
+            "classifier": EXACT_BODY_DIGEST_CLASSIFIER,
+            "dispatchCount": 3,
+            "startRecord": str(start_record),
+            "runResult": str(run_result),
+            "independentVerification": False,
+            "automaticSubmission": False,
+        }
+    )
+    return EXIT_OK
+
+
+def _campaign_exchange_sources(
+    *,
+    workspace: Path,
+    start: dict[str, object],
+    result: dict[str, object],
+    bindings: dict[str, dict[str, str]],
+) -> list[tuple[str, Path, Path, str]]:
+    start_requests = start.get("requests")
+    dispatched = result.get("requests")
+    if not isinstance(start_requests, list) or not isinstance(dispatched, list) or len(dispatched) != 3:
+        raise CliError("campaign records have invalid request entries", exit_code=EXIT_AUTHORITY)
+    definitions = {
+        item.get("role"): item
+        for item in start_requests
+        if isinstance(item, dict) and item.get("role") in {"effect", "negative_control"}
+    }
+    if set(definitions) != {"effect", "negative_control"}:
+        raise CliError("campaign start record has invalid request roles", exit_code=EXIT_AUTHORITY)
+    expected_roles = ("effect", "reproduction", "negative_control")
+    sources: list[tuple[str, Path, Path, str]] = []
+    for expected_role, item in zip(expected_roles, dispatched, strict=True):
+        if not isinstance(item, dict) or item.get("role") != expected_role:
+            raise CliError("campaign run result has invalid request order", exit_code=EXIT_AUTHORITY)
+        definition = definitions["effect" if expected_role == "reproduction" else expected_role]
+        binding = bindings.get(expected_role)
+        request_file_value = definition.get("request_file")
+        request_digest = definition.get("request_sha256")
+        dispatched_request = item.get("request")
+        reservation = item.get("reservation")
+        response_file_value = item.get("responseFile")
+        response = item.get("response")
+        body_digest = item.get("bodySha256")
+        if (
+            binding is None
+            or
+            not isinstance(request_file_value, str)
+            or not isinstance(request_digest, str)
+            or not isinstance(dispatched_request, dict)
+            or not isinstance(dispatched_request.get("sha256"), str)
+            or not _is_reservation_id(reservation)
+            or not isinstance(response_file_value, str)
+            or not isinstance(response, dict)
+            or not isinstance(response.get("sha256"), str)
+            or not isinstance(body_digest, str)
+        ):
+            raise CliError("campaign run result is incomplete", exit_code=EXIT_AUTHORITY)
+        if (
+            reservation != binding["reservation"]
+            or request_digest != binding["request_sha256"]
+            or dispatched_request.get("sha256") != binding["request_sha256"]
+            or response.get("sha256") != binding["response_sha256"]
+            or body_digest != binding["body_sha256"]
+            or response_file_value != binding["response_file"]
+        ):
+            raise CliError("campaign run result does not match request accounting", exit_code=EXIT_AUTHORITY)
+        request_file = Path(request_file_value)
+        response_file = Path(response_file_value)
+        expected_response = workspace / "responses" / f"{reservation}.personal-http1.raw"
+        try:
+            if response_file.resolve(strict=True) != expected_response.resolve(strict=True):
+                raise CliError("campaign response path is not workspace-owned", exit_code=EXIT_AUTHORITY)
+        except OSError as exc:
+            raise CliError("campaign response file is unavailable", exit_code=EXIT_AUTHORITY) from exc
+        request_content = _capture_bounded_local_file(
+            request_file, maximum_bytes=PERSONAL_HTTP1_MAX_REQUEST_BYTES, label="campaign request"
+        )
+        if sha256_hex(request_content) != request_digest:
+            raise CliError("campaign request digest changed after dispatch", exit_code=EXIT_AUTHORITY)
+        response_content = _capture_bounded_local_file(
+            response_file, maximum_bytes=PERSONAL_HTTP1_MAX_RESPONSE_BYTES, label="campaign response"
+        )
+        if sha256_hex(response_content) != response["sha256"]:
+            raise CliError("campaign response digest changed after dispatch", exit_code=EXIT_AUTHORITY)
+        method = definition.get("method")
+        if not isinstance(method, str):
+            raise CliError("campaign start record has invalid method", exit_code=EXIT_AUTHORITY)
+        _, _, body = _parse_personal_http11_response(response_content, method=method)
+        if sha256_hex(body) != body_digest:
+            raise CliError("campaign response body digest changed after dispatch", exit_code=EXIT_AUTHORITY)
+        sources.append((expected_role, request_file, response_file, body_digest))
+    return sources
+
+
+def _campaign_finalize_http1_triad(arguments: argparse.Namespace) -> int:
+    if not arguments.confirm_reviewed_non_sensitive:
+        raise CliError(
+            "--confirm-reviewed-non-sensitive is required before offline archival",
+            exit_code=EXIT_AUTHORITY,
+        )
+    manifest, _, _, _ = _verified_request_workspace(
+        arguments.workspace, _trusted_key_path(arguments), require_active=False
+    )
+    records = _campaign_records_directory(arguments.workspace)
+    start_path = _campaign_record(records, arguments.campaign_id, "start")
+    result_path = _campaign_record(records, arguments.campaign_id, "run-result")
+    start = _capture_campaign_json(start_path, label="campaign start record")
+    result = _capture_campaign_json(result_path, label="campaign run result")
+    required_start = {
+        "schema": "faultloom.personal-http1-triad-start.v1",
+        "campaign_id": arguments.campaign_id,
+        "run_id": manifest.get("run_id"),
+        "grant_id": manifest.get("grant_id"),
+        "grant_version": manifest.get("grant_version"),
+        "classifier": EXACT_BODY_DIGEST_CLASSIFIER,
+    }
+    required_result = {
+        "schema": "faultloom.personal-http1-triad-run-result.v1",
+        "campaign_id": arguments.campaign_id,
+        "run_id": manifest.get("run_id"),
+        "grant_id": manifest.get("grant_id"),
+        "grant_version": manifest.get("grant_version"),
+        "classifier": EXACT_BODY_DIGEST_CLASSIFIER,
+        "dispatch_count": 3,
+        "review_required": True,
+    }
+    if any(start.get(key) != value for key, value in required_start.items()) or any(
+        result.get(key) != value for key, value in required_result.items()
+    ):
+        raise CliError("campaign records are not bound to this workspace", exit_code=EXIT_AUTHORITY)
+    spec_path_value = start.get("spec_path")
+    spec_digest = start.get("spec_sha256")
+    if not isinstance(spec_path_value, str) or not isinstance(spec_digest, str):
+        raise CliError("campaign start record lacks its spec binding", exit_code=EXIT_AUTHORITY)
+    spec_content = _capture_bounded_local_file(
+        Path(spec_path_value), maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="campaign spec"
+    )
+    try:
+        spec = parse_personal_http1_triad_spec(spec_content)
+    except PersonalCampaignError as exc:
+        raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+    if (
+        sha256_hex(spec_content) != spec_digest
+        or spec.campaign_id != arguments.campaign_id
+        or spec.authorization_reference != start.get("authorization_reference")
+        or spec.authorization_document_sha256 != start.get("authorization_document_sha256")
+    ):
+        raise CliError("campaign spec changed after dispatch", exit_code=EXIT_AUTHORITY)
+    if result.get("start_sha256") != sha256_hex(
+        _capture_bounded_local_file(start_path, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="campaign start record")
+    ):
+        raise CliError("campaign run result is not bound to its start record", exit_code=EXIT_AUTHORITY)
+    bindings = _campaign_bindings(
+        workspace=arguments.workspace, manifest=manifest, campaign_id=arguments.campaign_id
+    )
+    sources = _campaign_exchange_sources(
+        workspace=arguments.workspace, start=start, result=result, bindings=bindings
+    )
+    finalize_start = _campaign_record(records, arguments.campaign_id, "finalize-start")
+    _write_new_campaign_record(
+        records,
+        finalize_start,
+        (json.dumps(
+            {
+                "schema": "faultloom.personal-http1-triad-finalize-start.v1",
+                "campaign_id": arguments.campaign_id,
+                "start_sha256": sha256_hex(_capture_bounded_local_file(start_path, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="campaign start record")),
+                "run_result_sha256": sha256_hex(_capture_bounded_local_file(result_path, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="campaign run result")),
+                "reviewed_non_sensitive": True,
+                "classifier": EXACT_BODY_DIGEST_CLASSIFIER,
+            },
+            indent=2,
+            sort_keys=True,
+        ) + "\n").encode("utf-8"),
+        mode=0o600,
+    )
+    evidence_ids: list[str] = []
+    body_digests: dict[str, str] = {}
+    response_digests: dict[str, str] = {}
+    dispatched = result.get("requests")
+    if not isinstance(dispatched, list):
+        raise CliError("campaign run result is invalid", exit_code=EXIT_AUTHORITY)
+    for (role, request_file, response_file, body_digest), dispatch in zip(sources, dispatched, strict=True):
+        if not isinstance(dispatch, dict):
+            raise CliError("campaign run result is invalid", exit_code=EXIT_AUTHORITY)
+        evidence = _evidence_add_exchange_result(
+            argparse.Namespace(
+                workspace=arguments.workspace,
+                trusted_key=arguments.trusted_key,
+                reservation_id=dispatch["reservation"],
+                request_file=request_file,
+                response_file=response_file,
+                title=f"HTTP/1 exact-digest triad {role}",
+            )
+        )
+        evidence_ids.append(str(evidence["evidence_id"]))
+        body_digests[role] = body_digest
+        response = dispatch.get("response")
+        if not isinstance(response, dict) or not isinstance(response.get("sha256"), str):
+            raise CliError("campaign run result is invalid", exit_code=EXIT_AUTHORITY)
+        response_digests[role] = response["sha256"]
+    try:
+        outcome = classify_exact_body_digest_triad(
+            effect_body_sha256=body_digests["effect"],
+            reproduction_body_sha256=body_digests["reproduction"],
+            negative_control_body_sha256=body_digests["negative_control"],
+        )
+    except PersonalCampaignError as exc:
+        raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+    finding: dict[str, object] | None = None
+    if outcome.status == "draft_unverified":
+        metadata = start.get("finding")
+        if not isinstance(metadata, dict):
+            raise CliError("campaign finding metadata is invalid", exit_code=EXIT_AUTHORITY)
+        finding = _finding_new_result(
+            argparse.Namespace(
+                workspace=arguments.workspace,
+                title=metadata["title"],
+                severity=metadata["severity"],
+                summary=metadata["summary"],
+                impact=metadata["impact"],
+                remediation=metadata["remediation"],
+                steps_file=None,
+                evidence=evidence_ids,
+            )
+        )
+    receipt_path = _campaign_record(records, arguments.campaign_id, "final-receipt")
+    receipt = {
+        "schema": "faultloom.personal-http1-triad-final-receipt.v1",
+        "campaign_id": arguments.campaign_id,
+        "status": outcome.status,
+        "classifier": outcome.classifier,
+        "dispatch_count": 3,
+        "evidence_ids": evidence_ids,
+        "response_sha256": response_digests,
+        "body_sha256": body_digests,
+        "independent_verification": False,
+        "automatic_submission": False,
+        "manual_review": "confirmed_non_sensitive_response_review",
+        "finding": finding,
+    }
+    _write_new_campaign_record(
+        records,
+        receipt_path,
+        (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+        mode=0o600,
+    )
+    _emit_json(
+        {
+            "schema": "faultloom.personal-http1-triad-finalize.v1",
+            "campaignId": arguments.campaign_id,
+            "status": outcome.status,
+            "classifier": outcome.classifier,
+            "receipt": str(receipt_path),
+            "independentVerification": False,
+            "automaticSubmission": False,
+        }
+    )
+    return EXIT_OK
 
 
 def _scope_complete_request(arguments: argparse.Namespace) -> int:
@@ -3549,6 +4444,30 @@ def build_parser() -> argparse.ArgumentParser:
     response_source.add_argument("--observed-response-bytes")
     response_source.add_argument("--response-file", type=Path)
     scope_complete_request.set_defaults(handler=_scope_complete_request)
+
+    campaign = commands.add_parser(
+        "campaign", help="run and manually finalize a bounded personal HTTP/1 triad"
+    )
+    campaign_commands = campaign.add_subparsers(dest="campaign_command", required=True)
+    campaign_run_http1_triad = campaign_commands.add_parser(
+        "run-http1-triad",
+        help="send effect, reproduction, and negative-control requests once each",
+    )
+    campaign_run_http1_triad.add_argument("--workspace", type=Path, required=True)
+    campaign_run_http1_triad.add_argument("--trusted-key", type=Path, required=True)
+    campaign_run_http1_triad.add_argument("--spec", type=Path, required=True)
+    campaign_run_http1_triad.set_defaults(handler=_campaign_run_http1_triad)
+    campaign_finalize_http1_triad = campaign_commands.add_parser(
+        "finalize-http1-triad",
+        help="offline archive a reviewed exact-digest triad result",
+    )
+    campaign_finalize_http1_triad.add_argument("--workspace", type=Path, required=True)
+    campaign_finalize_http1_triad.add_argument("--trusted-key", type=Path, required=True)
+    campaign_finalize_http1_triad.add_argument("--campaign-id", type=_campaign_id, required=True)
+    campaign_finalize_http1_triad.add_argument(
+        "--confirm-reviewed-non-sensitive", action="store_true"
+    )
+    campaign_finalize_http1_triad.set_defaults(handler=_campaign_finalize_http1_triad)
 
     run = commands.add_parser("run", help="start an authorized research run")
     run.add_argument("--authority", type=Path, required=True)

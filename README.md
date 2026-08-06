@@ -33,6 +33,20 @@ non-sensitive response expectation and provider/model-processing permission;
 the formal `doctor --json` `network_access` remains separate from the
 `personal_direct_send_*` capability fields.
 
+For a small supervised comparison, `campaign run-http1-triad` consumes a
+strict local JSON spec and sends exactly three sequential signed-scope
+requests: one effect request, the same effect request again as reproduction,
+and one minimally changed negative control. It has no preview, retry,
+redirect, provider, Burp, evidence, or submission path. If any dispatch is
+ambiguous it stops as `unresolved_no_retry`; it never guesses a completion.
+After the operator reviews the private responses and confirms they are
+non-sensitive, `campaign finalize-http1-triad` runs offline, archives the
+three exchanges, and applies only the `exact_body_digest_v1` classifier. An
+equal effect/reproduction body digest with a different control digest creates
+an explicitly `draft_unverified` finding; every other outcome is a
+`negative_campaign`. This is a bounded triad comparison, not independent
+verification or proof of a vulnerability.
+
 For the direct sender, hostname-only external targets use `https`; plaintext
 `http` requires an explicitly signed literal numeric IP or signed CIDR. An
 explicitly signed local `127.0.0.1` target remains supported.

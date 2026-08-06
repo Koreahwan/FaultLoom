@@ -262,6 +262,58 @@ then creates immutable request/response copies plus a
 be passed to `faultloom finding new --evidence <id>`. It opens no network
 socket, does not call Burp, make a verification claim, or infer a hypothesis.
 
+## Supervised HTTP/1.1 triad
+
+For the smallest useful personal campaign primitive, the CLI also provides a
+strict two-phase triad. It is deliberately separate from provider reasoning,
+Gateway automation, Burp, and reporting.
+
+First, prepare a strict `faultloom.personal-http1-triad.v1` JSON spec and two
+raw HTTP/1.1 request files in the same private directory. The spec contains
+one `effect` and one `negative_control` request definition. Both definitions
+must use the same `GET`, `HEAD`, or `OPTIONS` method and response cap, and the
+raw requests must differ only in their request-target line. The effect raw
+request is reused byte-for-byte for the second send as `reproduction`. Include
+the exact engagement `authorization_reference` and its
+`authorization_document_sha256`; these fields document the external approval
+but do not replace the signed FaultLoom scope.
+
+```bash
+faultloom campaign run-http1-triad \
+  --workspace <signed-manual-workspace> \
+  --trusted-key <public-key-outside-workspace> \
+  --spec <triad.json>
+```
+
+The command creates its start record before any target I/O, rechecks the
+signed workspace, then makes exactly three sequential requests with one
+concurrency slot: effect, the same effect again, and negative control. It has
+no response preview, retry, redirect, proxy, provider/model call, Burp
+operation, evidence archival, or submission path. A connection/TLS failure,
+429, partial or ambiguous response stops as `unresolved_no_retry`; the
+operator must reconcile manually and must not rerun the campaign. Private
+responses are left for the operator to classify; the run result is only
+`review_required`, never a vulnerability claim.
+
+After reviewing every response and confirming that it is non-sensitive, run:
+
+```bash
+faultloom campaign finalize-http1-triad \
+  --workspace <signed-manual-workspace> \
+  --trusted-key <public-key-outside-workspace> \
+  --campaign-id <campaign-id> \
+  --confirm-reviewed-non-sensitive
+```
+
+Finalization is offline and create-once. It verifies the bound request,
+response, and body digests, archives exactly the three exchanges, and applies
+only the deterministic `exact_body_digest_v1` classifier. If effect and
+reproduction body digests are equal while the negative-control body digest is
+different, it creates an evidence-bound `draft_unverified` finding. Any other
+digest relation creates a durable `negative_campaign` and no finding. This is
+not independent verification and does not prove exploitability or a
+vulnerability; independent replay and the normal report gate remain separate.
+
 The normal runtime is fail-closed and live mode is off by default. A POSIX
 `run --live` process is supported only when an external controller provisions
 the signed Gateway bootstrap, authenticated journal descriptors, channel
