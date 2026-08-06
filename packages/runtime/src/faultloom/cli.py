@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import contextvars
 import hashlib
 import io
 import ipaddress
@@ -112,6 +113,9 @@ REQUEST_ACCOUNTING_STATE_KEY = "request_accounting_state_id"
 PERSONAL_HTTP1_MAX_REQUEST_BYTES = 65_536
 PERSONAL_HTTP1_MAX_RESPONSE_BYTES = 1_048_576
 PERSONAL_HTTP1_PREVIEW_CHARS = 3_072
+_HANDOFF_VALIDATION_SNAPSHOTS: contextvars.ContextVar[dict[Path, bytes] | None] = contextvars.ContextVar(
+    "handoff_validation_snapshots", default=None
+)
 
 ModelT = TypeVar("ModelT", bound=ProtocolModel)
 
@@ -1717,15 +1721,22 @@ def _finding_new(arguments: argparse.Namespace) -> int:
 def _capture_single_protocol_file(path: Path) -> bytes:
     if os.name == "nt":
         snapshot = _snapshot_windows_protocol_file(path)
-        return _read_windows_protocol_file(path, snapshot)
-    snapshot = _snapshot_protocol_file_path(path)
-    bound = _open_bound_protocol_file(snapshot)
-    try:
-        content = _read_bound_protocol_file(bound)
-        _reconcile_bound_protocol_file(bound)
-        return content
-    finally:
-        _close_bound_protocol_file(bound)
+        content = _read_windows_protocol_file(path, snapshot)
+    else:
+        snapshot = _snapshot_protocol_file_path(path)
+        bound = _open_bound_protocol_file(snapshot)
+        try:
+            content = _read_bound_protocol_file(bound)
+            _reconcile_bound_protocol_file(bound)
+        finally:
+            _close_bound_protocol_file(bound)
+    snapshots = _HANDOFF_VALIDATION_SNAPSHOTS.get()
+    if snapshots is not None:
+        try:
+            snapshots[path.resolve(strict=True)] = content
+        except OSError as exc:
+            raise CliError("handoff source changed while being captured", exit_code=EXIT_AUTHORITY) from exc
+    return content
 
 
 def _path_matches(pattern: str, path: str) -> bool:
@@ -2916,6 +2927,73 @@ def _close_windows_response_directory_guard(handle: int) -> None:
     kernel32.CloseHandle(wintypes.HANDLE(handle))
 
 
+def _is_safe_handoff_filename(name: str) -> bool:
+    if (
+        not 1 <= len(name) <= 128
+        or not name[0].isascii()
+        or not name[0].isalnum()
+        or name.endswith(".")
+        or any(not character.isascii() or not (character.isalnum() or character in {".", "_", "-"}) for character in name)
+    ):
+        return False
+    stem = name.split(".", 1)[0].upper()
+    return stem not in {
+        "CON", "PRN", "AUX", "NUL",
+        *(f"COM{index}" for index in range(1, 10)),
+        *(f"LPT{index}" for index in range(1, 10)),
+    }
+
+
+def _windows_open_handoff_child(directory_handle: int, name: str, *, create: bool) -> int:
+    """Open one direct child through an already guarded Windows directory handle."""
+    import ctypes
+    from ctypes import wintypes
+
+    if not _is_safe_handoff_filename(name):
+        raise CliError("verification handoff output path is unsafe", exit_code=EXIT_AUTHORITY)
+
+    class UnicodeString(ctypes.Structure):
+        _fields_ = [("Length", wintypes.USHORT), ("MaximumLength", wintypes.USHORT), ("Buffer", wintypes.LPWSTR)]
+
+    class ObjectAttributes(ctypes.Structure):
+        _fields_ = [
+            ("Length", wintypes.ULONG), ("RootDirectory", wintypes.HANDLE),
+            ("ObjectName", ctypes.POINTER(UnicodeString)), ("Attributes", wintypes.ULONG),
+            ("SecurityDescriptor", ctypes.c_void_p), ("SecurityQualityOfService", ctypes.c_void_p),
+        ]
+
+    class IoStatusBlock(ctypes.Structure):
+        _fields_ = [("Status", ctypes.c_long), ("Information", ctypes.c_size_t)]
+
+    ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+    nt_create_file = ntdll.NtCreateFile
+    nt_create_file.argtypes = (
+        ctypes.POINTER(wintypes.HANDLE), wintypes.ULONG, ctypes.POINTER(ObjectAttributes),
+        ctypes.POINTER(IoStatusBlock), ctypes.c_void_p, wintypes.ULONG, wintypes.ULONG,
+        wintypes.ULONG, wintypes.ULONG, ctypes.c_void_p, wintypes.ULONG,
+    )
+    nt_create_file.restype = ctypes.c_long
+    buffer = ctypes.create_unicode_buffer(name)
+    length = len(name.encode("utf-16-le"))
+    unicode_name = UnicodeString(length, length + 2, ctypes.cast(buffer, wintypes.LPWSTR))
+    attributes = ObjectAttributes(
+        ctypes.sizeof(ObjectAttributes), directory_handle, ctypes.pointer(unicode_name), 0x40, None, None
+    )
+    io_status = IoStatusBlock()
+    handle = wintypes.HANDLE()
+    status = nt_create_file(
+        ctypes.byref(handle), 0x0012019F, ctypes.byref(attributes), ctypes.byref(io_status), None,
+        0x80, 0x3, 2 if create else 1, 0x20 | 0x40 | 0x00200000, None, 0,
+    )
+    if status != 0:
+        if ctypes.c_ulong(status).value == 0xC0000035:
+            raise FileExistsError(name)
+        raise CliError("cannot open verification handoff output", exit_code=EXIT_AUTHORITY)
+    if handle.value is None:
+        raise CliError("cannot open verification handoff output", exit_code=EXIT_AUTHORITY)
+    return int(handle.value)
+
+
 def _write_personal_response_file(workspace: Path, reservation_id: str, content: bytes) -> Path:
     responses = workspace / "responses"
     filename = f"{reservation_id}.personal-http1.raw"
@@ -3346,6 +3424,10 @@ def _write_new_campaign_record(
 
 def _capture_campaign_json(path: Path, *, label: str) -> dict[str, object]:
     content = _capture_bounded_local_file(path, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label=label)
+    return _parse_campaign_json_content(content, label=label)
+
+
+def _parse_campaign_json_content(content: bytes, *, label: str) -> dict[str, object]:
     try:
         value = json.loads(content.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
@@ -4666,6 +4748,7 @@ def _validated_campaign_evidence(
     for (role, request_file, response_file, _), dispatch, record in zip(
         inputs.sources, dispatched, evidence, strict=True
     ):
+        evidence_id = record.get("evidence_id") if isinstance(record, dict) else None
         request = dispatch.get("request") if isinstance(dispatch, dict) else None
         response = dispatch.get("response") if isinstance(dispatch, dict) else None
         reservation = dispatch.get("reservation") if isinstance(dispatch, dict) else None
@@ -4678,6 +4761,7 @@ def _validated_campaign_evidence(
             or record.get("schema") != "faultloom.manual-evidence.v1"
             or record.get("kind") != "http"
             or record.get("run_id") != inputs.manifest["run_id"]
+            or not isinstance(evidence_id, str)
             or record.get("reservation_id") != reservation
             or not isinstance(archived_request, dict)
             or not isinstance(archived_response, dict)
@@ -4685,6 +4769,15 @@ def _validated_campaign_evidence(
             or archived_response.get("sha256") != response.get("sha256")
         ):
             raise CliError("archived campaign evidence is invalid", exit_code=EXIT_AUTHORITY)
+        evidence_content = _capture_bounded_local_file(
+            raw_directory / f"{evidence_id}.json",
+            maximum_bytes=MAX_PROTOCOL_FILE_BYTES,
+            label="archived campaign evidence record",
+        )
+        if _parse_campaign_json_content(
+            evidence_content, label="archived campaign evidence record"
+        ) != record:
+            raise CliError("archived campaign evidence changed while being read", exit_code=EXIT_AUTHORITY)
         for archived, source, label in (
             (archived_request, request_file, "request"),
             (archived_response, response_file, "response"),
@@ -4793,6 +4886,400 @@ def _validate_completed_campaign_finalization(
         inputs=inputs, receipt=receipt, outcome_status=outcome_status, evidence_ids=evidence_ids
     )
     return outcome_status, 3
+
+
+def _handoff_workspace_file(
+    workspace: Path, path: Path, *, label: str, maximum_bytes: int, expected: bytes | None = None
+) -> tuple[str, dict[str, object]]:
+    """Return a bounded, non-symlink workspace-local file reference."""
+    try:
+        root = workspace.resolve(strict=True)
+        workspace_metadata = workspace.lstat()
+        candidate = path if path.is_absolute() else Path.cwd() / path
+        relative = candidate.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise CliError(f"{label} path is not workspace-local", exit_code=EXIT_AUTHORITY) from exc
+    if (
+        stat.S_ISLNK(workspace_metadata.st_mode)
+        or not stat.S_ISDIR(workspace_metadata.st_mode)
+        or workspace.is_junction()
+        or not relative.parts
+        or any(component in {"", ".", ".."} for component in relative.parts)
+    ):
+        raise CliError(f"{label} path is unsafe", exit_code=EXIT_AUTHORITY)
+    current = root
+    for component in relative.parts[:-1]:
+        current /= component
+        try:
+            metadata = current.lstat()
+        except OSError as exc:
+            raise CliError(f"cannot inspect {label} path", exit_code=EXIT_AUTHORITY) from exc
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or current.is_junction()
+        ):
+            raise CliError(f"{label} path is unsafe", exit_code=EXIT_AUTHORITY)
+    file_path = current / relative.parts[-1]
+    content = _capture_bounded_local_file(file_path, maximum_bytes=maximum_bytes, label=label)
+    if expected is not None and content != expected:
+        raise CliError(f"{label} changed after finalization validation", exit_code=EXIT_AUTHORITY)
+    reference_content = content if expected is None else expected
+    return str(relative), {
+        "path": str(relative),
+        "sizeBytes": len(reference_content),
+        "sha256": sha256_hex(reference_content),
+    }
+
+
+def _handoff_output_path(workspace: Path, path: Path) -> tuple[Path, str]:
+    """Accept only a direct workspace-child output to keep publication pinned."""
+    try:
+        root = workspace.resolve(strict=True)
+        candidate = path if path.is_absolute() else Path.cwd() / path
+        relative = candidate.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise CliError("verification handoff output is not workspace-local", exit_code=EXIT_AUTHORITY) from exc
+    if len(relative.parts) != 1 or not _is_safe_handoff_filename(relative.name):
+        raise CliError("verification handoff output path is unsafe", exit_code=EXIT_AUTHORITY)
+    output = root / relative.name
+    try:
+        metadata = output.lstat()
+    except FileNotFoundError:
+        return output, str(relative)
+    except OSError as exc:
+        raise CliError("cannot inspect verification handoff output", exit_code=EXIT_AUTHORITY) from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise CliError("verification handoff output is not a regular non-symlink file", exit_code=EXIT_AUTHORITY)
+    return output, str(relative)
+
+
+def _write_or_verify_handoff_output(workspace: Path, output: Path, content: bytes) -> None:
+    """Create one direct-child private file through a pinned workspace directory."""
+    name = output.name
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if os.name == "nt":
+        guard = _open_windows_response_directory_guard(workspace)
+        try:
+            metadata = workspace.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode) or workspace.is_junction():
+                raise CliError("verification handoff output parent is unsafe", exit_code=EXIT_AUTHORITY)
+            created = True
+            try:
+                descriptor = _windows_open_handoff_child(guard, name, create=True)
+            except FileExistsError:
+                created = False
+                descriptor = _windows_open_handoff_child(guard, name, create=False)
+            try:
+                import msvcrt
+
+                fd = msvcrt.open_osfhandle(descriptor, os.O_BINARY | os.O_RDWR)
+                descriptor = -1
+                try:
+                    metadata = os.fstat(fd)
+                    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_PROTOCOL_FILE_BYTES:
+                        raise CliError("verification handoff output is not a regular file", exit_code=EXIT_AUTHORITY)
+                    if not created:
+                        chunks: list[bytes] = []
+                        remaining = metadata.st_size
+                        while remaining:
+                            chunk = os.read(fd, min(PROTOCOL_READ_CHUNK_BYTES, remaining))
+                            if not chunk:
+                                raise CliError(
+                                    "verification handoff output changed while reading",
+                                    exit_code=EXIT_AUTHORITY,
+                                )
+                            chunks.append(chunk)
+                            remaining -= len(chunk)
+                        existing = b"".join(chunks)
+                        if existing != content:
+                            raise CliError("existing verification handoff output differs", exit_code=EXIT_AUTHORITY)
+                    else:
+                        offset = 0
+                        while offset < len(content):
+                            offset += os.write(fd, content[offset:])
+                        os.fsync(fd)
+                finally:
+                    os.close(fd)
+            finally:
+                if descriptor != -1:
+                    _close_windows_response_directory_guard(descriptor)
+        except OSError as exc:
+            raise CliError("cannot create verification handoff output", exit_code=EXIT_USAGE) from exc
+        finally:
+            _close_windows_response_directory_guard(guard)
+        return
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        directory_flags |= os.O_CLOEXEC
+    try:
+        expected = workspace.lstat()
+        directory = os.open(workspace, directory_flags)
+        try:
+            if not _stat_matches(os.fstat(directory), expected, _DIRECTORY_STAT_FIELDS):
+                raise CliError("verification handoff output parent changed", exit_code=EXIT_AUTHORITY)
+            try:
+                descriptor = os.open(name, flags, 0o600, dir_fd=directory)
+            except FileExistsError:
+                read_flags = os.O_RDONLY | os.O_NOFOLLOW
+                if hasattr(os, "O_CLOEXEC"):
+                    read_flags |= os.O_CLOEXEC
+                descriptor = os.open(name, read_flags, dir_fd=directory)
+                try:
+                    metadata = os.fstat(descriptor)
+                    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_PROTOCOL_FILE_BYTES:
+                        raise CliError("verification handoff output is not a regular file", exit_code=EXIT_AUTHORITY)
+                    chunks: list[bytes] = []
+                    remaining = metadata.st_size
+                    while remaining:
+                        chunk = os.read(descriptor, min(PROTOCOL_READ_CHUNK_BYTES, remaining))
+                        if not chunk:
+                            raise CliError("verification handoff output changed while reading", exit_code=EXIT_AUTHORITY)
+                        chunks.append(chunk)
+                        remaining -= len(chunk)
+                    existing = b"".join(chunks)
+                    if existing != content:
+                        raise CliError("existing verification handoff output differs", exit_code=EXIT_AUTHORITY)
+                finally:
+                    os.close(descriptor)
+                return
+            try:
+                offset = 0
+                while offset < len(content):
+                    offset += os.write(descriptor, content[offset:])
+                os.fchmod(descriptor, 0o600)
+                os.fsync(descriptor)
+                os.fsync(directory)
+            finally:
+                os.close(descriptor)
+        finally:
+            os.close(directory)
+    except CliError:
+        raise
+    except OSError as exc:
+        raise CliError("cannot create verification handoff output", exit_code=EXIT_USAGE) from exc
+
+
+def _campaign_verification_handoff_bytes(arguments: argparse.Namespace) -> bytes:
+    """Build one private replay manifest after fully revalidating a finalized v2 campaign."""
+    final_receipt = _campaign_record(
+        _campaign_records_directory(arguments.workspace), arguments.campaign_id, "final-receipt"
+    )
+    snapshots: dict[Path, bytes] = {}
+    token = _HANDOFF_VALIDATION_SNAPSHOTS.set(snapshots)
+    try:
+        inputs = _validated_campaign_finalization_inputs(arguments)
+        status, _ = _validate_completed_campaign_finalization(arguments, final_receipt)
+    finally:
+        _HANDOFF_VALIDATION_SNAPSHOTS.reset(token)
+    if status != "draft_unverified":
+        raise CliError("verification handoff requires a draft_unverified campaign", exit_code=EXIT_AUTHORITY)
+    def snapshot(path: Path, *, label: str) -> bytes:
+        try:
+            return snapshots[path.resolve(strict=True)]
+        except (KeyError, OSError) as exc:
+            raise CliError(f"{label} was not captured during finalization validation", exit_code=EXIT_AUTHORITY) from exc
+
+    receipt = _parse_campaign_json_content(
+        snapshot(final_receipt, label="campaign final receipt"), label="campaign final receipt"
+    )
+    spec_path_value = inputs.start.get("spec_path")
+    if not isinstance(spec_path_value, str):
+        raise CliError("campaign start record lacks its spec binding", exit_code=EXIT_AUTHORITY)
+    spec_content = snapshot(Path(spec_path_value), label="campaign spec")
+    try:
+        spec = parse_personal_http1_triad_spec(spec_content)
+    except PersonalCampaignError as exc:
+        raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+    binding = spec.automation_binding
+    start_binding = inputs.start.get("automation_binding")
+    start_binding_digest = inputs.start.get("automation_binding_digest")
+    if (
+        spec.schema_ != PERSONAL_HTTP1_TRIAD_BOUND_SCHEMA
+        or binding is None
+        or binding.schema_ != PERSONAL_HTTP1_TRIAD_AUTOMATION_BINDING_SCHEMA
+        or not isinstance(start_binding, dict)
+        or not isinstance(start_binding_digest, str)
+        or start_binding != binding.model_dump(by_alias=True)
+        or start_binding_digest != sha256_digest(start_binding)
+        or receipt.get("automation_binding") != start_binding
+        or receipt.get("automation_binding_digest") != start_binding_digest
+    ):
+        raise CliError("verification handoff requires an exact v2 automation binding", exit_code=EXIT_AUTHORITY)
+    finding = receipt.get("finding")
+    if not isinstance(finding, dict):
+        raise CliError("draft campaign finding is invalid", exit_code=EXIT_AUTHORITY)
+    finding_id = finding.get("finding_id")
+    finding_record_path = finding.get("record")
+    finding_markdown_path = finding.get("finding")
+    start_finding = inputs.start.get("finding")
+    if (
+        finding.get("status") != "draft_unverified"
+        or not isinstance(finding_id, str)
+        or not isinstance(finding_record_path, str)
+        or not isinstance(finding_markdown_path, str)
+        or not isinstance(start_finding, dict)
+    ):
+        raise CliError("draft campaign finding is invalid", exit_code=EXIT_AUTHORITY)
+    finding_record = _parse_campaign_json_content(
+        snapshot(Path(finding_record_path), label="draft campaign finding"), label="draft campaign finding"
+    )
+    for field in ("title", "severity", "summary", "impact", "remediation"):
+        if finding_record.get(field) != start_finding.get(field):
+            raise CliError("draft campaign finding prose differs from campaign start", exit_code=EXIT_AUTHORITY)
+    if (
+        finding_record.get("finding_id") != finding_id
+        or finding_record.get("run_id") != inputs.manifest.get("run_id")
+        or finding_record.get("status") != "draft_unverified"
+        or finding_record.get("evidence_ids") != receipt.get("evidence_ids")
+    ):
+        raise CliError("draft campaign finding does not match its final receipt", exit_code=EXIT_AUTHORITY)
+
+    refs: dict[str, object] = {}
+    for name, path, limit in (
+        ("run", inputs.records.workspace / "run.json", MAX_PROTOCOL_FILE_BYTES),
+        ("spec", Path(spec_path_value), MAX_PROTOCOL_FILE_BYTES),
+        ("start", inputs.start_path, MAX_PROTOCOL_FILE_BYTES),
+        ("runResult", inputs.result_path, MAX_PROTOCOL_FILE_BYTES),
+        ("finalizeStart", _campaign_record(inputs.records, arguments.campaign_id, "finalize-start"), MAX_PROTOCOL_FILE_BYTES),
+        ("finalReceipt", final_receipt, MAX_PROTOCOL_FILE_BYTES),
+    ):
+        _, refs[name] = _handoff_workspace_file(
+            inputs.records.workspace, path, label=name, maximum_bytes=limit,
+            expected=snapshot(path, label=name),
+        )
+    _, finding_record_ref = _handoff_workspace_file(
+        inputs.records.workspace, Path(finding_record_path), label="finding record",
+        maximum_bytes=MAX_PROTOCOL_FILE_BYTES,
+        expected=snapshot(Path(finding_record_path), label="finding record"),
+    )
+    # The JSON record is the exact prose/status/evidence source validated above.
+    # Do not hand off the human-readable Markdown separately: finalization only
+    # requires its presence, so it is not a second immutable prose authority.
+    refs["finding"] = {"id": finding_id, "status": "draft_unverified", "record": finding_record_ref}
+
+    binding_refs: dict[str, object] = {}
+    for name, path_value, limit in (
+        ("result", binding.result_path, MAX_PROTOCOL_FILE_BYTES),
+        ("receipt", binding.receipt_path, MAX_PROTOCOL_FILE_BYTES),
+        ("template", binding.template_path, MAX_PROTOCOL_FILE_BYTES),
+        ("effectRequest", binding.effect_request_path, PERSONAL_HTTP1_MAX_REQUEST_BYTES),
+        ("negativeControlRequest", binding.negative_control_request_path, PERSONAL_HTTP1_MAX_REQUEST_BYTES),
+    ):
+        _, binding_refs[name] = _handoff_workspace_file(
+            inputs.records.workspace, Path(path_value), label=f"automation {name}", maximum_bytes=limit,
+            expected=snapshot(Path(path_value), label=f"automation {name}"),
+        )
+
+    evidence_ids = receipt.get("evidence_ids")
+    if not isinstance(evidence_ids, list) or not all(isinstance(value, str) for value in evidence_ids):
+        raise CliError("campaign final receipt has invalid evidence ids", exit_code=EXIT_AUTHORITY)
+    evidence = _workspace_evidence(
+        inputs.records.workspace, run_id=str(inputs.manifest["run_id"]), selected_ids=tuple(evidence_ids)
+    )
+    dispatched = inputs.result.get("requests")
+    if not isinstance(dispatched, list):
+        raise CliError("campaign run result is invalid", exit_code=EXIT_AUTHORITY)
+    exchanges: list[dict[str, object]] = []
+    for (role, _, _, _), record, dispatch in zip(inputs.sources, evidence, dispatched, strict=True):
+        request = record.get("request") if isinstance(record, dict) else None
+        response = record.get("response") if isinstance(record, dict) else None
+        evidence_id = record.get("evidence_id") if isinstance(record, dict) else None
+        if (
+            not isinstance(request, dict)
+            or not isinstance(response, dict)
+            or not isinstance(evidence_id, str)
+            or not isinstance(request.get("stored_file"), str)
+            or not isinstance(response.get("stored_file"), str)
+            or not isinstance(dispatch, dict)
+            or record.get("reservation_id") != dispatch.get("reservation")
+        ):
+            raise CliError("archived campaign evidence is invalid", exit_code=EXIT_AUTHORITY)
+        dispatched_request = dispatch.get("request")
+        dispatched_response = dispatch.get("response")
+        body_sha256 = dispatch.get("bodySha256")
+        if (
+            not isinstance(dispatched_request, dict)
+            or not isinstance(dispatched_request.get("sha256"), str)
+            or not isinstance(dispatched_response, dict)
+            or not isinstance(dispatched_response.get("sha256"), str)
+            or not isinstance(body_sha256, str)
+        ):
+            raise CliError("campaign run result is incomplete", exit_code=EXIT_AUTHORITY)
+        record_path = inputs.records.workspace / "evidence" / "raw" / f"{evidence_id}.json"
+        raw_directory = inputs.records.workspace / "evidence" / "raw"
+        request_path = raw_directory / request["stored_file"]
+        response_path = raw_directory / response["stored_file"]
+        _, record_ref = _handoff_workspace_file(
+            inputs.records.workspace, record_path, label=f"{role} evidence record",
+            maximum_bytes=MAX_PROTOCOL_FILE_BYTES,
+            expected=snapshot(record_path, label=f"{role} evidence record"),
+        )
+        _, request_ref = _handoff_workspace_file(
+            inputs.records.workspace, request_path, label=f"{role} evidence request",
+            maximum_bytes=PERSONAL_HTTP1_MAX_REQUEST_BYTES,
+            expected=snapshot(request_path, label=f"{role} evidence request"),
+        )
+        _, response_ref = _handoff_workspace_file(
+            inputs.records.workspace, response_path, label=f"{role} evidence response",
+            maximum_bytes=PERSONAL_HTTP1_MAX_RESPONSE_BYTES,
+            expected=snapshot(response_path, label=f"{role} evidence response"),
+        )
+        exchanges.append({
+            "role": role,
+            "evidenceId": evidence_id,
+            "requestSha256": dispatched_request["sha256"],
+            "responseSha256": dispatched_response["sha256"],
+            "bodySha256": body_sha256,
+            "record": record_ref,
+            "request": request_ref,
+            "response": response_ref,
+        })
+
+    manifest = {
+        "schema": "faultloom.campaign-verification-handoff.v1",
+        "status": "verification_handoff_ready",
+        "verificationStatus": "pending",
+        "independentVerification": False,
+        "targetDispatch": False,
+        "networkAccess": False,
+        "automaticSubmission": False,
+        "campaign": {"id": arguments.campaign_id, "runId": inputs.manifest["run_id"], "grantId": inputs.manifest["grant_id"], "grantVersion": inputs.manifest["grant_version"]},
+        "automation": {"candidateId": binding.candidate_id, "candidateDigest": binding.candidate_digest, "bindingDigest": start_binding_digest, "signedAuthorityEnvelopeSha256": inputs.manifest.get("authority_sha256"), "references": binding_refs},
+        "manualFindingId": finding_id,
+        "references": refs,
+        "evidence": exchanges,
+        "replayRequirements": {
+            "freshIdentityAndReset": True,
+            "positiveReplay": True,
+            "negativeControl": True,
+            "newVerifierEvidence": True,
+            "sourceEvidenceReuse": False,
+        },
+    }
+    return (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def _campaign_export_verification_handoff(arguments: argparse.Namespace) -> int:
+    output, output_relative = _handoff_output_path(arguments.workspace, arguments.out)
+    content = _campaign_verification_handoff_bytes(arguments)
+    _write_or_verify_handoff_output(arguments.workspace, output, content)
+    _emit_json({
+        "schema": "faultloom.campaign-verification-handoff-export.v1",
+        "handoff": output_relative,
+        "sha256": sha256_hex(content),
+        "status": "verification_handoff_ready",
+        "verificationStatus": "pending",
+        "independentVerification": False,
+        "targetDispatch": False,
+        "networkAccess": False,
+        "automaticSubmission": False,
+    })
+    return EXIT_OK
 
 
 def _campaign_finalize_http1_triad(arguments: argparse.Namespace) -> int:
@@ -5439,6 +5926,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--confirm-reviewed-non-sensitive", action="store_true"
     )
     campaign_finalize_http1_triad.set_defaults(handler=_campaign_finalize_http1_triad)
+    campaign_export_verification_handoff = campaign_commands.add_parser(
+        "export-verification-handoff",
+        help="export a local replay handoff for one finalized v2 draft campaign",
+    )
+    campaign_export_verification_handoff.add_argument("--workspace", type=Path, required=True)
+    campaign_export_verification_handoff.add_argument("--trusted-key", type=Path, required=True)
+    campaign_export_verification_handoff.add_argument("--campaign-id", type=_campaign_id, required=True)
+    campaign_export_verification_handoff.add_argument("--out", type=Path, required=True)
+    campaign_export_verification_handoff.set_defaults(handler=_campaign_export_verification_handoff)
 
     run = commands.add_parser("run", help="start an authorized research run")
     run.add_argument("--authority", type=Path, required=True)

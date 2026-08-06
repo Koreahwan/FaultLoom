@@ -65,6 +65,13 @@ an explicitly `draft_unverified` finding; every other outcome is a
 `negative_campaign`. This is a bounded triad comparison, not independent
 verification or proof of a vulnerability.
 
+A completed bound-v2 `draft_unverified` campaign can be exported with
+`campaign export-verification-handoff`. This read-only command revalidates the
+terminal campaign and writes one private, create-once direct child of the
+workspace containing only relative references, sizes, digests, and pending
+verification requirements. It includes no raw bodies, secrets, verdict,
+report, target/provider traffic, or submission authority.
+
 For the direct sender, hostname-only external targets use `https`; plaintext
 `http` requires an explicitly signed literal numeric IP or signed CIDR. An
 explicitly signed local `127.0.0.1` target remains supported.

@@ -370,6 +370,37 @@ digest relation creates a durable `negative_campaign` and no finding. This is
 not independent verification and does not prove exploitability or a
 vulnerability; independent replay and the normal report gate remain separate.
 
+### Read-only verification handoff
+
+Only a finalized `draft_unverified` v2 campaign with its exact automation
+binding may be exported for an independent verifier:
+
+```bash
+faultloom campaign export-verification-handoff \
+  --workspace <signed-manual-workspace> \
+  --trusted-key <public-key-outside-workspace> \
+  --campaign-id <campaign-id> \
+  --out <workspace-local-handoff.json>
+```
+
+`--out` must be a direct child of the workspace; nested output paths are
+rejected. The output path and every referenced campaign, automation, finding, and
+evidence file must be regular non-symlink files beneath the workspace. The
+command revalidates the completed finalization chain, the exact v2 binding,
+and the finalized finding's title, severity, summary, impact, remediation,
+identity, status, and evidence IDs against the campaign start record. It then
+creates one private canonical manifest containing only workspace-relative
+file references, byte sizes, and SHA-256 values. It contains no raw exchange
+bodies, credentials, signing keys, report, verdict, or verified finding.
+
+The manifest requires a fresh verifier identity/reset, a positive replay, a
+negative control, new verifier evidence, and no reuse of the source evidence.
+It is marked `verification_handoff_ready` with verification still `pending`.
+Export makes no socket, provider, target, verifier, report, outbox, or
+submission call. Repeating the exact export revalidates sources and returns
+the existing manifest digest without rewriting it; changed sources or any
+different pre-existing output fail closed.
+
 The normal runtime is fail-closed and live mode is off by default. A POSIX
 `run --live` process is supported only when an external controller provisions
 the signed Gateway bootstrap, authenticated journal descriptors, channel
