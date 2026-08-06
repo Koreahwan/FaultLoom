@@ -8,6 +8,7 @@ import ipaddress
 import json
 import os
 import queue
+import re
 import secrets
 import shutil
 import socket
@@ -58,6 +59,10 @@ from .automation_cli import (
     AutomationExportHandoffDependencies,
     compile_automation,
     export_automation_handoff,
+)
+from .automation.candidate_outbox import (
+    CandidateOutboxError,
+    automation_result_candidate_digest,
 )
 from .personal_campaign import (
     EXACT_BODY_DIGEST_CLASSIFIER,
@@ -3381,13 +3386,19 @@ def _selected_automation_candidate(
     result: AuthorizedAutomationResult, candidate_id: str
 ) -> ToolCandidate:
     matches = [
-        plan.selected.candidate
+        plan.selected
         for plan in result.admitted_plans
         if plan.selected.candidate.candidate_id == candidate_id
     ]
     if len(matches) != 1:
         raise CliError("automation candidate is absent or ambiguous", exit_code=EXIT_AUTHORITY)
-    return matches[0]
+    selected = matches[0]
+    if selected.receipt.authority_digest != result.authority_grant_digest:
+        raise CliError(
+            "automation candidate admission is bound to another authority",
+            exit_code=EXIT_AUTHORITY,
+        )
+    return selected.candidate
 
 
 def _validate_automation_candidate_for_triad(
@@ -3428,7 +3439,10 @@ def _validate_automation_candidate_for_triad(
 
 
 def _validate_automation_result_receipt(
-    receipt: dict[str, object], *, result_digest: str
+    receipt: dict[str, object],
+    *,
+    result: AuthorizedAutomationResult,
+    result_digest: str,
 ) -> None:
     expected = {
         "schema",
@@ -3442,6 +3456,12 @@ def _validate_automation_result_receipt(
         "result_digest",
         "target_dispatch",
     }
+    candidate_digest = receipt.get("candidate_digest")
+    expected_entry_id = f"result.{result_digest.removeprefix('sha256:')[:32]}"
+    try:
+        expected_candidate_digest = automation_result_candidate_digest(result)
+    except CandidateOutboxError as exc:
+        raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
     if (
         set(receipt) != expected
         or receipt.get("schema") != "faultloom.automation.result.receipt.v1"
@@ -3452,8 +3472,15 @@ def _validate_automation_result_receipt(
         or receipt.get("independent_verification") is not False
         or receipt.get("network_access") != "none"
         or receipt.get("target_dispatch") is not False
-        or not isinstance(receipt.get("entry_id"), str)
-        or receipt.get("candidate_digest") is not None and not isinstance(receipt.get("candidate_digest"), str)
+        or receipt.get("entry_id") != expected_entry_id
+        or candidate_digest != expected_candidate_digest
+        or (
+            candidate_digest is not None
+            and (
+                not isinstance(candidate_digest, str)
+                or re.fullmatch(r"^sha256:[0-9a-f]{64}$", candidate_digest) is None
+            )
+        )
     ):
         raise CliError("automation result receipt is invalid", exit_code=EXIT_AUTHORITY)
 
@@ -3521,7 +3548,11 @@ def _validate_bound_triad_spec(
         raise CliError("invalid automation result receipt", exit_code=EXIT_AUTHORITY) from exc
     if not isinstance(receipt, dict):
         raise CliError("invalid automation result receipt", exit_code=EXIT_AUTHORITY)
-    _validate_automation_result_receipt(receipt, result_digest=result_digest)
+    _validate_automation_result_receipt(
+        receipt,
+        result=result,
+        result_digest=result_digest,
+    )
     effect_path, effect_content = _capture_bound_campaign_source(
         binding.effect_request_path,
         digest=binding.effect_request_sha256,
@@ -3678,7 +3709,10 @@ def _campaign_request_file(spec_path: Path, name: str) -> Path:
 
 
 def _prepare_campaign_requests(
-    spec: PersonalHttp1TriadSpec, spec_path: Path
+    spec: PersonalHttp1TriadSpec,
+    spec_path: Path,
+    *,
+    expected_sha256: dict[str, str] | None = None,
 ) -> dict[str, tuple[Path, bytes, str]]:
     prepared: dict[str, tuple[Path, bytes, str]] = {}
     for request in spec.requests:
@@ -3693,6 +3727,11 @@ def _prepare_campaign_requests(
             request_path=request.path,
             require_connection_close=True,
         )
+        if expected_sha256 is not None and digest != expected_sha256[request.role]:
+            raise CliError(
+                "request file digest differs from the automation binding",
+                exit_code=EXIT_AUTHORITY,
+            )
         prepared[request.role] = (request_file, content, digest)
     effect_content = prepared["effect"][1]
     control_content = prepared["negative_control"][1]
@@ -3843,7 +3882,11 @@ def _campaign_prepare_http1_triad(arguments: argparse.Namespace) -> int:
         raise CliError("invalid automation result receipt", exit_code=EXIT_AUTHORITY) from exc
     if not isinstance(receipt, dict):
         raise CliError("invalid automation result receipt", exit_code=EXIT_AUTHORITY)
-    _validate_automation_result_receipt(receipt, result_digest=result_digest)
+    _validate_automation_result_receipt(
+        receipt,
+        result=result,
+        result_digest=result_digest,
+    )
     candidate_digest = _validate_automation_candidate_for_triad(
         result=result,
         candidate_id=arguments.candidate_id,
@@ -3918,7 +3961,17 @@ def _campaign_run_http1_triad(arguments: argparse.Namespace) -> int:
         grant=grant,
         target=target,
     )
-    prepared = _prepare_campaign_requests(spec, spec_path)
+    expected_sha256 = None
+    if spec.automation_binding is not None:
+        expected_sha256 = {
+            "effect": spec.automation_binding.effect_request_sha256,
+            "negative_control": spec.automation_binding.negative_control_request_sha256,
+        }
+    prepared = _prepare_campaign_requests(
+        spec,
+        spec_path,
+        expected_sha256=expected_sha256,
+    )
     records = _campaign_records_directory(arguments.workspace)
     start_record = _campaign_record(records, spec.campaign_id, "start")
     _write_new_campaign_record(

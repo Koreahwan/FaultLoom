@@ -187,6 +187,25 @@ def _content_digest(content: str) -> str:
     return "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+def automation_result_candidate_digest(
+    result: AuthorizedAutomationResult,
+) -> str | None:
+    """Return the exact optional candidate artifact digest used by result bundles."""
+    if type(result) is not AuthorizedAutomationResult:
+        raise CandidateOutboxError(
+            "automation result candidate digest requires an exact automation result"
+        )
+    try:
+        validated = AuthorizedAutomationResult.model_validate(result)
+    except ValidationError as exc:
+        raise CandidateOutboxError(
+            "automation result candidate digest received an invalid result"
+        ) from exc
+    if validated.finding_draft is None:
+        return None
+    return _content_digest(_candidate_markdown(validated, validated.finding_draft))
+
+
 def _create_file_once(path: Path, content: str) -> None:
     directory_fd = _ACTIVE_DIRECTORY_FD.get()
     if directory_fd is not None:
@@ -719,10 +738,9 @@ def write_automation_result_bundle(
     result_digest = sha256_digest(result_value)
     entry_id = f"result.{result_digest.removeprefix('sha256:')[:32]}"
     candidate_content: str | None = None
-    candidate_digest: str | None = None
+    candidate_digest = automation_result_candidate_digest(validated)
     if validated.finding_draft is not None:
         candidate_content = _candidate_markdown(validated, validated.finding_draft)
-        candidate_digest = _content_digest(candidate_content)
 
     receipt_content = canonical_json(
         {

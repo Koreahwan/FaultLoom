@@ -8,7 +8,8 @@ from pathlib import Path
 import pytest
 
 from faultloom import cli
-from faultloom.automation.models import AuthorizedAutomationResult
+from faultloom.automation.candidate_outbox import write_automation_result_bundle
+from faultloom.automation.models import AuthorizedAutomationResult, CandidateFindingDraft
 from faultloom.tool_planner import (
     PlanningBudget,
     ToolCandidate,
@@ -41,7 +42,14 @@ def _prepare_arguments(
     ]
 
 
-def _bundle(workspace: Path, key: Path, template: Path, port: int) -> tuple[Path, Path]:
+def _bundle(
+    workspace: Path,
+    key: Path,
+    template: Path,
+    port: int,
+    *,
+    finding_draft: CandidateFindingDraft | None = None,
+) -> tuple[Path, Path]:
     # Reuse the live verifier to obtain the typed authority, instead of trusting test JSON.
     verified_manifest, typed_grant, target, _ = cli._verified_request_workspace(
         workspace, key
@@ -67,7 +75,7 @@ def _bundle(workspace: Path, key: Path, template: Path, port: int) -> tuple[Path
         receipt=ToolPlanReceipt(
             candidate_id=candidate.candidate_id, candidate_digest=sha256_digest(candidate.model_dump(mode="json")),
             hypothesis_id=candidate.hypothesis_id, hypothesis_digest="sha256:" + "1" * 64,
-            authority_digest="sha256:" + "2" * 64, adapter_id=candidate.adapter_id,
+            authority_digest=sha256_digest(typed_grant), adapter_id=candidate.adapter_id,
             manifest_digest="sha256:" + "3" * 64, admission_snapshot_digest="sha256:" + "4" * 64,
             utility_receipt_digest="sha256:" + "5" * 64, budget_digest="sha256:" + "6" * 64,
         ),
@@ -78,19 +86,14 @@ def _bundle(workspace: Path, key: Path, template: Path, port: int) -> tuple[Path
         observation_bundle_digest="sha256:" + "7" * 64, action_context_digest="sha256:" + "8" * 64,
         hypotheses=(), negative_results=(),
         admitted_plans=(ToolPlan(hypothesis_id=candidate.hypothesis_id, selected=item, remaining=PlanningBudget(rate_slots=0, duration_seconds=0, bytes=0, concurrency=0, actions=0, cost_microunits=0)),),
+        finding_draft=finding_draft,
         stop_reason="Await independent verification.", provider_network_access="none",
     )
-    result_path = template.parent / "result.json"
-    receipt_path = template.parent / "receipt.json"
-    result_path.write_text(canonical_json(result.model_dump(mode="json")), encoding="utf-8")
-    result_digest = sha256_digest(result.model_dump(mode="json"))
-    receipt_path.write_text(canonical_json({
-        "schema": "faultloom.automation.result.receipt.v1", "automatic_submission": False,
-        "candidate_digest": None, "candidate_only": True, "entry_id": "result.test",
-        "evidence_existence_independently_verified": False, "independent_verification": False,
-        "network_access": "none", "result_digest": result_digest, "target_dispatch": False,
-    }), encoding="utf-8")
-    return result_path, receipt_path
+    publication = write_automation_result_bundle(
+        result,
+        template.parent / "automation-results",
+    )
+    return publication.result_path, publication.receipt_path
 
 
 def test_prepared_candidate_runs_exactly_three_and_preserves_provenance(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -144,6 +147,32 @@ def test_bound_source_tamper_fails_before_socket(tmp_path: Path, source: str) ->
     listener.close()
 
 
+def test_request_swap_after_binding_validation_fails_before_socket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    listener, port = _listener()
+    workspace, key = _workspace(tmp_path, port)
+    template = _spec(tmp_path, port)
+    result, receipt = _bundle(workspace, key, template, port)
+    bound = tmp_path / "bound.json"
+    assert cli.main(_prepare_arguments(workspace, key, template, result, receipt, bound)) == cli.EXIT_OK
+
+    validate = cli._validate_bound_triad_spec
+
+    def swap_after_validation(**kwargs: object) -> dict[str, object] | None:
+        provenance = validate(**kwargs)
+        (tmp_path / "effect.raw").write_bytes(_request(port, "/api/effect?changed=1"))
+        return provenance
+
+    monkeypatch.setattr(cli, "_validate_bound_triad_spec", swap_after_validation)
+    assert cli.main(_campaign_run_arguments(workspace, key, bound)) == cli.EXIT_AUTHORITY
+    listener.settimeout(0.1)
+    with pytest.raises(socket.timeout):
+        listener.accept()
+    listener.close()
+
+
 def test_prepare_rejects_unknown_candidate_without_writing_spec(tmp_path: Path) -> None:
     listener, port = _listener()
     listener.close()
@@ -155,7 +184,50 @@ def test_prepare_rejects_unknown_candidate_without_writing_spec(tmp_path: Path) 
     assert not bound.exists()
 
 
-@pytest.mark.parametrize("mutation", ("intent_path", "result_run"))
+def test_prepare_rejects_malformed_receipt_candidate_digest(tmp_path: Path) -> None:
+    listener, port = _listener()
+    listener.close()
+    workspace, key = _workspace(tmp_path, port)
+    template = _spec(tmp_path, port)
+    result, receipt_path = _bundle(workspace, key, template, port)
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["candidate_digest"] = "NOT-A-DIGEST"
+    receipt_path.write_text(canonical_json(receipt), encoding="utf-8")
+    bound = tmp_path / "bound.json"
+    assert cli.main(_prepare_arguments(workspace, key, template, result, receipt_path, bound)) == cli.EXIT_AUTHORITY
+    assert not bound.exists()
+
+
+def test_prepare_rejects_false_candidate_artifact_digest(tmp_path: Path) -> None:
+    listener, port = _listener()
+    listener.close()
+    workspace, key = _workspace(tmp_path, port)
+    template = _spec(tmp_path, port)
+    draft = CandidateFindingDraft(
+        hypothesis_id="hypothesis.triad",
+        title="Owned loopback candidate",
+        severity="low",
+        summary="Requires independent replay.",
+        impact="No impact is verified.",
+        reproduction_steps=("Replay only the admitted triad.",),
+        remediation="Review before changing the service.",
+    )
+    result, receipt_path = _bundle(
+        workspace,
+        key,
+        template,
+        port,
+        finding_draft=draft,
+    )
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["candidate_digest"] = "sha256:" + "9" * 64
+    receipt_path.write_text(canonical_json(receipt), encoding="utf-8")
+    bound = tmp_path / "bound.json"
+    assert cli.main(_prepare_arguments(workspace, key, template, result, receipt_path, bound)) == cli.EXIT_AUTHORITY
+    assert not bound.exists()
+
+
+@pytest.mark.parametrize("mutation", ("intent_path", "result_run", "plan_authority"))
 def test_model_candidate_cannot_override_template_or_workspace(mutation: str, tmp_path: Path) -> None:
     listener, port = _listener()
     listener.close()
@@ -168,8 +240,12 @@ def test_model_candidate_cannot_override_template_or_workspace(mutation: str, tm
         value["admitted_plans"][0]["selected"]["receipt"]["candidate_digest"] = sha256_digest(
             value["admitted_plans"][0]["selected"]["candidate"]
         )
-    else:
+    elif mutation == "result_run":
         value["run_id"] = "run.other"
+    else:
+        value["admitted_plans"][0]["selected"]["receipt"]["authority_digest"] = (
+            "sha256:" + "2" * 64
+        )
     result = AuthorizedAutomationResult.model_validate_json(json.dumps(value))
     result_path.write_text(canonical_json(result.model_dump(mode="json")), encoding="utf-8")
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
