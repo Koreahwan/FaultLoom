@@ -53,6 +53,7 @@ from faultloom_protocol import (
     StateRef,
     TargetAsset,
     TimeWindow,
+    canonical_json,
     sha256_digest,
     sign_authority_grant,
     verify_authority_grant,
@@ -65,6 +66,7 @@ from .adapter_cli import configure_adapter_parser
 from .automation.candidate_outbox import (
     CandidateOutboxError,
     automation_result_candidate_digest,
+    ensure_private_content_bundle,
 )
 from .automation.models import AuthorizedAutomationResult
 from .automation_cli import (
@@ -75,9 +77,12 @@ from .automation_cli import (
     AutomationPrepareHttp1RequestArguments,
     AutomationPrepareHttp1RequestDependencies,
     compile_automation,
+    compile_automation_result,
     export_automation_handoff,
+    parse_automation_request,
     prepare_automation_http1_request,
 )
+from .automation import parse_model_turn
 from .personal_campaign import (
     EXACT_BODY_DIGEST_CLASSIFIER,
     PERSONAL_HTTP1_TRIAD_AUTOMATION_BINDING_SCHEMA,
@@ -4839,6 +4844,272 @@ def _campaign_supervise_http1_triad(arguments: argparse.Namespace) -> int:
     return _campaign_supervise_finalize_http1_triad(arguments, campaign_id, Path(run_result_value))
 
 
+def _model_http1_poc_metadata(
+    content: bytes,
+) -> tuple[dict[str, object], PersonalHttp1TriadSpec, dict[str, object]]:
+    """Parse the one strict operator-authored metadata document for this bridge."""
+
+    try:
+        value = json.loads(content.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise CliError("invalid model HTTP/1 PoC metadata", exit_code=EXIT_AUTHORITY) from exc
+    expected = {
+        "campaign_id", "authorization_reference", "authorization_document_sha256",
+        "endpoint", "timeout_seconds", "response_bytes", "finding",
+    }
+    endpoint_expected = {"hostname", "port", "scheme", "method", "path"}
+    if (
+        type(value) is not dict
+        or set(value) != expected
+        or type(value.get("endpoint")) is not dict
+        or set(cast(dict[str, object], value["endpoint"])) != endpoint_expected
+    ):
+        raise CliError("model HTTP/1 PoC metadata has an invalid layout", exit_code=EXIT_AUTHORITY)
+    endpoint = cast(dict[str, object], value["endpoint"])
+    triad = {
+        "schema": PERSONAL_HTTP1_TRIAD_SCHEMA,
+        "campaign_id": value["campaign_id"],
+        "authorization_reference": value["authorization_reference"],
+        "authorization_document_sha256": value["authorization_document_sha256"],
+        "hostname": endpoint["hostname"],
+        "port": endpoint["port"],
+        "scheme": endpoint["scheme"],
+        "timeout_seconds": value["timeout_seconds"],
+        "requests": [
+            {"role": "effect", "method": endpoint["method"], "path": endpoint["path"], "request_file": "effect.raw", "response_bytes": value["response_bytes"]},
+            {"role": "negative_control", "method": endpoint["method"], "path": "/__faultloom_control_placeholder__", "request_file": "control.raw", "response_bytes": value["response_bytes"]},
+        ],
+        "finding": value["finding"],
+    }
+    return cast(dict[str, object], value), parse_personal_http1_triad_spec(
+        json.dumps(triad).encode("utf-8")
+    ), endpoint
+
+
+def _model_http1_control_request(
+    effect: bytes, *, method: str, effect_path: str, control_path: str
+) -> bytes:
+    """Change only the raw request line target; every other byte is preserved."""
+
+    if not control_path.startswith("/") or "\r" in control_path or "\n" in control_path:
+        raise CliError("negative-control path is invalid", exit_code=EXIT_AUTHORITY)
+    old = f"{method} {effect_path} HTTP/1.1\r\n".encode("ascii")
+    new = f"{method} {control_path} HTTP/1.1\r\n".encode("ascii")
+    if not effect.startswith(old) or old == new:
+        raise CliError("archived effect request line differs from strict metadata", exit_code=EXIT_AUTHORITY)
+    return new + effect[len(old):]
+
+
+def _model_http1_result_receipt(result: AuthorizedAutomationResult) -> tuple[str, str, str]:
+    """Return the exact offline result/receipt payload used by normal compilation."""
+
+    value = result.model_dump(mode="json")
+    result_digest = sha256_digest(value)
+    entry_id = f"result.{result_digest.removeprefix('sha256:')[:32]}"
+    receipt = canonical_json(
+        {
+            "automatic_submission": False,
+            "candidate_digest": automation_result_candidate_digest(result),
+            "candidate_only": True,
+            "entry_id": entry_id,
+            "evidence_existence_independently_verified": False,
+            "independent_verification": False,
+            "network_access": "none",
+            "result_digest": result_digest,
+            "schema": "faultloom.automation.result.receipt.v1",
+            "target_dispatch": False,
+        }
+    )
+    return canonical_json(value), receipt, result_digest
+
+
+def _campaign_supervise_model_http1_poc(arguments: argparse.Namespace) -> int:
+    """Compile one archived-exchange PoC offline, then delegate to the triad supervisor."""
+
+    metadata_content = _capture_bounded_local_file(
+        arguments.metadata, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="model HTTP/1 PoC metadata"
+    )
+    try:
+        metadata, _, endpoint = _model_http1_poc_metadata(metadata_content)
+    except PersonalCampaignError as exc:
+        raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+    control_path = arguments.negative_control_path
+    if not isinstance(control_path, str):
+        raise CliError("negative-control path is invalid", exit_code=EXIT_USAGE)
+    request_content = _capture_bounded_local_file(
+        arguments.request, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="automation request"
+    )
+    try:
+        request = parse_automation_request(arguments.request, request_content)
+    except AutomationCompileError as exc:
+        raise CliError(str(exc), exit_code=EXIT_AUTHORITY if exc.authority else EXIT_USAGE) from exc
+    if request.limits.max_actions != 0 or request.limits.max_poc_steps != 1:
+        raise CliError("automation request must allow zero actions and one PoC step", exit_code=EXIT_AUTHORITY)
+    model_turn = _capture_bounded_local_file(
+        arguments.model_turn, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="model turn"
+    )
+    try:
+        parsed_turn = parse_model_turn(model_turn, limits=request.limits)
+    except Exception as exc:
+        raise CliError("model turn is invalid for the automation request", exit_code=EXIT_AUTHORITY) from exc
+    if parsed_turn.actions:
+        raise CliError("model HTTP/1 PoC turn must not contain actions", exit_code=EXIT_AUTHORITY)
+    hostname = endpoint["hostname"]
+    port = endpoint["port"]
+    scheme = endpoint["scheme"]
+    method = endpoint["method"]
+    effect_path = endpoint["path"]
+    if not all((isinstance(hostname, str), type(port) is int, isinstance(scheme, str), isinstance(method, str), isinstance(effect_path, str))):
+        raise CliError("model HTTP/1 PoC endpoint is invalid", exit_code=EXIT_AUTHORITY)
+    manifest, grant, target, _ = _verified_request_workspace(
+        arguments.workspace, _trusted_key_path(arguments), require_active=False
+    )
+    exchange = _load_archived_http_exchange(
+        arguments.workspace, manifest, grant, target, arguments.evidence_id,
+        hostname, port, scheme, method, effect_path,
+    )
+    if (
+        len(request.observations.evidence_refs) != 1
+        or request.observations.evidence_refs[0].evidence_id != arguments.evidence_id
+        or request.observations.evidence_refs[0].cas_digest != f"sha256:{exchange.response_sha256}"
+        or request.action_context.protocol != scheme
+        or request.action_context.method != method
+        or request.action_context.path != effect_path
+        or request.action_context.payload_digest != f"sha256:{exchange.request_sha256}"
+    ):
+        raise CliError("automation request is not derived from the exact archived exchange", exit_code=EXIT_AUTHORITY)
+    effect = exchange.request_content
+    control = _model_http1_control_request(
+        effect, method=method, effect_path=effect_path, control_path=control_path
+    )
+    _parse_raw_http11_request(effect, hostname=hostname, port=port, scheme=scheme, method=method, path=effect_path)
+    _parse_raw_http11_request(control, hostname=hostname, port=port, scheme=scheme, method=method, path=control_path)
+    triad_value = {
+        "schema": PERSONAL_HTTP1_TRIAD_SCHEMA, "campaign_id": metadata["campaign_id"],
+        "authorization_reference": metadata["authorization_reference"],
+        "authorization_document_sha256": metadata["authorization_document_sha256"],
+        "hostname": hostname, "port": port, "scheme": scheme,
+        "timeout_seconds": metadata["timeout_seconds"],
+        "requests": [
+            {"role": "effect", "method": method, "path": effect_path, "request_file": "effect.raw", "response_bytes": metadata["response_bytes"]},
+            {"role": "negative_control", "method": method, "path": control_path, "request_file": "control.raw", "response_bytes": metadata["response_bytes"]},
+        ], "finding": metadata["finding"],
+    }
+    try:
+        triad = parse_personal_http1_triad_spec(json.dumps(triad_value).encode("utf-8"))
+    except PersonalCampaignError as exc:
+        raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+    provenance_source = {
+        "schema": "faultloom.model-http1-poc.provenance.v1",
+        "automation_request_sha256": sha256_hex(request_content),
+        "model_turn_sha256": sha256_hex(model_turn), "metadata_sha256": sha256_hex(metadata_content),
+        "evidence_id": exchange.evidence_id, "archived_request_sha256": exchange.request_sha256,
+        "archived_response_sha256": exchange.response_sha256, "control_path": control_path,
+        "grant_digest": sha256_digest(grant), "run_id": manifest["run_id"],
+        "external_authorization_reference_status": "operator_asserted_unverified",
+    }
+    entry_id = "model-http1-poc." + sha256_hex(canonical_json(provenance_source).encode("utf-8"))[:32]
+    bundle_dir = arguments.out / entry_id
+    result_path, receipt_path = bundle_dir / "result.json", bundle_dir / "receipt.json"
+    durable_campaign = any(
+        _campaign_record_exists(arguments.workspace / "campaigns" / f"{triad.campaign_id}.{suffix}.json")
+        for suffix in ("start", "run-result", "finalize-start", "final-receipt", "unresolved")
+    )
+
+    def compile_exact_result() -> AuthorizedAutomationResult:
+        try:
+            compiled = compile_automation_result(
+                arguments,
+                dependencies=AutomationCompileDependencies(
+                    verify_workspace=_verified_request_workspace,
+                    capture_file=_capture_single_protocol_file,
+                    emit_json=_emit_json,
+                ),
+            ).model_copy(update={"finding_draft": None})
+        except AutomationCompileError as exc:
+            raise CliError(str(exc), exit_code=EXIT_AUTHORITY if exc.authority else EXIT_USAGE) from exc
+        if (
+            compiled.admitted_plans
+            or compiled.poc is None
+            or len(compiled.poc.recipe.steps) != 1
+            or compiled.poc.adaptation.removed_unsafe_step_digests
+        ):
+            raise CliError("compiled result must contain exactly one safe PoC step and no actions", exit_code=EXIT_AUTHORITY)
+        return compiled
+
+    try:
+        bundle_metadata = bundle_dir.lstat()
+    except FileNotFoundError:
+        bundle_exists = False
+    except OSError as exc:
+        raise CliError("cannot inspect model HTTP/1 PoC bundle", exit_code=EXIT_AUTHORITY) from exc
+    else:
+        if stat.S_ISLNK(bundle_metadata.st_mode) or not stat.S_ISDIR(bundle_metadata.st_mode):
+            raise CliError("existing model HTTP/1 PoC bundle is not a regular directory", exit_code=EXIT_AUTHORITY)
+        bundle_exists = True
+    if bundle_exists:
+        provenance_content = _capture_bounded_local_file(
+            bundle_dir / "provenance.v1.json", maximum_bytes=MAX_PROTOCOL_FILE_BYTES,
+            label="existing model HTTP/1 PoC provenance",
+        )
+        try:
+            provenance_value = json.loads(
+                provenance_content.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise CliError("existing model HTTP/1 PoC provenance is invalid", exit_code=EXIT_AUTHORITY) from exc
+        if (
+            type(provenance_value) is not dict
+            or set(provenance_value) != set(provenance_source).union({"result_digest"})
+            or any(provenance_value.get(key) != value for key, value in provenance_source.items())
+            or canonical_json(provenance_value) != provenance_content.decode("utf-8")
+        ):
+            raise CliError("existing model HTTP/1 PoC provenance differs", exit_code=EXIT_AUTHORITY)
+        result_content = _capture_bounded_local_file(result_path, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="existing model HTTP/1 PoC result")
+        _, result = _parse_bound_automation_result(result_content)
+        receipt_content = _capture_bounded_local_file(receipt_path, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="existing model HTTP/1 PoC receipt")
+        try:
+            receipt = json.loads(receipt_content.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise CliError("existing model HTTP/1 PoC receipt is invalid", exit_code=EXIT_AUTHORITY) from exc
+        if not isinstance(receipt, dict):
+            raise CliError("existing model HTTP/1 PoC receipt is invalid", exit_code=EXIT_AUTHORITY)
+        actual_text, actual_receipt_text, actual_result_digest = _model_http1_result_receipt(result)
+        _validate_automation_result_receipt(receipt, result=result, result_digest=actual_result_digest)
+        if provenance_value.get("result_digest") != actual_result_digest:
+            raise CliError("existing model HTTP/1 PoC result digest differs from provenance", exit_code=EXIT_AUTHORITY)
+        if durable_campaign:
+            result_text, receipt_text, result_digest = actual_text, actual_receipt_text, actual_result_digest
+        else:
+            result = compile_exact_result()
+            result_text, receipt_text, result_digest = _model_http1_result_receipt(result)
+    else:
+        result = compile_exact_result()
+        result_text, receipt_text, result_digest = _model_http1_result_receipt(result)
+    if result.admitted_plans or result.poc is None or len(result.poc.recipe.steps) != 1 or result.poc.adaptation.removed_unsafe_step_digests:
+        raise CliError("compiled result must contain exactly one safe PoC step and no actions", exit_code=EXIT_AUTHORITY)
+    candidate_id = result.poc.recipe.steps[0].step_id if result.poc is not None and len(result.poc.recipe.steps) == 1 else ""
+    if not candidate_id:
+        raise CliError("compiled result lacks one safe PoC step", exit_code=EXIT_AUTHORITY)
+    triad_text = json.dumps(triad.model_dump(by_alias=True, exclude_none=True), indent=2, sort_keys=True) + "\n"
+    provenance = canonical_json({**provenance_source, "result_digest": result_digest})
+    try:
+        bundle_dir = ensure_private_content_bundle(
+            arguments.out, entry_id=entry_id,
+            files=(("result.json", result_text), ("receipt.json", receipt_text), ("effect.raw", effect), ("control.raw", control), ("triad.v1.json", triad_text), ("provenance.v1.json", provenance)),
+            error_label="model HTTP/1 PoC bundle",
+            permitted_extra_files=frozenset({"triad.v2.json"}),
+        )
+    except CandidateOutboxError as exc:
+        raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+    supervised = argparse.Namespace(
+        workspace=arguments.workspace, trusted_key=arguments.trusted_key, template=bundle_dir / "triad.v1.json",
+        result=bundle_dir / "result.json", receipt=bundle_dir / "receipt.json", candidate_id=candidate_id,
+        out=bundle_dir / "triad.v2.json",
+    )
+    return _campaign_supervise_http1_triad(supervised)
+
+
 def _emit_verification_supervision(
     campaign_id: str,
     *,
@@ -7627,6 +7898,20 @@ def build_parser() -> argparse.ArgumentParser:
     campaign_supervise_http1_triad.add_argument("--candidate-id", required=True)
     campaign_supervise_http1_triad.add_argument("--out", type=Path, required=True)
     campaign_supervise_http1_triad.set_defaults(handler=_campaign_supervise_http1_triad)
+    campaign_supervise_model_http1_poc = campaign_commands.add_parser(
+        "supervise-model-http1-poc",
+        help="compile one archived-exchange safe PoC and supervise its exact HTTP/1 triad",
+    )
+    campaign_supervise_model_http1_poc.add_argument("--workspace", type=Path, required=True)
+    campaign_supervise_model_http1_poc.add_argument("--trusted-key", type=Path, required=True)
+    campaign_supervise_model_http1_poc.add_argument("--request", type=Path, required=True)
+    campaign_supervise_model_http1_poc.add_argument("--model-turn", type=Path, required=True)
+    campaign_supervise_model_http1_poc.add_argument("--evidence-id", required=True)
+    campaign_supervise_model_http1_poc.add_argument("--negative-control-path", required=True)
+    campaign_supervise_model_http1_poc.add_argument("--metadata", type=Path, required=True)
+    campaign_supervise_model_http1_poc.add_argument("--out", type=Path, required=True)
+    campaign_supervise_model_http1_poc.add_argument("--minimum-grant-version", type=_positive_int, default=1)
+    campaign_supervise_model_http1_poc.set_defaults(handler=_campaign_supervise_model_http1_poc)
     campaign_finalize_http1_triad = campaign_commands.add_parser(
         "finalize-http1-triad",
         help="offline archive a reviewed exact-digest triad result",

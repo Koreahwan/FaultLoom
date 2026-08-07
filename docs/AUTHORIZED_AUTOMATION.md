@@ -171,6 +171,49 @@ finding wording) remains untrusted explanatory material. It never replaces the
 operator-authored, digest-bound effect/control request bytes or finding metadata
 that govern the supervised triad.
 
+### 6. Archived-exchange model HTTP/1 PoC supervisor
+
+For the shortest supervised path from one completed archived exchange to a
+bounded PoC comparison, use:
+
+```text
+faultloom campaign supervise-model-http1-poc \
+  --workspace <signed-manual-workspace> \
+  --trusted-key <public-key-outside-workspace> \
+  --request <archived-exchange-automation-request.json> \
+  --model-turn <external-model-turn.json> \
+  --evidence-id <archived-exchange-evidence-id> \
+  --negative-control-path <request-target-only-control> \
+  --metadata <strict-operator-metadata.json> \
+  --out <private-model-http1-poc-outbox>
+```
+
+The request must be the exact `AutomationRequest` derived from the archived
+exchange, and the model turn is an untrusted external file. Metadata is a
+strict operator-authored document containing the campaign, external
+authorization reference and document digest, exact endpoint, timeout/response
+limits, and finding metadata. Compilation is deterministic and offline: it
+accepts zero generic actions and exactly one safe-PoC step, but never lets the
+model author raw requests or finding prose. The effect file is copied from the
+archived exchange byte-for-byte; the negative-control file is derived by
+changing only its HTTP request-target line. Any mismatch fails closed before
+the campaign start record or a socket.
+
+The command creates a private, create-once, source-keyed bundle containing the
+compiled result/receipt, exact effect and control files, triad spec, and
+provenance. The provenance labels the external authorization reference
+`operator_asserted_unverified`; the signed FaultLoom grant digest and run ID
+are independently verified and bound. It then delegates to the normal triad
+supervisor. Type exactly `RUN <campaign-id>` before dispatch and exactly
+`FINALIZE <campaign-id>` only after reviewing the three private responses as
+non-sensitive. The runner sends exactly three sequential requests—effect,
+the same effect again as reproduction, and the derived control—with no retry.
+Durable checkpoints resume without re-sending completed work; unresolved or
+start-only state requires manual reconciliation. This path makes no provider,
+Gateway, Burp, or submission call. Its `draft_unverified`/`negative_campaign`
+result still goes through the separate independent verifier and manual report
+workflow; it is not verification or proof of a vulnerability.
+
 ## Optional authorized target dispatch
 
 Dispatch is a separate, explicit operator/controller step. It does not happen

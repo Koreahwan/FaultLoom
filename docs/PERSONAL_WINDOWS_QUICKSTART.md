@@ -412,6 +412,43 @@ and writes a create-once result bundle under `run-01\automation`. A generated
 `candidate.md` is still unverified and cannot be treated as a confirmed
 finding or submitted automatically.
 
+### Archived-exchange model HTTP/1 PoC supervisor
+
+When the model turn contains one bounded safe-PoC proposal for the exact
+archived exchange, the operator can compile and supervise its three-request
+comparison in one command. Prepare a strict metadata file yourself; it must
+contain the campaign ID, external authorization reference and its SHA-256,
+exact endpoint, timeout and response limit, and the operator-authored finding
+fields. The model turn cannot provide raw request bytes or finding prose:
+
+```powershell
+$ModelPocOut = "$Job\run-01\model-http1-poc"
+& $FaultLoom campaign supervise-model-http1-poc `
+  --workspace "$Job\run-01" `
+  --trusted-key "$Root\authority\authority-public-key.json" `
+  --request "$Job\run-01\automation-request.json" `
+  --model-turn 'C:\path\to\external-model-turn.json' `
+  --evidence-id '<archived-exchange-evidence-id>' `
+  --negative-control-path '/operator-chosen-control-target' `
+  --metadata 'C:\path\to\operator-model-http1-metadata.json' `
+  --out $ModelPocOut
+```
+
+The command performs deterministic offline compilation of zero generic actions
+and exactly one safe-PoC step. It uses the archived effect request bytes
+exactly and derives `control.raw` by changing only the request-target line.
+The private create-once bundle is keyed by its source digests. Its provenance
+records the external authorization reference as
+`operator_asserted_unverified`, while the signed grant and run remain separate
+verified bindings. Review the generated triad, type exactly `RUN <campaign-id>`,
+inspect all three private responses, then type exactly
+`FINALIZE <campaign-id>` only when they are non-sensitive. It sends exactly
+effect, the same effect as reproduction, and the derived control, with no
+retry. Resume is durable and never replays completed sends; unresolved or
+start-only state stops for manual reconciliation. No provider, Gateway, Burp,
+or submission is called, and independent verification/reporting remains a
+separate downstream step.
+
 The command help also lists `automation provider-turn`. That direct official
 API path is intentionally POSIX-only because its durable receipt and state
 files rely on no-follow opens, owner-only permissions, file locking, and

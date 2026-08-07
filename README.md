@@ -42,6 +42,22 @@ a review-required v2 spec without provider or target access. The run and
 finalization commands revalidate those sources; changed provenance or request
 bytes fail before a socket is opened.
 
+For the archived-exchange path, `campaign supervise-model-http1-poc` takes an
+archived exchange ID, its exact `AutomationRequest`, an external model-turn
+file, strict operator-authored metadata, and a negative-control path. It
+deterministically compiles offline exactly one safe-PoC step with zero generic
+actions, keeps the archived effect bytes exact, and derives the control by
+changing only the request target. The model cannot author raw requests or
+finding prose. A private, create-once bundle is keyed by the source digests;
+its provenance records the external authorization reference as
+`operator_asserted_unverified` while binding the signed grant and run
+separately. The supervisor then requires exact `RUN <campaign-id>` and
+`FINALIZE <campaign-id>` acknowledgements around exactly three sequential,
+no-retry sends (effect, the same effect as reproduction, and the derived
+control), and resumes durably without replaying completed work. It makes no
+provider, Gateway, Burp, or submission call; independent verification and the
+manual report path remain separate.
+
 For the same bound workflow with less command juggling,
 `campaign supervise-http1-triad` prepares or resumes the campaign in one
 interactive invocation. It requires the exact acknowledgements
@@ -90,8 +106,9 @@ personal workflow, see [GPT_PRO_REVIEW_PROMPT.md](GPT_PRO_REVIEW_PROMPT.md).
 
 ## Build verification
 
-The clean-checkout build is offline and byte-reproducible. With the pinned
-Python and Rust toolchains preinstalled, run:
+The clean-checkout verifier requests offline package-manager behavior and
+checks byte reproducibility; it is not a hermetic or network-isolated release
+receipt. With the pinned Python and Rust toolchains preinstalled, run:
 
 ```bash
 python3 tools/verify_clean_checkout.py

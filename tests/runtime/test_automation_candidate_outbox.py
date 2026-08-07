@@ -525,6 +525,40 @@ def test_windows_move_uses_handle_no_replace_rename_information(
     assert raw_info[filename_end:] == b"\x00\x00"
 
 
+@pytest.mark.parametrize("error_number", (80, 183))
+def test_windows_move_translates_no_replace_destination_collisions(
+    error_number: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ctypes
+    import faultloom.automation.candidate_outbox as outbox_module
+
+    class FakeSetFileInformationByHandle:
+        argtypes: object | None = None
+        restype: object | None = None
+
+        def __call__(self, *_args: object) -> int:
+            return 0
+
+    class FakeKernel32:
+        def __init__(self) -> None:
+            self.SetFileInformationByHandle = FakeSetFileInformationByHandle()
+
+    monkeypatch.setattr(
+        ctypes, "WinDLL", lambda *_args, **_kwargs: FakeKernel32(), raising=False
+    )
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: error_number, raising=False)
+    staging_lock = outbox_module._WindowsDirectoryLock(
+        handle=0x100000001, stat=tmp_path.stat()
+    )
+
+    with pytest.raises(outbox_module._CandidateBundleAlreadyExists):
+        outbox_module._windows_move_no_replace(
+            staging_lock, tmp_path / "result.destination-exists"
+        )
+
+
 def test_windows_cleanup_marks_full_width_staging_handle_for_disposition(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

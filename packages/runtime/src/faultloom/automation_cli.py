@@ -158,7 +158,7 @@ def _validate_json_depth(text: str, *, maximum: int = 128) -> None:
             depth -= 1
 
 
-def _parse_request(
+def parse_automation_request(
     path: Path,
     content: bytes,
     *,
@@ -636,7 +636,7 @@ def export_automation_handoff(
         raise AutomationCompileError("automation export-handoff arguments are invalid", authority=False)
 
     manifest, grant, target, now = dependencies.verify_workspace(workspace, trusted_key)
-    request = _parse_request(
+    request = parse_automation_request(
         request_path,
         dependencies.capture_file(request_path),
         missing_disclosure_is_authority=True,
@@ -689,12 +689,12 @@ def export_automation_handoff(
     return 0
 
 
-def compile_automation(
+def compile_automation_result(
     arguments: object,
     *,
     dependencies: AutomationCompileDependencies,
-) -> int:
-    """Compile one local model turn and atomically publish an offline bundle."""
+) -> AuthorizedAutomationResult:
+    """Compile one local model turn without publishing or emitting output."""
 
     workspace = getattr(arguments, "workspace")
     trusted_key = getattr(arguments, "trusted_key")
@@ -711,7 +711,7 @@ def compile_automation(
         raise AutomationCompileError("automation compile arguments are invalid", authority=False)
 
     manifest, grant, target, now = dependencies.verify_workspace(workspace, trusted_key)
-    request = _parse_request(request_path, dependencies.capture_file(request_path))
+    request = parse_automation_request(request_path, dependencies.capture_file(request_path))
     model_turn = dependencies.capture_file(model_turn_path)
     try:
         _ = parse_model_turn(model_turn, limits=request.limits)
@@ -735,6 +735,20 @@ def compile_automation(
         result = coordinator.run(request=request, raw_model_turn=model_turn)
     except AuthorizedAutomationError as exc:
         raise AutomationCompileError(str(exc), authority=True) from exc
+    return result
+
+
+def compile_automation(
+    arguments: object,
+    *,
+    dependencies: AutomationCompileDependencies,
+) -> int:
+    """Compile one local model turn and atomically publish an offline bundle."""
+
+    workspace = getattr(arguments, "workspace")
+    if not isinstance(workspace, Path):
+        raise AutomationCompileError("automation compile arguments are invalid", authority=False)
+    result = compile_automation_result(arguments, dependencies=dependencies)
     try:
         publication = write_automation_result_bundle(result, workspace / "automation")
     except CandidateOutboxError as exc:

@@ -105,10 +105,41 @@ def test_current_public_tree_passes() -> None:
 
 def test_private_repository_root_is_rejected(tmp_path: Path) -> None:
     make_policies(tmp_path)
-    private = tmp_path / "ops"
-    private.mkdir()
-    (private / "engagement.json").write_text("{}\n", encoding="utf-8")
-    assert {item.rule for item in scan(tmp_path)} == {"private_root"}
+    private_roots = {
+        "ops",
+        "eval",
+        "legacy",
+        "targets",
+        "submissions",
+        "releases",
+        "evidence",
+        "keys",
+        "private-evidence",
+        "private-keys",
+    }
+    for name in private_roots:
+        private = tmp_path / name
+        private.mkdir()
+        (private / "fixture.json").write_text("{}\n", encoding="utf-8")
+
+    violations = scan(tmp_path)
+    assert {item.rule for item in violations} == {"private_root"}
+    assert {
+        item.path.split("/", maxsplit=1)[0]
+        for item in violations
+    } == private_roots
+
+
+def test_private_boundary_terms_in_public_docs_are_allowed(tmp_path: Path) -> None:
+    make_policies(tmp_path)
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "boundaries.md").write_text(
+        "Ops, Eval, legacy, targets, submissions, releases, evidence, and keys "
+        "remain outside public Core.\n",
+        encoding="utf-8",
+    )
+    assert scan(tmp_path) == []
 
 
 def test_secret_and_personal_data_are_rejected_but_placeholders_pass(tmp_path: Path) -> None:
