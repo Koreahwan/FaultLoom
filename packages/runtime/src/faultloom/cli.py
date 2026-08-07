@@ -25,7 +25,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from fnmatch import fnmatchcase
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Literal, TypeVar, cast
 
 from faultloom_protocol import (
@@ -6949,6 +6949,10 @@ def _validate_completed_campaign_finalization(
     return outcome_status, 3
 
 
+def _handoff_relative_path(relative: PurePath) -> str:
+    return relative.as_posix()
+
+
 def _handoff_workspace_file(
     workspace: Path, path: Path, *, label: str, maximum_bytes: int, expected: bytes | None = None
 ) -> tuple[str, dict[str, object]]:
@@ -6986,8 +6990,9 @@ def _handoff_workspace_file(
     if expected is not None and content != expected:
         raise CliError(f"{label} changed after finalization validation", exit_code=EXIT_AUTHORITY)
     reference_content = content if expected is None else expected
-    return str(relative), {
-        "path": str(relative),
+    relative_path = _handoff_relative_path(relative)
+    return relative_path, {
+        "path": relative_path,
         "sizeBytes": len(reference_content),
         "sha256": sha256_hex(reference_content),
     }

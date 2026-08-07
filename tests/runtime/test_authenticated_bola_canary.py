@@ -6,7 +6,7 @@ import socket
 import threading
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
@@ -236,6 +236,12 @@ def _assert_no_secret_artifacts(root: Path, *captured_text: str) -> None:
     joined = "".join(captured_text).encode()
     assert all(value not in joined for value in forbidden)
     assert all(value not in joined for value in token_digests)
+
+
+def test_handoff_relative_path_uses_posix_separators_for_windows_paths() -> None:
+    assert cli._handoff_relative_path(
+        PureWindowsPath(r"responses\reservation.personal-http1.raw")
+    ) == "responses/reservation.personal-http1.raw"
 
 
 def test_authenticated_operator_canary_source_and_reviewer_six_exact_requests(
