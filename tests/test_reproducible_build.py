@@ -23,6 +23,7 @@ from tools.reproducible_build import (
     build_reproducibly,
     build_source_archive,
     canonical_ci_workflow,
+    REQUIRED_RUNTIME_TESTS,
     discover_projects,
     git_commit_epoch,
     git_identity,
@@ -800,6 +801,25 @@ jobs:
                     commit_all(root, "Break the canonical CI execution contract")
                     with self.assertRaises(BuildPolicyError):
                         validate_repository_policy(root, load_policy(root))
+
+    def test_canonical_ci_runs_the_required_runtime_boundary_tests(self) -> None:
+        expected = (
+            "tests/runtime/test_personal_campaign.py",
+            "tests/runtime/test_personal_campaign_bridge.py",
+            "tests/runtime/test_personal_campaign_supervise.py",
+            "tests/runtime/test_model_http1_poc_supervisor.py",
+            "tests/runtime/test_campaign_verification_handoff.py",
+            "tests/runtime/test_independent_http1_verification.py",
+        )
+        self.assertEqual(REQUIRED_RUNTIME_TESTS, expected)
+        workflow = canonical_ci_workflow("1.96.1").decode("utf-8")
+        self.assertIn("required-runtime-tests:", workflow)
+        self.assertIn(
+            "run: python3 -m pip install --requirement requirements-dev.lock",
+            workflow,
+        )
+        for path in expected:
+            self.assertEqual(workflow.count(path), 1)
 
     def test_toolchain_policy_cannot_inject_ci_or_toolchain_paths(self) -> None:
         variants = (
