@@ -109,8 +109,10 @@ The practical authorized automation flow is documented in
 [`docs/AUTHORIZED_AUTOMATION.md`](docs/AUTHORIZED_AUTOMATION.md). It covers
 signed redacted evidence disclosure, provider-only reasoning, candidate
 admission, the default personal direct sender, optional one-shot Gateway
-dispatch, independent verification, and manual report outboxes. Live mode
-remains off by default and no automatic submission is provided.
+dispatch, independent HTTP response-differential replay, and manual report
+drafts. That replay reports only `observation_reproduced`; vulnerability
+semantics and taxonomy remain `not_evaluated`. Live mode remains off by default
+and no automatic submission is provided.
 
 For an independent, read-only review of this public Core and its intended
 personal workflow, see [GPT_PRO_REVIEW_PROMPT.md](GPT_PRO_REVIEW_PROMPT.md).

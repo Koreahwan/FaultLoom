@@ -111,6 +111,7 @@ class FindingClass(str, Enum):
     ONE_DAY_ADAPTATION = "one_day_adaptation"
     PATCH_VARIANT = "patch_variant"
     ZERO_DAY_LIKE = "zero_day_like"
+    HTTP_RESPONSE_DIFFERENTIAL = "http_response_differential"
 
 
 class KeyValue(ProtocolModel):

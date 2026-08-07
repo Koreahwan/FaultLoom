@@ -56,8 +56,13 @@ FaultLoom은 한 명의 소유자가 실제 허가를 받은 유료 보안 업�
   합니다. compile 단계가 handoff·case semantics·prepare receipt·finalized spec·raw
   request·response 파일의 경로, 크기, SHA-256과 검증 시점 이후 byte equality를
   모두 확인하고, source evidence를 verifier evidence로 재라벨하지 않는지
-  점검하세요. 최종 산출물은 conservative verifier verdict와 별도 provenance를
-  가진 새 evidence여야 하며, 이후 `faultloom verify`와 `faultloom report`가 만드는
+  점검하세요. 이 bridge가 `http_response_differential`만 admission하고, operator의
+  source claim은 `operator_asserted_unverified`로 분리하며, 서명 claim은 exact body
+  differential 관찰로 고정하는지 확인하세요. 외부 outcome은
+  `observation_reproduced`, semantic/taxonomy verdict는 `not_evaluated`여야 하며
+  CVE/one-day/patch-variant/zero-day class를 허용하면 안 됩니다. 최종 산출물은
+  conservative replay verdict와 별도 provenance를 가진 새 evidence여야 하며,
+  이후 `faultloom verify`와 `faultloom report`가 만드는
   것은 사람이 검토할 `draft_manual_review` 보고서 초안뿐이어야 합니다. 이 경로가
   자동 제출, 임의 재시도, 두 번째 네트워크 executor 또는 독립성 없는 self-review로
   변질되지 않았는지도 확인하세요.

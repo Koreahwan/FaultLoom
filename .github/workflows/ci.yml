@@ -52,6 +52,48 @@ jobs:
           FAULTLOOM_RUST_TOOLCHAIN: "1.96.1"
         run: python3 tools/verify_clean_checkout.py
 
+  required-runtime-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: "${{ github.repository }}"
+          ref: "${{ github.sha }}"
+          path: .
+          clean: true
+          fetch-depth: 1
+          persist-credentials: false
+          lfs: false
+          submodules: false
+
+      - name: Provision the pinned Python runtime
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        env:
+          PIP_NO_INDEX: "0"
+        with:
+          python-version-file: .python-version
+          cache: ""
+          check-latest: false
+
+      - name: Install pinned test dependencies (network-enabled)
+        env:
+          PIP_NO_INDEX: "0"
+          PIP_INDEX_URL: https://pypi.org/simple
+          UV_OFFLINE: "0"
+        run: python3 -m pip install --requirement requirements-dev.lock
+
+      - name: Run the required runtime tests
+        run: >-
+          python3 -m pytest
+          tests/runtime/test_personal_campaign.py
+          tests/runtime/test_personal_campaign_bridge.py
+          tests/runtime/test_personal_campaign_supervise.py
+          tests/runtime/test_model_http1_poc_supervisor.py
+          tests/runtime/test_campaign_verification_handoff.py
+          tests/runtime/test_independent_http1_verification.py
+
   public-history-secret-gate:
     runs-on: ubuntu-24.04
     timeout-minutes: 30

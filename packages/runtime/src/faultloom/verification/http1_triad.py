@@ -16,6 +16,19 @@ from .contracts import (
 )
 
 
+HTTP1_DIFFERENTIAL_OBSERVATION = "exact_http_response_body_differential"
+HTTP1_DIFFERENTIAL_OBSERVATION_CLAIM = (
+    "The exact HTTP response body differential was independently reproduced."
+)
+HTTP1_DIFFERENTIAL_OBSERVATION_REASON = (
+    "verification.http_response_body_differential_reproduced_only"
+)
+HTTP1_DIFFERENTIAL_OBSERVATION_TITLE = (
+    "Independent HTTP response-body differential observation"
+)
+HTTP1_DIFFERENTIAL_PUBLIC_OUTCOME = "observation_reproduced"
+
+
 @dataclass(frozen=True, slots=True)
 class Http1TriadVerificationError(ValueError):
     reason: str

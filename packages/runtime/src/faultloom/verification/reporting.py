@@ -23,6 +23,11 @@ from .contracts import (
     ReportReceipt,
     VerificationSummary,
 )
+from .http1_triad import (
+    HTTP1_DIFFERENTIAL_OBSERVATION_CLAIM,
+    HTTP1_DIFFERENTIAL_OBSERVATION_REASON,
+    HTTP1_DIFFERENTIAL_PUBLIC_OUTCOME,
+)
 from .provenance import (
     AutomationDispatchProvenanceError,
     automation_dispatch_provenance_marker,
@@ -85,8 +90,26 @@ def _classification(finding_class: FindingClass) -> tuple[str, str]:
             return finding_class.value, "patch variant classification"
         case FindingClass.ZERO_DAY_LIKE:
             return finding_class.value, "candidate taxonomy; not an automatic zero-day claim"
+        case FindingClass.HTTP_RESPONSE_DIFFERENTIAL:
+            return (
+                finding_class.value,
+                "exact response-body observation; vulnerability semantics not evaluated",
+            )
         case unreachable:
             assert_never(unreachable)
+
+
+def _public_outcome(selected: _FindingSelection) -> str:
+    if selected.candidate.finding_class is FindingClass.HTTP_RESPONSE_DIFFERENTIAL:
+        if (
+            selected.claim.claim != HTTP1_DIFFERENTIAL_OBSERVATION_CLAIM
+            or HTTP1_DIFFERENTIAL_OBSERVATION_REASON not in selected.verdict.reasons
+        ):
+            raise ReportGateError(
+                reason="response-differential result lacks its constrained observation scope"
+            )
+        return HTTP1_DIFFERENTIAL_PUBLIC_OUTCOME
+    return selected.verdict.outcome.value
 
 
 def _linked_selection(
@@ -169,7 +192,7 @@ def verification_summary(
         claim_id=selected.claim.claim_id,
         verdict_id=selected.verdict.verdict_id,
         verifier_run_id=selected.verdict.verifier_run_id,
-        outcome=selected.verdict.outcome.value,
+        outcome=_public_outcome(selected),
         result_artifact_digest=sha256_digest(artifact.envelope),
     )
 
@@ -210,13 +233,21 @@ def _json_report(
         "prerequisites": [_scrub(value) for value in claim.prerequisites],
         "reasons": [_scrub(value) for value in verdict.reasons],
         "title": _scrub(candidate.title),
-        "verdict": verdict.outcome.value,
+        "verdict": _public_outcome(selected),
         "verdict_id": verdict.verdict_id,
         "verified_at": verdict.verified_at.isoformat(),
         "verifier_actor_id": artifact.verifier.actor_id,
         "verifier_authority_digest": artifact.verifier.authority_digest,
         "verifier_run_id": verdict.verifier_run_id,
     }
+    if candidate.finding_class is FindingClass.HTTP_RESPONSE_DIFFERENTIAL:
+        document.update(
+            {
+                "protocol_replay_outcome": verdict.outcome.value,
+                "semantic_verdict": "not_evaluated",
+                "taxonomy_verdict": "not_evaluated",
+            }
+        )
     provenance = artifact.automation_dispatch_provenance
     if provenance is not None:
         document["automation_dispatch_provenance_digest"] = (
@@ -255,6 +286,13 @@ def _markdown_report(
     reasons = "\n".join(f"- `{_markdown(value)}`" for value in verdict.reasons)
     provenance = artifact.automation_dispatch_provenance
     provenance_section = ""
+    semantic_scope = ""
+    if candidate.finding_class is FindingClass.HTTP_RESPONSE_DIFFERENTIAL:
+        semantic_scope = (
+            f"- Protocol replay outcome: `{verdict.outcome.value}`\n"
+            "- Semantic verdict: `not_evaluated`\n"
+            "- Taxonomy verdict: `not_evaluated`\n"
+        )
     if provenance is not None:
         provenance_digest = automation_dispatch_provenance_marker(provenance).removeprefix(
             "faultloom:automation_dispatch_provenance="
@@ -268,7 +306,8 @@ def _markdown_report(
         f"# {_markdown(candidate.title)}\n\n"
         f"- Candidate: `{candidate.candidate_id}`\n"
         f"- Classification: `{classification}` ({classification_scope})\n"
-        f"- Verdict: `{verdict.outcome.value}`\n"
+        f"- Verdict: `{_public_outcome(selected)}`\n"
+        f"{semantic_scope}"
         f"- Verifier actor: `{artifact.verifier.actor_id}`\n"
         f"- Verifier authority: `{artifact.verifier.authority_digest}`\n\n"
         f"## Claim\n\n{_markdown(claim.claim)}\n\n"

@@ -113,6 +113,11 @@ from .verification import (
 )
 from .verification.http1_triad import (
     FinalizedTriadReplayExecutor,
+    HTTP1_DIFFERENTIAL_OBSERVATION,
+    HTTP1_DIFFERENTIAL_OBSERVATION_CLAIM,
+    HTTP1_DIFFERENTIAL_OBSERVATION_REASON,
+    HTTP1_DIFFERENTIAL_OBSERVATION_TITLE,
+    HTTP1_DIFFERENTIAL_PUBLIC_OUTCOME,
     Http1TriadVerificationError,
     parse_strict_http1_request,
     require_independent_identity,
@@ -149,6 +154,10 @@ REQUEST_ACCOUNTING_STATE_KEY = "request_accounting_state_id"
 PERSONAL_HTTP1_MAX_REQUEST_BYTES = 65_536
 PERSONAL_HTTP1_MAX_RESPONSE_BYTES = 1_048_576
 PERSONAL_HTTP1_PREVIEW_CHARS = 3_072
+INDEPENDENT_HTTP1_FINDING_CLASS = FindingClass.HTTP_RESPONSE_DIFFERENTIAL
+INDEPENDENT_HTTP1_SOURCE_CLAIM_STATUS = "operator_asserted_unverified"
+INDEPENDENT_HTTP1_SEMANTIC_VERDICT = "not_evaluated"
+INDEPENDENT_HTTP1_TAXONOMY_VERDICT = "not_evaluated"
 _HANDOFF_VALIDATION_SNAPSHOTS: contextvars.ContextVar[dict[Path, bytes] | None] = contextvars.ContextVar(
     "handoff_validation_snapshots", default=None
 )
@@ -5163,7 +5172,7 @@ def _emit_verification_supervision(
 ) -> None:
     """Emit the sole public result for the independent-review coordinator."""
     output: dict[str, object] = {
-        "schema": "faultloom.independent-http1-supervise.v1",
+        "schema": "faultloom.independent-http1-supervise.v2",
         "campaignId": campaign_id,
         "status": status,
         "automaticSubmission": False,
@@ -5267,16 +5276,19 @@ def _verification_supervisor_invocation(
         "--verifier-authority-key", "trusted-key.json",
     ]
     expected = {
-        "schema": "faultloom.independent-http1-compile.v1",
-        "status": "verified",
+        "schema": "faultloom.independent-http1-compile.v2",
+        "status": HTTP1_DIFFERENTIAL_PUBLIC_OUTCOME,
         "candidateId": candidate_id,
         "result": {"path": result_relative, "sha256": sha256_hex(result_content)},
         "sourceHandoffSha256": sha256_hex(context.handoff_content),
+        "observation": HTTP1_DIFFERENTIAL_OBSERVATION,
+        "sourceClaimStatus": INDEPENDENT_HTTP1_SOURCE_CLAIM_STATUS,
+        "semanticVerdict": INDEPENDENT_HTTP1_SEMANTIC_VERDICT,
+        "taxonomyVerdict": INDEPENDENT_HTTP1_TAXONOMY_VERDICT,
         "verifyArgs": [candidate_id, *common_args],
         "reportArgs": [
             candidate_id,
             "--format", "md",
-            "--out-dir", "verification-report-outbox",
             *common_args,
         ],
         "networkAccess": False,
@@ -5318,7 +5330,7 @@ def _verification_supervisor_complete(arguments: argparse.Namespace) -> int:
                 receipt_out=arguments.receipt_out,
             ),
         )
-        if exit_code != EXIT_OK or compiled.get("status") != "verified":
+        if exit_code != EXIT_OK or compiled.get("status") != HTTP1_DIFFERENTIAL_PUBLIC_OUTCOME:
             raise CliError(
                 "independent verifier compilation did not complete",
                 exit_code=EXIT_AUTHORITY,
@@ -5335,7 +5347,7 @@ def _verification_supervisor_complete(arguments: argparse.Namespace) -> int:
         verify_exit != EXIT_OK
         or not isinstance(verified, dict)
         or verified.get("candidate_id") != candidate_id
-        or verified.get("outcome") != "verified"
+        or verified.get("outcome") != HTTP1_DIFFERENTIAL_PUBLIC_OUTCOME
         or verified.get("network_access") != "none"
         or not isinstance(verified.get("claim_id"), str)
         or not isinstance(verified.get("verdict_id"), str)
@@ -5401,7 +5413,7 @@ def _verification_supervisor_complete(arguments: argparse.Namespace) -> int:
         status="completed",
         dispatch_count=3,
         verification={
-            "status": "verified",
+            "status": HTTP1_DIFFERENTIAL_PUBLIC_OUTCOME,
             "result": str(arguments.result_out),
             "compileReceipt": str(arguments.receipt_out),
             "reportStatus": "draft_manual_review",
@@ -6852,13 +6864,22 @@ def _source_verification_requests(
 
 
 def _campaign_prepare_verification_http1(arguments: argparse.Namespace) -> int:
+    if arguments.finding_class != INDEPENDENT_HTTP1_FINDING_CLASS.value:
+        raise CliError(
+            "independent HTTP/1 replay supports response-differential observations only",
+            exit_code=EXIT_USAGE,
+        )
     context = _verification_handoff_document(arguments)
     source_spec, effect_request, control_request, body_digests = _source_verification_requests(context)
     if not arguments.prerequisite or any(not value.strip() for value in arguments.prerequisite):
         raise CliError("at least one explicit prerequisite is required", exit_code=EXIT_USAGE)
     semantics_value = {
         "findingClass": arguments.finding_class,
-        "claim": arguments.claim,
+        "sourceClaim": arguments.claim,
+        "sourceClaimStatus": INDEPENDENT_HTTP1_SOURCE_CLAIM_STATUS,
+        "verifierObservation": HTTP1_DIFFERENTIAL_OBSERVATION,
+        "semanticVerdict": INDEPENDENT_HTTP1_SEMANTIC_VERDICT,
+        "taxonomyVerdict": INDEPENDENT_HTTP1_TAXONOMY_VERDICT,
         "prerequisites": list(arguments.prerequisite),
     }
     semantics_digest = sha256_digest(semantics_value)
@@ -6922,7 +6943,7 @@ def _campaign_prepare_verification_http1(arguments: argparse.Namespace) -> int:
     except (PersonalCampaignError, ValueError) as exc:
         raise CliError(f"invalid verification case: {exc}", exit_code=EXIT_USAGE) from exc
     case = {
-        "schema": "faultloom.independent-http1-case.v1",
+        "schema": "faultloom.independent-http1-case.v2",
         "campaignId": arguments.campaign_id,
         "source": {
             "actor": context.source_grant.issued_to,
@@ -6949,7 +6970,7 @@ def _campaign_prepare_verification_http1(arguments: argparse.Namespace) -> int:
     }
     case_content = (json.dumps(case, sort_keys=True, separators=(",", ":")) + "\n").encode()
     prepare_receipt = {
-        "schema": "faultloom.independent-http1-prepare-receipt.v1",
+        "schema": "faultloom.independent-http1-prepare-receipt.v2",
         "campaignId": arguments.campaign_id,
         "sourceHandoffSha256": sha256_hex(context.handoff_content),
         "sourceAuthorityDigest": sha256_digest(context.source_authority),
@@ -6983,7 +7004,7 @@ def _campaign_prepare_verification_http1(arguments: argparse.Namespace) -> int:
         prepare_receipt_content,
     )
     _emit_json({
-        "schema": "faultloom.independent-http1-prepare.v1",
+        "schema": "faultloom.independent-http1-prepare.v2",
         "campaignId": arguments.campaign_id,
         "case": case_name,
         "receipt": prepare_receipt_name,
@@ -7013,7 +7034,7 @@ def _verification_case_document(
     semantics = case.get("semantics")
     triad = case.get("triad")
     if (
-        case.get("schema") != "faultloom.independent-http1-case.v1"
+        case.get("schema") != "faultloom.independent-http1-case.v2"
         or case.get("campaignId") != arguments.campaign_id
         or case.get("networkAccess") is not False
         or case.get("automaticSubmission") is not False
@@ -7031,15 +7052,20 @@ def _verification_case_document(
         or verifier.get("runId") != context.verifier_manifest["run_id"]
     ):
         raise CliError("verification case boundary differs", exit_code=EXIT_AUTHORITY)
-    claim = semantics.get("claim")
+    source_claim = semantics.get("sourceClaim")
     prerequisites = semantics.get("prerequisites")
     try:
-        FindingClass(semantics.get("findingClass"))
+        finding_class = FindingClass(semantics.get("findingClass"))
     except ValueError as exc:
         raise CliError("verification finding class is invalid", exit_code=EXIT_AUTHORITY) from exc
     if (
-        not isinstance(claim, str)
-        or not claim.strip()
+        finding_class is not INDEPENDENT_HTTP1_FINDING_CLASS
+        or semantics.get("sourceClaimStatus") != INDEPENDENT_HTTP1_SOURCE_CLAIM_STATUS
+        or semantics.get("verifierObservation") != HTTP1_DIFFERENTIAL_OBSERVATION
+        or semantics.get("semanticVerdict") != INDEPENDENT_HTTP1_SEMANTIC_VERDICT
+        or semantics.get("taxonomyVerdict") != INDEPENDENT_HTTP1_TAXONOMY_VERDICT
+        or not isinstance(source_claim, str)
+        or not source_claim.strip()
         or not isinstance(prerequisites, list)
         or not prerequisites
         or not all(isinstance(value, str) and value.strip() for value in prerequisites)
@@ -7057,7 +7083,7 @@ def _verification_prepare_receipt(
     )
     receipt = _parse_campaign_json_content(content, label="verification prepare receipt")
     if (
-        receipt.get("schema") != "faultloom.independent-http1-prepare-receipt.v1"
+        receipt.get("schema") != "faultloom.independent-http1-prepare-receipt.v2"
         or receipt.get("campaignId") != arguments.campaign_id
         or receipt.get("sourceHandoffSha256") != sha256_hex(context.handoff_content)
         or receipt.get("sourceAuthorityDigest") != sha256_digest(context.source_authority)
@@ -7314,8 +7340,8 @@ def _campaign_compile_verification_http1(arguments: argparse.Namespace) -> int:
         schema_version=SCHEMA_VERSION,
         candidate_id=candidate_id,
         run_id=verifier_run_id,
-        finding_class=FindingClass(str(semantics["findingClass"])),
-        title=verifier_spec.finding.title,
+        finding_class=INDEPENDENT_HTTP1_FINDING_CLASS,
+        title=HTTP1_DIFFERENTIAL_OBSERVATION_TITLE,
         hypothesis_ids=(),
         primitive_ids=(),
         effect_ids=(f"effect.independent.{arguments.campaign_id}",),
@@ -7343,7 +7369,7 @@ def _campaign_compile_verification_http1(arguments: argparse.Namespace) -> int:
     try:
         claim = assemble_claim_packet(candidate, ClaimDraft(
             claim_id=f"claim.independent.{arguments.campaign_id}",
-            claim=str(semantics["claim"]),
+            claim=HTTP1_DIFFERENTIAL_OBSERVATION_CLAIM,
             prerequisites=tuple(cast(list[str], semantics["prerequisites"])),
             evidence_refs=(evidence_refs[0], evidence_refs[1]),
             negative_control_refs=(evidence_refs[2],),
@@ -7397,7 +7423,11 @@ def _campaign_compile_verification_http1(arguments: argparse.Namespace) -> int:
     if verdict.outcome.value != "verified":
         raise CliError("independent verifier verdict is not VERIFIED", exit_code=EXIT_AUTHORITY)
     verdict = verdict.model_copy(update={
-        "reasons": (*verdict.reasons, f"faultloom:source_handoff=sha256:{sha256_hex(context.handoff_content)}"),
+        "reasons": (
+            *verdict.reasons,
+            HTTP1_DIFFERENTIAL_OBSERVATION_REASON,
+            f"faultloom:source_handoff=sha256:{sha256_hex(context.handoff_content)}",
+        ),
         "evidence_refs": (*verdict.evidence_refs, imported_handoff),
     })
     signer = _private_signer(arguments.private_key, private_content)
@@ -7441,16 +7471,19 @@ def _campaign_compile_verification_http1(arguments: argparse.Namespace) -> int:
         "--verifier-authority-key", "trusted-key.json",
     ]
     compile_receipt = {
-        "schema": "faultloom.independent-http1-compile.v1",
-        "status": "verified",
+        "schema": "faultloom.independent-http1-compile.v2",
+        "status": HTTP1_DIFFERENTIAL_PUBLIC_OUTCOME,
         "candidateId": candidate_id,
         "result": {"path": result_relative, "sha256": sha256_hex(result_content)},
         "sourceHandoffSha256": sha256_hex(context.handoff_content),
+        "observation": HTTP1_DIFFERENTIAL_OBSERVATION,
+        "sourceClaimStatus": INDEPENDENT_HTTP1_SOURCE_CLAIM_STATUS,
+        "semanticVerdict": INDEPENDENT_HTTP1_SEMANTIC_VERDICT,
+        "taxonomyVerdict": INDEPENDENT_HTTP1_TAXONOMY_VERDICT,
         "verifyArgs": [candidate_id, *common_args],
         "reportArgs": [
             candidate_id,
             "--format", "md",
-            "--out-dir", "verification-report-outbox",
             *common_args,
         ],
         "networkAccess": False,
@@ -7463,8 +7496,8 @@ def _campaign_compile_verification_http1(arguments: argparse.Namespace) -> int:
     _write_or_verify_handoff_output(context.verifier_workspace, result_out, result_content)
     _write_or_verify_handoff_output(context.verifier_workspace, receipt_out, compile_receipt_content)
     _emit_json({
-        "schema": "faultloom.independent-http1-compile.v1",
-        "status": "verified",
+        "schema": "faultloom.independent-http1-compile.v2",
+        "status": HTTP1_DIFFERENTIAL_PUBLIC_OUTCOME,
         "candidateId": candidate_id,
         "result": result_relative,
         "receipt": receipt_relative,
@@ -8159,7 +8192,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--campaign-id", type=_campaign_id, required=True
     )
     campaign_prepare_verification_http1.add_argument(
-        "--finding-class", choices=tuple(item.value for item in FindingClass), required=True
+        "--finding-class", choices=(INDEPENDENT_HTTP1_FINDING_CLASS.value,), required=True
     )
     campaign_prepare_verification_http1.add_argument("--claim", required=True)
     campaign_prepare_verification_http1.add_argument(
@@ -8191,7 +8224,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--campaign-id", type=_campaign_id, required=True
     )
     campaign_supervise_verification_http1.add_argument(
-        "--finding-class", choices=tuple(item.value for item in FindingClass), required=True
+        "--finding-class", choices=(INDEPENDENT_HTTP1_FINDING_CLASS.value,), required=True
     )
     campaign_supervise_verification_http1.add_argument("--claim", required=True)
     campaign_supervise_verification_http1.add_argument(

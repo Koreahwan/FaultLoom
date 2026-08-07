@@ -16,8 +16,8 @@ signed redacted evidence approval
         -> encrypted turn / candidate outbox
         -> trusted issuer signs the exact admitted result
         -> (optional) one exact signed ToolPlan through the Gateway
-        -> independent replay and verification
-        -> verified report outbox (manual delivery)
+        -> independent replay of the bounded observation
+        -> independently reproduced observation -> manual-review report draft
 ```
 
 The provider boundary is model-agnostic. An adapter may use an approved
@@ -507,16 +507,19 @@ faultloom campaign prepare-verification-http1 \
   --source-workspace <source-workspace> --source-trusted-key <source-key> \
   --handoff <source-workspace>/verification-handoff.json \
   --verifier-workspace <verifier-workspace> --verifier-trusted-key <verifier-key> \
-  --campaign-id <campaign-id> --finding-class <class> \
+  --campaign-id <campaign-id> --finding-class http_response_differential \
   --claim <operator-claim> --prerequisite <operator-prerequisite> \
   --out <verifier-workspace>/verification-triad.json
 ```
 
-The first slice accepts only bodyless `GET` or `OPTIONS` requests with exactly
+The first slice admits only the `http_response_differential` observation class
+and bodyless `GET` or `OPTIONS` requests with exactly
 `Host` and `Connection: close`. `HEAD`, authorization or other headers, request
 bodies, same/nested workspaces, same actors or keys, different targets, and an
-expired verifier grant are rejected. The generated case and v1 triad are
-private, create-once files. Run that triad with the existing
+expired verifier grant are rejected. The operator's `--claim` is retained in
+the private case only as `operator_asserted_unverified`; it is not the claim
+signed by the replay verdict. The generated case and v1 triad are private,
+create-once files. Run that triad with the existing
 `campaign run-http1-triad`, review the three fresh responses, and finalize it
 with the existing `campaign finalize-http1-triad`; there is no second sender.
 
@@ -539,11 +542,22 @@ digests to equal the source effect digest, the verifier control to equal the
 source control, and effect to differ from control. It emits a signed
 verifier-run result, a new verifier-run imported-handoff evidence reference,
 and exact arguments for the existing `faultloom verify` and `faultloom report`
-gates. Only `VERIFIED` reaches the report gate. The report command creates a
-`draft_manual_review` outbox; neither command submits it.
+gates. The signed claim is fixed to the exact response-body differential, while
+the public outcome is only `observation_reproduced`; `semanticVerdict` and
+`taxonomyVerdict` remain `not_evaluated`. CVE, one-day, patch-variant, and
+zero-day classifications are rejected by this bridge. A report remains a local
+`draft_manual_review`; neither command submits it. The compile receipt records
+the exact stdout-rendering report arguments. An operator who separately wants
+the generic report command's optional outbox must supply and validate an
+explicit `--out-dir`; the supervisor instead publishes its own create-once
+workspace-local report and receipt.
 The canonical case-semantics digest is embedded in the finalized request
 filenames. A coordinated edit of the unsigned local case and its prepare
 receipt therefore cannot change what gets signed.
+
+This correction raises the prepared-case and compile schemas to v2. Older v1
+verification artifacts are rejected instead of being resumed under the narrower
+meaning; prepare a new v2 case from the source handoff.
 
 For the normal reviewer-operated path, one thin coordinator runs those same
 phases without adding another sender. Preparation is offline. It pauses for
@@ -556,7 +570,7 @@ faultloom campaign supervise-verification-http1 \
   --source-workspace <source-workspace> --source-trusted-key <source-key> \
   --handoff <source-workspace>/verification-handoff.json \
   --verifier-workspace <verifier-workspace> --verifier-trusted-key <verifier-key> \
-  --campaign-id <campaign-id> --finding-class <class> \
+  --campaign-id <campaign-id> --finding-class http_response_differential \
   --claim <operator-claim> --prerequisite <operator-prerequisite> \
   --out <verifier-workspace>/verification-triad.json \
   --case <verifier-workspace>/<campaign-id>.verification-case.json \

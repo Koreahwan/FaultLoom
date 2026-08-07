@@ -104,7 +104,8 @@ def _prepare_args(
         "--source-workspace", str(source), "--source-trusted-key", str(source_key),
         "--handoff", str(handoff),
         "--verifier-workspace", str(verifier), "--verifier-trusted-key", str(verifier_key),
-        "--campaign-id", "owned-loopback", "--finding-class", "zero_day_like",
+        "--campaign-id", "owned-loopback",
+        "--finding-class", "http_response_differential",
         "--claim", "The owned effect path deterministically differs from its control.",
         "--prerequisite", "Use the separately authorized verifier identity.",
         "--out", str(verifier / "verification-triad.json"),
@@ -145,7 +146,8 @@ def _supervise_args(
         "--source-workspace", str(source), "--source-trusted-key", str(source_key),
         "--handoff", str(handoff),
         "--verifier-workspace", str(verifier), "--verifier-trusted-key", str(verifier_key),
-        "--campaign-id", "owned-loopback", "--finding-class", "zero_day_like",
+        "--campaign-id", "owned-loopback",
+        "--finding-class", "http_response_differential",
         "--claim", "The owned effect path deterministically differs from its control.",
         "--prerequisite", "Use the separately authorized verifier identity.",
         "--out", str(verifier / "verification-triad.json"),
@@ -208,23 +210,39 @@ def test_independent_http1_bridge_runs_existing_triad_and_existing_verify(
     monkeypatch.setattr(cli.socket, "socket", unexpected_socket)
     assert cli.main(_compile_args(source, source_key, handoff, verifier, verifier_key, private_key)) == cli.EXIT_OK
     compiled = json.loads(capsys.readouterr().out)
-    assert compiled["status"] == "verified"
+    assert compiled["status"] == "observation_reproduced"
     receipt = json.loads((verifier / "verification-compile-receipt.json").read_text())
     assert receipt["automaticReport"] is False and receipt["automaticSubmission"] is False
+    assert receipt["observation"] == "exact_http_response_body_differential"
+    assert receipt["sourceClaimStatus"] == "operator_asserted_unverified"
+    assert receipt["semanticVerdict"] == "not_evaluated"
+    assert receipt["taxonomyVerdict"] == "not_evaluated"
+    assert "--out-dir" not in receipt["reportArgs"]
 
     monkeypatch.chdir(verifier)
     assert cli.main(["verify", *receipt["verifyArgs"]]) == cli.EXIT_OK
     verified = json.loads(capsys.readouterr().out)
-    assert verified["outcome"] == "verified"
+    assert verified["outcome"] == "observation_reproduced"
     assert verified["network_access"] == "none"
     assert cli.main(["report", *receipt["reportArgs"]]) == cli.EXIT_OK
-    capsys.readouterr()
-    report_receipt = json.loads(next(
-        (verifier / "verification-report-outbox").glob("*/receipt.json")
-    ).read_text())
-    assert report_receipt["status"] == "draft_manual_review"
-    assert report_receipt["automatic_submission_performed"] is False
-    assert report_receipt["network_access"] == "none"
+    report = capsys.readouterr().out
+    assert "- Verdict: `observation_reproduced`" in report
+    assert "vulnerability semantics not evaluated" in report
+    assert "- Semantic verdict: `not_evaluated`" in report
+    assert "- Taxonomy verdict: `not_evaluated`" in report
+    assert cli.HTTP1_DIFFERENTIAL_OBSERVATION_TITLE in report
+    assert cli.HTTP1_DIFFERENTIAL_OBSERVATION_CLAIM in report
+    assert "# Owned triad" not in report
+    assert "The owned effect path deterministically differs from its control." not in report
+    assert not (verifier / "verification-report-outbox").exists()
+    json_report_args = list(receipt["reportArgs"])
+    json_report_args[json_report_args.index("md")] = "json"
+    assert cli.main(["report", *json_report_args]) == cli.EXIT_OK
+    json_report = json.loads(capsys.readouterr().out)
+    assert json_report["verdict"] == "observation_reproduced"
+    assert json_report["protocol_replay_outcome"] == "verified"
+    assert json_report["semantic_verdict"] == "not_evaluated"
+    assert json_report["taxonomy_verdict"] == "not_evaluated"
 
 
 def test_supervise_independent_http1_runs_verifier_triad_then_offline_report(
@@ -254,12 +272,15 @@ def test_supervise_independent_http1_runs_verifier_triad_then_offline_report(
     outside.mkdir()
     legacy_outbox = verifier / "verification-report-outbox"
     original_invoke = cli._invoke_cli_main_captured
+    report_argv: list[str] = []
 
     def swap_legacy_outbox_before_report(
         argv: list[str], *, working_directory: Path
     ) -> tuple[int, str]:
         if argv[0] == "report" and cli.os.name != "nt" and not legacy_outbox.exists():
             legacy_outbox.symlink_to(outside, target_is_directory=True)
+        if argv[0] == "report":
+            report_argv.extend(argv)
         return original_invoke(argv, working_directory=working_directory)
 
     monkeypatch.setattr(
@@ -278,8 +299,10 @@ def test_supervise_independent_http1_runs_verifier_triad_then_offline_report(
     assert output["automaticSubmission"] is False
     verification = output["verification"]
     assert isinstance(verification, dict)
-    assert verification["status"] == "verified"
+    assert verification["status"] == "observation_reproduced"
     assert verification["reportStatus"] == "draft_manual_review"
+    compile_receipt = json.loads((verifier / "verification-compile-receipt.json").read_text())
+    assert report_argv == ["report", *compile_receipt["reportArgs"]]
     assert captured == [
         _request(port, "/api/effect"),
         _request(port, "/api/effect"),
@@ -652,6 +675,23 @@ def test_prepare_rejects_expired_verifier_grant(
     assert not (verifier / "verification-triad.json").exists()
 
 
+def test_prepare_rejects_semantic_vulnerability_class_before_io(tmp_path: Path) -> None:
+    arguments = _prepare_args(
+        tmp_path / "source",
+        tmp_path / "source-key.json",
+        tmp_path / "handoff.json",
+        tmp_path / "verifier",
+        tmp_path / "verifier-key.json",
+    )
+    arguments[arguments.index("http_response_differential")] = "zero_day_like"
+
+    with pytest.raises(SystemExit) as raised:
+        cli.main(arguments)
+
+    assert raised.value.code == cli.EXIT_USAGE
+    assert not (tmp_path / "verifier" / "verification-triad.json").exists()
+
+
 @pytest.mark.parametrize("mutation", ("claim", "finding_class", "prerequisite", "triad_ref"))
 def test_compile_rejects_tampered_prepared_case_after_finalization(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], mutation: str
@@ -687,7 +727,7 @@ def test_compile_rejects_tampered_prepared_case_after_finalization(
     case_path = verifier / "owned-loopback.verification-case.json"
     case = json.loads(case_path.read_text())
     if mutation == "claim":
-        case["semantics"]["claim"] = "tampered"
+        case["semantics"]["sourceClaim"] = "tampered"
         case["semanticsDigest"] = cli.sha256_digest(case["semantics"])
     elif mutation == "finding_class":
         case["semantics"]["findingClass"] = "patch_variant"
