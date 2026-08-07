@@ -458,8 +458,9 @@ closed; use the offline handoff and compilation flow above there instead.
 
 ## 11. Independent HTTP/1 replay and manual-review report
 
-RC15 can independently replay a finalized `draft_unverified` campaign without
-adding another sender. First export the source handoff, then create a second
+The personal package can independently replay a finalized `draft_unverified`
+campaign without adding another sender. First export the source handoff, then
+create a second
 manual workspace from a separately signed verifier grant. The verifier must
 have a different actor, key, authority, and workspace while naming the exact
 same target:
@@ -484,8 +485,8 @@ same target:
   --out '<separate-verifier-workspace>\verification-triad.json'
 ```
 
-The preferred RC15 path coordinates those existing phases behind the same two
-explicit review pauses:
+The preferred package path coordinates those existing phases behind the same
+two explicit review pauses:
 
 ```powershell
 $Verifier = '<separate-verifier-workspace>'
