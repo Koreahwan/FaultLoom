@@ -85,14 +85,7 @@ jobs:
         run: python3 -m pip install --requirement requirements-dev.lock
 
       - name: Run the required runtime tests
-        run: >-
-          python3 -m pytest
-          tests/runtime/test_personal_campaign.py
-          tests/runtime/test_personal_campaign_bridge.py
-          tests/runtime/test_personal_campaign_supervise.py
-          tests/runtime/test_model_http1_poc_supervisor.py
-          tests/runtime/test_campaign_verification_handoff.py
-          tests/runtime/test_independent_http1_verification.py
+        run: python3 -m pytest tests/runtime/test_personal_campaign.py tests/runtime/test_personal_campaign_bridge.py tests/runtime/test_personal_campaign_supervise.py tests/runtime/test_model_http1_poc_supervisor.py tests/runtime/test_campaign_verification_handoff.py tests/runtime/test_independent_http1_verification.py
 
   public-history-secret-gate:
     runs-on: ubuntu-24.04
