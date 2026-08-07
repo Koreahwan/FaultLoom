@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import socket
@@ -52,7 +53,7 @@ def _prepared_command(
     return ([
         "campaign", "supervise-model-http1-poc", "--workspace", str(workspace), "--trusted-key", str(key),
         "--request", str(request), "--model-turn", str(turn), "--evidence-id", evidence_id,
-        "--negative-control-path", control, "--metadata", str(metadata), "--out", str(tmp_path / "out"),
+        "--negative-control-path", control, "--metadata", str(metadata), "--out", str(workspace / "model-http1-poc"),
     ], workspace, key, port)
 
 
@@ -81,15 +82,35 @@ def test_model_http1_poc_supervisor_happy_resume_and_operator_metadata(
     listener.bind(("127.0.0.1", port))
     listener.listen(3)
     captured: list[bytes] = []
-    thread = _serve(listener, [b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nx"] * 3, captured)
+    thread = _serve(
+        listener,
+        [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\neffect",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\neffect",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\ncontrol",
+        ],
+        captured,
+    )
     monkeypatch.setattr(cli.sys, "stdin", io.StringIO("RUN owned-model-loopback\nFINALIZE owned-model-loopback\n"))
     assert cli.main(arguments) == cli.EXIT_OK
     thread.join(timeout=3)
     listener.close()
     output = _one_json(capsys)
     assert output["status"] == "completed"
+    assert output["finalStatus"] == "draft_unverified"
+    assert isinstance(output["handoff"], str)
+    assert output["handoff"].startswith("campaign-")
+    assert output["handoff"].endswith(".verification-handoff.json")
+    assert cli._is_safe_handoff_filename(output["handoff"])
+    handoff = workspace / output["handoff"]
+    assert output["handoffSha256"] == hashlib.sha256(handoff.read_bytes()).hexdigest()
+    assert output["handoff"] == (
+        f"campaign-{output['handoffSha256']}.verification-handoff.json"
+    )
+    assert isinstance(output["nextAction"], str)
+    assert "supervise-verification-http1" in output["nextAction"]
     assert captured == [_request(port, "/api/effect"), _request(port, "/api/effect"), _request(port, "/api/control")]
-    bundle = next((tmp_path / "out").glob("model-http1-poc.*"))
+    bundle = next((workspace / "model-http1-poc").glob("model-http1-poc.*"))
     assert {path.name for path in bundle.iterdir()} >= {"effect.raw", "control.raw", "triad.v1.json", "result.json", "receipt.json"}
     triad = json.loads((bundle / "triad.v1.json").read_text(encoding="utf-8"))
     assert triad["finding"]["title"] == "Operator authored title"
@@ -97,10 +118,92 @@ def test_model_http1_poc_supervisor_happy_resume_and_operator_metadata(
     assert triad["authorization_document_sha256"] == "a" * 64
     provenance = json.loads((bundle / "provenance.v1.json").read_text(encoding="utf-8"))
     assert provenance["external_authorization_reference_status"] == "operator_asserted_unverified"
+
+    def no_recompile(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("completed resume must not recompile the model output")
+
+    monkeypatch.setattr(cli, "compile_automation_result", no_recompile)
     monkeypatch.setattr(cli.sys, "stdin", io.StringIO())
     assert cli.main(arguments) == cli.EXIT_OK
-    assert _one_json(capsys)["status"] == "completed"
+    resumed = _one_json(capsys)
+    assert resumed["status"] == "completed"
+    assert resumed["handoff"] == output["handoff"]
+    assert resumed["handoffSha256"] == hashlib.sha256(handoff.read_bytes()).hexdigest()
     assert len(captured) == 3
+
+    def no_socket(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("completed handoff verification must remain offline")
+
+    monkeypatch.setattr(cli.socket, "socket", no_socket)
+    handoff.write_text("different\n", encoding="utf-8")
+    assert cli.main(arguments) == cli.EXIT_AUTHORITY
+    assert capsys.readouterr().out == ""
+    handoff.unlink()
+    external = tmp_path / "external-handoff.json"
+    external.write_text("different\n", encoding="utf-8")
+    try:
+        handoff.symlink_to(external)
+    except OSError:
+        return
+    assert cli.main(arguments) == cli.EXIT_AUTHORITY
+    assert capsys.readouterr().out == ""
+
+
+def test_model_http1_poc_supervisor_pending_finalize_never_writes_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    arguments, workspace, _, port = _prepared_command(tmp_path, capsys)
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", port))
+    listener.listen(3)
+    captured: list[bytes] = []
+    thread = _serve(
+        listener,
+        [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\neffect",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\neffect",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\ncontrol",
+        ],
+        captured,
+    )
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO("RUN owned-model-loopback\nno\n"))
+    assert cli.main(arguments) == cli.EXIT_OK
+    thread.join(timeout=3)
+    listener.close()
+    output = _one_json(capsys)
+    assert output["status"] == "review_required"
+    assert len(captured) == 3
+    assert not list(workspace.glob("campaign-*.verification-handoff.json"))
+    assert "handoff" not in output
+
+
+def test_model_http1_poc_supervisor_negative_campaign_never_writes_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    arguments, workspace, _, port = _prepared_command(tmp_path, capsys)
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", port))
+    listener.listen(3)
+    captured: list[bytes] = []
+    thread = _serve(
+        listener,
+        [b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\neffect"] * 3,
+        captured,
+    )
+    monkeypatch.setattr(
+        cli.sys, "stdin", io.StringIO("RUN owned-model-loopback\nFINALIZE owned-model-loopback\n")
+    )
+    assert cli.main(arguments) == cli.EXIT_OK
+    thread.join(timeout=3)
+    listener.close()
+    output = _one_json(capsys)
+    assert output["status"] == "completed"
+    assert output["finalStatus"] == "negative_campaign"
+    assert len(captured) == 3
+    assert not list(workspace.glob("campaign-*.verification-handoff.json"))
+    assert "handoff" not in output
 
 
 def test_model_http1_poc_supervisor_decline_and_invalid_control_never_open_socket(
@@ -111,7 +214,10 @@ def test_model_http1_poc_supervisor_decline_and_invalid_control_never_open_socke
     assert cli.main(arguments) == cli.EXIT_OK
     assert _one_json(capsys)["status"] == "review_required"
     assert not (workspace / "campaigns").exists()
+    assert not list(workspace.glob("campaign-*.verification-handoff.json"))
     bad, _, _, _ = _prepared_command(tmp_path / "bad", capsys, control="/outside-authority")
+    outside, outside_workspace, _, _ = _prepared_command(tmp_path / "outside", capsys)
+    outside[outside.index("--out") + 1] = str(tmp_path / "outside-output")
 
     def no_socket(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("out-of-scope control must fail before a socket")
@@ -120,15 +226,51 @@ def test_model_http1_poc_supervisor_decline_and_invalid_control_never_open_socke
     assert cli.main(bad) == cli.EXIT_AUTHORITY
     assert capsys.readouterr().out == ""
 
+    assert cli.main(outside) == cli.EXIT_AUTHORITY
+    assert capsys.readouterr().out == ""
+    assert not (outside_workspace / "campaigns").exists()
+    assert not (tmp_path / "outside-output").exists()
+
+
+def test_automatic_campaign_handoff_filename_is_safe_for_boundary_campaign_ids() -> None:
+    for campaign_id in ("CON", "x" * 128):
+        content = f"handoff-for-{campaign_id}".encode("utf-8")
+        filename = cli._automatic_campaign_verification_handoff_filename(content)
+        assert filename == (
+            f"campaign-{hashlib.sha256(content).hexdigest()}.verification-handoff.json"
+        )
+        assert filename.startswith("campaign-")
+        assert filename.endswith(".verification-handoff.json")
+        assert len(filename) <= 128
+        assert cli._is_safe_handoff_filename(filename)
+
+
+def test_model_http1_poc_supervisor_rejects_non_immediate_output_before_socket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    arguments, workspace, _, _ = _prepared_command(tmp_path, capsys)
+
+    def no_socket(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("unsafe output must fail before a socket")
+
+    monkeypatch.setattr(cli.socket, "socket", no_socket)
+    out_index = arguments.index("--out") + 1
+    for unsafe_output in (workspace, workspace / "model-http1-poc" / "nested"):
+        arguments[out_index] = str(unsafe_output)
+        assert cli.main(arguments) == cli.EXIT_AUTHORITY
+        assert capsys.readouterr().out == ""
+    assert not (workspace / "campaigns").exists()
+    assert not (workspace / "model-http1-poc").exists()
+
 
 def test_model_http1_poc_supervisor_rejects_tampered_bundle_before_socket(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    arguments, _, _, _ = _prepared_command(tmp_path, capsys)
+    arguments, workspace, _, _ = _prepared_command(tmp_path, capsys)
     monkeypatch.setattr(cli.sys, "stdin", io.StringIO("no\n"))
     assert cli.main(arguments) == cli.EXIT_OK
     _ = _one_json(capsys)
-    bundle = next((tmp_path / "out").glob("model-http1-poc.*"))
+    bundle = next((workspace / "model-http1-poc").glob("model-http1-poc.*"))
     (bundle / "effect.raw").write_bytes(b"tampered")
 
     def no_socket(*_args: object, **_kwargs: object) -> object:
@@ -138,6 +280,7 @@ def test_model_http1_poc_supervisor_rejects_tampered_bundle_before_socket(
     assert cli.main(arguments) == cli.EXIT_AUTHORITY
     assert capsys.readouterr().out == ""
 
+
 def test_model_http1_poc_supervisor_recomputes_pre_run_bundle_before_socket(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -145,7 +288,7 @@ def test_model_http1_poc_supervisor_recomputes_pre_run_bundle_before_socket(
     monkeypatch.setattr(cli.sys, "stdin", io.StringIO("no\n"))
     assert cli.main(arguments) == cli.EXIT_OK
     _ = _one_json(capsys)
-    bundle = next((tmp_path / "out").glob("model-http1-poc.*"))
+    bundle = next((tmp_path / "workspace" / "model-http1-poc").glob("model-http1-poc.*"))
     original = AuthorizedAutomationResult.model_validate_json(
         (bundle / "result.json").read_text(encoding="utf-8")
     )

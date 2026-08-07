@@ -188,6 +188,10 @@ faultloom campaign supervise-model-http1-poc \
   --out <private-model-http1-poc-outbox>
 ```
 
+`--out` must name exactly one safe immediate child directory of the verified
+workspace (for example, `<workspace>/model-http1-poc`). The workspace root,
+nested paths, and paths outside the workspace fail before any socket is opened.
+
 The request must be the exact `AutomationRequest` derived from the archived
 exchange, and the model turn is an untrusted external file. Metadata is a
 strict operator-authored document containing the campaign, external
@@ -210,9 +214,21 @@ non-sensitive. The runner sends exactly three sequential requests—effect,
 the same effect again as reproduction, and the derived control—with no retry.
 Durable checkpoints resume without re-sending completed work; unresolved or
 start-only state requires manual reconciliation. This path makes no provider,
-Gateway, Burp, or submission call. Its `draft_unverified`/`negative_campaign`
-result still goes through the separate independent verifier and manual report
-workflow; it is not verification or proof of a vulnerability.
+Gateway, Burp, or submission call. When finalization returns
+`finalStatus=draft_unverified`, the supervisor creates or verifies the
+campaign-derived source handoff as a private direct child of the verified
+workspace. Its content-addressed safe filename is
+`campaign-<handoff-sha256>.verification-handoff.json`; consume the trust JSON's
+`handoff` and `handoffSha256` fields rather than constructing a path. Its single
+JSON result includes that handoff path, `handoffSha256`, and a `nextAction` naming the separately
+authorized verifier workflow. That next action does not grant reviewer
+authority: the verifier must use a separate workspace, actor, signing key, and
+active grant, with its own exact `RUN <campaign-id>` and
+`FINALIZE <campaign-id>` checkpoints. A pending, `review_required`, negative, or
+unresolved result creates no handoff. The handoff remains
+`verificationStatus=pending`; independent verification and the local `draft_manual_review` report
+workflow are separate, and this path is not verification or proof of a
+vulnerability.
 
 ## Optional authorized target dispatch
 
@@ -449,7 +465,9 @@ vulnerability; independent replay and the normal report gate remain separate.
 ### Read-only verification handoff
 
 Only a finalized `draft_unverified` v2 campaign with its exact automation
-binding may be exported for an independent verifier:
+binding may be handed to an independent verifier. The model supervisor above
+creates the source-side handoff automatically. For a campaign run through the
+phase commands directly, export the same manifest explicitly:
 
 ```bash
 faultloom campaign export-verification-handoff \

@@ -447,7 +447,13 @@ effect, the same effect as reproduction, and the derived control, with no
 retry. Resume is durable and never replays completed sends; unresolved or
 start-only state stops for manual reconciliation. No provider, Gateway, Burp,
 or submission is called, and independent verification/reporting remains a
-separate downstream step.
+separate downstream step. When finalization returns `finalStatus=draft_unverified`,
+the command creates or verifies a private direct child of the verified source
+workspace with content-addressed safe filename
+`campaign-<handoff-sha256>.verification-handoff.json`. Use the trust JSON's
+`handoff` and `handoffSha256` fields rather than constructing a filename. Its
+one JSON result includes `handoffSha256` and a `nextAction` naming the separately authorized reviewer workflow. Pending,
+negative, unresolved, or review-required results create no handoff.
 
 The command help also lists `automation provider-turn`. That direct official
 API path is intentionally POSIX-only because its durable receipt and state
@@ -459,11 +465,15 @@ closed; use the offline handoff and compilation flow above there instead.
 ## 11. Independent HTTP/1 replay and manual-review report
 
 The personal package can independently replay a finalized `draft_unverified`
-campaign without adding another sender. First export the source handoff, then
-create a second
-manual workspace from a separately signed verifier grant. The verifier must
-have a different actor, key, authority, and workspace while naming the exact
-same target:
+campaign without adding another sender. If the campaign came from
+`supervise-model-http1-poc`, use its automatically created content-addressed
+handoff named by the reported `handoff` and `handoffSha256` fields (for example,
+`campaign-<handoff-sha256>.verification-handoff.json`).
+Pending or negative campaigns have no source handoff. If the phase commands
+were used directly, export the source handoff as shown below. In both cases,
+then create a second manual workspace from a separately signed active verifier
+grant. The verifier must have a different actor, key, authority, and workspace
+while naming the exact same target:
 
 ```powershell
 & $FaultLoom campaign export-verification-handoff `

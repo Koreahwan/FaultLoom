@@ -333,22 +333,21 @@ def test_windows_handoff_child_remains_bound_to_renamed_workspace(tmp_path: Path
     assert not (workspace / "handoff.json").exists()
 
 
-@pytest.mark.skipif(cli.os.name == "nt", reason="directory descriptor pinning is POSIX-specific")
-def test_campaign_export_verification_handoff_rejects_workspace_parent_swap(
+def test_campaign_export_verification_handoff_rejects_workspace_replacement_after_validation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     workspace, key = _finalized_v2_campaign(tmp_path, capsys)
-    original = cli._campaign_verification_handoff_bytes
-    outside = tmp_path / "outside"
-    outside.mkdir()
+    original = cli._campaign_verification_handoff_payload
     parked = tmp_path / "workspace-parked"
 
-    def swap_before_publication(arguments: object) -> bytes:
-        content = original(arguments)
+    def swap_before_publication(
+        arguments: object,
+    ) -> tuple[bytes, cli.os.stat_result]:
+        payload = original(arguments)
         workspace.rename(parked)
-        workspace.symlink_to(outside, target_is_directory=True)
-        return content
+        workspace.mkdir()
+        return payload
 
-    monkeypatch.setattr(cli, "_campaign_verification_handoff_bytes", swap_before_publication)
-    assert cli.main(_export_arguments(workspace, key, workspace / "handoff.json")) == cli.EXIT_USAGE
-    assert not (outside / "handoff.json").exists()
+    monkeypatch.setattr(cli, "_campaign_verification_handoff_payload", swap_before_publication)
+    assert cli.main(_export_arguments(workspace, key, workspace / "handoff.json")) == cli.EXIT_AUTHORITY
+    assert not (workspace / "handoff.json").exists()

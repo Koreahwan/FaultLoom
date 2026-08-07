@@ -54,9 +54,18 @@ its provenance records the external authorization reference as
 separately. The supervisor then requires exact `RUN <campaign-id>` and
 `FINALIZE <campaign-id>` acknowledgements around exactly three sequential,
 no-retry sends (effect, the same effect as reproduction, and the derived
-control), and resumes durably without replaying completed work. It makes no
-provider, Gateway, Burp, or submission call; independent verification and the
-manual report path remain separate.
+control), and resumes durably without replaying completed work. When
+finalization succeeds with `finalStatus=draft_unverified`, it creates or
+verifies the campaign-derived source handoff directly under the verified
+workspace. The trust JSON names its content-addressed safe filename as
+`campaign-<handoff-sha256>.verification-handoff.json`; consume its `handoff`
+and `handoffSha256` fields rather than constructing a filename. The result also
+includes the next reviewer action. A `review_required`, pending, negative, unresolved, or otherwise
+non-`draft_unverified` result creates no handoff. It makes no provider,
+Gateway, Burp, or submission call; independent verification and the manual
+report path remain separate. The reviewer action still requires a separate
+workspace, actor, signing key, and active authorization, plus its own exact
+`RUN <campaign-id>` and `FINALIZE <campaign-id>` checkpoints.
 
 For the same bound workflow with less command juggling,
 `campaign supervise-http1-triad` prepares or resumes the campaign in one
@@ -81,12 +90,14 @@ an explicitly `draft_unverified` finding; every other outcome is a
 `negative_campaign`. This is a bounded triad comparison, not independent
 verification or proof of a vulnerability.
 
-A completed bound-v2 `draft_unverified` campaign can be exported with
-`campaign export-verification-handoff`. This read-only command revalidates the
-terminal campaign and writes one private, create-once direct child of the
-workspace containing only relative references, sizes, digests, and pending
-verification requirements. It includes no raw bodies, secrets, verdict,
-report, target/provider traffic, or submission authority.
+A completed bound-v2 `draft_unverified` campaign can also be exported with
+`campaign export-verification-handoff` when using the phase commands directly.
+The model-supervisor path performs the same source-side handoff creation and
+verification automatically. In either case, the handoff is one private,
+create-once direct child of the source workspace containing only relative
+references, sizes, digests, and pending verification requirements. It includes
+no raw bodies, secrets, verdict, report, target/provider traffic, or submission
+authority.
 
 For the direct sender, hostname-only external targets use `https`; plaintext
 `http` requires an explicitly signed literal numeric IP or signed CIDR. An

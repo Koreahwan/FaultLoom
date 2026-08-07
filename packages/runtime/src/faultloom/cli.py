@@ -4964,6 +4964,9 @@ def _campaign_supervise_model_http1_poc(arguments: argparse.Namespace) -> int:
     manifest, grant, target, _ = _verified_request_workspace(
         arguments.workspace, _trusted_key_path(arguments), require_active=False
     )
+    output_directory = _require_safe_workspace_local_output_directory(
+        arguments.workspace, arguments.out, label="model HTTP/1 PoC output"
+    )
     exchange = _load_archived_http_exchange(
         arguments.workspace, manifest, grant, target, arguments.evidence_id,
         hostname, port, scheme, method, effect_path,
@@ -5009,7 +5012,7 @@ def _campaign_supervise_model_http1_poc(arguments: argparse.Namespace) -> int:
         "external_authorization_reference_status": "operator_asserted_unverified",
     }
     entry_id = "model-http1-poc." + sha256_hex(canonical_json(provenance_source).encode("utf-8"))[:32]
-    bundle_dir = arguments.out / entry_id
+    bundle_dir = output_directory / entry_id
     result_path, receipt_path = bundle_dir / "result.json", bundle_dir / "receipt.json"
     durable_campaign = any(
         _campaign_record_exists(arguments.workspace / "campaigns" / f"{triad.campaign_id}.{suffix}.json")
@@ -5095,19 +5098,56 @@ def _campaign_supervise_model_http1_poc(arguments: argparse.Namespace) -> int:
     provenance = canonical_json({**provenance_source, "result_digest": result_digest})
     try:
         bundle_dir = ensure_private_content_bundle(
-            arguments.out, entry_id=entry_id,
+            output_directory, entry_id=entry_id,
             files=(("result.json", result_text), ("receipt.json", receipt_text), ("effect.raw", effect), ("control.raw", control), ("triad.v1.json", triad_text), ("provenance.v1.json", provenance)),
             error_label="model HTTP/1 PoC bundle",
             permitted_extra_files=frozenset({"triad.v2.json"}),
         )
     except CandidateOutboxError as exc:
         raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+    if _require_safe_workspace_local_output_directory(
+        arguments.workspace, output_directory, label="model HTTP/1 PoC output"
+    ) != output_directory:
+        raise CliError("model HTTP/1 PoC output changed during publication", exit_code=EXIT_AUTHORITY)
+    try:
+        published_metadata = bundle_dir.lstat()
+    except OSError as exc:
+        raise CliError("cannot inspect published model HTTP/1 PoC bundle", exit_code=EXIT_AUTHORITY) from exc
+    if (
+        bundle_dir.parent != output_directory
+        or stat.S_ISLNK(published_metadata.st_mode)
+        or not stat.S_ISDIR(published_metadata.st_mode)
+        or bundle_dir.is_junction()
+    ):
+        raise CliError("published model HTTP/1 PoC bundle is unsafe", exit_code=EXIT_AUTHORITY)
     supervised = argparse.Namespace(
         workspace=arguments.workspace, trusted_key=arguments.trusted_key, template=bundle_dir / "triad.v1.json",
         result=bundle_dir / "result.json", receipt=bundle_dir / "receipt.json", candidate_id=candidate_id,
         out=bundle_dir / "triad.v2.json",
     )
-    return _campaign_supervise_http1_triad(supervised)
+    exit_code, outcome = _invoke_campaign_handler(
+        _campaign_supervise_http1_triad, supervised
+    )
+    if (
+        exit_code == EXIT_OK
+        and outcome.get("status") == "completed"
+        and outcome.get("finalStatus") == "draft_unverified"
+    ):
+        _, handoff_relative, handoff_digest = _ensure_automatic_campaign_verification_handoff(
+            argparse.Namespace(
+                workspace=arguments.workspace,
+                trusted_key=arguments.trusted_key,
+                campaign_id=triad.campaign_id,
+            )
+        )
+        outcome["handoff"] = handoff_relative
+        outcome["handoffSha256"] = handoff_digest
+        outcome["nextAction"] = (
+            "create or use a separately authorized verifier workspace and run "
+            "campaign supervise-verification-http1 with this source handoff"
+        )
+    _emit_json(outcome)
+    return exit_code
 
 
 def _emit_verification_supervision(
@@ -6020,10 +6060,14 @@ def _validated_campaign_finding(
 
 
 def _validate_completed_campaign_finalization(
-    arguments: argparse.Namespace, final_receipt: Path
+    arguments: argparse.Namespace,
+    final_receipt: Path,
+    *,
+    inputs: _CampaignFinalizationInputs | None = None,
 ) -> tuple[str, int]:
     """Read-only terminal validation shared by finalization resume and supervision."""
-    inputs = _validated_campaign_finalization_inputs(arguments)
+    if inputs is None:
+        inputs = _validated_campaign_finalization_inputs(arguments)
     receipt = _capture_campaign_json(final_receipt, label="campaign final receipt")
     finalize_start = _campaign_record(inputs.records, arguments.campaign_id, "finalize-start")
     finalize = _capture_campaign_json(finalize_start, label="campaign finalization start")
@@ -6111,6 +6155,42 @@ def _handoff_workspace_file(
     }
 
 
+def _require_safe_workspace_local_output_directory(
+    workspace: Path, path: Path, *, label: str
+) -> Path:
+    """Reject an outbox that could place handoff bindings outside the workspace."""
+
+    try:
+        root = workspace.resolve(strict=True)
+        workspace_metadata = workspace.lstat()
+        candidate = path if path.is_absolute() else Path.cwd() / path
+        relative = candidate.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise CliError(f"{label} is not workspace-local", exit_code=EXIT_AUTHORITY) from exc
+    if (
+        stat.S_ISLNK(workspace_metadata.st_mode)
+        or not stat.S_ISDIR(workspace_metadata.st_mode)
+        or workspace.is_junction()
+        or len(relative.parts) != 1
+        or not _is_safe_handoff_filename(relative.name)
+    ):
+        raise CliError(f"{label} is unsafe", exit_code=EXIT_AUTHORITY)
+    output = root / relative.name
+    try:
+        metadata = output.lstat()
+    except FileNotFoundError:
+        return output
+    except OSError as exc:
+        raise CliError(f"cannot inspect {label}", exit_code=EXIT_AUTHORITY) from exc
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or output.is_junction()
+    ):
+        raise CliError(f"{label} is unsafe", exit_code=EXIT_AUTHORITY)
+    return output
+
+
 def _handoff_output_path(workspace: Path, path: Path) -> tuple[Path, str]:
     """Accept only a direct workspace-child output to keep publication pinned."""
     try:
@@ -6133,7 +6213,13 @@ def _handoff_output_path(workspace: Path, path: Path) -> tuple[Path, str]:
     return output, str(relative)
 
 
-def _write_or_verify_handoff_output(workspace: Path, output: Path, content: bytes) -> None:
+def _write_or_verify_handoff_output(
+    workspace: Path,
+    output: Path,
+    content: bytes,
+    *,
+    expected_workspace_stat: os.stat_result | None = None,
+) -> None:
     """Create one direct-child private file through a pinned workspace directory."""
     name = output.name
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
@@ -6144,8 +6230,18 @@ def _write_or_verify_handoff_output(workspace: Path, output: Path, content: byte
     if os.name == "nt":
         guard = _open_windows_response_directory_guard(workspace)
         try:
-            metadata = workspace.lstat()
-            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode) or workspace.is_junction():
+            workspace_metadata = workspace.lstat()
+            if (
+                stat.S_ISLNK(workspace_metadata.st_mode)
+                or not stat.S_ISDIR(workspace_metadata.st_mode)
+                or workspace.is_junction()
+                or (
+                    expected_workspace_stat is not None
+                    and not _stat_matches(
+                        workspace_metadata, expected_workspace_stat, _DIRECTORY_STAT_FIELDS
+                    )
+                )
+            ):
                 raise CliError("verification handoff output parent is unsafe", exit_code=EXIT_AUTHORITY)
             created = True
             try:
@@ -6159,12 +6255,12 @@ def _write_or_verify_handoff_output(workspace: Path, output: Path, content: byte
                 fd = msvcrt.open_osfhandle(descriptor, os.O_BINARY | os.O_RDWR)
                 descriptor = -1
                 try:
-                    metadata = os.fstat(fd)
-                    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_PROTOCOL_FILE_BYTES:
+                    file_metadata = os.fstat(fd)
+                    if not stat.S_ISREG(file_metadata.st_mode) or file_metadata.st_size > MAX_PROTOCOL_FILE_BYTES:
                         raise CliError("verification handoff output is not a regular file", exit_code=EXIT_AUTHORITY)
                     if not created:
                         chunks: list[bytes] = []
-                        remaining = metadata.st_size
+                        remaining = file_metadata.st_size
                         while remaining:
                             chunk = os.read(fd, min(PROTOCOL_READ_CHUNK_BYTES, remaining))
                             if not chunk:
@@ -6187,6 +6283,21 @@ def _write_or_verify_handoff_output(workspace: Path, output: Path, content: byte
             finally:
                 if descriptor != -1:
                     _close_windows_response_directory_guard(descriptor)
+            current_workspace_metadata = workspace.lstat()
+            if (
+                not _stat_matches(
+                    current_workspace_metadata, workspace_metadata, _DIRECTORY_STAT_FIELDS
+                )
+                or (
+                    expected_workspace_stat is not None
+                    and not _stat_matches(
+                        current_workspace_metadata,
+                        expected_workspace_stat,
+                        _DIRECTORY_STAT_FIELDS,
+                    )
+                )
+            ):
+                raise CliError("verification handoff output parent changed", exit_code=EXIT_AUTHORITY)
         except OSError as exc:
             raise CliError("cannot create verification handoff output", exit_code=EXIT_USAGE) from exc
         finally:
@@ -6196,10 +6307,25 @@ def _write_or_verify_handoff_output(workspace: Path, output: Path, content: byte
     if hasattr(os, "O_CLOEXEC"):
         directory_flags |= os.O_CLOEXEC
     try:
-        expected = workspace.lstat()
+        workspace_metadata = workspace.lstat()
+        if (
+            expected_workspace_stat is not None
+            and not _stat_matches(
+                workspace_metadata, expected_workspace_stat, _DIRECTORY_STAT_FIELDS
+            )
+        ):
+            raise CliError("verification handoff output parent changed", exit_code=EXIT_AUTHORITY)
         directory = os.open(workspace, directory_flags)
         try:
-            if not _stat_matches(os.fstat(directory), expected, _DIRECTORY_STAT_FIELDS):
+            if (
+                not _stat_matches(os.fstat(directory), workspace_metadata, _DIRECTORY_STAT_FIELDS)
+                or (
+                    expected_workspace_stat is not None
+                    and not _stat_matches(
+                        os.fstat(directory), expected_workspace_stat, _DIRECTORY_STAT_FIELDS
+                    )
+                )
+            ):
                 raise CliError("verification handoff output parent changed", exit_code=EXIT_AUTHORITY)
             try:
                 descriptor = os.open(name, flags, 0o600, dir_fd=directory)
@@ -6225,16 +6351,31 @@ def _write_or_verify_handoff_output(workspace: Path, output: Path, content: byte
                         raise CliError("existing verification handoff output differs", exit_code=EXIT_AUTHORITY)
                 finally:
                     os.close(descriptor)
-                return
-            try:
-                offset = 0
-                while offset < len(content):
-                    offset += os.write(descriptor, content[offset:])
-                os.fchmod(descriptor, 0o600)
-                os.fsync(descriptor)
-                os.fsync(directory)
-            finally:
-                os.close(descriptor)
+            else:
+                try:
+                    offset = 0
+                    while offset < len(content):
+                        offset += os.write(descriptor, content[offset:])
+                    os.fchmod(descriptor, 0o600)
+                    os.fsync(descriptor)
+                    os.fsync(directory)
+                finally:
+                    os.close(descriptor)
+            current_workspace_metadata = workspace.lstat()
+            if (
+                not _stat_matches(
+                    current_workspace_metadata, workspace_metadata, _DIRECTORY_STAT_FIELDS
+                )
+                or (
+                    expected_workspace_stat is not None
+                    and not _stat_matches(
+                        current_workspace_metadata,
+                        expected_workspace_stat,
+                        _DIRECTORY_STAT_FIELDS,
+                    )
+                )
+            ):
+                raise CliError("verification handoff output parent changed", exit_code=EXIT_AUTHORITY)
         finally:
             os.close(directory)
     except CliError:
@@ -6243,16 +6384,32 @@ def _write_or_verify_handoff_output(workspace: Path, output: Path, content: byte
         raise CliError("cannot create verification handoff output", exit_code=EXIT_USAGE) from exc
 
 
-def _campaign_verification_handoff_bytes(arguments: argparse.Namespace) -> bytes:
-    """Build one private replay manifest after fully revalidating a finalized v2 campaign."""
-    final_receipt = _campaign_record(
-        _campaign_records_directory(arguments.workspace), arguments.campaign_id, "final-receipt"
-    )
+def _campaign_verification_handoff_payload(
+    arguments: argparse.Namespace,
+) -> tuple[bytes, os.stat_result]:
+    """Build a validated handoff plus the validated workspace directory identity."""
+
+    records = _campaign_records_directory(arguments.workspace)
+    final_receipt = _campaign_record(records, arguments.campaign_id, "final-receipt")
     snapshots: dict[Path, bytes] = {}
     token = _HANDOFF_VALIDATION_SNAPSHOTS.set(snapshots)
     try:
         inputs = _validated_campaign_finalization_inputs(arguments)
-        status, _ = _validate_completed_campaign_finalization(arguments, final_receipt)
+        if (
+            not _stat_matches(
+                inputs.records.workspace_stat, records.workspace_stat, _DIRECTORY_STAT_FIELDS
+            )
+            or not _stat_matches(
+                inputs.records.campaigns_stat, records.campaigns_stat, _DIRECTORY_STAT_FIELDS
+            )
+        ):
+            raise CliError(
+                "campaign workspace changed during handoff validation",
+                exit_code=EXIT_AUTHORITY,
+            )
+        status, _ = _validate_completed_campaign_finalization(
+            arguments, final_receipt, inputs=inputs
+        )
     finally:
         _HANDOFF_VALIDATION_SNAPSHOTS.reset(token)
     if status != "draft_unverified":
@@ -6449,17 +6606,70 @@ def _campaign_verification_handoff_bytes(arguments: argparse.Namespace) -> bytes
             "sourceEvidenceReuse": False,
         },
     }
-    return (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    try:
+        current_workspace_stat = records.workspace.lstat()
+        current_campaigns_stat = records.campaigns.lstat()
+    except OSError as exc:
+        raise CliError("campaign workspace changed during handoff validation", exit_code=EXIT_AUTHORITY) from exc
+    if (
+        not _stat_matches(current_workspace_stat, records.workspace_stat, _DIRECTORY_STAT_FIELDS)
+        or not _stat_matches(current_campaigns_stat, records.campaigns_stat, _DIRECTORY_STAT_FIELDS)
+    ):
+        raise CliError("campaign workspace changed during handoff validation", exit_code=EXIT_AUTHORITY)
+    return (
+        (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8"),
+        records.workspace_stat,
+    )
+
+
+def _campaign_verification_handoff_bytes(arguments: argparse.Namespace) -> bytes:
+    """Build one private replay manifest after fully revalidating a finalized v2 campaign."""
+
+    content, _ = _campaign_verification_handoff_payload(arguments)
+    return content
+
+
+def _ensure_campaign_verification_handoff(
+    arguments: argparse.Namespace,
+) -> tuple[Path, str, str]:
+    """Create or exactly verify the source workspace's fixed verifier handoff."""
+
+    output, output_relative = _handoff_output_path(arguments.workspace, arguments.out)
+    content, workspace_stat = _campaign_verification_handoff_payload(arguments)
+    _write_or_verify_handoff_output(
+        arguments.workspace, output, content, expected_workspace_stat=workspace_stat
+    )
+    return output, output_relative, sha256_hex(content)
+
+
+def _automatic_campaign_verification_handoff_filename(content: bytes) -> str:
+    """Return the safe, content-addressed filename for automatic handoffs."""
+
+    return f"campaign-{sha256_hex(content)}.verification-handoff.json"
+
+
+def _ensure_automatic_campaign_verification_handoff(
+    arguments: argparse.Namespace,
+) -> tuple[Path, str, str]:
+    """Publish a finalized source handoff under its full-content digest name."""
+
+    content, workspace_stat = _campaign_verification_handoff_payload(arguments)
+    output, output_relative = _handoff_output_path(
+        arguments.workspace,
+        arguments.workspace / _automatic_campaign_verification_handoff_filename(content),
+    )
+    _write_or_verify_handoff_output(
+        arguments.workspace, output, content, expected_workspace_stat=workspace_stat
+    )
+    return output, output_relative, sha256_hex(content)
 
 
 def _campaign_export_verification_handoff(arguments: argparse.Namespace) -> int:
-    output, output_relative = _handoff_output_path(arguments.workspace, arguments.out)
-    content = _campaign_verification_handoff_bytes(arguments)
-    _write_or_verify_handoff_output(arguments.workspace, output, content)
+    _, output_relative, content_digest = _ensure_campaign_verification_handoff(arguments)
     _emit_json({
         "schema": "faultloom.campaign-verification-handoff-export.v1",
         "handoff": output_relative,
-        "sha256": sha256_hex(content),
+        "sha256": content_digest,
         "status": "verification_handoff_ready",
         "verificationStatus": "pending",
         "independentVerification": False,
