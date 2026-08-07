@@ -473,6 +473,23 @@ def test_provider_proxy_compiles_only_configured_destination_and_secret_referenc
     assert "provider.example.invalid" not in serialized
 
 
+def test_provider_proxy_accepts_and_preserves_verified_grant_digest(
+    tmp_path: Path,
+) -> None:
+    authority = grant()
+    transport = MemoryProviderTransport()
+    grant_digest = sha256_digest(authority)
+    receipt = provider_proxy(
+        authority,
+        tmp_path / "state.sqlite3",
+        transport=transport,
+    ).dispatch(provider_request(authority, authority_digest=grant_digest))
+
+    assert receipt.outcome is EgressOutcome.COMPLETED
+    assert receipt.authority_digest == grant_digest
+    assert len(transport.requests) == 1
+
+
 @pytest.mark.parametrize(
     ("changes", "expected"),
     [

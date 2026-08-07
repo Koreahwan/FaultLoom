@@ -82,6 +82,45 @@ A subscription-only service needs an official API, OAuth, CLI, or SDK adapter
 behind `ProviderProxyPort`; consumer cookies and browser sessions are not API
 credentials and are not used.
 
+## One live provider turn
+
+`faultloom automation provider-turn` composes the signed automation request,
+one pinned OpenAI-compatible endpoint/profile/destination, the provider egress
+proxy, durable provider receipts, and the candidate-only coordinator. Use
+`faultloom automation provider-turn --help` for the complete explicit input
+list. The command performs one provider dispatch only: it does not open a
+target connection, independently verify a candidate, or submit a report.
+
+The runtime JSON passed to `provider-turn` is not the raw public configuration.
+First sign the entire raw configuration with the same authority key that signed
+the workspace grant:
+
+```text
+faultloom automation sign-provider-config \
+  --config provider-runtime.raw.json \
+  --authority workspace/authority.json \
+  --private-key authority-private.key \
+  --out provider-runtime.signed.json
+```
+
+Pass `provider-runtime.signed.json` as `--runtime-config`. The envelope signature
+and payload digest cover the endpoint/origin, pinned destination and addresses,
+model profile, and credential environment-variable selector. It is also bound
+to the exact grant ID/version and authority issuer key. Any change requires an
+authorized re-sign and is rejected before FaultLoom reads the selected
+environment variable.
+
+This command is POSIX-only. Its durable state depends on no-follow file opens,
+owner-only directory modes, file locking, and directory `fsync`; it fails on
+native Windows rather than implying that a Windows executable provides those
+guarantees. The operator must externally provision the signed workspace,
+signed scope epoch, authority/reconciliation/disclosure public keys, public
+signed runtime envelope and intent JSON, and three mode-`0600` local
+state/signing key files.
+The provider credential value is supplied only through the uppercase
+environment-variable name declared in the public runtime JSON. FaultLoom does
+not generate or install those trust materials in this command.
+
 ## Offline manual handoff
 
 `faultloom automation export-handoff` is outside this provider transport. It

@@ -33,6 +33,72 @@ non-sensitive response expectation and provider/model-processing permission;
 the formal `doctor --json` `network_access` remains separate from the
 `personal_direct_send_*` capability fields.
 
+An offline automation result can be connected to this personal path with
+`campaign prepare-http1-triad`. The command does not let model output author
+request bytes. It binds one coordinator-admitted `observe`/`safe_probe`
+candidate to an operator-authored v1 triad template, the verified workspace
+and grant, the exact result/receipt, and both raw request digests. It produces
+a review-required v2 spec without provider or target access. The run and
+finalization commands revalidate those sources; changed provenance or request
+bytes fail before a socket is opened.
+
+For the archived-exchange path, `campaign supervise-model-http1-poc` takes an
+archived exchange ID, its exact `AutomationRequest`, an external model-turn
+file, strict operator-authored metadata, and a negative-control path. It
+deterministically compiles offline exactly one safe-PoC step with zero generic
+actions, keeps the archived effect bytes exact, and derives the control by
+changing only the request target. The model cannot author raw requests or
+finding prose. A private, create-once bundle is keyed by the source digests;
+its provenance records the external authorization reference as
+`operator_asserted_unverified` while binding the signed grant and run
+separately. The supervisor then requires exact `RUN <campaign-id>` and
+`FINALIZE <campaign-id>` acknowledgements around exactly three sequential,
+no-retry sends (effect, the same effect as reproduction, and the derived
+control), and resumes durably without replaying completed work. When
+finalization succeeds with `finalStatus=draft_unverified`, it creates or
+verifies the campaign-derived source handoff directly under the verified
+workspace. The trust JSON names its content-addressed safe filename as
+`campaign-<handoff-sha256>.verification-handoff.json`; consume its `handoff`
+and `handoffSha256` fields rather than constructing a filename. The result also
+includes the next reviewer action. A `review_required`, pending, negative, unresolved, or otherwise
+non-`draft_unverified` result creates no handoff. It makes no provider,
+Gateway, Burp, or submission call; independent verification and the manual
+report path remain separate. The reviewer action still requires a separate
+workspace, actor, signing key, and active authorization, plus its own exact
+`RUN <campaign-id>` and `FINALIZE <campaign-id>` checkpoints.
+
+For the same bound workflow with less command juggling,
+`campaign supervise-http1-triad` prepares or resumes the campaign in one
+interactive invocation. It requires the exact acknowledgements
+`RUN <campaign-id>` before target traffic and `FINALIZE <campaign-id>` after
+the operator privately reviews the three responses. Prompts use stderr and
+stdout remains one JSON result. It never retries an unresolved or possibly
+started campaign; a start-only crash is reported with dispatch state
+`unknown` for manual reconciliation.
+
+For a small supervised comparison, `campaign run-http1-triad` consumes a
+strict local v1 or bound v2 JSON spec and sends exactly three sequential signed-scope
+requests: one effect request, the same effect request again as reproduction,
+and one minimally changed negative control. It has no preview, retry,
+redirect, provider, Burp, evidence, or submission path. If any dispatch is
+ambiguous it stops as `unresolved_no_retry`; it never guesses a completion.
+After the operator reviews the private responses and confirms they are
+non-sensitive, `campaign finalize-http1-triad` runs offline, archives the
+three exchanges, and applies only the `exact_body_digest_v1` classifier. An
+equal effect/reproduction body digest with a different control digest creates
+an explicitly `draft_unverified` finding; every other outcome is a
+`negative_campaign`. This is a bounded triad comparison, not independent
+verification or proof of a vulnerability.
+
+A completed bound-v2 `draft_unverified` campaign can also be exported with
+`campaign export-verification-handoff` when using the phase commands directly.
+The model-supervisor path performs the same source-side handoff creation and
+verification automatically. In either case, the handoff is one private,
+create-once direct child of the source workspace containing only relative
+references, sizes, digests, and pending verification requirements. It includes
+no raw bodies, secrets, verdict, report, target/provider traffic, or submission
+authority.
+
 For the direct sender, hostname-only external targets use `https`; plaintext
 `http` requires an explicitly signed literal numeric IP or signed CIDR. An
 explicitly signed local `127.0.0.1` target remains supported.
@@ -43,13 +109,19 @@ The practical authorized automation flow is documented in
 [`docs/AUTHORIZED_AUTOMATION.md`](docs/AUTHORIZED_AUTOMATION.md). It covers
 signed redacted evidence disclosure, provider-only reasoning, candidate
 admission, the default personal direct sender, optional one-shot Gateway
-dispatch, independent verification, and manual report outboxes. Live mode
-remains off by default and no automatic submission is provided.
+dispatch, independent HTTP response-differential replay, and manual report
+drafts. That replay reports only `observation_reproduced`; vulnerability
+semantics and taxonomy remain `not_evaluated`. Live mode remains off by default
+and no automatic submission is provided.
+
+For an independent, read-only review of this public Core and its intended
+personal workflow, see [GPT_PRO_REVIEW_PROMPT.md](GPT_PRO_REVIEW_PROMPT.md).
 
 ## Build verification
 
-The clean-checkout build is offline and byte-reproducible. With the pinned
-Python and Rust toolchains preinstalled, run:
+The clean-checkout verifier requests offline package-manager behavior and
+checks byte reproducibility; it is not a hermetic or network-isolated release
+receipt. With the pinned Python and Rust toolchains preinstalled, run:
 
 ```bash
 python3 tools/verify_clean_checkout.py

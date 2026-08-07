@@ -23,7 +23,14 @@ from .execution_helpers import (
     semantic_request,
 )
 
-CHROMIUM = Path("/home/hw/.cache/ms-playwright/chromium-1232/chrome-linux64/chrome")
+CHROMIUM = (
+    Path.home()
+    / ".cache"
+    / "ms-playwright"
+    / "chromium-1232"
+    / "chrome-linux64"
+    / "chrome"
+)
 CHROMIUM_DIGEST = "sha256:888bc05a6af72381dd9e45777a0a65569078a732d8c71f194f2789fdbfc6ad53"
 
 

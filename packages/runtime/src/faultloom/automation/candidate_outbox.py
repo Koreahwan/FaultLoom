@@ -71,6 +71,11 @@ class CandidateOutboxError(RuntimeError):
         return self.reason
 
 
+@final
+class _CandidateBundleAlreadyExists(CandidateOutboxError):
+    """Typed create-once collision used only by exact-verify publication."""
+
+
 @dataclass(frozen=True, slots=True)
 class CandidateOutboxPublication:
     entry_id: str
@@ -187,7 +192,26 @@ def _content_digest(content: str) -> str:
     return "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-def _create_file_once(path: Path, content: str) -> None:
+def automation_result_candidate_digest(
+    result: AuthorizedAutomationResult,
+) -> str | None:
+    """Return the exact optional candidate artifact digest used by result bundles."""
+    if type(result) is not AuthorizedAutomationResult:
+        raise CandidateOutboxError(
+            "automation result candidate digest requires an exact automation result"
+        )
+    try:
+        validated = AuthorizedAutomationResult.model_validate(result)
+    except ValidationError as exc:
+        raise CandidateOutboxError(
+            "automation result candidate digest received an invalid result"
+        ) from exc
+    if validated.finding_draft is None:
+        return None
+    return _content_digest(_candidate_markdown(validated, validated.finding_draft))
+
+
+def _create_file_once(path: Path, content: str | bytes) -> None:
     directory_fd = _ACTIVE_DIRECTORY_FD.get()
     if directory_fd is not None:
         if path.name != str(path):
@@ -197,11 +221,12 @@ def _create_file_once(path: Path, content: str) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
+    data = content.encode("utf-8") if isinstance(content, str) else content
     descriptor = os.open(path, flags, 0o600)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as output:
+        with os.fdopen(descriptor, "wb") as output:
             descriptor = -1
-            _ = output.write(content)
+            _ = output.write(data)
             output.flush()
             os.fsync(output.fileno())
         os.chmod(path, 0o600)
@@ -215,15 +240,16 @@ def _create_file_once(path: Path, content: str) -> None:
         raise
 
 
-def _create_file_once_at(directory_fd: int, name: str, content: str) -> None:
+def _create_file_once_at(directory_fd: int, name: str, content: str | bytes) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
+    data = content.encode("utf-8") if isinstance(content, str) else content
     descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as output:
+        with os.fdopen(descriptor, "wb") as output:
             descriptor = -1
-            _ = output.write(content)
+            _ = output.write(data)
             output.flush()
             os.fsync(output.fileno())
         os.chmod(name, 0o600, dir_fd=directory_fd, follow_symlinks=False)
@@ -258,6 +284,15 @@ def _same_directory(left: os.stat_result, right: os.stat_result) -> bool:
     return (
         stat.S_ISDIR(left.st_mode)
         and stat.S_ISDIR(right.st_mode)
+        and left.st_dev == right.st_dev
+        and left.st_ino == right.st_ino
+    )
+
+
+def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(left.st_mode)
+        and stat.S_ISREG(right.st_mode)
         and left.st_dev == right.st_dev
         and left.st_ino == right.st_ino
     )
@@ -426,7 +461,10 @@ def _windows_move_no_replace(
         ctypes.byref(rename_info),
         buffer_size,
     ):
-        raise OSError(ctypes.get_last_error(), "SetFileInformationByHandle failed")
+        error_number = ctypes.get_last_error()
+        if error_number in {80, 183}:  # ERROR_FILE_EXISTS / ERROR_ALREADY_EXISTS
+            raise _CandidateBundleAlreadyExists("Windows no-replace destination already exists")
+        raise OSError(error_number, "SetFileInformationByHandle failed")
 
 
 def _windows_mark_directory_for_delete(staging_lock: _WindowsDirectoryLock) -> None:
@@ -553,7 +591,7 @@ def _publish_windows_create_once_bundle(
     *,
     out_dir: Path,
     entry_id: str,
-    files: tuple[tuple[str, str], ...],
+    files: tuple[tuple[str, str | bytes], ...],
     error_label: str,
 ) -> Path:
     entry_dir = out_dir / entry_id
@@ -564,7 +602,7 @@ def _publish_windows_create_once_bundle(
     committed = False
     try:
         if os.path.lexists(entry_dir):
-            raise FileExistsError(f"{error_label} entry already exists")
+            raise _CandidateBundleAlreadyExists(f"{error_label} entry already exists")
         staging_dir = Path(
             tempfile.mkdtemp(prefix=f".{entry_id}.", suffix=".tmp", dir=out_dir)
         )
@@ -599,6 +637,8 @@ def _publish_windows_create_once_bundle(
                 raise CandidateOutboxError(
                     f"unable to clean failed {error_label} staging: {cleanup_error}"
                 ) from cleanup_error
+        if isinstance(exc, FileExistsError):
+            raise _CandidateBundleAlreadyExists(f"{error_label} entry already exists") from exc
         if isinstance(exc, OSError):
             raise CandidateOutboxError(
                 f"unable to create {error_label}: {exc}"
@@ -615,7 +655,7 @@ def _publish_posix_create_once_bundle(
     *,
     out_dir: Path,
     entry_id: str,
-    files: tuple[tuple[str, str], ...],
+    files: tuple[tuple[str, str | bytes], ...],
     error_label: str,
 ) -> Path:
     entry_dir = out_dir / entry_id
@@ -626,7 +666,7 @@ def _publish_posix_create_once_bundle(
     try:
         try:
             os.stat(entry_id, dir_fd=output_fd, follow_symlinks=False)
-            raise FileExistsError(f"{error_label} entry already exists")
+            raise _CandidateBundleAlreadyExists(f"{error_label} entry already exists")
         except FileNotFoundError:
             pass
         for _ in range(32):
@@ -651,7 +691,7 @@ def _publish_posix_create_once_bundle(
         _fsync_descriptor(staging_fd)
         try:
             os.stat(entry_id, dir_fd=output_fd, follow_symlinks=False)
-            raise FileExistsError(f"{error_label} entry already exists")
+            raise _CandidateBundleAlreadyExists(f"{error_label} entry already exists")
         except FileNotFoundError:
             pass
         _rename_no_replace_at(
@@ -667,6 +707,8 @@ def _publish_posix_create_once_bundle(
     except BaseException as exc:
         if not committed and staging_fd is not None:
             _remove_staging_directory(output_fd, staging_name, staging_fd)
+        if isinstance(exc, FileExistsError):
+            raise _CandidateBundleAlreadyExists(f"{error_label} entry already exists") from exc
         if isinstance(exc, OSError):
             raise CandidateOutboxError(
                 f"unable to create {error_label}: {exc}"
@@ -683,7 +725,7 @@ def _publish_create_once_bundle(
     *,
     out_dir: Path,
     entry_id: str,
-    files: tuple[tuple[str, str], ...],
+    files: tuple[tuple[str, str | bytes], ...],
     error_label: str,
 ) -> Path:
     if os.name == "nt":
@@ -699,6 +741,151 @@ def _publish_create_once_bundle(
         files=files,
         error_label=error_label,
     )
+
+
+def ensure_private_content_bundle(
+    out_dir: Path,
+    *,
+    entry_id: str,
+    files: tuple[tuple[str, str | bytes], ...],
+    error_label: str,
+    permitted_extra_files: frozenset[str] = frozenset(),
+) -> Path:
+    """Create one private content-addressed bundle or verify its exact bytes.
+
+    Existing entries are never repaired in place: a partial, symlinked, or
+    different entry is an authority failure for callers rather than a reason to
+    republish possibly changed material.
+    """
+
+    if (
+        not entry_id
+        or Path(entry_id).name != entry_id
+        or len(files) == 0
+        or len({name for name, _ in files}) != len(files)
+        or any(not name or Path(name).name != name for name, _ in files)
+        or any(not name or Path(name).name != name for name in permitted_extra_files)
+        or set(permitted_extra_files).intersection(name for name, _ in files)
+    ):
+        raise CandidateOutboxError("private bundle layout is invalid")
+    expected = {
+        name: content.encode("utf-8") if isinstance(content, str) else content
+        for name, content in files
+    }
+    entry_dir = out_dir / entry_id
+
+    def verify_posix() -> None:
+        root_fd, root_stat = _open_output_directory(out_dir)
+        entry_fd: int | None = None
+        try:
+            entry_stat = os.stat(entry_id, dir_fd=root_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(entry_stat.st_mode):
+                raise CandidateOutboxError(f"existing {error_label} is not a regular directory")
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            entry_fd = os.open(entry_id, flags, dir_fd=root_fd)
+            if not _same_directory(entry_stat, os.fstat(entry_fd)):
+                raise CandidateOutboxError(f"existing {error_label} changed while opening")
+            observed = os.listdir(entry_fd)
+            if set(observed) != set(expected).union(permitted_extra_files):
+                raise CandidateOutboxError(f"existing {error_label} has an incomplete or different layout")
+            for name, wanted in expected.items():
+                flags = os.O_RDONLY | os.O_NOFOLLOW
+                if hasattr(os, "O_CLOEXEC"):
+                    flags |= os.O_CLOEXEC
+                file_fd = os.open(name, flags, dir_fd=entry_fd)
+                try:
+                    metadata = os.fstat(file_fd)
+                    listed = os.stat(name, dir_fd=entry_fd, follow_symlinks=False)
+                    if not stat.S_ISREG(metadata.st_mode) or not _same_file(metadata, listed):
+                        raise CandidateOutboxError(f"existing {error_label} contains a changed artifact")
+                    actual = bytearray()
+                    while len(actual) <= len(wanted):
+                        block = os.read(file_fd, min(65_536, len(wanted) + 1 - len(actual)))
+                        if not block:
+                            break
+                        actual.extend(block)
+                    if bytes(actual) != wanted:
+                        raise CandidateOutboxError(f"existing {error_label} artifact differs")
+                finally:
+                    os.close(file_fd)
+            for name in permitted_extra_files:
+                metadata = os.stat(name, dir_fd=entry_fd, follow_symlinks=False)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise CandidateOutboxError(f"existing {error_label} contains a non-regular artifact")
+            if not _output_directory_is_current(out_dir, root_stat):
+                raise CandidateOutboxError(f"existing {error_label} parent changed during verification")
+            current = os.stat(entry_id, dir_fd=root_fd, follow_symlinks=False)
+            if not _same_directory(entry_stat, current):
+                raise CandidateOutboxError(f"existing {error_label} changed during verification")
+        except CandidateOutboxError:
+            raise
+        except OSError as exc:
+            raise CandidateOutboxError(f"cannot inspect existing {error_label}: {exc}") from exc
+        finally:
+            if entry_fd is not None:
+                os.close(entry_fd)
+            os.close(root_fd)
+
+    def verify_windows() -> None:
+        root_lock = _lock_windows_output_directory(out_dir)
+        entry_lock: _WindowsDirectoryLock | None = None
+        try:
+            entry_lock = _lock_windows_directory(entry_dir, access=0x00010080)
+            observed = list(entry_dir.iterdir())
+            if {item.name for item in observed} != set(expected).union(permitted_extra_files):
+                raise CandidateOutboxError(f"existing {error_label} has an incomplete or different layout")
+            for item in observed:
+                metadata = item.lstat()
+                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                    raise CandidateOutboxError(f"existing {error_label} contains a non-regular artifact")
+                descriptor = os.open(item, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+                try:
+                    opened = os.fstat(descriptor)
+                    current = item.lstat()
+                    if not _same_file(opened, current):
+                        raise CandidateOutboxError(f"existing {error_label} artifact changed while opening")
+                    wanted = expected.get(item.name)
+                    actual = os.read(descriptor, (len(wanted) + 1) if wanted is not None else 1)
+                    if wanted is not None and actual != wanted:
+                        raise CandidateOutboxError(f"existing {error_label} artifact differs")
+                finally:
+                    os.close(descriptor)
+            if not _windows_directory_is_current(out_dir, root_lock.stat) or not _windows_directory_is_current(entry_dir, entry_lock.stat):
+                raise CandidateOutboxError(f"existing {error_label} changed during verification")
+        except CandidateOutboxError:
+            raise
+        except OSError as exc:
+            raise CandidateOutboxError(f"cannot inspect existing {error_label}: {exc}") from exc
+        finally:
+            if entry_lock is not None:
+                entry_lock.close()
+            root_lock.close()
+
+    def verify() -> None:
+        if os.name == "nt":
+            verify_windows()
+        else:
+            verify_posix()
+
+    try:
+        _ = entry_dir.lstat()
+    except FileNotFoundError:
+        try:
+            return _publish_create_once_bundle(
+                out_dir=out_dir,
+                entry_id=entry_id,
+                files=files,
+                error_label=error_label,
+            )
+        except _CandidateBundleAlreadyExists:
+            verify()
+            return entry_dir
+    except OSError as exc:
+        raise CandidateOutboxError(f"cannot inspect existing {error_label}: {exc}") from exc
+    verify()
+    return entry_dir
 
 
 def write_automation_result_bundle(
@@ -719,10 +906,9 @@ def write_automation_result_bundle(
     result_digest = sha256_digest(result_value)
     entry_id = f"result.{result_digest.removeprefix('sha256:')[:32]}"
     candidate_content: str | None = None
-    candidate_digest: str | None = None
+    candidate_digest = automation_result_candidate_digest(validated)
     if validated.finding_draft is not None:
         candidate_content = _candidate_markdown(validated, validated.finding_draft)
-        candidate_digest = _content_digest(candidate_content)
 
     receipt_content = canonical_json(
         {
@@ -742,12 +928,15 @@ def write_automation_result_bundle(
     if candidate_content is not None:
         files.append(("candidate.md", candidate_content))
     files.append(("receipt.json", receipt_content))
-    entry_dir = _publish_create_once_bundle(
-        out_dir=out_dir,
-        entry_id=entry_id,
-        files=tuple(files),
-        error_label="automation result bundle",
-    )
+    try:
+        entry_dir = _publish_create_once_bundle(
+            out_dir=out_dir,
+            entry_id=entry_id,
+            files=tuple(files),
+            error_label="automation result bundle",
+        )
+    except _CandidateBundleAlreadyExists as exc:
+        raise CandidateOutboxError("automation result bundle entry already exists: File exists") from exc
     return AutomationResultBundlePublication(
         entry_id=entry_id,
         entry_dir=entry_dir,
@@ -808,12 +997,15 @@ def write_candidate_outbox(
         }
     )
 
-    _ = _publish_create_once_bundle(
-        out_dir=out_dir,
-        entry_id=entry_id,
-        files=(("candidate.md", candidate_content), ("receipt.json", receipt_content)),
-        error_label="candidate outbox",
-    )
+    try:
+        _ = _publish_create_once_bundle(
+            out_dir=out_dir,
+            entry_id=entry_id,
+            files=(("candidate.md", candidate_content), ("receipt.json", receipt_content)),
+            error_label="candidate outbox",
+        )
+    except _CandidateBundleAlreadyExists as exc:
+        raise CandidateOutboxError("candidate outbox entry already exists: File exists") from exc
 
     return CandidateOutboxPublication(
         entry_id=entry_id,

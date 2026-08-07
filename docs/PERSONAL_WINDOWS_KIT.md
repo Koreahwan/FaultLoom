@@ -8,7 +8,10 @@ This kit contains two independent, non-installing components:
   request checks,
   evidence ingestion, unverified finding drafts, and offline compilation of
   an already-produced structured model turn into a create-once candidate
-  bundle.
+  bundle. The command help also exposes the signed live-provider interface,
+  but that path deliberately fails closed on native Windows because its
+  durable state requires POSIX no-follow, locking, permission, and directory
+  sync primitives.
 - `windows-authority/`: the native `faultloom_ctl.exe` -> broker -> independent
   reviewer boundary for bounded local host checks.
 
@@ -51,6 +54,11 @@ and must not be retried. Its default output has no body preview; omit
 expected and the selected provider/model is permitted to process it. Burp/browser use remains optional manual analysis.
 Its `automation compile` command performs no model, provider, Burp, Gateway,
 or target call; it only validates local JSON and writes a candidate-only bundle.
+For a direct official API call, run the separately documented signed
+`automation provider-turn` path from WSL/Linux against a workspace stored in
+that POSIX environment. It performs one provider-only turn and still does not
+contact the target, verify a candidate, or submit a report. Do not expect the
+native Windows executable to provide that durable live-provider path.
 Automatic Gateway target dispatch (`run --live`), automatic exploitation,
 remote host management, and automatic submission remain disabled.
 

@@ -13,7 +13,22 @@ from pathlib import Path
 
 
 REQUIRED_POLICY_FILES = {"LICENSE", "NOTICE", "SECURITY.md", "ETHICAL_USE.md"}
-PRIVATE_ROOTS = {"eval", "legacy", "ops"}
+# These are private workspace roots, rather than terms that may appear in
+# public Core source, docs, or tests.  Keep the check anchored to the first
+# path component below so descriptive text and nested fixture names remain
+# valid public content.
+PRIVATE_ROOTS = {
+    "eval",
+    "legacy",
+    "ops",
+    "targets",
+    "submissions",
+    "releases",
+    "evidence",
+    "keys",
+    "private-evidence",
+    "private-keys",
+}
 PRIVATE_NAMES = {
     ".env",
     "labels.private.json",
@@ -47,6 +62,10 @@ CONFIG_SUFFIXES = {
 PUBLIC_EMAIL_DOMAINS = {"example.com", "example.net", "example.org"}
 ABSOLUTE_PATH_PATTERNS = (
     re.compile(r"/mnt/[a-z]/users/", re.IGNORECASE),
+    re.compile(
+        r"(?<![A-Za-z0-9:/])/(?:home|Users)/[A-Za-z0-9._-]+/",
+        re.IGNORECASE,
+    ),
     re.compile(r"[a-z]:\\\\users\\\\", re.IGNORECASE),
 )
 MUTABLE_REFERENCE_PATTERNS = (
