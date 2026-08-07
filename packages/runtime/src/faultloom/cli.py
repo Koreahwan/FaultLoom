@@ -5965,11 +5965,6 @@ def _campaign_run_authenticated_canary(arguments: argparse.Namespace) -> int:
         arguments.workspace,
         arguments.workspace / f"{case.campaign_id}.{case.phase}.canary-start.json",
     )
-    if start.exists():
-        raise CliError(
-            "authenticated canary already started; do not retry or redispatch",
-            exit_code=EXIT_AUTHORITY,
-        )
     _write_or_verify_handoff_output(
         arguments.workspace,
         start,
@@ -5988,6 +5983,7 @@ def _campaign_run_authenticated_canary(arguments: argparse.Namespace) -> int:
             )
             + "\n"
         ).encode("utf-8"),
+        require_new=True,
     )
     observations: list[CanaryObservation] = []
     dispatch_count = 0
@@ -7061,8 +7057,9 @@ def _write_or_verify_handoff_output(
     content: bytes,
     *,
     expected_workspace_stat: os.stat_result | None = None,
+    require_new: bool = False,
 ) -> None:
-    """Create one direct-child private file through a pinned workspace directory."""
+    """Create or verify one direct-child private file through a pinned workspace directory."""
     name = output.name
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     if hasattr(os, "O_CLOEXEC"):
@@ -7089,6 +7086,11 @@ def _write_or_verify_handoff_output(
             try:
                 descriptor = _windows_open_handoff_child(guard, name, create=True)
             except FileExistsError:
+                if require_new:
+                    raise CliError(
+                        "verification handoff output already exists",
+                        exit_code=EXIT_AUTHORITY,
+                    )
                 created = False
                 descriptor = _windows_open_handoff_child(guard, name, create=False)
             try:
@@ -7172,6 +7174,11 @@ def _write_or_verify_handoff_output(
             try:
                 descriptor = os.open(name, flags, 0o600, dir_fd=directory)
             except FileExistsError:
+                if require_new:
+                    raise CliError(
+                        "verification handoff output already exists",
+                        exit_code=EXIT_AUTHORITY,
+                    )
                 read_flags = os.O_RDONLY | os.O_NOFOLLOW
                 if hasattr(os, "O_CLOEXEC"):
                     read_flags |= os.O_CLOEXEC

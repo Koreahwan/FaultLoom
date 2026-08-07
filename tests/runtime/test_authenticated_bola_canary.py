@@ -430,6 +430,64 @@ def test_dropped_connection_is_unresolved_and_never_retried(
     assert len(captured) == 1
 
 
+def test_concurrent_identical_canary_runs_dispatch_only_one_triad(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    listener, port = _listener()
+    workspace, key, private = _workspace(
+        tmp_path / "source", port, actor="researcher.source", signer_seed=55
+    )
+    case = workspace / "source-canary-case.json"
+    assert cli.main(
+        _prepare_args(workspace, key, private, phase="source", env_name=SOURCE_ENV, out=case)
+    ) == cli.EXIT_OK
+    monkeypatch.setenv(SOURCE_ENV, SOURCE_TOKEN)
+    captured: list[bytes] = []
+    thread = _serve(
+        listener,
+        [_response(CANARY), _response(CANARY), _response("missing-control")],
+        captured,
+    )
+    barrier = threading.Barrier(2)
+    validate_capacity = cli._validate_campaign_accounting_capacity
+
+    def synchronize_capacity(*args: object, **kwargs: object) -> None:
+        validate_capacity(*args, **kwargs)
+        barrier.wait(timeout=3)
+
+    monkeypatch.setattr(cli, "_validate_campaign_accounting_capacity", synchronize_capacity)
+    outcomes: list[int] = []
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            outcomes.append(cli.main(_run_args(workspace, key, private, case)))
+        except BaseException as exc:  # pragma: no cover - assertion reports unexpected worker errors
+            errors.append(exc)
+
+    workers = [threading.Thread(target=run) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=5)
+    thread.join(timeout=3)
+    listener.close()
+
+    assert not any(worker.is_alive() for worker in workers)
+    assert not errors
+    assert sorted(outcomes) == [cli.EXIT_OK, cli.EXIT_AUTHORITY]
+    assert len(captured) == 3
+    start_paths = list(workspace.glob("*.canary-start.json"))
+    run_paths = list(workspace.glob("*.canary-run.json"))
+    assert len(start_paths) == len(run_paths) == 1
+    assert json.loads(run_paths[0].read_text())["run"]["dispatch_count"] == 3
+    assert {path.name for path in workspace.glob("*.canary-*.json")} == {
+        start_paths[0].name,
+        run_paths[0].name,
+    }
+
+
 def test_prepare_requires_explicit_owned_and_non_sensitive_admission(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
