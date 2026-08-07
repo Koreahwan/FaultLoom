@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import TypeVar, cast
+from typing import Literal, TypeVar, cast
 
 from faultloom_protocol import (
     PROTOCOL_VERSION,
@@ -47,6 +47,7 @@ from faultloom_protocol import (
     ProviderPolicy,
     ReplayPlan,
     RetentionPolicy,
+    SecretRef,
     ScopeContractDraft,
     SignedAuthorityGrant,
     StateChangePolicy,
@@ -83,6 +84,35 @@ from .automation_cli import (
     prepare_automation_http1_request,
 )
 from .automation import parse_model_turn
+from .authenticated_canary import (
+    CANARY_CASE_SCHEMA,
+    CANARY_HANDOFF_SCHEMA,
+    CANARY_RUN_SCHEMA,
+    AuthenticatedCanaryError,
+    CanaryCase,
+    CanaryObservation,
+    CanaryRunResult,
+    SignedCanaryCase,
+    SignedCanaryRun,
+    build_authenticated_get,
+    build_canary_handoff,
+    canonical_model_bytes as canary_model_bytes,
+    parse_canary_handoff,
+    parse_canary_http_response,
+    parse_canary_run,
+    parse_signed_canary_case,
+    redacted_request_sha256,
+    require_active_target_session,
+    resolve_target_bearer,
+    semantic_result as canary_semantic_result,
+    sha256_hex as canary_sha256_hex,
+    sign_canary_case,
+    sign_canary_run,
+    signed_case_bytes,
+    verify_canary_handoff,
+    verify_signed_canary_case,
+    verify_signed_canary_run,
+)
 from .personal_campaign import (
     EXACT_BODY_DIGEST_CLASSIFIER,
     PERSONAL_HTTP1_TRIAD_AUTOMATION_BINDING_SCHEMA,
@@ -965,7 +995,7 @@ def _scope_draft(arguments: argparse.Namespace) -> int:
             targets=(target,),
             adapter_ids=("adapter.http",),
             action_policy=policy,
-            identities=("identity.operator",),
+            identities=tuple(arguments.identity or ("identity.operator",)),
             execution_windows=(
                 TimeWindow(schema_version=SCHEMA_VERSION, starts_at=now, ends_at=ends_at),
             ),
@@ -2892,6 +2922,60 @@ def _complete_request(
         "reservation_id": reservation_id,
         "response_sha256": response_sha256,
         "within_reserved_response_budget": within_reserved_response_budget,
+    }
+
+
+def _complete_in_memory_request(
+    *,
+    workspace: Path,
+    manifest: dict[str, object],
+    reservation_id: str,
+    request_content: bytes,
+    expected_redacted_request_sha256: str,
+    response_content: bytes,
+) -> dict[str, str]:
+    """Complete one reservation without ever materializing authenticated request bytes."""
+
+    connection = _request_accounting_connection(workspace)
+    try:
+        _prepare_request_accounting(connection, manifest)
+        row = connection.execute(
+            "SELECT expires_at, request_bytes, request_sha256, response_limit, completed_at "
+            "FROM reservations WHERE reservation_id = ?",
+            (reservation_id,),
+        ).fetchone()
+        response_digest = hashlib.sha256(response_content).hexdigest()
+        if (
+            row is None
+            or row[4] is not None
+            or _utc_now().timestamp() >= row[0]
+            or row[1] != len(request_content)
+            or row[2] != expected_redacted_request_sha256
+            or len(response_content) > row[3]
+        ):
+            raise CliError(
+                "authenticated canary reservation binding is unavailable",
+                exit_code=EXIT_AUTHORITY,
+            )
+        connection.execute(
+            "UPDATE reservations SET completed_at = ?, observed_response_bytes = ?, "
+            "response_sha256 = ? WHERE reservation_id = ?",
+            (_utc_now().timestamp(), len(response_content), response_digest, reservation_id),
+        )
+        connection.commit()
+    except CliError:
+        connection.rollback()
+        raise
+    except sqlite3.Error as exc:
+        connection.rollback()
+        raise CliError(
+            "cannot complete authenticated canary reservation", exit_code=EXIT_AUTHORITY
+        ) from exc
+    finally:
+        connection.close()
+    return {
+        "redacted_request_sha256": expected_redacted_request_sha256,
+        "response_sha256": response_digest,
     }
 
 
@@ -5559,6 +5643,752 @@ def _campaign_supervise_verification_http1(arguments: argparse.Namespace) -> int
     )
 
 
+def _canary_workspace_context(
+    workspace: Path, trusted_key: Path, *, require_active: bool = True
+) -> tuple[
+    dict[str, object], AuthorityGrant, TargetAsset, datetime,
+    SignedAuthorityGrant, Ed25519PublicKeyRecord, str,
+]:
+    manifest, grant, target, now = _verified_request_workspace(
+        workspace, trusted_key, require_active=require_active
+    )
+    authority_path = workspace / "authority.json"
+    authority = _parse_protocol_file(
+        authority_path,
+        _capture_single_protocol_file(authority_path),
+        SignedAuthorityGrant,
+    )
+    public_key = _parse_protocol_file(
+        trusted_key,
+        _capture_single_protocol_file(trusted_key),
+        Ed25519PublicKeyRecord,
+    )
+    grant_sha256 = sha256_digest(grant).removeprefix("sha256:")
+    return manifest, grant, target, now, authority, public_key, grant_sha256
+
+
+def _canary_case_output(workspace: Path, path: Path) -> Path:
+    output, _ = _handoff_output_path(workspace, path)
+    return output
+
+
+def _canary_case_binding_matches(
+    case: CanaryCase,
+    *,
+    manifest: dict[str, object],
+    grant: AuthorityGrant,
+    target: TargetAsset,
+    grant_sha256: str,
+) -> bool:
+    return (
+        case.run_id == manifest.get("run_id")
+        and case.grant_id == grant.grant_id
+        and case.grant_version == grant.grant_version
+        and case.grant_sha256 == grant_sha256
+        and case.operator_actor_id == grant.issued_to
+        and case.target_id == target.target_id
+        and case.owner_identity in grant.identities
+        and case.requester_identity in grant.identities
+        and case.owner_identity != case.requester_identity
+    )
+
+
+def _campaign_prepare_authenticated_canary(arguments: argparse.Namespace) -> int:
+    if not (
+        arguments.confirm_operator_owned_canary
+        and arguments.confirm_reviewed_non_sensitive_canary
+    ):
+        raise CliError(
+            "authenticated canary requires explicit operator-owned and reviewed-non-sensitive confirmation",
+            exit_code=EXIT_USAGE,
+        )
+    workspace = arguments.workspace
+    trusted_key = _trusted_key_path(arguments)
+    (
+        manifest, grant, target, now, authority, public_key, grant_sha256,
+    ) = _canary_workspace_context(workspace, trusted_key)
+    signer = _private_signer(
+        arguments.private_key,
+        _capture_private_protocol_file(arguments.private_key),
+    )
+    if signer.key_id != authority.signature.key_id or signer.key_id != public_key.key_id:
+        raise CliError(
+            "canary case signer must be the current workspace authority signer",
+            exit_code=EXIT_AUTHORITY,
+        )
+    try:
+        session_ref = SecretRef(
+            schema_version=SCHEMA_VERSION,
+            uri=arguments.requester_session_ref,
+            purpose="target-bearer-session",
+        )
+        source_handoff_sha256: str | None = None
+        source_claim = arguments.source_claim
+        if arguments.phase == "reviewer":
+            if not all((arguments.source_workspace, arguments.source_trusted_key, arguments.source_handoff)):
+                raise CliError(
+                    "reviewer preparation requires source workspace, key, and handoff",
+                    exit_code=EXIT_USAGE,
+                )
+            require_separate_workspaces(arguments.source_workspace, workspace)
+            (
+                source_manifest, source_grant, _, _, source_authority, source_key,
+                source_grant_sha256,
+            ) = _canary_workspace_context(
+                arguments.source_workspace,
+                arguments.source_trusted_key,
+                require_active=False,
+            )
+            handoff_content = _capture_bounded_local_file(
+                arguments.source_handoff,
+                maximum_bytes=MAX_PROTOCOL_FILE_BYTES,
+                label="authenticated canary source handoff",
+            )
+            handoff = verify_canary_handoff(
+                parse_canary_handoff(handoff_content), source_key
+            )
+            source_case = handoff.source_case.case
+            if (
+                handoff.source_workspace_sha256
+                != canary_sha256_hex(
+                    f"{source_manifest['run_id']}:{source_grant_sha256}".encode("utf-8")
+                )
+                or source_authority.signature.key_id == authority.signature.key_id
+                or source_grant.issued_to == grant.issued_to
+                or source_case.requester_session_ref.uri == session_ref.uri
+            ):
+                raise CliError(
+                    "reviewer authority, actor, or target session is not independent",
+                    exit_code=EXIT_AUTHORITY,
+                )
+            expected = (
+                source_case.campaign_id,
+                source_case.target_id,
+                source_case.hostname,
+                source_case.port,
+                source_case.scheme,
+                source_case.owner_identity,
+                source_case.requester_identity,
+                source_case.canary_path,
+                source_case.missing_control_path,
+                source_case.canary_sha256,
+                source_case.response_bytes,
+            )
+            actual = (
+                arguments.campaign_id,
+                target.target_id,
+                arguments.hostname,
+                arguments.port,
+                arguments.scheme,
+                arguments.owner_identity,
+                arguments.requester_identity,
+                arguments.canary_path,
+                arguments.missing_control_path,
+                arguments.canary_sha256,
+                arguments.response_bytes,
+            )
+            if actual != expected or source_claim != source_case.source_claim:
+                raise CliError(
+                    "reviewer case differs from the signed source relation",
+                    exit_code=EXIT_AUTHORITY,
+                )
+            source_handoff_sha256 = canary_sha256_hex(handoff_content)
+        elif any((arguments.source_workspace, arguments.source_trusted_key, arguments.source_handoff)):
+            raise CliError("source case cannot bind a source handoff", exit_code=EXIT_USAGE)
+        case = CanaryCase(
+            schema=CANARY_CASE_SCHEMA,
+            campaign_id=arguments.campaign_id,
+            phase=arguments.phase,
+            source_handoff_sha256=source_handoff_sha256,
+            source_claim=source_claim,
+            owner_relation_status="operator_asserted_owned",
+            sensitivity_status="operator_reviewed_non_sensitive",
+            target_id=target.target_id,
+            hostname=arguments.hostname,
+            port=arguments.port,
+            scheme=arguments.scheme,
+            owner_identity=arguments.owner_identity,
+            requester_identity=arguments.requester_identity,
+            canary_path=arguments.canary_path,
+            missing_control_path=arguments.missing_control_path,
+            canary_sha256=arguments.canary_sha256,
+            requester_session_ref=session_ref,
+            requester_session_expires_at=arguments.requester_session_expires_at,
+            response_bytes=arguments.response_bytes,
+            timeout_seconds=arguments.timeout_seconds,
+            run_id=str(manifest["run_id"]),
+            grant_id=grant.grant_id,
+            grant_version=grant.grant_version,
+            grant_sha256=grant_sha256,
+            operator_actor_id=grant.issued_to,
+            signed_at=now.isoformat().replace("+00:00", "Z"),
+        )
+        signed = sign_canary_case(case, signer)
+    except (AuthenticatedCanaryError, ValidationError, ValueError) as exc:
+        raise CliError(f"invalid authenticated canary case: {exc}", exit_code=EXIT_AUTHORITY) from exc
+    if not _canary_case_binding_matches(
+        case, manifest=manifest, grant=grant, target=target, grant_sha256=grant_sha256
+    ):
+        raise CliError("authenticated canary case is outside current authority", exit_code=EXIT_AUTHORITY)
+    for path in (case.canary_path, case.missing_control_path):
+        request_size = len(build_authenticated_get(case, path=path, bearer="A" * 512))
+        _validate_request_authority(
+            grant=grant,
+            target=target,
+            hostname=case.hostname,
+            port=case.port,
+            scheme=case.scheme,
+            method="GET",
+            path=path,
+            request_bytes=request_size,
+            response_bytes=case.response_bytes,
+            maximum_request_bytes=min(grant.budget.max_request_bytes, PERSONAL_HTTP1_MAX_REQUEST_BYTES),
+            maximum_response_bytes=min(grant.budget.max_response_bytes, PERSONAL_HTTP1_MAX_RESPONSE_BYTES),
+        )
+    if grant.budget.total_actions < 3 or grant.budget.max_concurrency != 1:
+        raise CliError(
+            "canary authority must cover three requests at concurrency one",
+            exit_code=EXIT_AUTHORITY,
+        )
+    output = _canary_case_output(workspace, arguments.out)
+    content = signed_case_bytes(signed)
+    _write_or_verify_handoff_output(workspace, output, content)
+    _emit_json(
+        {
+            "schema": CANARY_CASE_SCHEMA,
+            "status": "ready_for_authenticated_canary_run",
+            "phase": case.phase,
+            "case": str(output),
+            "caseSha256": canary_sha256_hex(content),
+            "networkAccess": False,
+            "sourceClaimStatus": "operator_asserted_unverified",
+        }
+    )
+    return EXIT_OK
+
+
+def _canary_unresolved(
+    *, workspace: Path, case: CanaryCase, case_sha256: str, dispatch_count: int,
+    observations: list[CanaryObservation], error: str,
+) -> int:
+    result = CanaryRunResult(
+        schema=CANARY_RUN_SCHEMA,
+        campaign_id=case.campaign_id,
+        phase=case.phase,
+        case_sha256=case_sha256,
+        status="unresolved_not_evaluated",
+        dispatch_count=dispatch_count,
+        observations=tuple(observations),
+    )
+    output = _canary_case_output(
+        workspace, workspace / f"{case.campaign_id}.{case.phase}.canary-unresolved.json"
+    )
+    _write_or_verify_handoff_output(workspace, output, canary_model_bytes(result))
+    _emit_json(
+        {
+            "schema": CANARY_RUN_SCHEMA,
+            "status": "unresolved_not_evaluated",
+            "dispatchCount": dispatch_count,
+            "reservationState": "unresolved_no_retry",
+            "semanticVerdict": "not_evaluated",
+            "taxonomyVerdict": "not_evaluated",
+            "error": error,
+        }
+    )
+    return EXIT_UNAVAILABLE
+
+
+def _campaign_run_authenticated_canary(arguments: argparse.Namespace) -> int:
+    case_content = _capture_bounded_local_file(
+        arguments.case,
+        maximum_bytes=MAX_PROTOCOL_FILE_BYTES,
+        label="signed authenticated canary case",
+    )
+    case_sha256 = canary_sha256_hex(case_content)
+    trusted_key = _trusted_key_path(arguments)
+    (
+        manifest, grant, target, now, authority, public_key, grant_sha256,
+    ) = _canary_workspace_context(arguments.workspace, trusted_key)
+    try:
+        signed = parse_signed_canary_case(case_content)
+        case = verify_signed_canary_case(signed, public_key)
+    except AuthenticatedCanaryError as exc:
+        raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+    if (
+        signed.signer_key_id != authority.signature.key_id
+        or not _canary_case_binding_matches(
+            case, manifest=manifest, grant=grant, target=target, grant_sha256=grant_sha256
+        )
+    ):
+        raise CliError("authenticated canary case is not bound to this workspace", exit_code=EXIT_AUTHORITY)
+    signer = _private_signer(
+        arguments.private_key,
+        _capture_private_protocol_file(arguments.private_key),
+    )
+    if signer.key_id != authority.signature.key_id or signer.key_id != public_key.key_id:
+        raise CliError("canary run signer differs from current authority", exit_code=EXIT_AUTHORITY)
+    try:
+        require_active_target_session(case, now=now)
+        bearer = resolve_target_bearer(case.requester_session_ref, os.environ)
+    except AuthenticatedCanaryError as exc:
+        raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+    requests = {
+        "effect": build_authenticated_get(case, path=case.canary_path, bearer=bearer),
+        "reproduction": build_authenticated_get(case, path=case.canary_path, bearer=bearer),
+        "missing_control": build_authenticated_get(
+            case, path=case.missing_control_path, bearer=bearer
+        ),
+    }
+    for role, content in requests.items():
+        path = case.missing_control_path if role == "missing_control" else case.canary_path
+        _validate_request_authority(
+            grant=grant,
+            target=target,
+            hostname=case.hostname,
+            port=case.port,
+            scheme=case.scheme,
+            method="GET",
+            path=path,
+            request_bytes=len(content),
+            response_bytes=case.response_bytes,
+            maximum_request_bytes=min(grant.budget.max_request_bytes, PERSONAL_HTTP1_MAX_REQUEST_BYTES),
+            maximum_response_bytes=min(grant.budget.max_response_bytes, PERSONAL_HTTP1_MAX_RESPONSE_BYTES),
+        )
+    _validate_campaign_accounting_capacity(
+        workspace=arguments.workspace,
+        manifest=manifest,
+        grant=grant,
+        now=now,
+        required_actions=3,
+    )
+    start = _canary_case_output(
+        arguments.workspace,
+        arguments.workspace / f"{case.campaign_id}.{case.phase}.canary-start.json",
+    )
+    if start.exists():
+        raise CliError(
+            "authenticated canary already started; do not retry or redispatch",
+            exit_code=EXIT_AUTHORITY,
+        )
+    _write_or_verify_handoff_output(
+        arguments.workspace,
+        start,
+        (
+            json.dumps(
+                {
+                    "schema": "faultloom.authenticated-operator-canary.start.v1",
+                    "campaign_id": case.campaign_id,
+                    "phase": case.phase,
+                    "case_sha256": case_sha256,
+                    "requester_session_ref": case.requester_session_ref.model_dump(mode="json"),
+                    "dispatch_order": ["effect", "reproduction", "missing_control"],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8"),
+    )
+    observations: list[CanaryObservation] = []
+    dispatch_count = 0
+    for role in ("effect", "reproduction", "missing_control"):
+        path = case.missing_control_path if role == "missing_control" else case.canary_path
+        request_content = requests[role]
+        request_digest = redacted_request_sha256(case, role=role, path=path)
+        try:
+            reservation = _reserve_request(
+                workspace=arguments.workspace,
+                manifest=manifest,
+                grant=grant,
+                now=_utc_now(),
+                hostname=case.hostname,
+                port=case.port,
+                scheme=case.scheme,
+                method="GET",
+                path=path,
+                request_bytes=len(request_content),
+                request_sha256=request_digest,
+                response_bytes=case.response_bytes,
+            )
+            expires = datetime.fromisoformat(
+                str(reservation["reservation_expires_at"]).replace("Z", "+00:00")
+            )
+            timeout_seconds = min(
+                float(case.timeout_seconds), (expires - _utc_now()).total_seconds() - 1
+            )
+            if timeout_seconds <= 0:
+                raise _PersonalPreDispatchError("reservation expired before canary dispatch")
+            response = _send_direct_http11_once(
+                hostname=case.hostname,
+                port=case.port,
+                scheme=case.scheme,
+                target=target,
+                request_content=request_content,
+                response_limit=case.response_bytes,
+                deadline=time.monotonic() + timeout_seconds,
+            )
+            dispatch_count += 1
+            if bearer.encode("ascii") in response:
+                raise AuthenticatedCanaryError(
+                    "target bearer secret appeared in the canary response"
+                )
+            parsed = parse_canary_http_response(
+                response,
+                response_limit=case.response_bytes,
+                expected_canary_sha256=case.canary_sha256,
+            )
+            response_path = _write_personal_response_file(
+                arguments.workspace,
+                str(reservation["reservation_id"]),
+                response,
+            )
+            completed = _complete_in_memory_request(
+                workspace=arguments.workspace,
+                manifest=manifest,
+                reservation_id=str(reservation["reservation_id"]),
+                request_content=request_content,
+                expected_redacted_request_sha256=request_digest,
+                response_content=response,
+            )
+            observations.append(
+                CanaryObservation(
+                    role=cast(Literal["effect", "reproduction", "missing_control"], role),
+                    path=path,
+                    reservation_id=str(reservation["reservation_id"]),
+                    redacted_request_sha256=redacted_request_sha256(
+                        case, role=role, path=path
+                    ),
+                    response_sha256=completed["response_sha256"],
+                    response_bytes=parsed.size,
+                    status_code=parsed.status_code,
+                    canary_value_sha256=parsed.canary_value_sha256,
+                    expected_canary=parsed.expected_canary,
+                    response_file=response_path.relative_to(arguments.workspace).as_posix(),
+                )
+            )
+        except _PersonalPreDispatchError:
+            return _canary_unresolved(
+                workspace=arguments.workspace,
+                case=case,
+                case_sha256=case_sha256,
+                dispatch_count=dispatch_count,
+                observations=observations,
+                error="no_dispatch_connection_or_tls_failure",
+            )
+        except (AuthenticatedCanaryError, CliError, OSError, TimeoutError):
+            return _canary_unresolved(
+                workspace=arguments.workspace,
+                case=case,
+                case_sha256=case_sha256,
+                dispatch_count=max(dispatch_count, len(observations) + 1),
+                observations=observations,
+                error="response_or_dispatch_ambiguous",
+            )
+    result = CanaryRunResult(
+        schema=CANARY_RUN_SCHEMA,
+        campaign_id=case.campaign_id,
+        phase=case.phase,
+        case_sha256=case_sha256,
+        status="observation_recorded",
+        dispatch_count=3,
+        observations=tuple(observations),
+    )
+    output = _canary_case_output(
+        arguments.workspace,
+        arguments.workspace / f"{case.campaign_id}.{case.phase}.canary-run.json",
+    )
+    signed_result = sign_canary_run(result, signer)
+    content = canary_model_bytes(signed_result)
+    _write_or_verify_handoff_output(arguments.workspace, output, content)
+    _emit_json(
+        {
+            "schema": CANARY_RUN_SCHEMA,
+            "status": "observation_recorded",
+            "phase": case.phase,
+            "dispatchCount": 3,
+            "runResult": str(output),
+            "runResultSha256": canary_sha256_hex(content),
+            "semanticVerdict": "not_evaluated",
+            "taxonomyVerdict": "not_evaluated",
+            "automaticSubmission": False,
+        }
+    )
+    return EXIT_OK
+
+
+def _validate_authenticated_canary_evidence(
+    *,
+    workspace: Path,
+    manifest: dict[str, object],
+    signed_case: SignedCanaryCase,
+    signed_run: SignedCanaryRun,
+    trusted_key: Ed25519PublicKeyRecord,
+) -> None:
+    """Rebuild one completed canary run from start, accounting, and raw responses."""
+
+    try:
+        case = verify_signed_canary_case(signed_case, trusted_key)
+        run = verify_signed_canary_run(signed_run, trusted_key)
+    except AuthenticatedCanaryError as exc:
+        raise CliError("authenticated canary evidence signature is invalid", exit_code=EXIT_AUTHORITY) from exc
+    case_content = signed_case_bytes(signed_case)
+    if (
+        run.status != "observation_recorded"
+        or run.case_sha256 != canary_sha256_hex(case_content)
+        or run.campaign_id != case.campaign_id
+        or run.phase != case.phase
+        or len({item.reservation_id for item in run.observations}) != 3
+    ):
+        raise CliError("authenticated canary run binding is invalid", exit_code=EXIT_AUTHORITY)
+
+    start_path = workspace / f"{case.campaign_id}.{case.phase}.canary-start.json"
+    start_content = _capture_bounded_local_file(
+        start_path,
+        maximum_bytes=MAX_PROTOCOL_FILE_BYTES,
+        label="authenticated canary start",
+    )
+    expected_start = (
+        json.dumps(
+            {
+                "schema": "faultloom.authenticated-operator-canary.start.v1",
+                "campaign_id": case.campaign_id,
+                "phase": case.phase,
+                "case_sha256": run.case_sha256,
+                "requester_session_ref": case.requester_session_ref.model_dump(mode="json"),
+                "dispatch_order": ["effect", "reproduction", "missing_control"],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+    if start_content != expected_start:
+        raise CliError("authenticated canary start binding is invalid", exit_code=EXIT_AUTHORITY)
+
+    connection = _request_accounting_connection(workspace)
+    try:
+        _prepare_request_accounting(connection, manifest)
+        for observation in run.observations:
+            path = (
+                case.missing_control_path
+                if observation.role == "missing_control"
+                else case.canary_path
+            )
+            expected_redacted_digest = redacted_request_sha256(
+                case, role=observation.role, path=path
+            )
+            row = connection.execute(
+                "SELECT request_fingerprint, request_bytes, request_sha256, response_limit, "
+                "completed_at, observed_response_bytes, response_sha256 "
+                "FROM reservations WHERE reservation_id = ?",
+                (observation.reservation_id,),
+            ).fetchone()
+            expected_response_file = (
+                f"responses/{observation.reservation_id}.personal-http1.raw"
+            )
+            if (
+                row is None
+                or observation.path != path
+                or observation.redacted_request_sha256 != expected_redacted_digest
+                or row[1] <= 0
+                or row[2] != expected_redacted_digest
+                or row[3] != case.response_bytes
+                or row[4] is None
+                or row[5] != observation.response_bytes
+                or row[6] != observation.response_sha256
+                or observation.response_file != expected_response_file
+                or row[0]
+                != _request_fingerprint(
+                    hostname=case.hostname,
+                    port=case.port,
+                    scheme=case.scheme,
+                    method="GET",
+                    path=path,
+                    request_bytes=row[1],
+                    request_sha256=expected_redacted_digest,
+                    response_bytes=case.response_bytes,
+                )
+            ):
+                raise CliError(
+                    "authenticated canary reservation binding is invalid",
+                    exit_code=EXIT_AUTHORITY,
+                )
+            response_path = workspace / observation.response_file
+            relative, reference = _handoff_workspace_file(
+                workspace,
+                response_path,
+                label="authenticated canary response",
+                maximum_bytes=case.response_bytes,
+            )
+            response_content = _capture_bounded_local_file(
+                response_path,
+                maximum_bytes=case.response_bytes,
+                label="authenticated canary response",
+            )
+            parsed = parse_canary_http_response(
+                response_content,
+                response_limit=case.response_bytes,
+                expected_canary_sha256=case.canary_sha256,
+            )
+            if (
+                relative != expected_response_file
+                or reference["sizeBytes"] != observation.response_bytes
+                or reference["sha256"] != observation.response_sha256
+                or parsed.response_sha256 != observation.response_sha256
+                or parsed.size != observation.response_bytes
+                or parsed.status_code != observation.status_code
+                or parsed.canary_value_sha256 != observation.canary_value_sha256
+                or parsed.expected_canary != observation.expected_canary
+            ):
+                raise CliError(
+                    "authenticated canary response evidence is invalid",
+                    exit_code=EXIT_AUTHORITY,
+                )
+        connection.commit()
+    except CliError:
+        connection.rollback()
+        raise
+    except sqlite3.Error as exc:
+        connection.rollback()
+        raise CliError(
+            "authenticated canary accounting evidence is invalid",
+            exit_code=EXIT_AUTHORITY,
+        ) from exc
+    finally:
+        connection.close()
+
+
+def _campaign_export_authenticated_canary_handoff(arguments: argparse.Namespace) -> int:
+    trusted_key = _trusted_key_path(arguments)
+    (
+        manifest, grant, _, _, authority, public_key, grant_sha256,
+    ) = _canary_workspace_context(arguments.workspace, trusted_key, require_active=False)
+    signer = _private_signer(
+        arguments.private_key,
+        _capture_private_protocol_file(arguments.private_key),
+    )
+    if signer.key_id != authority.signature.key_id or signer.key_id != public_key.key_id:
+        raise CliError("source handoff signer differs from source authority", exit_code=EXIT_AUTHORITY)
+    case_content = _capture_bounded_local_file(
+        arguments.case, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="source canary case"
+    )
+    run_content = _capture_bounded_local_file(
+        arguments.run_result,
+        maximum_bytes=MAX_PROTOCOL_FILE_BYTES,
+        label="source canary run",
+    )
+    try:
+        signed_case = parse_signed_canary_case(case_content)
+        case = verify_signed_canary_case(signed_case, public_key)
+        signed_run = parse_canary_run(run_content)
+        run = verify_signed_canary_run(signed_run, public_key)
+    except AuthenticatedCanaryError as exc:
+        raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+    if (
+        case.phase != "source"
+        or run.phase != "source"
+        or run.status != "observation_recorded"
+        or run.case_sha256 != canary_sha256_hex(case_content)
+        or case.grant_id != grant.grant_id
+        or case.grant_sha256 != grant_sha256
+    ):
+        raise CliError("source canary evidence is incomplete or unbound", exit_code=EXIT_AUTHORITY)
+    _validate_authenticated_canary_evidence(
+        workspace=arguments.workspace,
+        manifest=manifest,
+        signed_case=signed_case,
+        signed_run=signed_run,
+        trusted_key=public_key,
+    )
+    handoff = build_canary_handoff(
+        source_workspace_sha256=canary_sha256_hex(
+            f"{manifest['run_id']}:{grant_sha256}".encode("utf-8")
+        ),
+        source_case=signed_case,
+        source_case_sha256=canary_sha256_hex(case_content),
+        source_run=signed_run,
+        source_run_sha256=canary_sha256_hex(run_content),
+        signer=signer,
+    )
+    output = _canary_case_output(arguments.workspace, arguments.out)
+    content = canary_model_bytes(handoff)
+    _write_or_verify_handoff_output(arguments.workspace, output, content)
+    _emit_json(
+        {
+            "schema": CANARY_HANDOFF_SCHEMA,
+            "status": "pending_independent_reviewer",
+            "handoff": str(output),
+            "handoffSha256": canary_sha256_hex(content),
+            "semanticVerdict": "not_evaluated",
+            "taxonomyVerdict": "not_evaluated",
+        }
+    )
+    return EXIT_OK
+
+
+def _campaign_finalize_authenticated_canary_review(arguments: argparse.Namespace) -> int:
+    require_separate_workspaces(arguments.source_workspace, arguments.reviewer_workspace)
+    (source_manifest, source_grant, _, _, source_authority, source_key, _) = _canary_workspace_context(
+        arguments.source_workspace, arguments.source_trusted_key, require_active=False
+    )
+    (reviewer_manifest, reviewer_grant, _, _, reviewer_authority, reviewer_key, _) = _canary_workspace_context(
+        arguments.reviewer_workspace, arguments.reviewer_trusted_key, require_active=False
+    )
+    handoff_content = _capture_bounded_local_file(
+        arguments.handoff, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="source canary handoff"
+    )
+    reviewer_case_content = _capture_bounded_local_file(
+        arguments.reviewer_case,
+        maximum_bytes=MAX_PROTOCOL_FILE_BYTES,
+        label="reviewer canary case",
+    )
+    reviewer_run_content = _capture_bounded_local_file(
+        arguments.reviewer_run,
+        maximum_bytes=MAX_PROTOCOL_FILE_BYTES,
+        label="reviewer canary run",
+    )
+    try:
+        handoff = verify_canary_handoff(parse_canary_handoff(handoff_content), source_key)
+        reviewer_case = parse_signed_canary_case(reviewer_case_content)
+        verify_signed_canary_case(reviewer_case, reviewer_key)
+        signed_reviewer_run = parse_canary_run(reviewer_run_content)
+        reviewer_run = verify_signed_canary_run(signed_reviewer_run, reviewer_key)
+        if (
+            source_authority.signature.key_id == reviewer_authority.signature.key_id
+            or source_grant.issued_to == reviewer_grant.issued_to
+            or reviewer_case.case.source_handoff_sha256 != canary_sha256_hex(handoff_content)
+        ):
+            raise AuthenticatedCanaryError("reviewer boundary is not independent")
+        _validate_authenticated_canary_evidence(
+            workspace=arguments.source_workspace,
+            manifest=source_manifest,
+            signed_case=handoff.source_case,
+            signed_run=handoff.source_run,
+            trusted_key=source_key,
+        )
+        _validate_authenticated_canary_evidence(
+            workspace=arguments.reviewer_workspace,
+            manifest=reviewer_manifest,
+            signed_case=reviewer_case,
+            signed_run=signed_reviewer_run,
+            trusted_key=reviewer_key,
+        )
+        result = canary_semantic_result(
+            handoff=handoff,
+            reviewer_case=reviewer_case,
+            reviewer_case_sha256=canary_sha256_hex(reviewer_case_content),
+            reviewer_run=reviewer_run,
+            reviewer_run_sha256=canary_sha256_hex(reviewer_run_content),
+        )
+    except AuthenticatedCanaryError as exc:
+        raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+    output = _canary_case_output(arguments.reviewer_workspace, arguments.out)
+    content = canary_model_bytes(result)
+    _write_or_verify_handoff_output(arguments.reviewer_workspace, output, content)
+    _emit_json(result.model_dump(mode="json", by_alias=True))
+    return EXIT_OK
+
+
 def _campaign_run_http1_triad(arguments: argparse.Namespace) -> int:
     spec_content = _capture_bounded_local_file(
         arguments.spec, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="campaign spec"
@@ -8037,6 +8867,11 @@ def build_parser() -> argparse.ArgumentParser:
     scope_draft.add_argument("--duration-hours", type=_positive_int, default=8)
     scope_draft.add_argument("--title", default="FaultLoom authorized engagement")
     scope_draft.add_argument("--operator", default="operator.local")
+    scope_draft.add_argument(
+        "--identity",
+        action="append",
+        help="signed identity ID; repeat only for explicitly authorized identities",
+    )
     scope_draft.add_argument("--out", type=Path, required=True)
     scope_draft.set_defaults(handler=_scope_draft)
     scope_approve = scope_commands.add_parser("approve", help="approve a scope draft")
@@ -8109,6 +8944,84 @@ def build_parser() -> argparse.ArgumentParser:
         "campaign", help="run and manually finalize a bounded personal HTTP/1 triad"
     )
     campaign_commands = campaign.add_subparsers(dest="campaign_command", required=True)
+    campaign_prepare_authenticated_canary = campaign_commands.add_parser(
+        "prepare-authenticated-canary",
+        help="sign one owner/requester read-only operator-canary case",
+    )
+    campaign_prepare_authenticated_canary.add_argument("--workspace", type=Path, required=True)
+    campaign_prepare_authenticated_canary.add_argument("--trusted-key", type=Path, required=True)
+    campaign_prepare_authenticated_canary.add_argument("--private-key", type=Path, required=True)
+    campaign_prepare_authenticated_canary.add_argument("--phase", choices=("source", "reviewer"), required=True)
+    campaign_prepare_authenticated_canary.add_argument("--campaign-id", type=_campaign_id, required=True)
+    campaign_prepare_authenticated_canary.add_argument("--source-claim", required=True)
+    campaign_prepare_authenticated_canary.add_argument("--hostname", required=True)
+    campaign_prepare_authenticated_canary.add_argument("--port", type=_port, required=True)
+    campaign_prepare_authenticated_canary.add_argument("--scheme", choices=("http", "https"), required=True)
+    campaign_prepare_authenticated_canary.add_argument("--owner-identity", required=True)
+    campaign_prepare_authenticated_canary.add_argument("--requester-identity", required=True)
+    campaign_prepare_authenticated_canary.add_argument("--canary-path", required=True)
+    campaign_prepare_authenticated_canary.add_argument("--missing-control-path", required=True)
+    campaign_prepare_authenticated_canary.add_argument("--canary-sha256", required=True)
+    campaign_prepare_authenticated_canary.add_argument("--requester-session-ref", required=True)
+    campaign_prepare_authenticated_canary.add_argument(
+        "--confirm-operator-owned-canary", action="store_true"
+    )
+    campaign_prepare_authenticated_canary.add_argument(
+        "--confirm-reviewed-non-sensitive-canary", action="store_true"
+    )
+    campaign_prepare_authenticated_canary.add_argument(
+        "--requester-session-expires-at",
+        required=True,
+        help="signed canonical UTC expiry for this target session",
+    )
+    campaign_prepare_authenticated_canary.add_argument("--response-bytes", type=_positive_int, required=True)
+    campaign_prepare_authenticated_canary.add_argument(
+        "--timeout-seconds", type=_personal_timeout_seconds, default=10
+    )
+    campaign_prepare_authenticated_canary.add_argument("--source-workspace", type=Path)
+    campaign_prepare_authenticated_canary.add_argument("--source-trusted-key", type=Path)
+    campaign_prepare_authenticated_canary.add_argument("--source-handoff", type=Path)
+    campaign_prepare_authenticated_canary.add_argument("--out", type=Path, required=True)
+    campaign_prepare_authenticated_canary.set_defaults(
+        handler=_campaign_prepare_authenticated_canary
+    )
+    campaign_run_authenticated_canary = campaign_commands.add_parser(
+        "run-authenticated-canary",
+        help="send the exact B-to-owner-canary triad with a target-only SecretRef",
+    )
+    campaign_run_authenticated_canary.add_argument("--workspace", type=Path, required=True)
+    campaign_run_authenticated_canary.add_argument("--trusted-key", type=Path, required=True)
+    campaign_run_authenticated_canary.add_argument("--private-key", type=Path, required=True)
+    campaign_run_authenticated_canary.add_argument("--case", type=Path, required=True)
+    campaign_run_authenticated_canary.set_defaults(handler=_campaign_run_authenticated_canary)
+    campaign_export_authenticated_canary = campaign_commands.add_parser(
+        "export-authenticated-canary-handoff",
+        help="sign a create-once source canary handoff for an independent reviewer",
+    )
+    campaign_export_authenticated_canary.add_argument("--workspace", type=Path, required=True)
+    campaign_export_authenticated_canary.add_argument("--trusted-key", type=Path, required=True)
+    campaign_export_authenticated_canary.add_argument("--private-key", type=Path, required=True)
+    campaign_export_authenticated_canary.add_argument("--case", type=Path, required=True)
+    campaign_export_authenticated_canary.add_argument("--run-result", type=Path, required=True)
+    campaign_export_authenticated_canary.add_argument("--out", type=Path, required=True)
+    campaign_export_authenticated_canary.set_defaults(
+        handler=_campaign_export_authenticated_canary_handoff
+    )
+    campaign_finalize_authenticated_canary = campaign_commands.add_parser(
+        "finalize-authenticated-canary-review",
+        help="emit only the narrow independently reproduced operator-canary observation",
+    )
+    campaign_finalize_authenticated_canary.add_argument("--source-workspace", type=Path, required=True)
+    campaign_finalize_authenticated_canary.add_argument("--source-trusted-key", type=Path, required=True)
+    campaign_finalize_authenticated_canary.add_argument("--reviewer-workspace", type=Path, required=True)
+    campaign_finalize_authenticated_canary.add_argument("--reviewer-trusted-key", type=Path, required=True)
+    campaign_finalize_authenticated_canary.add_argument("--handoff", type=Path, required=True)
+    campaign_finalize_authenticated_canary.add_argument("--reviewer-case", type=Path, required=True)
+    campaign_finalize_authenticated_canary.add_argument("--reviewer-run", type=Path, required=True)
+    campaign_finalize_authenticated_canary.add_argument("--out", type=Path, required=True)
+    campaign_finalize_authenticated_canary.set_defaults(
+        handler=_campaign_finalize_authenticated_canary_review
+    )
     campaign_run_http1_triad = campaign_commands.add_parser(
         "run-http1-triad",
         help="send effect, reproduction, and negative-control requests once each",
