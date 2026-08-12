@@ -114,6 +114,14 @@ drafts. That replay reports only `observation_reproduced`; vulnerability
 semantics and taxonomy remain `not_evaluated`. Live mode remains off by default
 and no automatic submission is provided.
 
+The class-specific read-only BOLA candidate commands are documented in
+[`docs/BOLA_READ_CANDIDATE.md`](docs/BOLA_READ_CANDIDATE.md):
+`prepare-bola-read`, `run-bola-read`, `export-bola-read-handoff`, and
+`finalize-bola-read-review`. Source and reviewer workspaces each run an exact
+three-`GET` control flow; the result is only an independently reproduced
+cross-principal owner-object read, with BOLA policy, taxonomy, and impact left
+`not_evaluated` for manual review.
+
 For an independent, read-only review of this public Core and its intended
 personal workflow, see [GPT_PRO_REVIEW_PROMPT.md](GPT_PRO_REVIEW_PROMPT.md).
 

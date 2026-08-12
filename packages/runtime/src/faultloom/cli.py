@@ -42,16 +42,19 @@ from faultloom_protocol import (
     ExplicitDeny,
     FindingCandidate,
     FindingClass,
+    IdentityContext,
     PoCStep,
     ProtocolModel,
     ProviderPolicy,
     ReplayPlan,
+    ResourceRef,
     RetentionPolicy,
     SecretRef,
     ScopeContractDraft,
     SignedAuthorityGrant,
     StateChangePolicy,
     StateRef,
+    SubjectRef,
     TargetAsset,
     TimeWindow,
     canonical_json,
@@ -112,6 +115,31 @@ from .authenticated_canary import (
     verify_canary_handoff,
     verify_signed_canary_case,
     verify_signed_canary_run,
+)
+from .bola_read_semantics import (
+    BOLA_READ_CASE_SCHEMA,
+    BOLA_READ_HANDOFF_SCHEMA,
+    BOLA_READ_RUN_SCHEMA,
+    BolaReadCase,
+    BolaReadHandoff,
+    BolaReadObservation,
+    BolaReadRunResult,
+    BolaReadSemanticError,
+    SignedBolaReadCase,
+    SignedBolaReadRun,
+    bola_model_bytes,
+    build_bola_read_get,
+    build_bola_read_handoff,
+    parse_bola_http_response,
+    redacted_bola_request_sha256,
+    semantic_bola_read_result,
+    sign_bola_read_case,
+    sign_bola_read_run,
+    signed_bola_case_bytes,
+    signed_bola_run_bytes,
+    verify_bola_read_handoff,
+    verify_signed_bola_case,
+    verify_signed_bola_run,
 )
 from .personal_campaign import (
     EXACT_BODY_DIGEST_CLASSIFIER,
@@ -6385,6 +6413,632 @@ def _campaign_finalize_authenticated_canary_review(arguments: argparse.Namespace
     return EXIT_OK
 
 
+def _bola_parse_model(content: bytes, model: type[ProtocolModel] | type[SignedBolaReadCase] | type[SignedBolaReadRun] | type[BolaReadHandoff], *, label: str):
+    try:
+        # Reject duplicate keys before Pydantic's JSON-mode tuple restoration.
+        json.loads(content.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+        return model.model_validate_json(content)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, ValidationError) as exc:
+        raise CliError(f"invalid {label}", exit_code=EXIT_AUTHORITY) from exc
+
+
+def _bola_workspace_sha256(manifest: dict[str, object], grant_sha256: str) -> str:
+    return hashlib.sha256(
+        f"{manifest['run_id']}:{grant_sha256}".encode("utf-8")
+    ).hexdigest()
+
+
+def _bola_case_binding_matches(
+    case: BolaReadCase, *, manifest: dict[str, object], grant: AuthorityGrant,
+    target: TargetAsset, grant_sha256: str,
+) -> bool:
+    context = case.requester_identity_context
+    return (
+        case.workspace_sha256 == _bola_workspace_sha256(manifest, grant_sha256)
+        and case.run_id == manifest.get("run_id")
+        and case.grant_id == grant.grant_id
+        and case.grant_version == grant.grant_version
+        and case.grant_sha256 == grant_sha256
+        and case.operator_actor_id == grant.issued_to
+        and case.target_id == target.target_id
+        and case.owner_subject.identity_id in grant.identities
+        and case.requester_subject.identity_id in grant.identities
+        and case.object_resource.tenant_id in grant.tenants
+        and case.owner_subject.tenant_id in grant.tenants
+        and case.requester_subject.tenant_id in grant.tenants
+        and bool(context.role_ids)
+        and set(context.role_ids).issubset(grant.roles)
+    )
+
+
+def _campaign_prepare_bola_read(arguments: argparse.Namespace) -> int:
+    if not (
+        arguments.confirm_operator_reviewed_owner_binding
+        and arguments.confirm_requester_must_not_read
+    ):
+        raise CliError(
+            "BOLA read requires explicit owner-binding and denied-read confirmations",
+            exit_code=EXIT_USAGE,
+        )
+    if not arguments.source_claim.strip():
+        raise CliError("BOLA source claim cannot be empty", exit_code=EXIT_USAGE)
+    workspace = arguments.workspace
+    trusted_key = _trusted_key_path(arguments)
+    manifest, grant, target, now, authority, public_key, grant_sha256 = (
+        _canary_workspace_context(workspace, trusted_key)
+    )
+    if arguments.target_id != target.target_id:
+        raise CliError("BOLA target differs from the workspace grant", exit_code=EXIT_AUTHORITY)
+    signer = _private_signer(
+        arguments.private_key, _capture_private_protocol_file(arguments.private_key)
+    )
+    if signer.key_id != authority.signature.key_id or signer.key_id != public_key.key_id:
+        raise CliError("BOLA case signer differs from current authority", exit_code=EXIT_AUTHORITY)
+    source_handoff_sha256: str | None = None
+    source_case: BolaReadCase | None = None
+    if arguments.phase == "reviewer":
+        if not all((arguments.source_workspace, arguments.source_trusted_key, arguments.source_handoff)):
+            raise CliError(
+                "reviewer BOLA preparation requires source workspace, key, and handoff",
+                exit_code=EXIT_USAGE,
+            )
+        require_separate_workspaces(arguments.source_workspace, workspace)
+        source_manifest, source_grant, source_target, _, source_authority, source_key, source_grant_sha256 = (
+            _canary_workspace_context(
+                arguments.source_workspace, arguments.source_trusted_key, require_active=False
+            )
+        )
+        handoff_content = _capture_bounded_local_file(
+            arguments.source_handoff,
+            maximum_bytes=MAX_PROTOCOL_FILE_BYTES,
+            label="source BOLA handoff",
+        )
+        handoff = _bola_parse_model(
+            handoff_content, BolaReadHandoff, label="source BOLA handoff"
+        )
+        try:
+            verify_bola_read_handoff(handoff, source_key)
+        except BolaReadSemanticError as exc:
+            raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+        source_case = handoff.source_case.case
+        if (
+            handoff.source_workspace_sha256
+            != _bola_workspace_sha256(source_manifest, source_grant_sha256)
+            or source_authority.signature.key_id == authority.signature.key_id
+            or source_grant.issued_to == grant.issued_to
+            or source_case.requester_identity_context.api_session_ref is None
+            or source_case.requester_identity_context.api_session_ref.uri
+            == arguments.requester_session_ref
+            or not _bola_case_binding_matches(
+                source_case, manifest=source_manifest, grant=source_grant,
+                target=source_target, grant_sha256=source_grant_sha256,
+            )
+        ):
+            raise CliError("BOLA reviewer boundary is not independent", exit_code=EXIT_AUTHORITY)
+        source_handoff_sha256 = hashlib.sha256(handoff_content).hexdigest()
+    elif any((arguments.source_workspace, arguments.source_trusted_key, arguments.source_handoff)):
+        raise CliError("source BOLA case cannot bind a source handoff", exit_code=EXIT_USAGE)
+    try:
+        session_ref = SecretRef(
+            schema_version=SCHEMA_VERSION,
+            uri=arguments.requester_session_ref,
+            purpose="target-bearer-session",
+        )
+        owner = SubjectRef(
+            schema_version=SCHEMA_VERSION,
+            subject_id=f"subject.{arguments.owner_identity.rsplit('.', maxsplit=1)[-1]}",
+            subject_kind="human",
+            identity_id=arguments.owner_identity,
+            tenant_id=arguments.tenant_id,
+        )
+        requester = SubjectRef(
+            schema_version=SCHEMA_VERSION,
+            subject_id=f"subject.{arguments.requester_identity.rsplit('.', maxsplit=1)[-1]}",
+            subject_kind="human",
+            identity_id=arguments.requester_identity,
+            tenant_id=arguments.tenant_id,
+        )
+        case = BolaReadCase(
+            schema=BOLA_READ_CASE_SCHEMA,
+            campaign_id=arguments.campaign_id,
+            phase=arguments.phase,
+            source_handoff_sha256=source_handoff_sha256,
+            source_claim=arguments.source_claim.strip(),
+            workspace_sha256=_bola_workspace_sha256(manifest, grant_sha256),
+            target_id=target.target_id,
+            hostname=arguments.hostname,
+            port=arguments.port,
+            scheme=arguments.scheme,
+            object_resource=ResourceRef(
+                schema_version=SCHEMA_VERSION,
+                resource_id=arguments.object_id,
+                resource_kind=arguments.object_kind,
+                target_id=target.target_id,
+                tenant_id=arguments.tenant_id,
+            ),
+            owner_subject=owner,
+            requester_subject=requester,
+            requester_identity_context=IdentityContext(
+                schema_version=SCHEMA_VERSION,
+                identity_context_id=f"identity-context.requester.{arguments.phase}",
+                identity_id=arguments.requester_identity,
+                tenant_id=arguments.tenant_id,
+                role_ids=grant.roles,
+                auth_session_id=f"auth-session.requester.{arguments.phase}",
+                api_session_ref=session_ref,
+            ),
+            requester_session_expires_at=arguments.requester_session_expires_at,
+            principal_control_path=arguments.principal_control_path,
+            object_read_path=arguments.object_read_path,
+            response_bytes=arguments.response_bytes,
+            timeout_seconds=arguments.timeout_seconds,
+            run_id=str(manifest["run_id"]),
+            grant_id=grant.grant_id,
+            grant_version=grant.grant_version,
+            grant_sha256=grant_sha256,
+            operator_actor_id=grant.issued_to,
+            signed_at=now.isoformat().replace("+00:00", "Z"),
+        )
+        signed = sign_bola_read_case(case, signer)
+    except (BolaReadSemanticError, ValidationError, ValueError) as exc:
+        raise CliError(f"invalid BOLA read case: {exc}", exit_code=EXIT_AUTHORITY) from exc
+    if source_case is not None:
+        fields = (
+            "campaign_id", "source_claim", "target_id", "hostname", "port", "scheme", "object_resource",
+            "owner_subject", "requester_subject", "principal_control_path", "object_read_path",
+            "principal_id_field", "object_id_field", "owner_principal_field",
+            "owner_binding_method", "requester_principal_binding_method",
+            "authorization_expectation", "authorization_expectation_status",
+            "denied_read_expected", "response_bytes", "timeout_seconds",
+        )
+        if any(getattr(case, name) != getattr(source_case, name) for name in fields):
+            raise CliError("reviewer BOLA case differs from source relation", exit_code=EXIT_AUTHORITY)
+    if not _bola_case_binding_matches(
+        case, manifest=manifest, grant=grant, target=target, grant_sha256=grant_sha256
+    ):
+        raise CliError("BOLA case is outside current authority", exit_code=EXIT_AUTHORITY)
+    for role, path, bearer in (
+        ("principal_control", case.principal_control_path, "A" * 512),
+        ("object_read", case.object_read_path, "A" * 512),
+        ("anonymous_control", case.object_read_path, None),
+    ):
+        request = build_bola_read_get(case, role=role, path=path, bearer=bearer)
+        _validate_request_authority(
+            grant=grant, target=target, hostname=case.hostname, port=case.port,
+            scheme=case.scheme, method="GET", path=path, request_bytes=len(request),
+            response_bytes=case.response_bytes,
+            maximum_request_bytes=min(grant.budget.max_request_bytes, PERSONAL_HTTP1_MAX_REQUEST_BYTES),
+            maximum_response_bytes=min(grant.budget.max_response_bytes, PERSONAL_HTTP1_MAX_RESPONSE_BYTES),
+        )
+    if grant.budget.total_actions < 3 or grant.budget.max_concurrency != 1:
+        raise CliError("BOLA authority must cover three serial requests", exit_code=EXIT_AUTHORITY)
+    output = _canary_case_output(workspace, arguments.out)
+    content = signed_bola_case_bytes(signed)
+    _write_or_verify_handoff_output(workspace, output, content)
+    _emit_json({
+        "schema": BOLA_READ_CASE_SCHEMA, "status": "ready_for_bola_read_run",
+        "phase": case.phase, "case": str(output),
+        "case_sha256": hashlib.sha256(content).hexdigest(), "network_access": False,
+        "source_claim_status": "operator_asserted_unverified",
+    })
+    return EXIT_OK
+
+
+def _bola_unresolved(
+    *, workspace: Path, case: BolaReadCase, case_sha256: str, signer: AuthoritySigner,
+    dispatch_count: int, observations: list[BolaReadObservation], error: str,
+) -> int:
+    result = BolaReadRunResult(
+        schema=BOLA_READ_RUN_SCHEMA, campaign_id=case.campaign_id, phase=case.phase,
+        case_sha256=case_sha256, status="unresolved_not_evaluated",
+        dispatch_count=dispatch_count, observations=tuple(observations),
+    )
+    output = _canary_case_output(
+        workspace, workspace / f"{case.campaign_id}.{case.phase}.bola-read-unresolved.json"
+    )
+    _write_or_verify_handoff_output(
+        workspace, output, signed_bola_run_bytes(sign_bola_read_run(result, signer)), require_new=True
+    )
+    _emit_json({
+        "schema": BOLA_READ_RUN_SCHEMA, "status": "unresolved_not_evaluated",
+        "dispatchCount": dispatch_count, "reservationState": "unresolved_no_retry",
+        "semantic_verdict": "not_evaluated", "taxonomy_verdict": "not_evaluated",
+        "error": error,
+    })
+    return EXIT_UNAVAILABLE
+
+
+def _campaign_run_bola_read(arguments: argparse.Namespace) -> int:
+    case_content = _capture_bounded_local_file(
+        arguments.case, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="signed BOLA case"
+    )
+    case_sha256 = hashlib.sha256(case_content).hexdigest()
+    manifest, grant, target, now, authority, public_key, grant_sha256 = (
+        _canary_workspace_context(arguments.workspace, _trusted_key_path(arguments))
+    )
+    signed = _bola_parse_model(case_content, SignedBolaReadCase, label="signed BOLA case")
+    try:
+        case = verify_signed_bola_case(signed, public_key)
+    except BolaReadSemanticError as exc:
+        raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+    if (
+        signed.signer_key_id != authority.signature.key_id
+        or not _bola_case_binding_matches(
+            case, manifest=manifest, grant=grant, target=target, grant_sha256=grant_sha256
+        )
+    ):
+        raise CliError("BOLA case is not bound to this workspace", exit_code=EXIT_AUTHORITY)
+    signer = _private_signer(
+        arguments.private_key, _capture_private_protocol_file(arguments.private_key)
+    )
+    if signer.key_id != authority.signature.key_id or signer.key_id != public_key.key_id:
+        raise CliError("BOLA run signer differs from current authority", exit_code=EXIT_AUTHORITY)
+    session_ref = case.requester_identity_context.api_session_ref
+    if session_ref is None:
+        raise CliError("BOLA requester session binding is missing", exit_code=EXIT_AUTHORITY)
+    roles = (
+        ("principal_control", "requester", case.principal_control_path),
+        ("object_read", "requester", case.object_read_path),
+        ("anonymous_control", "anonymous", case.object_read_path),
+    )
+    # Finish all scope and budget checks before touching the target bearer.
+    # A maximum-size placeholder proves the authority also covers the largest
+    # request that this contract can build without exposing secret material.
+    for role, _, path in roles:
+        placeholder = build_bola_read_get(
+            case,
+            role=role,
+            path=path,
+            bearer="A" * 512 if role != "anonymous_control" else None,
+        )
+        _validate_request_authority(
+            grant=grant, target=target, hostname=case.hostname, port=case.port,
+            scheme=case.scheme, method="GET", path=path, request_bytes=len(placeholder),
+            response_bytes=case.response_bytes,
+            maximum_request_bytes=min(grant.budget.max_request_bytes, PERSONAL_HTTP1_MAX_REQUEST_BYTES),
+            maximum_response_bytes=min(grant.budget.max_response_bytes, PERSONAL_HTTP1_MAX_RESPONSE_BYTES),
+        )
+    _validate_campaign_accounting_capacity(
+        workspace=arguments.workspace, manifest=manifest, grant=grant, now=now,
+        required_actions=3,
+    )
+    start = _canary_case_output(
+        arguments.workspace,
+        arguments.workspace / f"{case.campaign_id}.{case.phase}.bola-read-start.json",
+    )
+    if start.exists():
+        raise CliError(
+            "BOLA read already has a durable start record; automatic replay is forbidden",
+            exit_code=EXIT_AUTHORITY,
+        )
+    try:
+        expires_at = datetime.fromisoformat(
+            case.requester_session_expires_at.removesuffix("Z") + "+00:00"
+        )
+        if now >= expires_at:
+            raise BolaReadSemanticError("BOLA requester session is expired")
+        bearer = resolve_target_bearer(session_ref, os.environ)
+        requests = {
+            "principal_control": build_bola_read_get(
+                case, role="principal_control", path=case.principal_control_path, bearer=bearer
+            ),
+            "object_read": build_bola_read_get(
+                case, role="object_read", path=case.object_read_path, bearer=bearer
+            ),
+            "anonymous_control": build_bola_read_get(
+                case, role="anonymous_control", path=case.object_read_path, bearer=None
+            ),
+        }
+    except (AuthenticatedCanaryError, BolaReadSemanticError, ValueError) as exc:
+        raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+    start_content = (json.dumps({
+        "schema": "faultloom.bola-read.start.v1", "campaign_id": case.campaign_id,
+        "phase": case.phase, "case_sha256": case_sha256,
+        "requester_session_ref": session_ref.model_dump(mode="json"),
+        "dispatch_order": [item[0] for item in roles],
+        "auth_modes": [item[1] for item in roles],
+    }, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    _write_or_verify_handoff_output(
+        arguments.workspace, start, start_content, require_new=True
+    )
+    observations: list[BolaReadObservation] = []
+    dispatch_count = 0
+    for role, auth_mode, path in roles:
+        request_content = requests[role]
+        request_digest = redacted_bola_request_sha256(case, role=role, path=path)
+        try:
+            reservation = _reserve_request(
+                workspace=arguments.workspace, manifest=manifest, grant=grant, now=_utc_now(),
+                hostname=case.hostname, port=case.port, scheme=case.scheme, method="GET",
+                path=path, request_bytes=len(request_content), request_sha256=request_digest,
+                response_bytes=case.response_bytes,
+            )
+            expires = datetime.fromisoformat(
+                str(reservation["reservation_expires_at"]).replace("Z", "+00:00")
+            )
+            timeout_seconds = min(
+                float(case.timeout_seconds), (expires - _utc_now()).total_seconds() - 1
+            )
+            if timeout_seconds <= 0:
+                raise _PersonalPreDispatchError("reservation expired before BOLA dispatch")
+            response = _send_direct_http11_once(
+                hostname=case.hostname, port=case.port, scheme=case.scheme, target=target,
+                request_content=request_content, response_limit=case.response_bytes,
+                deadline=time.monotonic() + timeout_seconds,
+            )
+            dispatch_count += 1
+            if bearer.encode("ascii") in response:
+                raise BolaReadSemanticError("target bearer appeared in BOLA response")
+            parsed = parse_bola_http_response(response, response_limit=case.response_bytes)
+            response_path = _write_personal_response_file(
+                arguments.workspace, str(reservation["reservation_id"]), response
+            )
+            try:
+                completed = _complete_in_memory_request(
+                    workspace=arguments.workspace, manifest=manifest,
+                    reservation_id=str(reservation["reservation_id"]),
+                    request_content=request_content,
+                    expected_redacted_request_sha256=request_digest,
+                    response_content=response,
+                )
+            except (CliError, OSError, sqlite3.Error):
+                # A normal completion failure must not leave an authoritative-
+                # looking orphan response.  A hard process crash is still
+                # fail-closed by the signed-run and completed-row checks.
+                try:
+                    response_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+            observations.append(BolaReadObservation(
+                role=cast(Literal["principal_control", "object_read", "anonymous_control"], role),
+                auth_mode=cast(Literal["requester", "anonymous"], auth_mode),
+                path=path, reservation_id=str(reservation["reservation_id"]),
+                redacted_request_sha256=request_digest,
+                response_sha256=completed["response_sha256"], response_bytes=parsed.size,
+                status_code=parsed.status_code,
+                response_file=response_path.relative_to(arguments.workspace).as_posix(),
+            ))
+        except _PersonalPreDispatchError:
+            return _bola_unresolved(
+                workspace=arguments.workspace, case=case, case_sha256=case_sha256,
+                signer=signer, dispatch_count=dispatch_count, observations=observations,
+                error="no_dispatch_connection_or_tls_failure",
+            )
+        except (BolaReadSemanticError, CliError, OSError, TimeoutError):
+            return _bola_unresolved(
+                workspace=arguments.workspace, case=case, case_sha256=case_sha256,
+                signer=signer, dispatch_count=max(dispatch_count, len(observations) + 1),
+                observations=observations, error="response_or_dispatch_ambiguous",
+            )
+    result = BolaReadRunResult(
+        schema=BOLA_READ_RUN_SCHEMA, campaign_id=case.campaign_id, phase=case.phase,
+        case_sha256=case_sha256, status="observation_recorded", dispatch_count=3,
+        observations=tuple(observations),
+    )
+    output = _canary_case_output(
+        arguments.workspace,
+        arguments.workspace / f"{case.campaign_id}.{case.phase}.bola-read-run.json",
+    )
+    signed_result = sign_bola_read_run(result, signer)
+    content = signed_bola_run_bytes(signed_result)
+    _write_or_verify_handoff_output(arguments.workspace, output, content)
+    _emit_json({
+        "schema": BOLA_READ_RUN_SCHEMA, "status": "observation_recorded",
+        "phase": case.phase, "dispatch_count": 3, "run_result": str(output),
+        "run_result_sha256": hashlib.sha256(content).hexdigest(),
+        "semantic_verdict": "not_evaluated", "taxonomy_verdict": "not_evaluated",
+        "automatic_submission": False,
+    })
+    return EXIT_OK
+
+
+def _validate_bola_read_evidence(
+    *, workspace: Path, manifest: dict[str, object], signed_case: SignedBolaReadCase,
+    signed_run: SignedBolaReadRun, trusted_key: Ed25519PublicKeyRecord,
+) -> dict[str, bytes]:
+    try:
+        case = verify_signed_bola_case(signed_case, trusted_key)
+        run = verify_signed_bola_run(signed_run, trusted_key)
+    except BolaReadSemanticError as exc:
+        raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+    case_content = signed_bola_case_bytes(signed_case)
+    if (
+        run.status != "observation_recorded"
+        or run.case_sha256 != hashlib.sha256(case_content).hexdigest()
+        or run.campaign_id != case.campaign_id or run.phase != case.phase
+        or len(run.observations) != 3
+    ):
+        raise CliError("BOLA run binding is invalid", exit_code=EXIT_AUTHORITY)
+    roles = (
+        ("principal_control", "requester", case.principal_control_path),
+        ("object_read", "requester", case.object_read_path),
+        ("anonymous_control", "anonymous", case.object_read_path),
+    )
+    start_path = workspace / f"{case.campaign_id}.{case.phase}.bola-read-start.json"
+    expected_start = (json.dumps({
+        "schema": "faultloom.bola-read.start.v1", "campaign_id": case.campaign_id,
+        "phase": case.phase, "case_sha256": run.case_sha256,
+        "requester_session_ref": case.requester_identity_context.api_session_ref.model_dump(mode="json"),
+        "dispatch_order": [item[0] for item in roles], "auth_modes": [item[1] for item in roles],
+    }, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    if _capture_bounded_local_file(
+        start_path, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="BOLA start"
+    ) != expected_start:
+        raise CliError("BOLA start binding is invalid", exit_code=EXIT_AUTHORITY)
+    responses: dict[str, bytes] = {}
+    connection = _request_accounting_connection(workspace)
+    try:
+        _prepare_request_accounting(connection, manifest)
+        for observation, (role, auth_mode, path) in zip(run.observations, roles, strict=True):
+            expected_digest = redacted_bola_request_sha256(case, role=role, path=path)
+            row = connection.execute(
+                "SELECT request_fingerprint, request_bytes, request_sha256, response_limit, "
+                "completed_at, observed_response_bytes, response_sha256 FROM reservations "
+                "WHERE reservation_id = ?", (observation.reservation_id,),
+            ).fetchone()
+            expected_file = f"responses/{observation.reservation_id}.personal-http1.raw"
+            if (
+                row is None or observation.role != role or observation.auth_mode != auth_mode
+                or observation.path != path or observation.redacted_request_sha256 != expected_digest
+                or row[1] <= 0 or row[2] != expected_digest or row[3] != case.response_bytes
+                or row[4] is None or row[5] != observation.response_bytes
+                or row[6] != observation.response_sha256 or observation.response_file != expected_file
+                or row[0] != _request_fingerprint(
+                    hostname=case.hostname, port=case.port, scheme=case.scheme, method="GET",
+                    path=path, request_bytes=row[1], request_sha256=expected_digest,
+                    response_bytes=case.response_bytes,
+                )
+            ):
+                raise CliError("BOLA reservation binding is invalid", exit_code=EXIT_AUTHORITY)
+            response_path = workspace / observation.response_file
+            relative, reference = _handoff_workspace_file(
+                workspace, response_path, label="BOLA response", maximum_bytes=case.response_bytes
+            )
+            raw = _capture_bounded_local_file(
+                response_path, maximum_bytes=case.response_bytes, label="BOLA response"
+            )
+            parsed = parse_bola_http_response(raw, response_limit=case.response_bytes)
+            if (
+                relative != expected_file or reference["sizeBytes"] != observation.response_bytes
+                or reference["sha256"] != observation.response_sha256
+                or parsed.response_sha256 != observation.response_sha256
+                or parsed.size != observation.response_bytes
+                or parsed.status_code != observation.status_code
+            ):
+                raise CliError("BOLA response evidence is invalid", exit_code=EXIT_AUTHORITY)
+            responses[observation.response_file] = raw
+        connection.commit()
+    except (BolaReadSemanticError, CliError, sqlite3.Error) as exc:
+        connection.rollback()
+        if isinstance(exc, CliError):
+            raise
+        raise CliError("BOLA evidence is invalid", exit_code=EXIT_AUTHORITY) from exc
+    finally:
+        connection.close()
+    return responses
+
+
+def _campaign_export_bola_read_handoff(arguments: argparse.Namespace) -> int:
+    manifest, grant, target, _, authority, public_key, grant_sha256 = _canary_workspace_context(
+        arguments.workspace, _trusted_key_path(arguments), require_active=False
+    )
+    signer = _private_signer(
+        arguments.private_key, _capture_private_protocol_file(arguments.private_key)
+    )
+    if signer.key_id != authority.signature.key_id or signer.key_id != public_key.key_id:
+        raise CliError("BOLA handoff signer differs from source authority", exit_code=EXIT_AUTHORITY)
+    case_content = _capture_bounded_local_file(
+        arguments.case, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="source BOLA case"
+    )
+    run_content = _capture_bounded_local_file(
+        arguments.run_result, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="source BOLA run"
+    )
+    signed_case = _bola_parse_model(case_content, SignedBolaReadCase, label="source BOLA case")
+    signed_run = _bola_parse_model(run_content, SignedBolaReadRun, label="source BOLA run")
+    try:
+        case = verify_signed_bola_case(signed_case, public_key)
+        run = verify_signed_bola_run(signed_run, public_key)
+    except BolaReadSemanticError as exc:
+        raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+    if (
+        case.phase != "source" or run.phase != "source" or run.status != "observation_recorded"
+        or run.case_sha256 != hashlib.sha256(case_content).hexdigest()
+        or case.grant_id != grant.grant_id or case.grant_sha256 != grant_sha256
+        or not _bola_case_binding_matches(
+            case, manifest=manifest, grant=grant, target=target,
+            grant_sha256=grant_sha256,
+        )
+    ):
+        raise CliError("source BOLA evidence is incomplete or unbound", exit_code=EXIT_AUTHORITY)
+    _validate_bola_read_evidence(
+        workspace=arguments.workspace, manifest=manifest, signed_case=signed_case,
+        signed_run=signed_run, trusted_key=public_key,
+    )
+    handoff = build_bola_read_handoff(
+        source_workspace_sha256=_bola_workspace_sha256(manifest, grant_sha256),
+        source_case=signed_case, source_case_sha256=hashlib.sha256(case_content).hexdigest(),
+        source_run=signed_run, source_run_sha256=hashlib.sha256(run_content).hexdigest(),
+        signer=signer,
+    )
+    output = _canary_case_output(arguments.workspace, arguments.out)
+    content = bola_model_bytes(handoff)
+    _write_or_verify_handoff_output(arguments.workspace, output, content)
+    _emit_json({
+        "schema": BOLA_READ_HANDOFF_SCHEMA, "status": "pending_independent_reviewer",
+        "handoff": str(output), "handoff_sha256": hashlib.sha256(content).hexdigest(),
+        "semantic_verdict": "not_evaluated", "taxonomy_verdict": "not_evaluated",
+    })
+    return EXIT_OK
+
+
+def _campaign_finalize_bola_read_review(arguments: argparse.Namespace) -> int:
+    require_separate_workspaces(arguments.source_workspace, arguments.reviewer_workspace)
+    source_manifest, source_grant, source_target, _, source_authority, source_key, source_grant_sha256 = _canary_workspace_context(
+        arguments.source_workspace, arguments.source_trusted_key, require_active=False
+    )
+    reviewer_manifest, reviewer_grant, reviewer_target, _, reviewer_authority, reviewer_key, reviewer_grant_sha256 = _canary_workspace_context(
+        arguments.reviewer_workspace, arguments.reviewer_trusted_key, require_active=False
+    )
+    handoff_content = _capture_bounded_local_file(
+        arguments.handoff, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="source BOLA handoff"
+    )
+    reviewer_case_content = _capture_bounded_local_file(
+        arguments.reviewer_case, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="reviewer BOLA case"
+    )
+    reviewer_run_content = _capture_bounded_local_file(
+        arguments.reviewer_run, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="reviewer BOLA run"
+    )
+    handoff = _bola_parse_model(handoff_content, BolaReadHandoff, label="source BOLA handoff")
+    reviewer_case = _bola_parse_model(
+        reviewer_case_content, SignedBolaReadCase, label="reviewer BOLA case"
+    )
+    reviewer_run = _bola_parse_model(
+        reviewer_run_content, SignedBolaReadRun, label="reviewer BOLA run"
+    )
+    try:
+        verify_bola_read_handoff(handoff, source_key)
+        verify_signed_bola_case(reviewer_case, reviewer_key)
+        verify_signed_bola_run(reviewer_run, reviewer_key)
+        if (
+            source_authority.signature.key_id == reviewer_authority.signature.key_id
+            or source_grant.issued_to == reviewer_grant.issued_to
+            or reviewer_case.case.source_handoff_sha256 != hashlib.sha256(handoff_content).hexdigest()
+            or not _bola_case_binding_matches(
+                handoff.source_case.case, manifest=source_manifest,
+                grant=source_grant, target=source_target,
+                grant_sha256=source_grant_sha256,
+            )
+            or not _bola_case_binding_matches(
+                reviewer_case.case, manifest=reviewer_manifest,
+                grant=reviewer_grant, target=reviewer_target,
+                grant_sha256=reviewer_grant_sha256,
+            )
+        ):
+            raise BolaReadSemanticError("BOLA reviewer boundary is not independent")
+        source_responses = _validate_bola_read_evidence(
+            workspace=arguments.source_workspace, manifest=source_manifest,
+            signed_case=handoff.source_case, signed_run=handoff.source_run, trusted_key=source_key,
+        )
+        reviewer_responses = _validate_bola_read_evidence(
+            workspace=arguments.reviewer_workspace, manifest=reviewer_manifest,
+            signed_case=reviewer_case, signed_run=reviewer_run, trusted_key=reviewer_key,
+        )
+        result = semantic_bola_read_result(
+            handoff=handoff, source_trusted_key=source_key,
+            source_response_bytes=source_responses, reviewer_case=reviewer_case,
+            reviewer_run=reviewer_run, reviewer_trusted_key=reviewer_key,
+            reviewer_response_bytes=reviewer_responses,
+        )
+    except BolaReadSemanticError as exc:
+        raise CliError(str(exc), exit_code=EXIT_AUTHORITY) from exc
+    output = _canary_case_output(arguments.reviewer_workspace, arguments.out)
+    content = bola_model_bytes(result)
+    _write_or_verify_handoff_output(arguments.reviewer_workspace, output, content, require_new=True)
+    _emit_json(result.model_dump(mode="json", by_alias=True))
+    return EXIT_OK
+
+
 def _campaign_run_http1_triad(arguments: argparse.Namespace) -> int:
     spec_content = _capture_bounded_local_file(
         arguments.spec, maximum_bytes=MAX_PROTOCOL_FILE_BYTES, label="campaign spec"
@@ -9034,6 +9688,75 @@ def build_parser() -> argparse.ArgumentParser:
     campaign_finalize_authenticated_canary.set_defaults(
         handler=_campaign_finalize_authenticated_canary_review
     )
+    campaign_prepare_bola_read = campaign_commands.add_parser(
+        "prepare-bola-read",
+        help="sign one bounded cross-principal owner-object read observation case",
+    )
+    campaign_prepare_bola_read.add_argument("--workspace", type=Path, required=True)
+    campaign_prepare_bola_read.add_argument("--trusted-key", type=Path, required=True)
+    campaign_prepare_bola_read.add_argument("--private-key", type=Path, required=True)
+    campaign_prepare_bola_read.add_argument("--phase", choices=("source", "reviewer"), required=True)
+    campaign_prepare_bola_read.add_argument("--campaign-id", type=_campaign_id, required=True)
+    campaign_prepare_bola_read.add_argument("--source-claim", required=True)
+    campaign_prepare_bola_read.add_argument("--target-id", required=True)
+    campaign_prepare_bola_read.add_argument("--hostname", required=True)
+    campaign_prepare_bola_read.add_argument("--port", type=_port, required=True)
+    campaign_prepare_bola_read.add_argument("--scheme", choices=("http", "https"), required=True)
+    campaign_prepare_bola_read.add_argument("--tenant-id", required=True)
+    campaign_prepare_bola_read.add_argument("--object-id", required=True)
+    campaign_prepare_bola_read.add_argument("--object-kind", required=True)
+    campaign_prepare_bola_read.add_argument("--owner-identity", required=True)
+    campaign_prepare_bola_read.add_argument("--requester-identity", required=True)
+    campaign_prepare_bola_read.add_argument("--principal-control-path", required=True)
+    campaign_prepare_bola_read.add_argument("--object-read-path", required=True)
+    campaign_prepare_bola_read.add_argument("--requester-session-ref", required=True)
+    campaign_prepare_bola_read.add_argument("--requester-session-expires-at", required=True)
+    campaign_prepare_bola_read.add_argument(
+        "--confirm-operator-reviewed-owner-binding", action="store_true"
+    )
+    campaign_prepare_bola_read.add_argument(
+        "--confirm-requester-must-not-read", action="store_true"
+    )
+    campaign_prepare_bola_read.add_argument("--response-bytes", type=_positive_int, required=True)
+    campaign_prepare_bola_read.add_argument(
+        "--timeout-seconds", type=_personal_timeout_seconds, default=10
+    )
+    campaign_prepare_bola_read.add_argument("--source-workspace", type=Path)
+    campaign_prepare_bola_read.add_argument("--source-trusted-key", type=Path)
+    campaign_prepare_bola_read.add_argument("--source-handoff", type=Path)
+    campaign_prepare_bola_read.add_argument("--out", type=Path, required=True)
+    campaign_prepare_bola_read.set_defaults(handler=_campaign_prepare_bola_read)
+    campaign_run_bola_read = campaign_commands.add_parser(
+        "run-bola-read", help="send the exact requester/requester/anonymous read triad"
+    )
+    campaign_run_bola_read.add_argument("--workspace", type=Path, required=True)
+    campaign_run_bola_read.add_argument("--trusted-key", type=Path, required=True)
+    campaign_run_bola_read.add_argument("--private-key", type=Path, required=True)
+    campaign_run_bola_read.add_argument("--case", type=Path, required=True)
+    campaign_run_bola_read.set_defaults(handler=_campaign_run_bola_read)
+    campaign_export_bola_read = campaign_commands.add_parser(
+        "export-bola-read-handoff", help="export validated source read evidence"
+    )
+    campaign_export_bola_read.add_argument("--workspace", type=Path, required=True)
+    campaign_export_bola_read.add_argument("--trusted-key", type=Path, required=True)
+    campaign_export_bola_read.add_argument("--private-key", type=Path, required=True)
+    campaign_export_bola_read.add_argument("--case", type=Path, required=True)
+    campaign_export_bola_read.add_argument("--run-result", type=Path, required=True)
+    campaign_export_bola_read.add_argument("--out", type=Path, required=True)
+    campaign_export_bola_read.set_defaults(handler=_campaign_export_bola_read_handoff)
+    campaign_finalize_bola_read = campaign_commands.add_parser(
+        "finalize-bola-read-review",
+        help="emit a local independently reproduced owner-object read observation",
+    )
+    campaign_finalize_bola_read.add_argument("--source-workspace", type=Path, required=True)
+    campaign_finalize_bola_read.add_argument("--source-trusted-key", type=Path, required=True)
+    campaign_finalize_bola_read.add_argument("--reviewer-workspace", type=Path, required=True)
+    campaign_finalize_bola_read.add_argument("--reviewer-trusted-key", type=Path, required=True)
+    campaign_finalize_bola_read.add_argument("--handoff", type=Path, required=True)
+    campaign_finalize_bola_read.add_argument("--reviewer-case", type=Path, required=True)
+    campaign_finalize_bola_read.add_argument("--reviewer-run", type=Path, required=True)
+    campaign_finalize_bola_read.add_argument("--out", type=Path, required=True)
+    campaign_finalize_bola_read.set_defaults(handler=_campaign_finalize_bola_read_review)
     campaign_run_http1_triad = campaign_commands.add_parser(
         "run-http1-triad",
         help="send effect, reproduction, and negative-control requests once each",

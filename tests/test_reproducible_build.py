@@ -811,6 +811,8 @@ jobs:
             "tests/runtime/test_campaign_verification_handoff.py",
             "tests/runtime/test_independent_http1_verification.py",
             "tests/runtime/test_authenticated_bola_canary.py",
+            "tests/runtime/test_bola_read_semantics.py",
+            "tests/runtime/test_bola_read_cli.py",
         )
         self.assertEqual(REQUIRED_RUNTIME_TESTS, expected)
         workflow = canonical_ci_workflow("1.96.1").decode("utf-8")

@@ -93,6 +93,8 @@ REQUIRED_RUNTIME_TESTS = (
     "tests/runtime/test_campaign_verification_handoff.py",
     "tests/runtime/test_independent_http1_verification.py",
     "tests/runtime/test_authenticated_bola_canary.py",
+    "tests/runtime/test_bola_read_semantics.py",
+    "tests/runtime/test_bola_read_cli.py",
 )
 NETWORK_EXECUTION: dict[str, Any] = {
     "mode": "offline_requested",
