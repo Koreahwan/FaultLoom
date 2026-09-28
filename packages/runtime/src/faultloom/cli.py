@@ -64,6 +64,8 @@ from pydantic import ValidationError
 
 from . import __version__
 from .adapter_cli import configure_adapter_parser
+from .knowledge_cli import configure_knowledge_parser
+from .history_cli import configure_history_parser
 from .automation.candidate_outbox import (
     CandidateOutboxError,
     automation_result_candidate_digest,
@@ -8852,6 +8854,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="faultloom")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     commands = parser.add_subparsers(dest="command", required=True)
+
+    knowledge = commands.add_parser("knowledge", help="browse and cite inert local references")
+    configure_knowledge_parser(knowledge)
+
+    history = commands.add_parser("history", help="record and review private work history")
+    configure_history_parser(history)
 
     doctor = commands.add_parser("doctor", help="check local runtime readiness")
     doctor.add_argument("--json", action="store_true", help="emit compact JSON")

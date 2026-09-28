@@ -10,6 +10,15 @@ authorized Web/API and LLM/agent assessments. Live mode is off by default.
 FaultLoom does not promise automatic zero-day discovery or complete lab
 coverage.
 
+## Research workspace preview
+
+Development source also includes a local reference catalogue and private work
+history for research, bug bounty, and client work. The
+[workspace guide](docs/RESEARCH_WORKSPACE.md) provides a synthetic demo and
+focused checks for source provenance, corrections, encrypted attachments, and
+backup recovery. These features do not call a model or contact research targets,
+and are not included in the immutable personal RC20 package.
+
 ## Repository layout
 
 - `packages/protocol`: versioned Pydantic and JSON Schema contracts

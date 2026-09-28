@@ -1,5 +1,15 @@
 # FaultLoom runtime
 
+The development-source CLI includes an offline
+[reference workspace](../../docs/REFERENCE_WORKSPACE.md) for selecting,
+searching, checking, and citing inert local reference files. Use
+`faultloom knowledge --help`; immutable personal packages are unchanged.
+
+The source-only [private work history](../../docs/WORK_HISTORY.md) records
+operator notes, corrections, and historical tracker metadata with encrypted
+local storage, a private timeline viewer, and verified local backups.
+Use `faultloom history --help`.
+
 This package provides the public `faultloom` command-line surface and the
 durable research runtime. The v0.1 CLI starts fail closed: its default run path
 validates a signed authority grant without opening a socket. On POSIX,
